@@ -78,9 +78,12 @@ impl Config {
 
 /// Transport protocol for an allowlist entry.
 ///
-/// TCP is the only one actually enforced today (the smoltcp UDP path
-/// is not wired). UDP entries are still parsed so the on-disk schema
-/// can describe a DNS resolver without later config churn.
+/// TCP is the only one supported today. UDP is reserved at the type
+/// level so the wire schema doesn't have to break when it lands, but
+/// validation actively rejects UDP entries with a clear error rather
+/// than silently dropping them at runtime. See
+/// https://github.com/EnclaviaIO/enclavia/issues/1 for the tracking
+/// issue.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -193,6 +196,8 @@ pub enum AllowlistLoadError {
     Json(PathBuf, serde_json::Error),
     #[error("unsupported allowlist schema version {0} (expected 1)")]
     UnsupportedVersion(u32),
+    #[error("UDP egress is not supported yet (entry `{host}:{port}/udp`); see https://github.com/EnclaviaIO/enclavia/issues/1")]
+    UdpNotSupported { host: String, port: u16 },
 }
 
 impl AllowlistConfig {
@@ -252,6 +257,16 @@ impl AllowlistConfig {
         let mut entries = Vec::new();
         let mut hostnames = Vec::new();
         for raw_entry in raw.egress {
+            // UDP entries used to be accepted by the schema and silently
+            // ignored at runtime (the daemon is TCP-only). That's footgun-y;
+            // reject upfront with a clear error pointing at the tracking
+            // issue. When the daemon learns UDP this check goes away.
+            if matches!(raw_entry.protocol, Protocol::Udp) {
+                return Err(AllowlistLoadError::UdpNotSupported {
+                    host: raw_entry.host.trim().to_string(),
+                    port: raw_entry.port,
+                });
+            }
             let host = raw_entry.host.trim().to_string();
             if let Ok(net) = host.parse::<Ipv4Net>() {
                 entries.push(AllowlistEntry {
@@ -599,19 +614,54 @@ mod tests {
     }
 
     #[test]
-    fn hostnames_for_port_filters_by_port_and_protocol() {
+    fn hostnames_for_port_filters_by_port() {
         let raw = br#"{
             "version": 1,
             "egress": [
                 {"host": "a.example", "port": 443, "protocol": "tcp"},
-                {"host": "b.example", "port": 80,  "protocol": "tcp"},
-                {"host": "c.example", "port": 53,  "protocol": "udp"}
+                {"host": "b.example", "port": 80,  "protocol": "tcp"}
             ]
         }"#;
         let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
         let on_443: Vec<_> =
             cfg.tcp_hostnames_for_port(443).map(|h| h.host.as_str()).collect();
         assert_eq!(on_443, vec!["a.example"]);
+    }
+
+    #[test]
+    fn udp_entry_in_json_is_rejected() {
+        let raw = br#"{
+            "version": 1,
+            "egress": [
+                {"host": "1.1.1.1", "port": 53, "protocol": "udp"}
+            ]
+        }"#;
+        let err = AllowlistConfig::from_bytes(raw).expect_err("must reject UDP");
+        assert!(matches!(
+            err,
+            AllowlistLoadError::UdpNotSupported { ref host, port: 53 } if host == "1.1.1.1"
+        ));
+    }
+
+    #[test]
+    fn udp_entry_in_hostname_form_is_rejected() {
+        let raw = br#"{
+            "version": 1,
+            "egress": [
+                {"host": "example.com", "port": 53, "protocol": "udp"}
+            ]
+        }"#;
+        let err = AllowlistConfig::from_bytes(raw).expect_err("must reject UDP");
+        assert!(matches!(err, AllowlistLoadError::UdpNotSupported { .. }));
+    }
+
+    #[test]
+    fn udp_via_assemble_from_cli_is_rejected() {
+        let err = assemble_from_cli(&["1.1.1.1:53/udp"], &[]).expect_err("must reject UDP");
+        assert!(matches!(
+            err,
+            AllowlistFlagError::Validation(AllowlistLoadError::UdpNotSupported { .. })
+        ));
     }
 
     #[test]

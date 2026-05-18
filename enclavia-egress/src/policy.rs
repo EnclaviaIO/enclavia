@@ -188,16 +188,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_only_entry_denies_tcp() {
-        let cfg = cfg_from_json(
-            r#"{ "version": 1, "egress": [ {"host":"1.2.3.4","port":53,"protocol":"udp"} ] }"#,
-        );
-        let policy = StaticAllowlistPolicy::new(cfg, allow_all_resolver());
-        let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 53);
-        assert_eq!(policy.allow_tcp(dst).await, PolicyDecision::Deny);
-    }
-
-    #[tokio::test]
     async fn empty_allowlist_denies_everything() {
         let policy =
             StaticAllowlistPolicy::new(AllowlistConfig::empty(), allow_all_resolver());
@@ -275,23 +265,6 @@ mod tests {
         let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 80);
         assert_eq!(policy.allow_tcp(dst).await, PolicyDecision::Deny);
         assert_eq!(resolver.calls(), 0, "policy must short-circuit before DNS");
-    }
-
-    #[tokio::test]
-    async fn hostname_wrong_protocol_denies() {
-        // UDP-shaped hostname entry should not be picked up by the
-        // TCP-side matcher.
-        let cfg = cfg_from_json(
-            r#"{ "version": 1, "egress": [ {"host":"api.openai.com","port":53,"protocol":"udp"} ] }"#,
-        );
-        let resolver = Arc::new(MockResolver::with_answer(
-            "api.openai.com",
-            [Ipv4Addr::new(1, 2, 3, 4)],
-        ));
-        let policy = StaticAllowlistPolicy::new(cfg, resolver.clone());
-        let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 53);
-        assert_eq!(policy.allow_tcp(dst).await, PolicyDecision::Deny);
-        assert_eq!(resolver.calls(), 0, "UDP hostname entry not in TCP matcher");
     }
 
     #[tokio::test]
