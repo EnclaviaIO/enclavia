@@ -195,7 +195,6 @@ async fn run_login() -> Result<(), CliError> {
 }
 
 async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
-    let client = ApiClient::new()?;
     match cmd {
         EnclaveCmd::Create {
             instance_type,
@@ -207,12 +206,19 @@ async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
             egress_resolver,
             egress_config,
         } => {
+            // Validate the egress allowlist BEFORE constructing the API
+            // client. The validator is purely local (parses --egress-allow
+            // / --egress-config, runs the same checks the daemon would
+            // run at boot). A logged-out user passing a bad allowlist
+            // should see the actual local error (e.g. "UDP egress is not
+            // supported yet"), not "not logged in" from ApiClient::new().
             let egress_inputs = enclave_cmds::EgressInputs {
                 allows: egress_allow,
                 resolvers: egress_resolver,
                 config_path: egress_config,
             };
             let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress_inputs)?;
+            let client = ApiClient::new()?;
             let res = enclave_cmds::create(
                 &client,
                 instance_type.into(),
@@ -231,26 +237,31 @@ async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
             Ok(())
         }
         EnclaveCmd::List { include_archived } => {
+            let client = ApiClient::new()?;
             let enclaves = enclave_cmds::list(&client, include_archived).await?;
             print_enclave_list(&enclaves, include_archived);
             Ok(())
         }
         EnclaveCmd::Status { id } => {
+            let client = ApiClient::new()?;
             let e = enclave_cmds::status(&client, &id).await?;
             print_enclave_status(&e);
             Ok(())
         }
         EnclaveCmd::Stop { id } => {
+            let client = ApiClient::new()?;
             enclave_cmds::stop(&client, &id).await?;
             println!("Enclave {id} stopped.");
             Ok(())
         }
         EnclaveCmd::Start { id } => {
+            let client = ApiClient::new()?;
             enclave_cmds::start(&client, &id).await?;
             println!("Enclave {id} started.");
             Ok(())
         }
         EnclaveCmd::Destroy { id } => {
+            let client = ApiClient::new()?;
             enclave_cmds::destroy(&client, &id).await?;
             println!("Enclave {id} destroyed.");
             Ok(())
