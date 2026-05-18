@@ -1,0 +1,24 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in CLAUDE.md before adding any
+# transport-related feature here.
+
+[package]
+name = "nbd-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave NBD client over vsock: backs the encrypted filesystem on top of the host-side storage relay."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+
+tokio-vsock = { workspace = true }
+
+[[bin]]
+name = "enclavia-nbd-client"
+path = "src/main.rs"

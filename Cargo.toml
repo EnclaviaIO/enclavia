@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "enclavia",
+    "enclavia-cli",
+    "enclavia-crypto",
+    "enclavia-egress",
+    "enclavia-protocol",
+    "enclavia-server",
+    "mock-kms",
+    "nbd-client",
+    "synchronizer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/EnclaviaIO/enclavia"
+
+# Silences a `crane will use a placeholder value since `name` cannot be found`
+# warning. The root Cargo.toml is workspace-only, so crane has no `[package].name`
+# to read; every individual derivation sets its own `pname` anyway.
+[workspace.metadata.crane]
+name = "enclavia"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "process", "time"] }
+tokio-tungstenite = "0.26"
+tokio-vsock = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+snow = "0.9"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+thiserror = "2"
+httparse = "1"
+url = "2"
+base64 = "0.22"
+attestation-doc-validation = "0.10"
+aws-nitro-enclaves-nsm-api = { version = "0.4", default-features = false }
+hex = "0.4"
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+jsonwebtoken = "9"
+reqwest = { version = "0.12", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+libc = "0.2"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+rand = "0.8"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+hyper = { version = "1", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+async-trait = "0.1"
+ipnet = { version = "2", features = ["serde"] }
+hickory-proto = { version = "0.26", default-features = false }

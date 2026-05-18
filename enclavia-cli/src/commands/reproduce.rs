@@ -1,0 +1,498 @@
+//! `enclavia reproduce <enclave-id>` — rebuild an enclave's EIF locally and
+//! verify its PCRs match what the backend recorded for the original build.
+//!
+//! Trust model: a public enclave's PCR set is the public proof that a given
+//! image was built into the running enclave. Any third party can pull the
+//! pinned image, run the same builder, and demand byte-for-byte PCR equality.
+//! For private enclaves only the owner can pull the image (the registry
+//! enforces this); the comparison is otherwise identical.
+//!
+//! The CLI does not re-implement the build — it shells out to the same
+//! `builder` binary the backend uses, which is published as part of the
+//! product. Path discovery falls back to `BUILDER_PATH` env var, then to
+//! `builder` on `$PATH`.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+
+use crate::api::{ApiClient, EnclaveSummary};
+use crate::error::CliError;
+
+/// Result of `enclavia reproduce`. The CLI binary turns this into a
+/// human-readable success/diff; downstream callers (MCP) can format it
+/// however they like.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReproduceResult {
+    pub enclave_id: String,
+    pub image_digest: String,
+    /// PCRs the backend recorded when it originally built this enclave.
+    pub expected: PcrTriple,
+    /// PCRs the local builder produced just now.
+    pub actual: PcrTriple,
+    /// Empty when the build is reproducible. Each entry names a PCR slot
+    /// (`PCR0`/`PCR1`/`PCR2`) that diverged.
+    pub mismatches: Vec<PcrMismatch>,
+    /// Git rev of the `builder` flake input the backend used when it
+    /// originally built this enclave. Surfaced as a hint so the user can
+    /// re-run their local builder against the matching source. `None` on
+    /// rows from a backend without `FLAKE_LOCK_PATH` (or built before
+    /// the column existed).
+    pub recorded_builder_rev: Option<String>,
+    /// Git rev of the `enclavia-crates` flake input. Same null
+    /// semantics as `recorded_builder_rev`.
+    pub recorded_crates_rev: Option<String>,
+    /// Egress allowlist that the backend recorded for this enclave
+    /// (verbatim from the JSONB column). `null` means the user didn't
+    /// supply one; the local build is handed the empty document so
+    /// PCRs match the backend's empty-doc bake.
+    pub recorded_egress_allowlist: serde_json::Value,
+}
+
+impl ReproduceResult {
+    pub fn is_reproducible(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PcrTriple {
+    #[serde(rename = "PCR0")]
+    pub pcr0: String,
+    #[serde(rename = "PCR1")]
+    pub pcr1: String,
+    #[serde(rename = "PCR2")]
+    pub pcr2: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PcrMismatch {
+    pub slot: &'static str,
+    pub expected: String,
+    pub actual: String,
+}
+
+/// Resolve `<id-or-prefix>`, fetch the enclave row, run the local builder,
+/// and compare PCRs. Returns Ok even when the comparison fails — the
+/// caller decides how to surface a non-reproducible build (the binary
+/// exits non-zero; MCP returns the struct as-is).
+pub async fn reproduce(
+    client: &ApiClient,
+    id_or_prefix: &str,
+) -> Result<ReproduceResult, CliError> {
+    let summary = resolve_enclave(client, id_or_prefix).await?;
+    let enclave = client.get_enclave(&summary.id).await?;
+
+    let image_digest = enclave
+        .get("image_digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CliError::Other(format!(
+            "enclave {} has no recorded image_digest — only enclaves whose build has started can be reproduced",
+            summary.id
+        )))?
+        .to_string();
+
+    let expected = expected_pcrs(&enclave)?;
+
+    let docker_image = enclave
+        .get("docker_image")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CliError::Other("enclave is missing docker_image".into()))?
+        .to_string();
+    let pinned_image = pin_to_digest(&docker_image, &image_digest);
+
+    let recorded_builder_rev = enclave
+        .get("builder_rev")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let recorded_crates_rev = enclave
+        .get("crates_rev")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let recorded_egress_allowlist = enclave
+        .get("egress_allowlist")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let actual = run_builder(
+        &summary.id,
+        &pinned_image,
+        &enclave,
+        &recorded_egress_allowlist,
+    )
+    .await?;
+
+    let mismatches = diff_pcrs(&expected, &actual);
+
+    Ok(ReproduceResult {
+        enclave_id: summary.id,
+        image_digest,
+        expected,
+        actual,
+        mismatches,
+        recorded_builder_rev,
+        recorded_crates_rev,
+        recorded_egress_allowlist,
+    })
+}
+
+/// Pull the typed PCR triple out of the GET /enclaves/:id response.
+fn expected_pcrs(enclave: &serde_json::Value) -> Result<PcrTriple, CliError> {
+    let pcrs = enclave
+        .get("pcrs")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| CliError::Other(
+            "enclave has no recorded PCRs — only enclaves that have been built can be reproduced".into(),
+        ))?;
+
+    let take = |key: &str| -> Result<String, CliError> {
+        pcrs.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| CliError::Other(format!("PCRs object is missing {key}")))
+    };
+
+    Ok(PcrTriple {
+        pcr0: take("PCR0")?,
+        pcr1: take("PCR1")?,
+        pcr2: take("PCR2")?,
+    })
+}
+
+/// Spawn the local builder with flags that mirror the backend's invocation
+/// for this enclave. PCR equality is sensitive to every flag that touches
+/// the kernel, initramfs, or rootfs — `--debug`, `--storage`, `--enclave-id`,
+/// and `--control-pubkey` all change the measurements, so each is forwarded
+/// based on what's recorded on the row.
+async fn run_builder(
+    enclave_id: &str,
+    pinned_image: &str,
+    enclave: &serde_json::Value,
+    egress_allowlist: &serde_json::Value,
+) -> Result<PcrTriple, CliError> {
+    let builder_path = std::env::var("BUILDER_PATH").unwrap_or_else(|_| "builder".to_string());
+    let output_dir = std::env::temp_dir().join(format!("enclavia-reproduce-{enclave_id}"));
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| CliError::Other(format!("creating {}: {e}", output_dir.display())))?;
+
+    // Materialise the recorded allowlist as a file the builder can copy
+    // into the bundle. NULL on the row means the original build went
+    // through the empty-doc path, so we mirror that here for PCR
+    // equality.
+    let egress_doc = if egress_allowlist.is_null() {
+        serde_json::json!({"version": 1, "resolvers": [], "egress": []})
+    } else {
+        egress_allowlist.clone()
+    };
+    let egress_path = output_dir.join("egress.json");
+    let serialized = serde_json::to_vec_pretty(&egress_doc)
+        .map_err(|e| CliError::Other(format!("serialising allowlist: {e}")))?;
+    std::fs::write(&egress_path, serialized)
+        .map_err(|e| CliError::Other(format!("writing {}: {e}", egress_path.display())))?;
+
+    let mut cmd = Command::new(&builder_path);
+    cmd.arg("build")
+        .arg("--image")
+        .arg(pinned_image)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--enclave-id")
+        .arg(enclave_id)
+        .arg("--egress-allowlist")
+        .arg(&egress_path);
+
+    if let Some(port) = enclave.get("container_port").and_then(|v| v.as_u64()) {
+        cmd.arg("--container-port").arg(port.to_string());
+    }
+
+    let mode = enclave.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    if mode == "debug" {
+        cmd.arg("--debug");
+    }
+
+    let storage_size = enclave
+        .get("storage_size_bytes")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            enclave
+                .get("storage")
+                .and_then(|s| s.get("size_bytes"))
+                .and_then(|v| v.as_u64())
+        });
+    if storage_size.is_some() {
+        cmd.arg("--storage");
+    }
+
+    if let Some(pubkey_field) = enclave.get("control_public_key") {
+        if let Some(b64) = pubkey_field.as_str() {
+            // `serde_json` serialises `Vec<u8>` as a JSON array of bytes,
+            // not a base64 string — so a string here means an upstream
+            // formatter has already encoded it. Pass it straight through.
+            cmd.arg("--control-pubkey").arg(b64);
+        } else if let Some(arr) = pubkey_field.as_array() {
+            // Array-of-bytes form: re-encode as base64 since the builder
+            // expects a 32-byte key as base64 on the command line.
+            use base64::Engine;
+            let bytes: Vec<u8> = arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .collect();
+            if !bytes.is_empty() {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                cmd.arg("--control-pubkey").arg(b64);
+            }
+        }
+    }
+
+    eprintln!("Running local builder: {builder_path:?}");
+    eprintln!("  output: {}", output_dir.display());
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| CliError::Other(format!("failed to spawn builder ({builder_path:?}): {e}. Set BUILDER_PATH to point at a `builder` binary.")))?
+        .wait_with_output()
+        .await
+        .map_err(|e| CliError::Other(format!("builder I/O error: {e}")))?;
+
+    if !output.status.success() {
+        return Err(CliError::Other(format!(
+            "builder exited with {}: rerun with `RUST_LOG=debug` for details",
+            output.status,
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_builder_output(stdout.trim()).map_err(|e| {
+        CliError::Other(format!(
+            "couldn't parse builder output: {e}\n--- builder stdout ---\n{stdout}\n--- end ---"
+        ))
+    })
+}
+
+/// The builder writes a JSON line on stdout with `eif_path` and `pcrs`.
+/// Some builders also emit logs on stdout; tolerate that by scanning for
+/// the last line that parses as the expected JSON object.
+fn parse_builder_output(stdout: &str) -> Result<PcrTriple, String> {
+    #[derive(Deserialize)]
+    struct BuildResult {
+        pcrs: PcrTriple,
+        #[serde(default)]
+        #[allow(dead_code)]
+        eif_path: Option<PathBuf>,
+    }
+
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err("builder produced no stdout".into());
+    }
+
+    // Fast path: stdout is a single JSON object.
+    if let Ok(parsed) = serde_json::from_str::<BuildResult>(trimmed) {
+        return Ok(parsed.pcrs);
+    }
+
+    // Fallback: parse each line, keep the last successful parse.
+    let mut last: Option<PcrTriple> = None;
+    for line in trimmed.lines().rev() {
+        if let Ok(parsed) = serde_json::from_str::<BuildResult>(line.trim()) {
+            last = Some(parsed.pcrs);
+            break;
+        }
+    }
+    last.ok_or_else(|| {
+        "no JSON line in builder stdout matched `{ pcrs: { PCR0, PCR1, PCR2 } }`".to_string()
+    })
+}
+
+/// Replace a `<host>/<owner>/<repo>:<tag>` reference with its digest-pinned
+/// form `<host>/<owner>/<repo>@sha256:<digest>`. Mirrors the backend's
+/// `pin_image_to_digest` so the CLI pulls exactly the bytes the original
+/// build pulled, even if the tag has since been overwritten by a newer push.
+fn pin_to_digest(canonical: &str, digest: &str) -> String {
+    if canonical.contains('@') {
+        // Already digest-pinned. Trust the caller — re-pinning would just
+        // produce the same string.
+        return canonical.to_string();
+    }
+    match canonical.rsplit_once(':') {
+        Some((stem, _tag)) => format!("{stem}@{digest}"),
+        None => format!("{canonical}@{digest}"),
+    }
+}
+
+/// Slot-by-slot comparison. Three independent PCRs means up to three
+/// entries in the diff, each labelled with its slot.
+pub fn diff_pcrs(expected: &PcrTriple, actual: &PcrTriple) -> Vec<PcrMismatch> {
+    let mut diffs = Vec::new();
+    if expected.pcr0 != actual.pcr0 {
+        diffs.push(PcrMismatch {
+            slot: "PCR0",
+            expected: expected.pcr0.clone(),
+            actual: actual.pcr0.clone(),
+        });
+    }
+    if expected.pcr1 != actual.pcr1 {
+        diffs.push(PcrMismatch {
+            slot: "PCR1",
+            expected: expected.pcr1.clone(),
+            actual: actual.pcr1.clone(),
+        });
+    }
+    if expected.pcr2 != actual.pcr2 {
+        diffs.push(PcrMismatch {
+            slot: "PCR2",
+            expected: expected.pcr2.clone(),
+            actual: actual.pcr2.clone(),
+        });
+    }
+    diffs
+}
+
+/// Same prefix-matching the `push` command uses. Returns the `EnclaveSummary`
+/// for the unique match; errors with a candidate list when the prefix is
+/// ambiguous, and with a "no match" when nothing hits.
+///
+/// A full UUID short-circuits the listing — we don't need
+/// `list_enclaves` to disambiguate, and skipping it lets the anonymous
+/// reproduce path (no credentials, querying a public enclave) work
+/// without ever hitting the authenticated list endpoint.
+async fn resolve_enclave(
+    client: &ApiClient,
+    id_or_prefix: &str,
+) -> Result<EnclaveSummary, CliError> {
+    if id_or_prefix.is_empty() {
+        return Err("enclave id cannot be empty".into());
+    }
+
+    if uuid::Uuid::parse_str(id_or_prefix).is_ok() {
+        return Ok(EnclaveSummary {
+            id: id_or_prefix.to_string(),
+            ..Default::default()
+        });
+    }
+
+    let all = client.list_enclaves(true).await?;
+    let matches: Vec<EnclaveSummary> = all
+        .into_iter()
+        .filter(|e| e.id.starts_with(id_or_prefix))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(CliError::Other(format!(
+            "no enclave matches `{id_or_prefix}`. List your enclaves with `enclavia enclave list`."
+        ))),
+        [one] => Ok(one.clone()),
+        many => {
+            let mut msg = format!(
+                "prefix `{id_or_prefix}` matches {} enclaves; pass a longer prefix:\n",
+                many.len()
+            );
+            for e in many {
+                let name = e.name.as_deref().unwrap_or("-");
+                msg.push_str(&format!("  {} ({name})\n", e.id));
+            }
+            Err(CliError::Other(msg.trim_end().to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn triple(p0: &str, p1: &str, p2: &str) -> PcrTriple {
+        PcrTriple {
+            pcr0: p0.into(),
+            pcr1: p1.into(),
+            pcr2: p2.into(),
+        }
+    }
+
+    #[test]
+    fn diff_returns_empty_when_all_match() {
+        let t = triple("aa", "bb", "cc");
+        assert!(diff_pcrs(&t, &t).is_empty());
+    }
+
+    #[test]
+    fn diff_flags_single_mismatch() {
+        let expected = triple("aa", "bb", "cc");
+        let actual = triple("aa", "BB", "cc");
+        let diffs = diff_pcrs(&expected, &actual);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].slot, "PCR1");
+        assert_eq!(diffs[0].expected, "bb");
+        assert_eq!(diffs[0].actual, "BB");
+    }
+
+    #[test]
+    fn diff_flags_all_three_when_all_differ() {
+        let expected = triple("aa", "bb", "cc");
+        let actual = triple("AA", "BB", "CC");
+        let diffs = diff_pcrs(&expected, &actual);
+        assert_eq!(diffs.len(), 3);
+        let slots: Vec<_> = diffs.iter().map(|m| m.slot).collect();
+        assert_eq!(slots, vec!["PCR0", "PCR1", "PCR2"]);
+    }
+
+    #[test]
+    fn pin_replaces_tag_with_digest() {
+        let pinned = pin_to_digest("registry.local:5000/alice/foo:bar", "sha256:deadbeef");
+        assert_eq!(pinned, "registry.local:5000/alice/foo@sha256:deadbeef");
+    }
+
+    #[test]
+    fn pin_is_idempotent_when_already_digest_pinned() {
+        let already = "registry.local:5000/alice/foo@sha256:deadbeef";
+        assert_eq!(pin_to_digest(already, "sha256:other"), already);
+    }
+
+    #[test]
+    fn parse_builder_output_handles_single_json_line() {
+        let stdout = r#"{"pcrs":{"PCR0":"a","PCR1":"b","PCR2":"c"},"eif_path":"/tmp/x"}"#;
+        let pcrs = parse_builder_output(stdout).expect("parse");
+        assert_eq!(pcrs, triple("a", "b", "c"));
+    }
+
+    #[test]
+    fn parse_builder_output_picks_last_json_when_logs_present() {
+        let stdout = "loading…\nstep 1\n{\"pcrs\":{\"PCR0\":\"x\",\"PCR1\":\"y\",\"PCR2\":\"z\"}}";
+        let pcrs = parse_builder_output(stdout).expect("parse");
+        assert_eq!(pcrs, triple("x", "y", "z"));
+    }
+
+    #[test]
+    fn parse_builder_output_errors_when_no_json() {
+        assert!(parse_builder_output("nothing here\n").is_err());
+    }
+
+    #[test]
+    fn is_reproducible_reflects_diff() {
+        let r = ReproduceResult {
+            enclave_id: "id".into(),
+            image_digest: "sha256:x".into(),
+            expected: triple("a", "b", "c"),
+            actual: triple("a", "b", "c"),
+            mismatches: vec![],
+            recorded_builder_rev: None,
+            recorded_crates_rev: None,
+            recorded_egress_allowlist: serde_json::Value::Null,
+        };
+        assert!(r.is_reproducible());
+
+        let r = ReproduceResult {
+            mismatches: vec![PcrMismatch {
+                slot: "PCR0",
+                expected: "a".into(),
+                actual: "z".into(),
+            }],
+            ..r
+        };
+        assert!(!r.is_reproducible());
+    }
+}

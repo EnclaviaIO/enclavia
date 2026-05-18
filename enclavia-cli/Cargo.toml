@@ -1,0 +1,41 @@
+[package]
+name = "enclavia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Enclavia CLI: auth, push, and enclave lifecycle commands. Also exposes a reusable library face for tooling."
+
+[lib]
+name = "enclavia_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "enclavia"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+# OAuth 2.1 + PKCE flow (#88) — hand-rolled in `commands::auth` so the CLI
+# isn't pulled into a heavyweight oauth2-crate dependency just to mint a
+# challenge and run a one-shot loopback callback server.
+axum = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+dirs = "6"
+open = "5"
+# Egress allowlist parser. Same crate the backend and in-enclave daemon
+# share, so all three agree on what is well-formed for the
+# --egress-allow / --egress-resolver / --egress-config flags.
+enclavia-egress = { path = "../enclavia-egress" }

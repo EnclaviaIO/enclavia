@@ -1,0 +1,54 @@
+[package]
+name = "synchronizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave multi-node storage synchronizer: mesh replication of LUKS-encrypted volumes over attested Noise tunnels."
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["sync"] }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tokio-vsock = { workspace = true, optional = true }
+# Noise responder helpers + attestation verifier. The listener wraps
+# every accepted stream in a Noise_NN tunnel, then derives the session's
+# PcrKey from a Nitro NSM document whose nonce is bound to the Noise
+# handshake hash.
+enclavia-protocol = { path = "../enclavia-protocol", optional = true, default-features = false }
+snow = { workspace = true, optional = true }
+# Verifies Ed25519 control-key signatures on Transition requests against
+# the pubkey registered at first attestation. Pulled in by the `node`
+# feature — the pure state machine stays crypto-free.
+ed25519-dalek = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+wire = ["serde", "dep:ciborium"]
+# Async single-node RPC surface. Pulls in tokio, the Noise responder
+# helpers, and the attestation verifier from `enclavia-protocol`.
+# Implies `wire`.
+node = ["wire", "dep:tokio", "tokio/io-util", "dep:enclavia-protocol", "enclavia-protocol/async-transport", "dep:snow", "dep:ed25519-dalek"]
+# Build the listener binary. Pick one of `debug` (UDS) or `enclave`
+# (vsock) — same pattern as the other in-enclave crates.
+debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber"]
+enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "dep:tokio-vsock"]
+
+[dev-dependencies]
+ciborium = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "io-util"] }
+enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }
+# Tests construct real Ed25519 keypairs from deterministic seeds so they
+# can sign canonical transition payloads and exercise the listener/Node
+# verifier end to end.
+ed25519-dalek = { workspace = true }
+
+[[bin]]
+name = "enclavia-synchronizer"
+path = "src/main.rs"
+required-features = ["node"]

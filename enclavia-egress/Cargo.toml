@@ -1,0 +1,52 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in CLAUDE.md before adding any
+# transport-related feature here.
+#
+# The `test-utils` feature exposes a UDS-capable transport so integration
+# tests can stand up the daemon on a dev machine without booting QEMU.
+# It is for tests only and is never compiled into the production binary.
+
+[package]
+name = "enclavia-egress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave outbound TCP daemon: TUN + smoltcp + vsock client with allowlist enforcement."
+
+[features]
+default = []
+# UDS-capable transport for the test harness. Mutually compatible with
+# the default vsock transport: enabling it adds the UDS impl, it does
+# not replace anything.
+test-utils = []
+
+[dependencies]
+enclavia-protocol = { path = "../enclavia-protocol" }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-vsock = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+libc.workspace = true
+
+smoltcp = { version = "0.12", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "async"] }
+tun = { version = "0.7", features = ["async"] }
+serde.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+hickory-proto.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+# Note: the integration test in tests/forward.rs re-implements a minimal
+# stand-in for the host-side `egress-host` relay (which lives in the
+# closed-source workspace) so this crate has no dependency on it. See
+# the comment at the top of that test for context.
+tempfile = "3"
+
+[[bin]]
+name = "enclavia-egress"
+path = "src/main.rs"

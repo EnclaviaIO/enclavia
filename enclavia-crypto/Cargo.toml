@@ -1,0 +1,37 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in CLAUDE.md before adding any
+# transport-related feature here.
+
+[package]
+name = "enclavia-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave key management: KMS-backed LUKS unsealing for the persistent storage volume."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "fs", "process"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+rand.workspace = true
+
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+
+clap.workspace = true
+
+tokio-vsock = { workspace = true }
+
+[[bin]]
+name = "enclavia-crypto"
+path = "src/main.rs"

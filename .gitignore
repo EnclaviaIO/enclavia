@@ -1,0 +1,6 @@
+/target
+result
+result-*
+.dev/
+.direnv/
+.envrc.local

@@ -1,0 +1,32 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in CLAUDE.md before adding any
+# transport-related feature here.
+
+[package]
+name = "enclavia-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave Noise responder: terminates the encrypted channel and forwards plaintext to the inner container."
+
+[dependencies]
+enclavia-protocol = { path = "../enclavia-protocol" }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+base64.workspace = true
+tokio-vsock = { workspace = true }
+# Re-enable the `nix` feature: enclavia-server is the one place that
+# actually drives `/dev/nsm` to produce attestations.
+aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
+
+[[bin]]
+name = "enclavia-server"
+path = "src/main.rs"

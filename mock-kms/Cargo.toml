@@ -1,0 +1,30 @@
+[package]
+name = "mock-kms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only KMS Trent endpoint used by the local stack and the builder's QEMU wrappers."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "fs", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+rand.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "enclavia-mock-kms"
+path = "src/main.rs"

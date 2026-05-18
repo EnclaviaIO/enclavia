@@ -1,0 +1,35 @@
+[package]
+name = "enclavia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Encrypted HTTP client SDK for the Enclavia enclave runtime: Noise tunnel over WebSocket with built-in attestation verification."
+
+[features]
+default = []
+json = ["serde_json"]
+
+[dependencies]
+# enclavia-protocol owns the shared attestation verifier. The SDK uses
+# its own `noise.rs` over WebSocket frames rather than the
+# `async-transport` byte-stream variant, so disable that feature.
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+# rustls 0.23 dropped the implicit default CryptoProvider — without an
+# explicit `install_default()` call, the first TLS handshake panics with
+# "Could not automatically determine the process-level CryptoProvider".
+# Pull in the `ring` provider here so `Client::build()` can install it
+# once before connect_async runs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = { workspace = true }
+snow.workspace = true
+serde.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+httparse.workspace = true
+url.workspace = true
+tracing.workspace = true
+
+serde_json = { version = "1", optional = true }
