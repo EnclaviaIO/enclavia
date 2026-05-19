@@ -122,6 +122,8 @@ pub async fn reproduce(
         &pinned_image,
         &enclave,
         &recorded_egress_allowlist,
+        recorded_builder_rev.as_deref(),
+        recorded_crates_rev.as_deref(),
     )
     .await?;
 
@@ -162,16 +164,32 @@ fn expected_pcrs(enclave: &serde_json::Value) -> Result<PcrTriple, CliError> {
     })
 }
 
+/// Public-repo URLs used to fetch the `builder` and `enclavia` flake
+/// sources at the revs the backend recorded. `git+ssh://` while the
+/// repos are private; swap to `github:` once they flip public.
+const BUILDER_FLAKE_URL: &str = "git+ssh://git@github.com/EnclaviaIO/builder";
+const ENCLAVIA_FLAKE_URL: &str = "git+ssh://git@github.com/EnclaviaIO/enclavia";
+
 /// Spawn the local builder with flags that mirror the backend's invocation
 /// for this enclave. PCR equality is sensitive to every flag that touches
 /// the kernel, initramfs, or rootfs — `--debug`, `--storage`, `--enclave-id`,
 /// and `--control-pubkey` all change the measurements, so each is forwarded
 /// based on what's recorded on the row.
+///
+/// When the backend recorded `builder_rev` / `crates_rev`, we fetch the
+/// matching sources via `nix flake metadata` and pass them as
+/// `BUILDER_FLAKE` / `ENCLAVIA_FLAKE` env vars. The builder picks these
+/// up and passes them to its own `nix build` as `--override-input`, so
+/// the EIF is reconstructed from the exact sources the backend used.
+/// Without recorded revs we fall through to the caller's environment —
+/// reproduce won't reliably match in that case, but it still runs.
 async fn run_builder(
     enclave_id: &str,
     pinned_image: &str,
     enclave: &serde_json::Value,
     egress_allowlist: &serde_json::Value,
+    recorded_builder_rev: Option<&str>,
+    recorded_crates_rev: Option<&str>,
 ) -> Result<PcrTriple, CliError> {
     let builder_path = std::env::var("BUILDER_PATH").unwrap_or_else(|_| "builder".to_string());
     let output_dir = std::env::temp_dir().join(format!("enclavia-reproduce-{enclave_id}"));
@@ -247,6 +265,22 @@ async fn run_builder(
         }
     }
 
+    // If the backend recorded the source revs, materialise both as
+    // /nix/store paths and hand them to the builder via the env vars
+    // its `nix build` invocation honours as `--override-input`.
+    if let Some(rev) = recorded_builder_rev {
+        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, rev).await?;
+        cmd.env("BUILDER_FLAKE", path);
+    } else {
+        eprintln!("No recorded builder_rev on this enclave; reproduce will use the BUILDER_FLAKE in your environment (or the builder's own default), which may differ from what the backend used and produce diverging PCRs.");
+    }
+    if let Some(rev) = recorded_crates_rev {
+        let path = fetch_flake_source("enclavia", ENCLAVIA_FLAKE_URL, rev).await?;
+        cmd.env("ENCLAVIA_FLAKE", path);
+    } else {
+        eprintln!("No recorded crates_rev on this enclave; reproduce will use the ENCLAVIA_FLAKE in your environment (or the builder's flake.lock pin), which may differ from what the backend used and produce diverging PCRs.");
+    }
+
     eprintln!("Running local builder: {builder_path:?}");
     eprintln!("  output: {}", output_dir.display());
 
@@ -307,6 +341,52 @@ fn parse_builder_output(stdout: &str) -> Result<PcrTriple, String> {
     last.ok_or_else(|| {
         "no JSON line in builder stdout matched `{ pcrs: { PCR0, PCR1, PCR2 } }`".to_string()
     })
+}
+
+/// Fetch a flake source at a given git rev and return its /nix/store path.
+/// Used to pin the builder + enclavia sources to whatever the backend
+/// recorded for an enclave at build time. Shells out to `nix flake
+/// metadata --json <url>?rev=<rev>` and parses the `path` field.
+///
+/// The user must have `nix` on PATH (a CLI prerequisite). Fetching uses
+/// whatever auth `nix` is configured with — for `git+ssh://` URLs that
+/// means the user's GitHub SSH key; for `github:` URLs (post public
+/// flip) it's unauthenticated HTTPS.
+async fn fetch_flake_source(label: &str, url: &str, rev: &str) -> Result<PathBuf, CliError> {
+    let flake_ref = format!("{url}?rev={rev}");
+    eprintln!("Fetching {label} source at {rev} from {url} …");
+
+    let output = Command::new("nix")
+        .args(["flake", "metadata", "--json", "--refresh", &flake_ref])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            CliError::Other(format!(
+                "failed to spawn `nix flake metadata` (is `nix` on PATH?): {e}"
+            ))
+        })?
+        .wait_with_output()
+        .await
+        .map_err(|e| CliError::Other(format!("`nix flake metadata` I/O error: {e}")))?;
+
+    if !output.status.success() {
+        return Err(CliError::Other(format!(
+            "`nix flake metadata {flake_ref}` failed ({}). The recorded {label} rev is {rev}; verify your nix has access to the source URL (SSH key for the private repos pre-flip).",
+            output.status,
+        )));
+    }
+
+    #[derive(Deserialize)]
+    struct FlakeMetadata {
+        path: String,
+    }
+    let parsed: FlakeMetadata = serde_json::from_slice(&output.stdout).map_err(|e| {
+        CliError::Other(format!(
+            "couldn't parse `nix flake metadata` output for {label}: {e}"
+        ))
+    })?;
+    Ok(PathBuf::from(parsed.path))
 }
 
 /// Replace a `<host>/<owner>/<repo>:<tag>` reference with its digest-pinned
