@@ -165,10 +165,12 @@ fn expected_pcrs(enclave: &serde_json::Value) -> Result<PcrTriple, CliError> {
 }
 
 /// Public-repo URLs used to fetch the `builder` and `enclavia` flake
-/// sources at the revs the backend recorded. `git+ssh://` while the
-/// repos are private; swap to `github:` once they flip public.
-const BUILDER_FLAKE_URL: &str = "git+ssh://git@github.com/EnclaviaIO/builder";
-const ENCLAVIA_FLAKE_URL: &str = "git+ssh://git@github.com/EnclaviaIO/enclavia";
+/// sources at the revs the backend recorded. `github:` is unauthenticated
+/// HTTPS now that both repos are public — anyone running
+/// `enclavia reproduce` can fetch the recorded sources without an
+/// SSH key on file with GitHub.
+const BUILDER_FLAKE_URL: &str = "github:EnclaviaIO/builder";
+const ENCLAVIA_FLAKE_URL: &str = "github:EnclaviaIO/enclavia";
 
 /// Spawn the local builder with flags that mirror the backend's invocation
 /// for this enclave. PCR equality is sensitive to every flag that touches
