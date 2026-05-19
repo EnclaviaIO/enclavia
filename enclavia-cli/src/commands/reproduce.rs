@@ -356,8 +356,18 @@ async fn fetch_flake_source(label: &str, url: &str, rev: &str) -> Result<PathBuf
     let flake_ref = format!("{url}?rev={rev}");
     eprintln!("Fetching {label} source at {rev} from {url} …");
 
+    // --no-write-lock-file: the remote URL is read-only, so don't let
+    // nix try to rewrite the fetched flake's lock when it spots stale
+    // transitive inputs. We only want the source store path; nothing
+    // else cares about transitive lock freshness here.
     let output = Command::new("nix")
-        .args(["flake", "metadata", "--json", "--refresh", &flake_ref])
+        .args([
+            "flake",
+            "metadata",
+            "--json",
+            "--no-write-lock-file",
+            &flake_ref,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
