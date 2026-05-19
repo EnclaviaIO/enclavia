@@ -344,8 +344,8 @@ fn print_enclave_list(enclaves: &[EnclaveSummary], include_archived: bool) {
     }
 
     println!(
-        "{:<38} {:<24} {:<40} {:<12} {:<8} {}",
-        "ID", "NAME", "IMAGE", "STATUS", "SIZE", "CREATED"
+        "{:<38} {:<24} {:<40} {:<12} {:<8} CREATED",
+        "ID", "NAME", "IMAGE", "STATUS", "SIZE"
     );
     println!("{}", "-".repeat(140));
     for e in enclaves {

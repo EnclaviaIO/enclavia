@@ -1,4 +1,4 @@
-/// NBD protocol constants for the client-side handshake.
+//! NBD protocol constants for the client-side handshake.
 
 // Handshake magic values
 pub const NBD_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"

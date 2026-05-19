@@ -16,7 +16,7 @@ pub fn get_attestation_with_data(
 
     let fd = nsm_init();
     if fd == -1 {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to initialize NSM")));
+        return Err(Box::new(std::io::Error::other("Failed to initialize NSM")));
     }
     let _guard = NsmGuard(fd);
 
@@ -28,8 +28,8 @@ pub fn get_attestation_with_data(
 
     let response = match nsm_process_request(fd, request) {
         Response::Attestation { document } => document,
-        Response::Error(error) => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Unexpected response from NSM: {:?}", error)))),
-        _ => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unexpected response from NSM"))),
+        Response::Error(error) => return Err(Box::new(std::io::Error::other(format!("Unexpected response from NSM: {error:?}")))),
+        _ => return Err(Box::new(std::io::Error::other("Unexpected response from NSM"))),
     };
 
     Ok(response)

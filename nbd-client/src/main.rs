@@ -3,7 +3,7 @@ mod nbd;
 
 use std::collections::HashMap;
 use std::os::fd::FromRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -430,7 +430,7 @@ where
 }
 
 /// Open the NBD device file, returning the raw fd.
-fn open_nbd_device(path: &PathBuf) -> Result<i32, Box<dyn std::error::Error>> {
+fn open_nbd_device(path: &Path) -> Result<i32, Box<dyn std::error::Error>> {
     use std::ffi::CString;
 
     let c_path = CString::new(path.to_str().ok_or("invalid device path")?)?;

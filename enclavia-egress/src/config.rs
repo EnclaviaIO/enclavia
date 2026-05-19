@@ -244,8 +244,8 @@ impl AllowlistConfig {
     ///   - parses as `a.b.c.d/n`     -> `HostMatcher::Cidr`
     ///   - parses as `a.b.c.d`       -> `HostMatcher::Literal`
     ///   - parses as IPv6 literal    -> logged + dropped (always-deny)
-    ///   - anything else (hostname)  -> `HostnameEntry`, enforced via
-    ///                                  the in-enclave resolver
+    ///   - anything else (hostname)  -> `HostnameEntry`, enforced via the
+    ///     in-enclave resolver
     ///
     /// Duplicates are not deduped; the matcher's short-circuit means
     /// they cost a little memory but cannot cause a logic bug.

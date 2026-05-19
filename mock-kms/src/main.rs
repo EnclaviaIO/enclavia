@@ -79,10 +79,10 @@ impl Config {
         // Accept either the env var or a CLI flag. The flag is the
         // user-facing knob (matches the issue spec); the env var is what
         // process-compose / systemd units typically set.
-        let auto_create_keys = match std::env::var("AUTO_CREATE_KEYS").ok().as_deref() {
-            Some("0") | Some("false") | Some("no") => false,
-            _ => true,
-        };
+        let auto_create_keys = !matches!(
+            std::env::var("AUTO_CREATE_KEYS").ok().as_deref(),
+            Some("0") | Some("false") | Some("no")
+        );
         Self { listen_path, key_dir, auto_create_keys }
     }
 }
@@ -871,7 +871,7 @@ mod tests {
         let pcrs = parse_policy_pcrs(policy).unwrap();
         assert_eq!(pcrs.pcrs.get("0"), Some(&"aa".to_string()));
         assert_eq!(pcrs.pcrs.get("2"), Some(&"cc".to_string()));
-        assert!(pcrs.pcrs.get("1").is_none());
+        assert!(!pcrs.pcrs.contains_key("1"));
         assert_eq!(pcrs.pcrs.len(), 2);
     }
 

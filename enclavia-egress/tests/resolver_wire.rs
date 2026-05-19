@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use hickory_proto::op::{Message, OpCode};
 use hickory_proto::rr::{RData, Record};
-use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use hickory_proto::serialize::binary::BinDecodable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
