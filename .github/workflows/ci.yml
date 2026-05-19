@@ -1,0 +1,67 @@
+# CI for the public Enclavia workspace.
+#
+# Per the EnclaviaIO CI epic (EnclaviaIO/enclavia-crates#157) and the
+# enclavia sub-task (#158), every repo gets the same Nix-first shape:
+# the first step warms `nix develop`, every subsequent step runs
+# inside it. We do not use `actions/setup-rust`; the toolchain
+# version is pinned by `flake.nix`.
+#
+# Single job by design. clippy, test, and doctests all reuse the
+# same `target/` artifacts that `cargo build` produced, so splitting
+# them across parallel jobs would either rebuild from scratch (slow)
+# or require an explicit cache action. Per the epic we lean on the
+# self-hosted runner's warm `/nix/store` + persistent `_work/`
+# checkout instead of layering on `actions/cache`.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# Cancel superseded runs for the same ref so a chain of force-pushes
+# does not pile up against the two-runner pool on hetzner-beta.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + clippy + test + doctests
+    # Self-hosted runner labels are defined in EnclaviaIO/deployment
+    # (`modules/github-runner.nix` on the `github-actions-runner`
+    # branch). `nix` gates the warm /nix/store; `self-hosted` is
+    # implicit but kept explicit for readability.
+    runs-on: [self-hosted, nix]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Warm the dev shell once so the rest of the steps see a
+      # populated /nix/store and don't each pay the eval cost.
+      - name: Warm nix develop
+        run: nix develop --command true
+
+      - name: cargo build
+        run: nix develop --command cargo build --workspace
+
+      - name: cargo clippy
+        run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+
+      # Workspace tests. The `forward.rs` integration test in
+      # `enclavia-egress` is gated behind the `test-utils` feature
+      # (see enclavia-egress/Cargo.toml); it is exercised explicitly
+      # in the next step so the default `cargo test --workspace`
+      # invocation stays close to what contributors run locally.
+      - name: cargo test
+        run: nix develop --command cargo test --workspace
+
+      - name: cargo test (enclavia-egress test-utils)
+        run: nix develop --command cargo test -p enclavia-egress --features test-utils
+
+      # Doctests on the client SDK matter (per #158): the `enclavia`
+      # crate's public API is documented with code examples that
+      # users copy/paste, so a doctest break is a real-world break.
+      - name: cargo doc-tests
+        run: nix develop --command cargo test --workspace --doc
