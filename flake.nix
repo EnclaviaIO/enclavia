@@ -84,6 +84,14 @@
           }
         );
 
+        enclaviaSecretsInit = craneLib.buildPackage (
+          individualCrateArgs
+          // {
+            pname = "enclavia-secrets-init";
+            cargoExtraArgs = "-p enclavia-secrets-init";
+          }
+        );
+
         # The CLI: crate name `enclavia-cli`, binary name `enclavia`.
         # Exposed as the flake package `enclavia` so testers can run
         # `nix profile install github:EnclaviaIO/enclavia#enclavia`.
@@ -111,6 +119,7 @@
           mock-kms = mockKms;
           enclavia-crypto = enclaviaCrypto;
           enclavia-server = enclaviaServer;
+          enclavia-secrets-init = enclaviaSecretsInit;
           # Beta-tester install entry point. Must stay named `enclavia`
           # so `nix profile install ...#enclavia` matches the binary.
           enclavia = enclaviaCli;

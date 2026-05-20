@@ -1,0 +1,25 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in enclavia-crates/CLAUDE.md before
+# adding any transport-related feature here.
+
+[package]
+name = "enclavia-secrets-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave init helper: fetches per-enclave secrets from the host (vsock 5004) and merges them into the workload's OCI config.json env."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "fs"] }
+tokio-vsock = { workspace = true }
+ciborium = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }
+
+[[bin]]
+name = "enclavia-secrets-init"
+path = "src/main.rs"
