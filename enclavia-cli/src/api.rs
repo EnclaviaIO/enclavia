@@ -329,6 +329,70 @@ impl ApiClient {
         .await
     }
 
+    /// Server-side stop + start. Used by `enclavia enclave restart` to
+    /// apply pending secret rotations / deletions (#169 / #175).
+    pub async fn restart_enclave(&self, id: &str) -> Result<(), CliError> {
+        self.request_no_response(
+            reqwest::Method::POST,
+            &format!("/enclaves/{id}/restart"),
+            "restart",
+        )
+        .await
+    }
+
+    // --- Per-enclave secrets (#169) --------------------------------------
+
+    pub async fn list_secrets(
+        &self,
+        enclave_id: &str,
+    ) -> Result<Vec<crate::commands::secrets::SecretSummary>, CliError> {
+        self.request(reqwest::Method::GET, &format!("/enclaves/{enclave_id}/secrets"))
+            .await
+    }
+
+    pub async fn create_secret(
+        &self,
+        enclave_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<crate::commands::secrets::SecretSummary, CliError> {
+        let body = serde_json::json!({ "name": name, "value": value });
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/secrets"),
+            &body,
+        )
+        .await
+    }
+
+    pub async fn update_secret(
+        &self,
+        enclave_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<crate::commands::secrets::SecretSummary, CliError> {
+        let body = serde_json::json!({ "value": value });
+        self.request_with_body(
+            reqwest::Method::PUT,
+            &format!("/enclaves/{enclave_id}/secrets/{name}"),
+            &body,
+        )
+        .await
+    }
+
+    pub async fn delete_secret(
+        &self,
+        enclave_id: &str,
+        name: &str,
+    ) -> Result<(), CliError> {
+        self.request_no_response(
+            reqwest::Method::DELETE,
+            &format!("/enclaves/{enclave_id}/secrets/{name}"),
+            "delete secret",
+        )
+        .await
+    }
+
     /// Helper for endpoints that don't return a typed body. Mirrors
     /// `request`'s refresh-on-401 behaviour.
     async fn request_no_response(
