@@ -8,8 +8,7 @@
 //!     │
 //!     ▼
 //!   open vsock CID 2 (host), port 5004 with a ~2s timeout
-//!     │  (no listener? secrets-host wasn't started by the launcher
-//!     │   because this enclave has no secrets defined; exit 0)
+//!     │
 //!     ▼
 //!   read CBOR BTreeMap<String, Vec<u8>> to EOF
 //!     │
@@ -22,10 +21,16 @@
 //!   write the file back, exit 0
 //! ```
 //!
-//! Failure modes: any error (CBOR parse, file I/O, malformed
-//! config.json) is fatal so the enclave fails to launch loudly rather
-//! than silently dropping secrets. The one exception is the connect
-//! timeout, which is the "no secrets defined" path and exits 0.
+//! Failure modes: any error (connect, timeout, CBOR parse, file I/O,
+//! malformed config.json) is fatal so the enclave fails to launch
+//! loudly rather than silently dropping secrets. A silent skip on
+//! connect failure would leave the workload running with missing env
+//! vars; that path is unrecoverable, since the workload (e.g. the
+//! notifier sample) may then re-bootstrap or otherwise overwrite
+//! persistent state. The "no secrets configured" case is handled by
+//! the host: the launcher always spawns `secrets-host`, which serves
+//! an empty CBOR map when no secrets are defined. We then walk the
+//! map and write nothing, which is a clean no-op.
 //!
 //! Wire format: matches the CBOR map `enclavia-secrets-host` writes
 //! (see `secrets-host/src/main.rs` in `enclavia-crates`). Values are
@@ -37,20 +42,25 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncReadExt;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-/// Vsock CID of the host (the parent EC2 instance under real Nitro, or
-/// `vhost-device-vsock` under QEMU). Locked by the Nitro/virtio-vsock
-/// contract.
+/// Vsock CID of the host: `VMADDR_CID_HOST = 2` per the Linux vsock
+/// contract. Works on both real Nitro (CID 2 is the parent EC2
+/// instance) and QEMU debug mode (`vhost-device-vsock` translates
+/// host-side connections to its UDS at `<proxy>_5004`). One binary,
+/// one transport, no debug/enclave feature split, per the in-enclave
+/// crate convention in CLAUDE.md.
 const VSOCK_HOST_CID: u32 = libc::VMADDR_CID_HOST;
 
 /// Port the host-side `enclavia-secrets-host` daemon listens on (#169).
 const SECRETS_HOST_PORT: u32 = 5004;
 
-/// How long we wait for the host-side daemon's `accept`. If nothing
-/// answers in this window we assume the enclave has no secrets
-/// configured (the backend doesn't start `secrets-host` in that case)
-/// and exit cleanly.
+/// How long we wait for the host-side daemon's `accept`. The host
+/// always spawns `secrets-host` (even for enclaves with no secrets,
+/// in which case it serves an empty map), so a timeout here is a
+/// hard failure: a missing or hung host daemon means the enclave
+/// would start without env vars it was supposed to have, which is
+/// unrecoverable for the workload.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 #[tokio::main]
@@ -71,11 +81,7 @@ async fn main() {
     };
 
     let secrets = match fetch_secrets().await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            info!("no host-side secrets daemon (assuming no secrets configured); exiting clean");
-            return;
-        }
+        Ok(s) => s,
         Err(e) => {
             error!("fetching secrets from host: {e}");
             std::process::exit(1);
@@ -107,46 +113,39 @@ fn parse_argv() -> Result<PathBuf, String> {
     Ok(PathBuf::from(bundle))
 }
 
-/// Connect to the host-side daemon and pull the CBOR map. `Ok(None)`
-/// means the host side isn't listening (the launcher didn't start it
-/// because the enclave has no secrets), which is the no-op path.
+/// Connect to the host-side daemon and pull the CBOR map. Any failure
+/// (connect refused, timeout, partial read, malformed CBOR) is fatal:
+/// the host's launcher always spawns `secrets-host`, so an absence
+/// here means something is wrong on the host side and we'd rather
+/// fail the boot than start the workload with missing env vars. A
+/// legitimately-empty secret set arrives as an empty CBOR map, not
+/// as a missing daemon.
 async fn fetch_secrets()
--> Result<Option<BTreeMap<String, Vec<u8>>>, Box<dyn std::error::Error + Send + Sync>> {
-    let stream = match tokio::time::timeout(
+-> Result<BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_vsock::VsockStream::connect(VSOCK_HOST_CID, SECRETS_HOST_PORT),
     )
     .await
     {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            // Distinguish "host process not listening" from "host vsock
-            // stack broken". ConnectionRefused / NotFound is the
-            // no-secrets path; anything else is a hard failure.
-            match e.kind() {
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-                    warn!("vsock 5004 not listening (errno: {:?}); skipping injection", e.kind());
-                    return Ok(None);
-                }
-                _ => return Err(Box::new(e)),
-            }
-        }
+        Ok(Err(e)) => return Err(Box::new(e)),
         Err(_) => {
-            warn!("vsock 5004 connect timed out after {CONNECT_TIMEOUT:?}; skipping injection");
-            return Ok(None);
+            return Err(format!(
+                "vsock {VSOCK_HOST_CID}:{SECRETS_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
+            )
+            .into());
         }
     };
 
-    let mut stream = stream;
     let mut bytes = Vec::with_capacity(1024);
     stream.read_to_end(&mut bytes).await?;
     if bytes.is_empty() {
-        warn!("host closed connection with empty payload");
-        return Ok(Some(BTreeMap::new()));
+        return Err("host closed connection with empty payload (expected at least an empty CBOR map)".into());
     }
     let map: BTreeMap<String, Vec<u8>> = ciborium::de::from_reader(&bytes[..])?;
     info!(count = map.len(), bytes = bytes.len(), "received secrets payload from host");
-    Ok(Some(map))
+    Ok(map)
 }
 
 /// Read the bundle's `config.json`, merge the secrets into
