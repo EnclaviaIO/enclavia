@@ -45,12 +45,12 @@ use tokio::io::AsyncReadExt;
 use tracing::{error, info};
 
 /// Vsock CID of the host: `VMADDR_CID_HOST = 2` per the Linux vsock
-/// contract. Works on both real Nitro (CID 2 is the parent EC2
-/// instance) and QEMU debug mode (`vhost-device-vsock` translates
-/// host-side connections to its UDS at `<proxy>_5004`). One binary,
-/// one transport, no debug/enclave feature split, per the in-enclave
-/// crate convention in CLAUDE.md.
-const VSOCK_HOST_CID: u32 = libc::VMADDR_CID_HOST;
+/// contract (`<linux/vm_sockets.h>`). Works on both real Nitro (CID 2
+/// is the parent EC2 instance) and QEMU debug mode
+/// (`vhost-device-vsock` translates host-side connections to its UDS
+/// at `<proxy>_5004`). One binary, one transport, no debug/enclave
+/// feature split, per the in-enclave crate convention in CLAUDE.md.
+const VSOCK_HOST_CID: u32 = 2;
 
 /// Port the host-side `enclavia-secrets-host` daemon listens on (#169).
 const SECRETS_HOST_PORT: u32 = 5004;
