@@ -1089,6 +1089,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclavia-secrets-init"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "libc",
+ "serde_json",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "enclavia-server"
 version = "0.1.0"
 dependencies = [

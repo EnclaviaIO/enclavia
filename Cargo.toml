@@ -6,6 +6,7 @@ members = [
     "enclavia-crypto",
     "enclavia-egress",
     "enclavia-protocol",
+    "enclavia-secrets-init",
     "enclavia-server",
     "mock-kms",
     "nbd-client",
