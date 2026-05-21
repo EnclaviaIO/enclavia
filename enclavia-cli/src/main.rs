@@ -2,10 +2,12 @@
 //! return typed values; this binary is the only place that prints to the
 //! terminal.
 
+use std::io::{IsTerminal, Read, Write};
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 use enclavia_cli::api::{ApiClient, EnclaveSummary};
-use enclavia_cli::commands::{auth, enclave as enclave_cmds, push, reproduce};
+use enclavia_cli::commands::{auth, enclave as enclave_cmds, push, reproduce, secrets};
 use enclavia_cli::error::CliError;
 
 /// Local clap-friendly mirror of the lib's `InstanceTypeArg`. We can't
@@ -69,6 +71,14 @@ enum Command {
         /// Target enclave id. Accepts a unique prefix as long as it
         /// resolves to exactly one of your enclaves.
         enclave_id: String,
+    },
+    /// Manage per-enclave environment-variable secrets. Values are
+    /// encrypted at rest with the backend's master key and injected
+    /// into the workload's `process.env` at boot. Changes don't take
+    /// effect until the next `enclavia enclave restart <id>`.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
     },
 }
 
@@ -150,10 +160,64 @@ enum EnclaveCmd {
         /// Enclave ID
         id: String,
     },
+    /// Restart a running (or stopped) enclave: server-side stop + start.
+    /// Re-reads the secrets table so any pending `secret set` /
+    /// `secret delete` changes land in the EIF on the next boot
+    /// (#169 / #175).
+    Restart {
+        /// Enclave ID
+        id: String,
+    },
     /// Destroy an enclave
     Destroy {
         /// Enclave ID
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Create or rotate one or more secrets. Pass `NAME=value` pairs
+    /// (repeatable), or use --from-stdin / --from-file for a single
+    /// named secret whose value should not appear on the shell
+    /// command-line.
+    Set {
+        /// Target enclave id. Accepts a unique prefix as long as it
+        /// resolves to exactly one of your enclaves.
+        enclave_id: String,
+        /// `NAME=value` pairs. Names must match `^[A-Z_][A-Z0-9_]*$`,
+        /// not start with `__`, and not collide with a small set of
+        /// runtime-injected names (PATH, HOME, ...).
+        pairs: Vec<String>,
+        /// Read a single secret value from stdin. Requires --name.
+        /// Mutually exclusive with positional pairs and --from-file.
+        #[arg(long = "from-stdin", conflicts_with = "from_file")]
+        from_stdin: bool,
+        /// Read a single secret value from the contents of the given
+        /// file. Requires --name. Mutually exclusive with --from-stdin.
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<std::path::PathBuf>,
+        /// Secret name when used with --from-stdin or --from-file.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List secrets for an enclave (names + timestamps + pending flag).
+    /// Values are never returned by the backend, so they are never
+    /// printed here either.
+    List {
+        /// Target enclave id.
+        enclave_id: String,
+    },
+    /// Delete one or more secrets by name. Asks for confirmation per
+    /// name unless --yes is passed.
+    Delete {
+        /// Target enclave id.
+        enclave_id: String,
+        /// Names to delete.
+        names: Vec<String>,
+        /// Skip the per-name confirmation prompt.
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
     },
 }
 
@@ -168,6 +232,7 @@ async fn main() {
         Command::Enclave { cmd } => run_enclave(cmd).await,
         Command::Push { local_image, enclave_id } => push::push(&local_image, &enclave_id).await,
         Command::Reproduce { enclave_id } => run_reproduce(&enclave_id).await,
+        Command::Secret { cmd } => run_secret(cmd).await,
     };
 
     if let Err(e) = result {
@@ -260,12 +325,196 @@ async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
             println!("Enclave {id} started.");
             Ok(())
         }
+        EnclaveCmd::Restart { id } => {
+            let client = ApiClient::new()?;
+            secrets::restart(&client, &id).await?;
+            println!("Enclave {id} restart requested.");
+            Ok(())
+        }
         EnclaveCmd::Destroy { id } => {
             let client = ApiClient::new()?;
             enclave_cmds::destroy(&client, &id).await?;
             println!("Enclave {id} destroyed.");
             Ok(())
         }
+    }
+}
+
+async fn run_secret(cmd: SecretCmd) -> Result<(), CliError> {
+    match cmd {
+        SecretCmd::Set {
+            enclave_id,
+            pairs,
+            from_stdin,
+            from_file,
+            name,
+        } => {
+            let parsed_pairs = collect_set_pairs(pairs, from_stdin, from_file, name.as_deref())?;
+            if parsed_pairs.is_empty() {
+                return Err(CliError::Other(
+                    "no secrets to set (pass NAME=value pairs, --from-stdin, or --from-file)".into(),
+                ));
+            }
+            let client = ApiClient::new()?;
+            let n = secrets::set(&client, &enclave_id, parsed_pairs).await?;
+            print_pending_hint(&client, &enclave_id, n, "Run").await;
+            Ok(())
+        }
+        SecretCmd::List { enclave_id } => {
+            let client = ApiClient::new()?;
+            let rows = secrets::list(&client, &enclave_id).await?;
+            print_secret_list(&rows);
+            Ok(())
+        }
+        SecretCmd::Delete { enclave_id, names, yes } => {
+            if names.is_empty() {
+                return Err(CliError::Other(
+                    "no secret names provided to delete".into(),
+                ));
+            }
+            // Per-name confirmation. The flag exists for the
+            // non-interactive case (CI, scripts) where there's no TTY.
+            let confirmed: Vec<String> = if yes {
+                names
+            } else {
+                let mut keep = Vec::new();
+                for n in names {
+                    if confirm(&format!("Delete secret '{n}'?"))? {
+                        keep.push(n);
+                    } else {
+                        println!("Skipped {n}.");
+                    }
+                }
+                keep
+            };
+            if confirmed.is_empty() {
+                println!("Nothing to do.");
+                return Ok(());
+            }
+            let client = ApiClient::new()?;
+            let n = secrets::delete(&client, &enclave_id, &confirmed).await?;
+            print_pending_hint(&client, &enclave_id, n, "Run").await;
+            Ok(())
+        }
+    }
+}
+
+/// Collect the `(name, value)` pairs from the three input shapes.
+/// Returns an error if the user mixed positional pairs with the
+/// single-value modes; clap's `conflicts_with` already blocks the
+/// stdin/file combination.
+fn collect_set_pairs(
+    positional: Vec<String>,
+    from_stdin: bool,
+    from_file: Option<std::path::PathBuf>,
+    name: Option<&str>,
+) -> Result<Vec<(String, String)>, CliError> {
+    let single_value_mode = from_stdin || from_file.is_some();
+    if single_value_mode && !positional.is_empty() {
+        return Err(CliError::Other(
+            "positional NAME=value pairs are mutually exclusive with --from-stdin / --from-file".into(),
+        ));
+    }
+    if single_value_mode {
+        let n = name.ok_or_else(|| {
+            CliError::Other("--from-stdin / --from-file requires --name NAME".into())
+        })?;
+        secrets::validate_name(n)?;
+        let value = if from_stdin {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| CliError::Other(format!("reading stdin: {e}")))?;
+            // Trim a single trailing newline so `echo foo | enclavia
+            // secret set --from-stdin --name FOO` lands as "foo" not
+            // "foo\n". A user who genuinely wants the newline should
+            // use --from-file with a hand-crafted payload.
+            strip_one_trailing_newline(buf)
+        } else {
+            let path = from_file.as_ref().expect("from_file checked above");
+            let bytes = std::fs::read(path).map_err(|e| {
+                CliError::Other(format!("reading {}: {e}", path.display()))
+            })?;
+            String::from_utf8(bytes).map_err(|_| {
+                CliError::Other(format!("{} is not valid UTF-8", path.display()))
+            })?
+        };
+        return Ok(vec![(n.to_string(), value)]);
+    }
+    // Positional NAME=value pairs.
+    let mut out = Vec::with_capacity(positional.len());
+    for p in positional {
+        out.push(secrets::parse_name_value(&p)?);
+    }
+    Ok(out)
+}
+
+fn strip_one_trailing_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    s
+}
+
+fn confirm(prompt: &str) -> Result<bool, CliError> {
+    // Non-interactive callers should be using --yes; bail loudly rather
+    // than reading EOF and silently treating it as "no".
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::Other(format!(
+            "{prompt} (no TTY available; pass --yes to skip confirmation)"
+        )));
+    }
+    print!("{prompt} [y/N] ");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| CliError::Other(format!("flushing stdout: {e}")))?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| CliError::Other(format!("reading stdin: {e}")))?;
+    let s = line.trim().to_ascii_lowercase();
+    Ok(s == "y" || s == "yes")
+}
+
+/// If the enclave is not in the `stopped` state, hint at the restart
+/// step. Best-effort: if the status fetch fails we just skip the
+/// hint rather than failing the whole command (the change has
+/// already been applied at this point).
+async fn print_pending_hint(client: &ApiClient, enclave_id: &str, n: usize, lead_verb: &str) {
+    if n == 0 {
+        return;
+    }
+    let plural = if n == 1 { "" } else { "s" };
+    let status = client.get_enclave(enclave_id).await.ok();
+    let stopped = status
+        .as_ref()
+        .and_then(|v| v["status"].as_str())
+        .map(|s| s == "stopped")
+        .unwrap_or(false);
+    if stopped {
+        // Stopped enclaves pick the new snapshot up on the next start;
+        // no restart needed.
+        println!("{n} change{plural} applied. The new value{plural} will land on the next start.");
+    } else {
+        println!(
+            "{n} change{plural} pending. {lead_verb} `enclavia enclave restart {enclave_id}` to apply."
+        );
+    }
+}
+
+fn print_secret_list(rows: &[secrets::SecretSummary]) {
+    if rows.is_empty() {
+        println!("No secrets defined for this enclave.");
+        return;
+    }
+    println!("{:<32} {:<32} PENDING", "NAME", "LAST UPDATED");
+    println!("{}", "-".repeat(80));
+    for r in rows {
+        let pending = if r.pending { "yes" } else { "no" };
+        println!("{:<32} {:<32} {}", r.name, r.updated_at, pending);
     }
 }
 
