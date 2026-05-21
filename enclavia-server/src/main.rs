@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclavia_protocol::{perform_cbor_handshake_as_responder, ClientMessage, ControlCommand, ServerMessage};
@@ -127,16 +128,50 @@ async fn run_prepare_upgrade(
     }
 }
 
-/// Forward raw bytes to the inner container and return the response.
-async fn forward_to_container(container_addr: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-    let connect = TcpStream::connect(container_addr).await.map_err(|e| e.to_string())?;
-    let (mut read_half, mut write_half) = connect.into_split();
+/// How long we wait for the workload's HTTP response before giving up. The
+/// connection stays open until the workload finishes processing and sends
+/// FIN (driven by `Connection: close` in the client-supplied request, see
+/// `enclavia/src/request.rs` in the client SDK). A workload that holds the
+/// connection open past this window is treated as a hung response; the
+/// caller gets an error rather than this task blocking the whole client.
+const FORWARD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
-    write_half.write_all(payload).await.map_err(|e| e.to_string())?;
-    write_half.shutdown().await.map_err(|e| e.to_string())?;
+/// Forward raw bytes to the inner container and return the response.
+///
+/// We deliberately do NOT half-close the write side after sending the
+/// request, even though it's the textbook "I'm done sending" signal.
+/// Uvicorn's asyncio-based HTTP/1.1 protocol handler interprets the FIN
+/// arriving on its read side as "peer gone, abort" and closes the
+/// connection without dispatching the request, even when the request was
+/// fully buffered and `Connection: close` was set. We confirmed this both
+/// against a real customer enclave running nutshell-mint and against a
+/// minimal FastAPI/uvicorn reproduction. Other servers we've shipped
+/// against (`python -m http.server`, `aiohttp`, busybox httpd) tolerate
+/// the half-close fine, which is why this only surfaced once a Python
+/// uvicorn workload arrived.
+///
+/// We rely instead on the client-supplied `Connection: close` header
+/// (the `enclavia` SDK inserts it on every request) to make the workload
+/// close after responding; our `read_to_end` then returns with the full
+/// response when the workload sends its FIN.
+async fn forward_to_container(container_addr: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut stream = TcpStream::connect(container_addr).await.map_err(|e| e.to_string())?;
+
+    stream.write_all(payload).await.map_err(|e| e.to_string())?;
 
     let mut response = Vec::new();
-    read_half.read_to_end(&mut response).await.map_err(|e| e.to_string())?;
+    tokio::time::timeout(
+        FORWARD_RESPONSE_TIMEOUT,
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "workload did not respond within {}s; if it is an HTTP/1.1 keep-alive server, ensure clients send `Connection: close`",
+            FORWARD_RESPONSE_TIMEOUT.as_secs()
+        )
+    })?
+    .map_err(|e| e.to_string())?;
     Ok(response)
 }
 
