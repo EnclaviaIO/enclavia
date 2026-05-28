@@ -1093,7 +1093,6 @@ name = "enclavia-secrets-init"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "libc",
  "serde_json",
  "tokio",
  "tokio-vsock",
