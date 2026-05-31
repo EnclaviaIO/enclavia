@@ -245,6 +245,19 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                             break;
                         }
                     }
+                    ClientMessage::OpenStream { id, .. }
+                    | ClientMessage::StreamData { id, .. }
+                    | ClientMessage::StreamClose { id, .. } => {
+                        // Stream variants land here when a new client talks to a server
+                        // build that does not yet implement WebSocket tunneling (PR #2).
+                        // Surface a typed error so the client fails fast on that id rather
+                        // than waiting for a response that will never come.
+                        warn!(id, "Received stream message but stream tunneling is not implemented in this build");
+                        let _ = response_tx.send(ServerMessage::Error {
+                            id,
+                            message: "stream tunneling not supported by this enclave build".into(),
+                        }).await;
+                    }
                     ClientMessage::Data { id, payload } => {
                         if payload.len() > MAX_PAYLOAD_SIZE {
                             warn!(id, size = payload.len(), max = MAX_PAYLOAD_SIZE, "Payload exceeds size limit");
