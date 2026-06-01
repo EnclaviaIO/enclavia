@@ -4,7 +4,6 @@ use crate::client::Client;
 use crate::error::Error;
 use crate::http::{self, Method};
 use crate::response::Response;
-use crate::transport::PendingRequest;
 
 /// Builder for an HTTP request to be sent through the encrypted channel.
 pub struct RequestBuilder {
@@ -67,13 +66,7 @@ impl RequestBuilder {
             http::serialize_request(self.method, &self.path, &self.headers, self.body.as_deref());
 
         let (response_tx, response_rx) = oneshot::channel();
-
-        self.client
-            .send_raw(PendingRequest {
-                payload: raw_request,
-                response_tx,
-            })
-            .await?;
+        self.client.send_request(raw_request, response_tx).await?;
 
         let raw_response = response_rx
             .await

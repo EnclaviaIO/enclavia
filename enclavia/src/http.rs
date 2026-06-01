@@ -66,6 +66,26 @@ pub(crate) fn serialize_request(
     out
 }
 
+/// Try to parse an HTTP/1.1 response head out of `buf` while it's still being
+/// streamed in. Returns `Ok(Some((status, head_len)))` when the head ends in
+/// the double-CRLF terminator, `Ok(None)` when more bytes are needed, `Err`
+/// when the bytes can't be a valid HTTP/1.1 response head. Used by
+/// `Client::upgrade` to spot `101 Switching Protocols` (or any other status)
+/// without buffering past the headers.
+pub(crate) fn try_parse_response_head(buf: &[u8]) -> Result<Option<(u16, usize)>, Error> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut resp = httparse::Response::new(&mut headers);
+    match resp.parse(buf).map_err(|e| Error::HttpParse(e.to_string()))? {
+        httparse::Status::Complete(n) => {
+            let code = resp
+                .code
+                .ok_or_else(|| Error::HttpParse("Missing status code".into()))?;
+            Ok(Some((code, n)))
+        }
+        httparse::Status::Partial => Ok(None),
+    }
+}
+
 /// Parse a raw HTTP/1.1 response into a `Response`.
 pub(crate) fn parse_response(raw: &[u8]) -> Result<Response, Error> {
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
