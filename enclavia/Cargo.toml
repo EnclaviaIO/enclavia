@@ -33,3 +33,12 @@ url.workspace = true
 tracing.workspace = true
 
 serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+# Integration tests spin up an in-process Noise responder; that needs the
+# async-transport helpers (perform_cbor_handshake_as_responder + CborTransport)
+# plus the `test-utils` FakeAttestation builder for the debug-mode handshake.
+enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "sync"] }
+bytes = { workspace = true }
+tokio-tungstenite = { workspace = true }

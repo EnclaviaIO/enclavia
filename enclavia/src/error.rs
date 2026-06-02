@@ -34,6 +34,12 @@ pub enum Error {
 
     #[error("Unexpected server message")]
     UnexpectedMessage,
+
+    /// `Client::upgrade` received a complete HTTP response head, but the
+    /// status was not `101 Switching Protocols`. The raw response head is
+    /// preserved so the caller can surface it without losing information.
+    #[error("upgrade rejected: server returned status {status}")]
+    UpgradeFailed { status: u16, head: Vec<u8> },
 }
 
 impl From<ciborium::ser::Error<std::io::Error>> for Error {
