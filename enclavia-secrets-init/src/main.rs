@@ -61,7 +61,13 @@ const SECRETS_HOST_PORT: u32 = 5004;
 /// hard failure: a missing or hung host daemon means the enclave
 /// would start without env vars it was supposed to have, which is
 /// unrecoverable for the workload.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+///
+/// 30s is a long ceiling chosen for tolerance under shared-host load:
+/// the CI matrix runs multiple QEMUs concurrently on one box, and
+/// virtio-vsock packet forwarding latency grows under that contention.
+/// A healthy production enclave connects in single-digit milliseconds,
+/// so this only ever matters as an upper bound for runaway hosts.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
