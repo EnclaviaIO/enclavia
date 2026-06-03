@@ -50,6 +50,41 @@ impl UpgradedStream {
             closed: false,
         }
     }
+
+    /// Stream id assigned by the in-enclave server. The SDK uses this
+    /// internally to send close frames; downstream callers shouldn't need
+    /// to look at it, but it's `pub(crate)` so the HTTP upgrade path in
+    /// `client.rs` can keep working without re-fetching the id off the
+    /// `OpenStream` reply.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Pull the next decrypted `StreamData` chunk out of the background
+    /// transport task. Used by `Client::upgrade` to parse the HTTP head
+    /// before handing the stream to the caller; ordinary callers should
+    /// drive the stream via `AsyncRead` instead.
+    pub(crate) async fn recv_chunk(&mut self) -> Option<Result<Vec<u8>, Error>> {
+        self.rx.recv().await
+    }
+
+    /// Push bytes back to the front of the read buffer so the next
+    /// `AsyncRead::poll_read` returns them. `Client::upgrade` uses this to
+    /// hand the leftover bytes (anything past the 101 head's double-CRLF in
+    /// the same packet) back to the caller without losing them.
+    pub(crate) fn prepend_read(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // The internal read buffer is consumed front-to-back via `read_pos`.
+        // Splice the leftover bytes ahead of whatever's still unread, then
+        // reset the cursor so the next poll_read starts at the leftover.
+        let mut joined = Vec::with_capacity(bytes.len() + (self.read_buf.len() - self.read_pos));
+        joined.extend_from_slice(bytes);
+        joined.extend_from_slice(&self.read_buf[self.read_pos..]);
+        self.read_buf = joined;
+        self.read_pos = 0;
+    }
 }
 
 impl AsyncRead for UpgradedStream {

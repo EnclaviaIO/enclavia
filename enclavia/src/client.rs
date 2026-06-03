@@ -139,21 +139,12 @@ impl Client {
         }
 
         let raw = http::serialize_request(method, path, &hdrs, None);
-
-        let (id_tx, id_rx) = oneshot::channel();
-        let (stream_tx, mut stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(32);
-
-        self.inner
-            .cmd_tx
-            .send(OutboundCommand::OpenStream {
-                payload: raw,
-                id_tx,
-                stream_tx,
-            })
-            .await
-            .map_err(|_| Error::ConnectionClosed)?;
-
-        let id = id_rx.await.map_err(|_| Error::ConnectionClosed)??;
+        let mut stream = self.open_stream(raw).await?;
+        // The stream's id and the cmd_tx are private. We grab them via the
+        // accessors we need: the byte-pump's accumulator + recv loop is
+        // sufficient for HTTP head parsing, since the SDK pushes the leftover
+        // bytes back into the same UpgradedStream's read buffer.
+        let id = stream.id();
 
         // Accumulate StreamData chunks until we can parse the response head.
         // The server treats the stream as opaque bytes — any HTTP awareness
@@ -172,7 +163,7 @@ impl Client {
                             "response head exceeded {MAX_UPGRADE_HEAD} bytes before \\r\\n\\r\\n"
                         )));
                     }
-                    match stream_rx.recv().await {
+                    match stream.recv_chunk().await {
                         Some(Ok(chunk)) => head_buf.extend_from_slice(&chunk),
                         Some(Err(e)) => return Err(e),
                         None => {
@@ -185,7 +176,9 @@ impl Client {
 
         if status != 101 {
             // Tell the server to tear down the stream, then surface the head
-            // verbatim so the caller can decide what to do.
+            // verbatim so the caller can decide what to do. Dropping `stream`
+            // here is incidental: its Drop fires a StreamClose{Both} too, but
+            // we send one eagerly so the close races the head into the wire.
             let _ = self
                 .inner
                 .cmd_tx
@@ -203,17 +196,48 @@ impl Client {
         // first byte(s) of the upgraded stream the workload pushed in the same
         // packet as the head; surface them as the initial read buffer so we
         // don't lose them.
-        let leftover = if head_len < head_buf.len() {
-            head_buf[head_len..].to_vec()
-        } else {
-            Vec::new()
-        };
+        if head_len < head_buf.len() {
+            stream.prepend_read(&head_buf[head_len..]);
+        }
+
+        Ok(stream)
+    }
+
+    /// Opens a raw bidirectional byte stream to the workload.
+    ///
+    /// The workload's loopback TCP receives `payload` first, then bytes flow
+    /// bidirectionally over the returned [`UpgradedStream`]. No HTTP
+    /// semantics: this is the low-level primitive
+    /// [`Client::upgrade`] is built on top of. Useful for non-HTTP
+    /// protocols (raw TCP forwarding, custom wire formats) or for proxies
+    /// that handle HTTP parsing themselves (`pingora-enclavia` hands the
+    /// resulting stream to Pingora as a custom L4 transport).
+    ///
+    /// `payload` is delivered as the first chunk of the in-enclave socket's
+    /// receive buffer; if you don't have any prologue to ship, pass an empty
+    /// `Vec<u8>` and the channel becomes a plain TCP-shaped pipe from the
+    /// first byte.
+    pub async fn open_stream(&self, payload: Vec<u8>) -> Result<UpgradedStream, Error> {
+        let (id_tx, id_rx) = oneshot::channel();
+        let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(32);
+
+        self.inner
+            .cmd_tx
+            .send(OutboundCommand::OpenStream {
+                payload,
+                id_tx,
+                stream_tx,
+            })
+            .await
+            .map_err(|_| Error::ConnectionClosed)?;
+
+        let id = id_rx.await.map_err(|_| Error::ConnectionClosed)??;
 
         Ok(UpgradedStream::new(
             id,
             self.inner.cmd_tx.clone(),
             stream_rx,
-            leftover,
+            Vec::new(),
         ))
     }
 

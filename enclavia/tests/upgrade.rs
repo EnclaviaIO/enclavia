@@ -296,6 +296,102 @@ async fn upgrade_succeeds_and_streams_bytes_both_ways() {
     let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut tail)).await;
 }
 
+/// Round-trip raw bytes through `Client::open_stream`. The test responder
+/// expects an arbitrary prologue (no HTTP shape) as the OpenStream payload,
+/// then byte-echoes anything else it receives. This exercises the
+/// no-HTTP-parsing primitive that `Client::upgrade` is built on, which
+/// downstream proxies (e.g. `pingora-enclavia`) use directly.
+#[tokio::test]
+async fn open_stream_round_trips_raw_bytes() {
+    let url = spawn_test_server(|mut t| async move {
+        match t.receive::<ClientMessage>().await.unwrap() {
+            ClientMessage::RequestAttestation => {}
+            other => panic!("expected RequestAttestation, got {other:?}"),
+        }
+        let hash = t.handshake_hash().to_vec();
+        let doc = fake_attestation_for(hash);
+        t.send(&ServerMessage::Attestation {
+            data: doc,
+            control_nonce: [0u8; 32],
+        })
+        .await
+        .unwrap();
+
+        let id = match t.receive::<ClientMessage>().await.unwrap() {
+            ClientMessage::OpenStream { id, payload } => {
+                // Arbitrary opaque payload — no HTTP request line, no headers.
+                assert_eq!(payload, b"HELLO-PROLOGUE");
+                id
+            }
+            other => panic!("expected OpenStream, got {other:?}"),
+        };
+
+        t.send(&ServerMessage::StreamData {
+            id,
+            payload: b"prologue-ack".to_vec(),
+        })
+        .await
+        .unwrap();
+
+        loop {
+            let msg: ClientMessage = match t.receive().await {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                ClientMessage::StreamData { id: rid, payload } => {
+                    assert_eq!(rid, id);
+                    t.send(&ServerMessage::StreamData { id, payload })
+                        .await
+                        .unwrap();
+                }
+                ClientMessage::StreamClose { id: _, .. } => {
+                    let _ = t.send(&ServerMessage::StreamClose { id }).await;
+                    break;
+                }
+                other => panic!("unexpected message during pump: {other:?}"),
+            }
+        }
+    })
+    .await;
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(matching_pcrs())
+        .build()
+        .await
+        .expect("client connect");
+
+    let mut stream = client
+        .open_stream(b"HELLO-PROLOGUE".to_vec())
+        .await
+        .expect("open_stream ok");
+
+    let mut buf = vec![0u8; 32];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(&buf[..n], b"prologue-ack");
+
+    stream.write_all(b"ping").await.unwrap();
+    let mut received = Vec::new();
+    while received.len() < b"ping".len() {
+        let mut tmp = vec![0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut tmp))
+            .await
+            .expect("echo timeout")
+            .expect("echo read");
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&tmp[..n]);
+    }
+    assert_eq!(received, b"ping");
+
+    stream.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn upgrade_surfaces_non_101_as_error() {
     let url = spawn_test_server(|mut t| async move {
