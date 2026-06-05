@@ -80,6 +80,7 @@ pub fn build_egress_allowlist(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     client: &ApiClient,
     instance_type: crate::InstanceTypeArg,
@@ -88,6 +89,7 @@ pub async fn create(
     name: Option<&str>,
     visibility: Option<&str>,
     egress_allowlist: Option<serde_json::Value>,
+    upgradable: bool,
 ) -> Result<EnclaveCreated, CliError> {
     let enclave = client
         .create_enclave(
@@ -97,6 +99,7 @@ pub async fn create(
             name,
             visibility,
             egress_allowlist.as_ref(),
+            upgradable,
         )
         .await?;
 
