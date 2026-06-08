@@ -224,6 +224,19 @@ async fn run_builder(
         .arg("--egress-allowlist")
         .arg(&egress_path);
 
+    // Match the backend's `--image-digest` invocation so the rebuilt
+    // `enclavia-config.json` is byte-identical to the original.
+    // Without this the chain-init path bakes a different config into
+    // the initramfs, which moves PCR0 and PCR2 and makes the
+    // reproducibility check fail. The caller already validated the
+    // enclave has a recorded digest (the only path into here goes
+    // through the `image_digest` extraction in `reproduce`); pull it
+    // from the enclave JSON for consistency with the other fields
+    // this function reads (container_port, storage, etc.).
+    if let Some(digest) = enclave.get("image_digest").and_then(|v| v.as_str()) {
+        cmd.arg("--image-digest").arg(digest);
+    }
+
     if let Some(port) = enclave.get("container_port").and_then(|v| v.as_u64()) {
         cmd.arg("--container-port").arg(port.to_string());
     }
