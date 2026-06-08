@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod chain;
 #[cfg(feature = "async-transport")]
 pub mod egress;
 mod noise;

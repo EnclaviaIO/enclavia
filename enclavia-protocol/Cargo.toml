@@ -33,3 +33,11 @@ base64.workspace = true
 hex.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# Chain-link payload typed fields (UUID for enclave_id / revokes,
+# DateTime for booted_at / valid_from / issued_at) and the signature
+# verifier on upgrade / revocation links. Same shape every consumer
+# of the public chain endpoint will need to re-implement otherwise.
+uuid = { workspace = true }
+chrono = { workspace = true }
+p256 = { workspace = true }
+serde_bytes = "0.11"
