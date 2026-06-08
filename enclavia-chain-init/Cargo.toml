@@ -1,0 +1,43 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in enclavia-crates/CLAUDE.md before
+# adding any transport-related feature here.
+
+[package]
+name = "enclavia-chain-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave boot helper: produces the genesis `ChainLink` for the public upgrade chain (#47) and submits it to the host-side chain-host daemon on vsock 5005."
+
+[dependencies]
+enclavia-protocol = { path = "../enclavia-protocol" }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "fs"] }
+tokio-vsock = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Real attestation pulled from `/dev/nsm` (in both real Nitro and QEMU
+# debug, where the nitro-enclave QEMU machine emulates the NSM driver).
+# The `nix` feature enables the syscall path; the same binary runs in
+# both environments. The doc signature isn't checked in debug mode; the
+# backend's `verify_chain_attestation` accepts unsigned debug docs.
+aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+# Round-trip tests need the deterministic `FakeChainAttestation` for
+# stubbing out NSM in unit tests. Production builds never reach this
+# feature.
+enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }
+
+[[bin]]
+name = "enclavia-chain-init"
+path = "src/main.rs"
