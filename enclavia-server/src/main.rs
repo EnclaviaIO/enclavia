@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use enclavia_protocol::{
     perform_cbor_handshake_as_responder, ClientMessage, ControlCommand, ServerMessage, StreamHalf,
 };
@@ -71,9 +71,12 @@ async fn handle_control(
         None => return (false, "control channel disabled (no control_public_key configured)".into()),
     };
 
-    let sig = match <[u8; 64]>::try_from(signature) {
-        Ok(s) => Signature::from_bytes(&s),
-        Err(_) => return (false, "signature must be 64 bytes".into()),
+    // Locked-in wire format (#47): 64-byte raw `r || s`, each 32 B
+    // big-endian zero-padded. DER signatures from PIV/OpenSSL must be
+    // re-encoded to this shape by the signer before being shipped.
+    let sig = match Signature::from_slice(signature) {
+        Ok(s) => s,
+        Err(_) => return (false, "signature must be 64 bytes raw r||s".into()),
     };
 
     if pubkey.verify(payload, &sig).is_err() {
@@ -547,17 +550,30 @@ mod tests {
     //! single-use nonce semantics, malformed input handling, and dispatch
     //! to an enclavia-crypto subprocess (stubbed with `true`/`false`).
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use p256::ecdsa::{signature::Signer, SigningKey};
     use enclavia_protocol::ControlCommand;
 
     fn fixed_pair() -> (SigningKey, VerifyingKey) {
+        // Deterministic 32-byte scalar in (0, n). Seeds with `i+1` so
+        // the first byte is 1 — guarantees a non-zero scalar that is
+        // also far below the P-256 group order (n is just under 2^256;
+        // any value with high byte < 0xff is safely below).
         let mut seed = [0u8; 32];
         for (i, b) in seed.iter_mut().enumerate() {
-            *b = i as u8;
+            *b = (i + 1) as u8;
         }
-        let sk = SigningKey::from_bytes(&seed);
-        let pk = sk.verifying_key();
+        let sk = SigningKey::from_slice(&seed).expect("non-zero seed yields a valid scalar");
+        let pk = *sk.verifying_key();
         (sk, pk)
+    }
+
+    /// Type-annotated wrapper around `sk.sign(...)`. `p256::ecdsa::SigningKey`
+    /// implements `Signer<Signature>` and `Signer<DerSignature>`; without
+    /// annotating the return type the compiler can't pick one. Tests
+    /// uniformly want the 64-byte raw r||s form we've locked in (#47).
+    fn sign_raw(sk: &SigningKey, msg: &[u8]) -> Vec<u8> {
+        let sig: p256::ecdsa::Signature = sk.sign(msg);
+        sig.to_bytes().to_vec()
     }
 
     fn cbor_encode<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -580,7 +596,7 @@ mod tests {
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
         let (sk, _) = fixed_pair();
         let payload = make_command(nonce_value);
-        let signature = sk.sign(&payload).to_bytes().to_vec();
+        let signature = sign_raw(&sk, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, None, &nonce, "true").await;
         assert!(!ok, "msg = {msg}");
@@ -609,8 +625,20 @@ mod tests {
         let (_, pk) = fixed_pair();
         let payload = make_command(nonce_value);
 
-        // 64 bytes of zero — well-formed length, but not a valid signature.
-        let (ok, msg) = handle_control(&payload, &[0u8; 64], Some(&pk), &nonce, "true").await;
+        // Sign the payload with a DIFFERENT key, producing 64 bytes that
+        // parse as a valid `Signature` (well-formed `r || s`) but don't
+        // verify under `pk`. All-zero bytes won't work here: P-256
+        // rejects (r=0, s=0) at construction time, which would land on
+        // the "64 bytes raw" path instead of "signature verification
+        // failed".
+        let mut wrong_seed = [0u8; 32];
+        for (i, b) in wrong_seed.iter_mut().enumerate() {
+            *b = (i + 2) as u8;
+        }
+        let wrong_sk = SigningKey::from_slice(&wrong_seed).unwrap();
+        let signature = sign_raw(&wrong_sk, &payload);
+
+        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
         assert!(!ok);
         assert!(msg.contains("signature verification"), "msg = {msg}");
     }
@@ -621,7 +649,7 @@ mod tests {
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
         let (sk, pk) = fixed_pair();
         let bogus = b"\xff\xff\xff not cbor".to_vec();
-        let signature = sk.sign(&bogus).to_bytes().to_vec();
+        let signature = sign_raw(&sk, &bogus);
 
         let (ok, msg) = handle_control(&bogus, &signature, Some(&pk), &nonce, "true").await;
         assert!(!ok);
@@ -636,7 +664,7 @@ mod tests {
 
         // Sign a payload bearing the *wrong* nonce — server must reject it.
         let payload = make_command([0u8; 32]);
-        let signature = sk.sign(&payload).to_bytes().to_vec();
+        let signature = sign_raw(&sk, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
         assert!(!ok);
@@ -652,7 +680,7 @@ mod tests {
         // First call: sign with the initial nonce. Underlying enclavia-crypto
         // is stubbed to `true` so dispatch reports success.
         let payload = make_command(initial);
-        let signature = sk.sign(&payload).to_bytes().to_vec();
+        let signature = sign_raw(&sk, &payload);
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
         assert!(ok, "expected success, got: {msg}");
 
@@ -673,7 +701,7 @@ mod tests {
         let (sk, pk) = fixed_pair();
 
         let payload = make_command(initial);
-        let signature = sk.sign(&payload).to_bytes().to_vec();
+        let signature = sign_raw(&sk, &payload);
         // `false` exits 1 — verifies that enclavia-crypto failure is
         // reported back rather than silently masked.
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "false").await;

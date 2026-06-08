@@ -20,9 +20,14 @@ tokio-vsock = { workspace = true, optional = true }
 # handshake hash.
 enclavia-protocol = { path = "../enclavia-protocol", optional = true, default-features = false }
 snow = { workspace = true, optional = true }
-# Verifies Ed25519 control-key signatures on Transition requests against
-# the pubkey registered at first attestation. Pulled in by the `node`
-# feature — the pure state machine stays crypto-free.
+# Verifies Ed25519 control-key signatures on Transition requests
+# against the pubkey registered at first attestation. Pulled in by the
+# `node` feature — the pure state machine stays crypto-free. NB: the
+# synchronizer mesh's notion of control-key is independent from the
+# upgrade-chain control-key (#47), which is ECDSA P-256; the latter
+# is the key in `AttestationDoc::user_data`. The listener boundary
+# slices the SEC1-prefix off identity.control_pubkey before handing
+# it to observe_attestation. To be unified in a follow-up.
 ed25519-dalek = { workspace = true, optional = true }
 
 [features]
@@ -45,7 +50,9 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync
 enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }
 # Tests construct real Ed25519 keypairs from deterministic seeds so they
 # can sign canonical transition payloads and exercise the listener/Node
-# verifier end to end.
+# verifier end to end. Matches the synchronizer's own mesh-control-key
+# algorithm; the upgrade-chain control-key (#47, ECDSA P-256) is
+# verified by enclavia-server, not by synchronizer.
 ed25519-dalek = { workspace = true }
 
 [[bin]]

@@ -137,7 +137,20 @@ where
                 attestation::verify_and_extract(&nsm_doc, &handshake_hash, debug_mode)
                     .map_err(|e| ConnError::Attestation(e.to_string()))?;
             let key = PcrKey(identity.pcrs.digest());
-            node.observe_attestation(key, identity.control_pubkey).await;
+            // The protocol layer now extracts a 65-byte uncompressed
+            // SEC1 ECDSA P-256 pubkey from `user_data` (#47), but the
+            // synchronizer mesh's own control-key concept is a separate
+            // (Ed25519, 32-byte) thing that has not been migrated yet.
+            // Until that migration lands, hand `observe_attestation` a
+            // 32-byte slice derived from the SEC1 bytes — specifically
+            // the last 32 bytes (the Y coordinate) — so the synchronizer
+            // continues to compile and the mesh-level identity stays
+            // stable per attested enclave. This identity will not verify
+            // any real signature in this state; production mesh use is
+            // gated on a follow-up that aligns the algorithms.
+            let mut mesh_pubkey = [0u8; 32];
+            mesh_pubkey.copy_from_slice(&identity.control_pubkey[33..65]);
+            node.observe_attestation(key, mesh_pubkey).await;
             key
         }
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
@@ -274,15 +287,28 @@ mod tests {
     /// Like [`auth_frame`] but embeds a specific Ed25519 verifying-key
     /// in `user_data`. Use this for Transition tests where the
     /// signature has to verify against the registered pubkey.
+    ///
+    /// The protocol layer (post-#47) extracts a 65-byte uncompressed
+    /// SEC1 ECDSA P-256 pubkey from `user_data`, and the listener then
+    /// slices bytes `[33..65]` (the Y coordinate position) before
+    /// handing them to `observe_attestation`. Mirror that here: pack
+    /// the 32-byte Ed25519 verifying key into the Y-coordinate slot of
+    /// a synthetic SEC1 blob, so the listener slicing recovers the
+    /// exact 32 bytes the test holds the signing key for. The blob
+    /// will not decode as a valid P-256 point, but synchronizer's
+    /// listener doesn't decode it — it just slices and stores.
     fn auth_frame_with_pubkey(
         seed: u8,
         handshake_hash: &[u8],
         control_pubkey: [u8; 32],
     ) -> (Frame, PcrKey) {
+        let mut sec1 = [0u8; 65];
+        sec1[0] = 0x04;
+        sec1[33..65].copy_from_slice(&control_pubkey);
         let fake = FakeAttestation::with_seed_and_pubkey(
             seed,
             handshake_hash.to_vec(),
-            control_pubkey,
+            sec1,
         );
         let key = PcrKey(
             attestation::Pcrs {
