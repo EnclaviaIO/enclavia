@@ -1079,14 +1079,18 @@ dependencies = [
  "attestation-doc-validation",
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
+ "chrono",
  "ciborium",
  "hex",
+ "p256",
  "serde",
+ "serde_bytes",
  "sha2",
  "snow",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
