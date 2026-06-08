@@ -86,6 +86,13 @@ pub enum AttestationError {
     /// pubkey to verify `Transition` signatures later in the session.
     #[error("attestation document user_data is missing or not a 65-byte uncompressed SEC1 P-256 pubkey")]
     InvalidControlPubkey,
+    /// The doc's `user_data` field is missing or not the 32-byte
+    /// SHA-256 hash of the chain link's `payload`. Required by
+    /// [`verify_chain_attestation`] — every chain link binds its
+    /// `attestation.user_data` to `sha256(payload)`, so any mismatch
+    /// means either the payload or the attestation has been swapped.
+    #[error("attestation document user_data does not match sha256(payload)")]
+    PayloadBindingMismatch,
 }
 
 /// Length of an ECDSA P-256 verifying key in uncompressed SEC1 form
@@ -199,6 +206,60 @@ pub fn verify_and_extract(
         pcrs,
         control_pubkey,
     })
+}
+
+/// Verify a chain-link attestation document.
+///
+/// Used by the backend's `POST /enclaves/{id}/chain-links` ingest path
+/// (#47): each chain link (`boot`, `upgrade`, `revocation`) carries a
+/// hardware-signed `attestation` whose `user_data` field commits to the
+/// link's `payload` via `sha256(payload)`. This function performs the
+/// minimum-trust check required at ingest:
+///
+/// 1. Parse + structural validation of the COSE_Sign1 wrapper (same as
+///    [`verify_against`] / [`verify_and_extract`]).
+/// 2. `attestation.user_data == sha256(payload)` — the binding that
+///    makes the chain entry tamper-evident.
+/// 3. PCR0/1/2 in the doc equal `expected_pcrs` (the backend's recorded
+///    PCRs for this enclave, post-build).
+///
+/// In production mode (`debug_mode = false`), the AWS Nitro CA chain is
+/// validated and the COSE signature is verified by the upstream
+/// `attestation-doc-validation` crate, same as the existing entry
+/// points. In `debug_mode`, only structural validity is required —
+/// matching the dev-loop where the `FakeAttestor` test-utils path
+/// produces unsigned-but-well-formed documents.
+///
+/// The doc's `nonce` field is **not** checked here. The chain-link
+/// attestations are not produced in the context of a Noise session, so
+/// there is no handshake hash to bind against; the binding lives in
+/// `user_data` instead. Any value in `nonce` is accepted.
+pub fn verify_chain_attestation(
+    attestation_data: &[u8],
+    payload: &[u8],
+    expected_pcrs: &Pcrs,
+    debug_mode: bool,
+) -> Result<(), AttestationError> {
+    let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
+    let doc = parse_and_validate(attestation_data, debug_mode)?;
+
+    let user_data = doc
+        .user_data
+        .as_ref()
+        .ok_or(AttestationError::PayloadBindingMismatch)?;
+    let expected: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        hasher.finalize().into()
+    };
+    if user_data.as_slice() != expected {
+        return Err(AttestationError::PayloadBindingMismatch);
+    }
+
+    validate_expected_pcrs(&doc, &pcrs_hex)
+        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+
+    Ok(())
 }
 
 fn parse_and_validate(
@@ -388,6 +449,86 @@ pub mod test_utils {
             out
         }
     }
+
+    /// Builder for synthetic chain-link attestation documents accepted
+    /// by [`verify_chain_attestation`](super::verify_chain_attestation)
+    /// in debug mode. Differs from [`FakeAttestation`] in two ways:
+    ///   * `user_data` carries the SHA-256 of a caller-supplied
+    ///     `payload` (not the control pubkey, which the chain ingest
+    ///     path doesn't read).
+    ///   * `nonce` is irrelevant to the chain ingest verifier and is
+    ///     populated with a fixed zero-padded value so the doc still
+    ///     serialises.
+    pub struct FakeChainAttestation {
+        pub pcr0: Vec<u8>,
+        pub pcr1: Vec<u8>,
+        pub pcr2: Vec<u8>,
+        /// 32-byte SHA-256 of the chain link's payload. Set by
+        /// [`Self::for_payload`]; tests that want to exercise a
+        /// `user_data` mismatch can override after construction.
+        pub user_data: Vec<u8>,
+    }
+
+    impl FakeChainAttestation {
+        /// Build a fixture with all three PCRs derived from `seed` and
+        /// `user_data` set to `sha256(payload)`. Drop-in for the chain
+        /// ingest verifier's happy path.
+        pub fn for_payload(seed: u8, payload: &[u8]) -> Self {
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(payload);
+            let user_data: Vec<u8> = hasher.finalize().to_vec();
+            Self {
+                pcr0: vec![seed; 48],
+                pcr1: vec![seed.wrapping_add(1); 48],
+                pcr2: vec![seed.wrapping_add(2); 48],
+                user_data,
+            }
+        }
+
+        /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
+        /// `debug_mode` chain-attestation verify path.
+        pub fn encode(&self) -> Vec<u8> {
+            assert_eq!(self.pcr0.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
+            assert_eq!(self.pcr1.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
+            assert_eq!(self.pcr2.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
+
+            let mut pcrs = BTreeMap::new();
+            pcrs.insert(0usize, self.pcr0.clone());
+            pcrs.insert(1usize, self.pcr1.clone());
+            pcrs.insert(2usize, self.pcr2.clone());
+            pcrs.insert(8usize, vec![0u8; 48]);
+
+            let doc = AttestationDoc::new(
+                "test-module".to_string(),
+                Digest::SHA384,
+                0,
+                pcrs,
+                vec![0u8; 64],
+                vec![vec![0u8; 64]],
+                Some(self.user_data.clone()),
+                // Nonce is not consulted by `verify_chain_attestation`,
+                // but the doc has to carry one to serialise. Zero-padded
+                // to a length the structure-validator accepts.
+                Some(vec![0u8; 32]),
+                None,
+            );
+
+            let mut payload = Vec::new();
+            ciborium::into_writer(&doc, &mut payload).expect("ciborium encode AttestationDoc");
+
+            let cose = CborValue::Array(vec![
+                CborValue::Bytes(vec![0xa0]),
+                CborValue::Map(Vec::new()),
+                CborValue::Bytes(payload),
+                CborValue::Bytes(vec![0u8; 96]),
+            ]);
+
+            let mut out = Vec::new();
+            ciborium::into_writer(&cose, &mut out).expect("ciborium encode COSE_Sign1");
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +697,104 @@ mod tests {
         hasher.update(&pcrs.pcr2);
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(pcrs.digest(), expected);
+    }
+
+    fn pcrs_from_seed(seed: u8) -> Pcrs {
+        Pcrs {
+            pcr0: vec![seed; 48],
+            pcr1: vec![seed.wrapping_add(1); 48],
+            pcr2: vec![seed.wrapping_add(2); 48],
+        }
+    }
+
+    #[test]
+    fn verify_chain_attestation_accepts_well_formed_link_in_debug_mode() {
+        let payload = b"chain-link-payload-canary".to_vec();
+        let fake = test_utils::FakeChainAttestation::for_payload(0x33, &payload);
+        let bytes = fake.encode();
+        let expected_pcrs = pcrs_from_seed(0x33);
+
+        verify_chain_attestation(&bytes, &payload, &expected_pcrs, true)
+            .expect("valid chain attestation must pass");
+    }
+
+    #[test]
+    fn verify_chain_attestation_rejects_mismatched_payload_binding() {
+        let payload = b"chain-link-payload-canary".to_vec();
+        let fake = test_utils::FakeChainAttestation::for_payload(0x44, &payload);
+        let bytes = fake.encode();
+        let expected_pcrs = pcrs_from_seed(0x44);
+
+        // Same attestation, different payload — user_data binds to the
+        // original, so the verifier must reject the substitution.
+        let err = verify_chain_attestation(&bytes, b"DIFFERENT", &expected_pcrs, true)
+            .expect_err("payload swap must fail the binding check");
+        assert!(
+            matches!(err, AttestationError::PayloadBindingMismatch),
+            "expected PayloadBindingMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_chain_attestation_rejects_pcr_mismatch() {
+        let payload = b"chain-link-payload-canary".to_vec();
+        let fake = test_utils::FakeChainAttestation::for_payload(0x55, &payload);
+        let bytes = fake.encode();
+        // Wrong expected PCRs — the caller's recorded PCRs disagree with
+        // what the doc carries. Verifier must reject.
+        let mismatched_pcrs = pcrs_from_seed(0x99);
+
+        let err = verify_chain_attestation(&bytes, &payload, &mismatched_pcrs, true)
+            .expect_err("PCR mismatch must fail");
+        assert!(
+            matches!(err, AttestationError::Validation(_)),
+            "expected Validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_chain_attestation_rejects_doc_without_user_data() {
+        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
+        use ciborium::value::Value as CborValue;
+        use std::collections::BTreeMap;
+
+        let payload = b"any-payload".to_vec();
+        let pcrs = pcrs_from_seed(0x77);
+
+        let mut pcr_map = BTreeMap::new();
+        pcr_map.insert(0usize, pcrs.pcr0.clone());
+        pcr_map.insert(1usize, pcrs.pcr1.clone());
+        pcr_map.insert(2usize, pcrs.pcr2.clone());
+        pcr_map.insert(8usize, vec![0u8; 48]);
+
+        let doc = AttestationDoc::new(
+            "test-module".to_string(),
+            Digest::SHA384,
+            0,
+            pcr_map,
+            vec![0u8; 64],
+            vec![vec![0u8; 64]],
+            None, // user_data missing — the case under test.
+            Some(vec![0u8; 32]),
+            None,
+        );
+
+        let mut doc_bytes = Vec::new();
+        ciborium::into_writer(&doc, &mut doc_bytes).unwrap();
+        let cose = CborValue::Array(vec![
+            CborValue::Bytes(vec![0xa0]),
+            CborValue::Map(Vec::new()),
+            CborValue::Bytes(doc_bytes),
+            CborValue::Bytes(vec![0u8; 96]),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&cose, &mut bytes).unwrap();
+
+        let err = verify_chain_attestation(&bytes, &payload, &pcrs, true)
+            .expect_err("missing user_data must be rejected");
+        assert!(
+            matches!(err, AttestationError::PayloadBindingMismatch),
+            "expected PayloadBindingMismatch, got {err:?}"
+        );
     }
 }
