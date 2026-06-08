@@ -1006,6 +1006,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclavia-chain-init"
+version = "0.1.0"
+dependencies = [
+ "aws-nitro-enclaves-nsm-api",
+ "chrono",
+ "ciborium",
+ "enclavia-protocol",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "enclavia-cli"
 version = "0.1.0"
 dependencies = [
