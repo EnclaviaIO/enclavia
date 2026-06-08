@@ -269,6 +269,7 @@ impl ApiClient {
         name: Option<&str>,
         visibility: Option<&str>,
         egress_allowlist: Option<&serde_json::Value>,
+        upgradable: bool,
     ) -> Result<serde_json::Value, CliError> {
         let mut body = serde_json::json!({
             "instance_type": instance_type,
@@ -287,6 +288,12 @@ impl ApiClient {
         }
         if let Some(allow) = egress_allowlist {
             body["egress_allowlist"] = allow.clone();
+        }
+        // Only send `upgradable` when set, so the backend default
+        // (currently `false`) governs the omitted case and we don't
+        // commit the CLI to mirroring the server-side default.
+        if upgradable {
+            body["upgradable"] = serde_json::json!(true);
         }
         self.request_with_body(reqwest::Method::POST, "/enclaves", &body)
             .await

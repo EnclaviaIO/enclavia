@@ -137,6 +137,15 @@ enum EnclaveCmd {
         /// `--egress-resolver`.
         #[arg(long = "egress-config", value_name = "PATH")]
         egress_config: Option<std::path::PathBuf>,
+        /// Mark this enclave as upgradable (#47). The backend mints an
+        /// Ed25519 control keypair, bakes the public half into every
+        /// EIF for this enclave, and accepts staged v2+ pushes against
+        /// it. Without this flag the enclave is non-upgradable: it has
+        /// a single genesis push, no control pubkey is baked in, and
+        /// the in-enclave server refuses every signed control command.
+        /// Immutable post-create.
+        #[arg(long)]
+        upgradable: bool,
     },
     /// List your enclaves
     List {
@@ -270,6 +279,7 @@ async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
             egress_allow,
             egress_resolver,
             egress_config,
+            upgradable,
         } => {
             // Validate the egress allowlist BEFORE constructing the API
             // client. The validator is purely local (parses --egress-allow
@@ -292,6 +302,7 @@ async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
                 name.as_deref(),
                 visibility.as_deref(),
                 egress_allowlist,
+                upgradable,
             )
             .await?;
             println!("Enclave created:");
