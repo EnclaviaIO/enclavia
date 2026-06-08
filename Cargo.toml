@@ -55,6 +55,12 @@ rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 rand = "0.8"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+# ECDSA over NIST P-256. The upgrade control channel (#47) carries
+# its 65-byte uncompressed SEC1 verifying key in the attestation
+# `user_data` and its 64-byte raw r||s signatures over inbound
+# `ControlCommand`s. Picked over Ed25519 for the universal YubiKey 5
+# PIV story; see EnclaviaIO/enclavia-crates#47.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "arithmetic"] }
 hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 http-body-util = "0.1"

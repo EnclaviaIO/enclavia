@@ -80,29 +80,37 @@ pub enum AttestationError {
     /// upstream crate is the one that hex-encodes them on the way out.
     #[error("attestation document PCR {0} is not valid hex")]
     InvalidPcrHex(usize),
-    /// The doc's `user_data` field is missing or not a 32-byte raw
-    /// Ed25519 verifying key. Required by [`verify_and_extract`] — the
-    /// synchronizer needs the control pubkey to verify `Transition`
-    /// signatures later in the session.
-    #[error("attestation document user_data is missing or not a 32-byte Ed25519 pubkey")]
+    /// The doc's `user_data` field is missing or not a 65-byte
+    /// uncompressed SEC1 ECDSA P-256 verifying key (#47). Required by
+    /// [`verify_and_extract`] — the synchronizer needs the control
+    /// pubkey to verify `Transition` signatures later in the session.
+    #[error("attestation document user_data is missing or not a 65-byte uncompressed SEC1 P-256 pubkey")]
     InvalidControlPubkey,
 }
+
+/// Length of an ECDSA P-256 verifying key in uncompressed SEC1 form
+/// (`0x04 || X(32) || Y(32)`). Locked at the protocol layer because
+/// every caller — synchronizer node, in-enclave server, attestation
+/// emitter — needs to agree on the shape carried in
+/// `AttestationDoc::user_data`. See EnclaviaIO/enclavia-crates#47.
+pub const CONTROL_PUBKEY_LEN: usize = 65;
 
 /// Verified enclave identity extracted from an NSM attestation document.
 ///
 /// Returned by [`verify_and_extract`] when the document validates and the
 /// caller wants both the PCRs (for deriving a session key) and the
-/// enclave's Ed25519 control pubkey (for verifying future `Transition`
-/// signatures from this key).
+/// enclave's ECDSA P-256 control pubkey (for verifying future
+/// `Transition` signatures from this key).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedIdentity {
     /// PCR0/1/2 from the validated document.
     pub pcrs: Pcrs,
-    /// Raw 32-byte Ed25519 verifying key extracted from the doc's
-    /// `user_data` field. The synchronizer registers this alongside
-    /// the [`Pcrs::digest`]-derived key on first attestation, and uses
-    /// it to verify Ed25519 signatures on subsequent `Transition` RPCs.
-    pub control_pubkey: [u8; 32],
+    /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key extracted
+    /// from the doc's `user_data` field. The synchronizer registers
+    /// this alongside the [`Pcrs::digest`]-derived key on first
+    /// attestation, and uses it to verify raw r||s signatures on
+    /// subsequent `Transition` RPCs.
+    pub control_pubkey: [u8; CONTROL_PUBKEY_LEN],
 }
 
 /// Verify an attestation document against expected PCRs.
@@ -151,8 +159,8 @@ pub fn verify_against(
 /// `expected_pcrs` equality check (there are no expected PCRs at this
 /// layer — the doc's nonce binding to the handshake hash is what
 /// authenticates the document's origin to the live session), plus a
-/// requirement that `user_data` is exactly 32 bytes — the raw Ed25519
-/// verifying key.
+/// requirement that `user_data` is exactly [`CONTROL_PUBKEY_LEN`]
+/// bytes — the uncompressed SEC1 ECDSA P-256 verifying key.
 pub fn verify_and_extract(
     attestation_data: &[u8],
     handshake_hash: &[u8],
@@ -175,10 +183,17 @@ pub fn verify_and_extract(
         .user_data
         .as_ref()
         .ok_or(AttestationError::InvalidControlPubkey)?;
-    let control_pubkey: [u8; 32] = user_data
+    let control_pubkey: [u8; CONTROL_PUBKEY_LEN] = user_data
         .as_slice()
         .try_into()
         .map_err(|_| AttestationError::InvalidControlPubkey)?;
+    // SEC1 uncompressed-form prefix must be 0x04. Anything else (0x02 /
+    // 0x03 compressed, or random bytes that happen to fit) is rejected
+    // here so the in-enclave verifier doesn't have to handle the
+    // compressed-form decompression path.
+    if control_pubkey[0] != 0x04 {
+        return Err(AttestationError::InvalidControlPubkey);
+    }
 
     Ok(AttestedIdentity {
         pcrs,
@@ -278,36 +293,42 @@ pub mod test_utils {
         /// set to these bytes verbatim — the verifier base64-encodes
         /// before comparing, so it works out.
         pub handshake_hash: Vec<u8>,
-        /// Raw 32-byte Ed25519 verifying key. Encoded into the doc's
-        /// `user_data` field — [`super::verify_and_extract`] requires
-        /// this to be a 32-byte pubkey.
-        pub control_pubkey: [u8; 32],
+        /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key. Encoded
+        /// into the doc's `user_data` field — [`super::verify_and_extract`]
+        /// requires this to be a 65-byte pubkey with the SEC1 prefix
+        /// `0x04` (#47).
+        pub control_pubkey: [u8; super::CONTROL_PUBKEY_LEN],
     }
 
     impl FakeAttestation {
-        /// Build a fixture with all three PCRs and the control pubkey
-        /// derived from `seed` so tests can assert against a known
-        /// [`super::Pcrs::digest`] and a known pubkey. For tests that
-        /// need a *real* Ed25519 keypair (to produce signatures), set
-        /// `control_pubkey` directly after construction or use
-        /// [`Self::with_seed_and_pubkey`].
+        /// Build a fixture with all three PCRs derived from `seed` and a
+        /// synthetic but structurally-valid SEC1 control pubkey (prefix
+        /// `0x04`, the remaining 64 bytes filled with `seed | 0x80`).
+        /// The synthetic pubkey will NOT decode as a valid P-256 point,
+        /// so tests that only need to exercise the verifier's
+        /// length-and-prefix check can use this directly; tests that
+        /// need a *real* P-256 keypair (to actually sign) should use
+        /// [`Self::with_seed_and_pubkey`] with bytes from a
+        /// `p256::ecdsa::SigningKey`.
         pub fn with_seed(seed: u8, handshake_hash: Vec<u8>) -> Self {
+            let mut control_pubkey = [seed.wrapping_add(0x80); super::CONTROL_PUBKEY_LEN];
+            control_pubkey[0] = 0x04;
             Self {
                 pcr0: vec![seed; 48],
                 pcr1: vec![seed.wrapping_add(1); 48],
                 pcr2: vec![seed.wrapping_add(2); 48],
                 handshake_hash,
-                control_pubkey: [seed.wrapping_add(0x80); 32],
+                control_pubkey,
             }
         }
 
         /// Like [`Self::with_seed`] but with a caller-supplied control
-        /// pubkey (typically the verifying-key bytes from a real Ed25519
-        /// keypair the test holds the signing key for).
+        /// pubkey (typically `VerifyingKey::to_encoded_point(false)` from
+        /// a real `p256::ecdsa::SigningKey` the test holds for signing).
         pub fn with_seed_and_pubkey(
             seed: u8,
             handshake_hash: Vec<u8>,
-            control_pubkey: [u8; 32],
+            control_pubkey: [u8; super::CONTROL_PUBKEY_LEN],
         ) -> Self {
             let mut fake = Self::with_seed(seed, handshake_hash);
             fake.control_pubkey = control_pubkey;
