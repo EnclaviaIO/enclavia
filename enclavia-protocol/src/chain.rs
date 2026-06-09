@@ -493,6 +493,198 @@ fn validate_signed(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Full-chain walker
+// ---------------------------------------------------------------------------
+
+/// One stored chain link plus its server-assigned ingest time: the
+/// input unit for [`validate_chain`].
+#[derive(Debug, Clone)]
+pub struct RecordedLink {
+    pub link: ChainLink,
+    /// `created_at` on the stored row. Used as the reference instant
+    /// for time-dependent rules: a revocation is judged against the
+    /// clock at its ingest, not the verifier's clock: by the time
+    /// anyone re-walks the chain, the revoked upgrade's `valid_from`
+    /// has usually passed, and judging it "now" would reject a link
+    /// that was perfectly valid when the backend recorded it. `None`
+    /// falls back to the walk's `now`.
+    pub recorded_at: Option<DateTime<Utc>>,
+}
+
+/// Result of [`validate_chain`].
+#[derive(Debug)]
+pub struct ChainWalk {
+    /// Per-link outcome, same order as the input links.
+    pub outcomes: Vec<Result<Outcome, ChainValidationError>>,
+    /// PCRs in force after the walk: the genesis boot's values,
+    /// advanced by every verified promotion boot. `None` when the
+    /// chain has no usable genesis.
+    pub final_pcrs: Option<PcrsHex>,
+    /// Image digest in force after the walk (same advancement rule).
+    pub final_image_digest: Option<String>,
+    /// Whether the walk's final in-force state equals the enclave row
+    /// state supplied to [`validate_chain`]. `false` means the chain
+    /// does not explain what the row currently records (stale chain,
+    /// missing links, or row drift): treat the chain as NOT verified
+    /// even if every individual link validated.
+    pub tip_matches_row: bool,
+}
+
+/// Re-validate a stored chain end-to-end, reconstructing the context
+/// each link saw at ingest time.
+///
+/// The backend validates links incrementally: each arrives while the
+/// enclave row still holds the state in force at that moment: the
+/// genesis build's PCRs for the genesis boot, the old version's PCRs
+/// for upgrade / revocation links (the running enclave attests them),
+/// and the new version's PCRs for a promotion boot (the cutover sweep
+/// promotes the row before the new enclave boots). A later verifier
+/// only has the FINAL row state, so validating every link against it
+/// rejects perfectly good history. This walker rebuilds the historical
+/// context from the chain itself:
+///
+/// - The genesis boot anchors the walk on its own attested payload.
+///   [`validate_chain_link`] then enforces payload <-> attestation
+///   agreement, and in production the AWS Nitro CA signature roots
+///   that payload in hardware.
+/// - Upgrade / revocation links validate against the in-force state:
+///   they are attested by the enclave version running at the time.
+/// - A boot whose PCRs match the `to_pcrs` of a prior unrevoked
+///   upgrade link (with the same target image digest) is a promotion:
+///   it validates against that upgrade's target state, and on success
+///   the in-force state advances to it.
+/// - Any other boot validates against the in-force state: a
+///   same-version reboot dedups, anything else fails the attestation
+///   PCR check. A transition no signed upgrade link explains is
+///   exactly what this rejects.
+///
+/// Callers MUST check [`ChainWalk::tip_matches_row`] in addition to
+/// the per-link outcomes: it ties the walk's final state to the row,
+/// proving the chain accounts for what is currently running.
+///
+/// `now` is the fallback reference instant for links with no
+/// `recorded_at` (e.g. not-yet-ingested candidates).
+pub fn validate_chain(
+    links: &[RecordedLink],
+    row_pcrs: &PcrsHex,
+    row_image_digest: &str,
+    control_public_key: Option<&[u8]>,
+    upgradable: bool,
+    now: DateTime<Utc>,
+    debug_mode: bool,
+) -> ChainWalk {
+    let mut outcomes = Vec::with_capacity(links.len());
+    let mut prior: Vec<ChainLink> = Vec::with_capacity(links.len());
+    // (pcrs, image_digest) in force at the current walk position. Set
+    // by the genesis boot, advanced by each verified promotion boot.
+    // `None` until a genesis validates; the row state then stands in
+    // so later links still get individually validated and reported.
+    let mut in_force: Option<(PcrsHex, String)> = None;
+
+    for recorded in links {
+        let link = &recorded.link;
+        let reference = recorded.recorded_at.unwrap_or(now);
+
+        // Reconstruct the row state this link saw at ingest. `promotes`
+        // marks the contexts that advance the in-force state when the
+        // link validates (genesis anchor, promotion boot).
+        let (ctx_pcrs, ctx_digest, promotes): (PcrsHex, String, bool) = match link.kind {
+            ChainLinkKind::Boot if prior.is_empty() => {
+                match ciborium::from_reader::<BootPayload, _>(link.payload.as_slice()) {
+                    Ok(p) => (p.pcrs, p.image_digest, true),
+                    // Undecodable genesis: hand the row state to the
+                    // validator so it reports the decode error.
+                    Err(_) => (row_pcrs.clone(), row_image_digest.to_owned(), false),
+                }
+            }
+            ChainLinkKind::Boot => {
+                match (
+                    ciborium::from_reader::<BootPayload, _>(link.payload.as_slice()),
+                    in_force.as_ref(),
+                ) {
+                    (Ok(p), Some((pcrs, digest))) => {
+                        if p.pcrs == *pcrs {
+                            // Same-version reboot.
+                            (pcrs.clone(), digest.clone(), false)
+                        } else if let Some(target) =
+                            promotion_target(&prior, &p.pcrs, &p.image_digest)
+                        {
+                            // Promotion boot: ingest saw the row
+                            // already promoted to the upgrade target.
+                            (target.to_pcrs, target.image_digest, true)
+                        } else {
+                            // No signed upgrade explains these PCRs;
+                            // validate against the in-force state and
+                            // fail loudly.
+                            (pcrs.clone(), digest.clone(), false)
+                        }
+                    }
+                    (_, Some((pcrs, digest))) => (pcrs.clone(), digest.clone(), false),
+                    (_, None) => (row_pcrs.clone(), row_image_digest.to_owned(), false),
+                }
+            }
+            ChainLinkKind::Upgrade | ChainLinkKind::Revocation => match in_force.as_ref() {
+                Some((pcrs, digest)) => (pcrs.clone(), digest.clone(), false),
+                None => (row_pcrs.clone(), row_image_digest.to_owned(), false),
+            },
+        };
+
+        let ctx = ChainContext {
+            enclave_pcrs: &ctx_pcrs,
+            enclave_image_digest: &ctx_digest,
+            control_public_key,
+            upgradable,
+            prior_chain: &prior,
+        };
+        let outcome = validate_chain_link(link, &ctx, reference, debug_mode);
+        if promotes && matches!(outcome, Ok(Outcome::Append { .. })) {
+            in_force = Some((ctx_pcrs, ctx_digest));
+        }
+        outcomes.push(outcome);
+        prior.push(link.clone());
+    }
+
+    let tip_matches_row = in_force
+        .as_ref()
+        .is_some_and(|(p, d)| p == row_pcrs && d == row_image_digest);
+    let (final_pcrs, final_image_digest) = match in_force {
+        Some((p, d)) => (Some(p), Some(d)),
+        None => (None, None),
+    };
+    ChainWalk {
+        outcomes,
+        final_pcrs,
+        final_image_digest,
+        tip_matches_row,
+    }
+}
+
+/// Most recent prior unrevoked upgrade link whose `to_pcrs` and target
+/// image digest match the boot being explained. `None` when no signed
+/// upgrade accounts for a boot with these measurements.
+fn promotion_target(
+    prior: &[ChainLink],
+    boot_pcrs: &PcrsHex,
+    boot_image_digest: &str,
+) -> Option<UpgradePayload> {
+    let revoked: Vec<Uuid> = prior
+        .iter()
+        .filter(|l| l.kind == ChainLinkKind::Revocation)
+        .filter_map(|l| {
+            ciborium::from_reader::<RevocationPayload, _>(l.payload.as_slice()).ok()
+        })
+        .map(|p| p.revokes)
+        .collect();
+    prior
+        .iter()
+        .rev()
+        .filter(|l| l.kind == ChainLinkKind::Upgrade)
+        .filter(|l| l.id.is_none_or(|id| !revoked.contains(&id)))
+        .filter_map(|l| ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()).ok())
+        .find(|p| p.to_pcrs == *boot_pcrs && p.image_digest == boot_image_digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1153,235 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ChainValidationError::AlreadyRevoked));
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-chain walker
+    // -----------------------------------------------------------------------
+
+    /// Upgrade link describing a real version transition: attested by
+    /// the OLD enclave (`from_seed`, the version running at confirm
+    /// time) and targeting the NEW measurements (`to_seed`). The
+    /// single-seed [`upgrade_link`] fixture above keeps from == to,
+    /// which never promotes anything.
+    fn transition_upgrade_link(
+        enclave_id: Uuid,
+        target_digest: &str,
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: DateTime<Utc>,
+    ) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id,
+            from_pcrs: pcrs_hex_from_seed(from_seed),
+            to_pcrs: pcrs_hex_from_seed(to_seed),
+            image_digest: target_digest.into(),
+            valid_from,
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x45; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation,
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    fn recorded(link: ChainLink, at: DateTime<Utc>) -> RecordedLink {
+        RecordedLink {
+            link,
+            recorded_at: Some(at),
+        }
+    }
+
+    /// The promoted-history shape a real upgrade leaves behind:
+    /// boot(v1) -> upgrade(v1->v2) -> boot(v2), walked AFTER promotion
+    /// with the row already holding the v2 state. Validating each link
+    /// against the final row state would reject the first two; the
+    /// walker must reconstruct the per-link historical context.
+    #[test]
+    fn walk_validates_promoted_history() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x20);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade = transition_upgrade_link(
+            id,
+            "sha256:v2",
+            0x20,
+            0x30,
+            &sk,
+            now - Duration::minutes(10),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut promo = boot_link(id, "sha256:v2", 0x30);
+        promo.id = Some(Uuid::new_v4());
+        promo.sequence = Some(2);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(2)),
+            recorded(upgrade, now - Duration::minutes(11)),
+            recorded(promo, now - Duration::minutes(9)),
+        ];
+        let row_pcrs = pcrs_hex_from_seed(0x30);
+        let walk = validate_chain(&links, &row_pcrs, "sha256:v2", Some(&pk), true, now, true);
+
+        for (i, outcome) in walk.outcomes.iter().enumerate() {
+            assert!(
+                matches!(outcome, Ok(Outcome::Append { sequence }) if *sequence == i as u64),
+                "link {i}: {outcome:?}"
+            );
+        }
+        assert!(walk.tip_matches_row);
+        assert_eq!(walk.final_pcrs, Some(row_pcrs));
+        assert_eq!(walk.final_image_digest, Some("sha256:v2".into()));
+    }
+
+    /// A boot whose measurements no prior upgrade link explains must
+    /// reject, and the in-force tip must NOT advance to it, even when
+    /// the enclave row already claims the new state.
+    #[test]
+    fn walk_rejects_unexplained_transition_boot() {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x21);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut rogue = boot_link(id, "sha256:v2", 0x31);
+        rogue.id = Some(Uuid::new_v4());
+        rogue.sequence = Some(1);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(1)),
+            recorded(rogue, now - Duration::minutes(5)),
+        ];
+        let row_pcrs = pcrs_hex_from_seed(0x31);
+        let walk = validate_chain(&links, &row_pcrs, "sha256:v2", Some(&[4u8; 65]), true, now, true);
+
+        assert!(matches!(walk.outcomes[0], Ok(Outcome::Append { sequence: 0 })));
+        assert!(walk.outcomes[1].is_err(), "{:?}", walk.outcomes[1]);
+        // Tip stays at genesis, which the row no longer matches.
+        assert!(!walk.tip_matches_row);
+        assert_eq!(walk.final_pcrs, Some(pcrs_hex_from_seed(0x21)));
+    }
+
+    /// A boot of a REVOKED upgrade's target must reject: the revocation
+    /// strips the upgrade link of its power to explain the transition.
+    #[test]
+    fn walk_rejects_boot_of_revoked_upgrade() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x22);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        // Confirmed for the future, then revoked before activation.
+        let mut upgrade = transition_upgrade_link(
+            id,
+            "sha256:v2",
+            0x22,
+            0x32,
+            &sk,
+            now + Duration::days(7),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x22, &sk);
+        revoke.id = Some(Uuid::new_v4());
+        revoke.sequence = Some(2);
+        let mut rogue = boot_link(id, "sha256:v2", 0x32);
+        rogue.id = Some(Uuid::new_v4());
+        rogue.sequence = Some(3);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(1)),
+            recorded(upgrade, now - Duration::minutes(30)),
+            recorded(revoke, now - Duration::minutes(20)),
+            recorded(rogue, now - Duration::minutes(5)),
+        ];
+        let row_pcrs = pcrs_hex_from_seed(0x22);
+        let walk = validate_chain(&links, &row_pcrs, "sha256:v1", Some(&pk), true, now, true);
+
+        assert!(walk.outcomes[0].is_ok());
+        assert!(walk.outcomes[1].is_ok());
+        assert!(walk.outcomes[2].is_ok());
+        assert!(walk.outcomes[3].is_err(), "{:?}", walk.outcomes[3]);
+        // Still on v1, which the row agrees with.
+        assert!(walk.tip_matches_row);
+    }
+
+    /// Historical revocations validate against their INGEST clock, not
+    /// the verifier's: by walk time the revoked upgrade's `valid_from`
+    /// has passed, and judging the revocation "now" would reject a
+    /// link the backend legitimately recorded.
+    #[test]
+    fn walk_accepts_historical_revocation_after_target_activation() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x23);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        // valid_from is an hour in the PAST relative to the walk...
+        let mut upgrade = transition_upgrade_link(
+            id,
+            "sha256:v2",
+            0x23,
+            0x33,
+            &sk,
+            now - Duration::hours(1),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        // ...but the revocation was recorded 30 minutes BEFORE that.
+        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x23, &sk);
+        revoke.id = Some(Uuid::new_v4());
+        revoke.sequence = Some(2);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(3)),
+            recorded(upgrade, now - Duration::hours(2)),
+            recorded(revoke, now - Duration::minutes(90)),
+        ];
+        let row_pcrs = pcrs_hex_from_seed(0x23);
+        let walk = validate_chain(&links, &row_pcrs, "sha256:v1", Some(&pk), true, now, true);
+
+        assert!(
+            walk.outcomes.iter().all(Result::is_ok),
+            "{:?}",
+            walk.outcomes
+        );
+        assert!(walk.tip_matches_row);
+
+        // Sanity: the same chain judged entirely at `now` (no recorded
+        // ingest times) rejects the revocation as past activation.
+        let unstamped: Vec<RecordedLink> = links
+            .iter()
+            .map(|r| RecordedLink {
+                link: r.link.clone(),
+                recorded_at: None,
+            })
+            .collect();
+        let walk_now =
+            validate_chain(&unstamped, &row_pcrs, "sha256:v1", Some(&pk), true, now, true);
+        assert!(matches!(
+            walk_now.outcomes[2],
+            Err(ChainValidationError::RevokePastActivation)
+        ));
     }
 }

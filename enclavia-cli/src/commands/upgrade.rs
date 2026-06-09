@@ -19,8 +19,8 @@
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
-    BootPayload, ChainContext, ChainLink, ChainLinkKind, PcrsHex, RevocationPayload,
-    UpgradePayload, validate_chain_link,
+    BootPayload, ChainLink, ChainLinkKind, PcrsHex, RecordedLink, RevocationPayload,
+    UpgradePayload, validate_chain,
 };
 pub use enclavia_protocol::staging::{StagedUpgradeJson, StagedUpgradeStatus};
 use serde::Serialize;
@@ -83,6 +83,12 @@ pub struct ChainSummary {
     /// but NOT against the AWS Nitro CA chain (QEMU enclaves can only
     /// produce fake, unsigned documents).
     pub debug_mode: bool,
+    /// Whether the walk's final in-force state (genesis advanced by
+    /// every verified promotion boot) equals the enclave row's current
+    /// `pcrs` + `image_digest`. `false` means the chain does not
+    /// explain what the row records: treat the chain as NOT verified
+    /// even if every individual link validated.
+    pub tip_matches_row: bool,
     pub links: Vec<VerifiedLink>,
 }
 
@@ -90,9 +96,12 @@ pub struct ChainSummary {
 ///
 /// Two backend round-trips: `GET /enclaves/{id}` for the validator
 /// context (PCRs, image digest, control pubkey, upgradable flag) and
-/// `GET /enclaves/{id}/upgrade-chain` for the link list. We walk the
-/// chain in order, accumulating `prior_chain` so each link sees the
-/// same context the backend ingest saw at insert time.
+/// `GET /enclaves/{id}/upgrade-chain` for the link list. The links are
+/// handed to `enclavia_protocol::chain::validate_chain`, which
+/// reconstructs the historical context each link saw at ingest time
+/// (the row state changes across upgrades, so validating history
+/// against today's row would reject perfectly good links) and ties the
+/// walk's final state back to the row (`tip_matches_row`).
 ///
 /// Per-link validation failures are recorded on the link and do not
 /// abort the walk — the user wants to see the whole chain even when a
@@ -124,19 +133,34 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
 
     let now = Utc::now();
-    let mut prior: Vec<ChainLink> = Vec::with_capacity(wire_links.len());
+    let mut links: Vec<RecordedLink> = Vec::with_capacity(wire_links.len());
+    for wire in &wire_links {
+        links.push(RecordedLink {
+            link: wire_to_chain_link(wire)?,
+            // Ingest timestamp: time-dependent rules (revocations must
+            // precede their target's valid_from) are judged against the
+            // clock at ingest, not the walk's.
+            recorded_at: wire.created_at,
+        });
+    }
+    let walk = validate_chain(
+        &links,
+        &pcrs,
+        &image_digest,
+        control_public_key_bytes.as_deref(),
+        upgradable,
+        now,
+        debug_mode,
+    );
+
     let mut out: Vec<VerifiedLink> = Vec::with_capacity(wire_links.len());
-    for wire in wire_links {
-        let link = wire_to_chain_link(&wire)?;
-        let payload = decode_payload(&link.kind, &link.payload);
-        let ctx = ChainContext {
-            enclave_pcrs: &pcrs,
-            enclave_image_digest: &image_digest,
-            control_public_key: control_public_key_bytes.as_deref(),
-            upgradable,
-            prior_chain: &prior,
-        };
-        let validation = validate_chain_link(&link, &ctx, now, debug_mode)
+    for ((wire, rl), outcome) in wire_links
+        .iter()
+        .zip(links.iter())
+        .zip(walk.outcomes.into_iter())
+    {
+        let payload = decode_payload(&rl.link.kind, &rl.link.payload);
+        let validation = outcome
             .map(|o| match o {
                 enclavia_protocol::chain::Outcome::Append { sequence } => {
                     VerificationOk::Append { sequence }
@@ -144,17 +168,14 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
                 enclavia_protocol::chain::Outcome::Dedup => VerificationOk::Dedup,
             })
             .map_err(|e| e.to_string());
-        let attestation_bytes = link.attestation.len();
-        let signature_bytes = link.signature.as_ref().map(|s| s.len());
-        prior.push(link);
         out.push(VerifiedLink {
             id: wire.id,
             sequence: wire.sequence,
             kind: wire.kind,
             created_at: wire.created_at,
             payload,
-            attestation_bytes,
-            signature_bytes,
+            attestation_bytes: rl.link.attestation.len(),
+            signature_bytes: rl.link.signature.as_ref().map(|s| s.len()),
             validation,
         });
     }
@@ -166,6 +187,7 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         pcrs,
         control_public_key: control_public_key_b64,
         debug_mode,
+        tip_matches_row: walk.tip_matches_row,
         links: out,
     })
 }

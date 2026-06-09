@@ -791,13 +791,21 @@ fn print_chain(summary: &upgrade::ChainSummary) {
         println!();
     }
 
-    if verified == n {
-        println!("Chain is valid. {n} {label}, all verified locally.");
+    if verified == n && summary.tip_matches_row {
+        println!("Chain is valid. {n} {label}, all verified locally; tip matches the enclave row.");
+    } else if verified == n {
+        println!(
+            "Chain links all verified, but the chain tip does NOT match the enclave row \
+             (stale chain or row drift); treat as unverified."
+        );
     } else {
         let rejected = n - verified;
         println!(
             "Chain has rejected links: {verified}/{n} verified, {rejected} failed local validation."
         );
+        if !summary.tip_matches_row {
+            println!("Chain tip does not match the enclave row state.");
+        }
     }
 }
 
