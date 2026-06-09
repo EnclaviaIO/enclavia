@@ -41,8 +41,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tokio::io::AsyncReadExt;
-use tracing::{error, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{error, info, warn};
 
 /// Vsock CID of the host: `VMADDR_CID_HOST = 2` per the Linux vsock
 /// contract (`<linux/vm_sockets.h>`). Works on both real Nitro (CID 2
@@ -54,6 +54,13 @@ const VSOCK_HOST_CID: u32 = 2;
 
 /// Port the host-side `enclavia-secrets-host` daemon listens on (#169).
 const SECRETS_HOST_PORT: u32 = 5004;
+
+/// One-byte ACK we send back to `secrets-host` after `read_to_end`
+/// returns the payload. The host blocks on this byte before exiting;
+/// without it the host's exit can race with our read on TCG/QEMU and
+/// surface as ENOTCONN. Value `0x06` matches the constant in
+/// `secrets-host/src/main.rs`. Don't change one without the other.
+const ACK_BYTE: u8 = 0x06;
 
 /// How long we wait for the host-side daemon's `accept`. The host
 /// always spawns `secrets-host` (even for enclaves with no secrets,
@@ -146,6 +153,19 @@ async fn fetch_secrets()
 
     let mut bytes = Vec::with_capacity(1024);
     stream.read_to_end(&mut bytes).await?;
+    // ACK as soon as we have the bytes in our address space: the host
+    // is waiting on this byte before it exits, and the parse + write
+    // steps that follow are local to our process. Best-effort: if the
+    // ACK write fails the host will time out and log, but we've already
+    // got the data so the boot can still proceed.
+    if let Err(e) = stream.write_all(&[ACK_BYTE]).await {
+        warn!("sending ack to secrets-host: {e}");
+    }
+    // tokio-vsock's `VsockStream::shutdown` is an inherent
+    // synchronous method that takes a `Shutdown` direction; we want
+    // the AsyncWriteExt half-close (FIN on the write side only) so
+    // the host's `read_exact(1)` returns immediately.
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
     if bytes.is_empty() {
         return Err("host closed connection with empty payload (expected at least an empty CBOR map)".into());
     }
