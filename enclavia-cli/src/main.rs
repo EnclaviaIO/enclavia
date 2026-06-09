@@ -245,10 +245,49 @@ enum UpgradeCmd {
     /// Fetch and pretty-print an enclave's public upgrade chain. Walks
     /// every link, re-validates locally against the enclave's recorded
     /// PCRs / image digest / control public key, and prints a tree of
-    /// boot → upgrades → revocations.
+    /// boot, upgrades, and revocations.
     Chain {
         /// Target enclave id. Accepts a unique prefix.
         enclave_id: String,
+    },
+
+    /// List all staged upgrades for an enclave, newest first. Shows the
+    /// upgrade id, status, image reference, digest (truncated), valid_from
+    /// time if set, and creation time.
+    List {
+        /// Target enclave id. Accepts a unique prefix.
+        enclave_id: String,
+    },
+
+    /// Confirm a staged upgrade and schedule its effective time.
+    ///
+    /// When neither --at nor --immediate is supplied the server defaults
+    /// to now + 7 days. The enclave swaps automatically once valid_from
+    /// passes; no further CLI action is needed.
+    ///
+    /// --at and --immediate are mutually exclusive.
+    Confirm {
+        /// Target enclave id. Accepts a unique prefix.
+        enclave_id: String,
+        /// Upgrade id to confirm (from `upgrade list`).
+        upgrade_id: String,
+        /// Schedule the upgrade for this specific RFC 3339 timestamp, e.g.
+        /// `2026-07-01T12:00:00Z`. Mutually exclusive with --immediate.
+        #[arg(long, value_name = "RFC3339", conflicts_with = "immediate")]
+        at: Option<String>,
+        /// Schedule the upgrade to take effect immediately (sets valid_from
+        /// to the current UTC time). Mutually exclusive with --at.
+        #[arg(long, conflicts_with = "at")]
+        immediate: bool,
+    },
+
+    /// Revoke a confirmed upgrade before it fires. The running enclave
+    /// keeps its current version and a Revocation chain link is recorded.
+    Revoke {
+        /// Target enclave id. Accepts a unique prefix.
+        enclave_id: String,
+        /// Upgrade id to revoke (from `upgrade list`).
+        upgrade_id: String,
     },
 }
 
@@ -688,6 +727,37 @@ async fn run_upgrade(cmd: UpgradeCmd) -> Result<(), CliError> {
             print_chain(&summary);
             Ok(())
         }
+        UpgradeCmd::List { enclave_id } => {
+            let client = ApiClient::new()?;
+            let rows = upgrade::list_upgrades(&client, &enclave_id).await?;
+            print_upgrade_list(&rows);
+            Ok(())
+        }
+        UpgradeCmd::Confirm { enclave_id, upgrade_id, at, immediate } => {
+            let valid_from: Option<chrono::DateTime<chrono::Utc>> = if immediate {
+                Some(chrono::Utc::now())
+            } else if let Some(ts) = at {
+                let parsed = chrono::DateTime::parse_from_rfc3339(&ts).map_err(|e| {
+                    CliError::Other(format!("invalid RFC 3339 timestamp {ts:?}: {e}"))
+                })?;
+                Some(parsed.with_timezone(&chrono::Utc))
+            } else {
+                None
+            };
+            let client = ApiClient::new()?;
+            let result =
+                upgrade::confirm_upgrade(&client, &enclave_id, &upgrade_id, valid_from)
+                    .await?;
+            print_upgrade_confirm(&result);
+            Ok(())
+        }
+        UpgradeCmd::Revoke { enclave_id, upgrade_id } => {
+            let client = ApiClient::new()?;
+            let result =
+                upgrade::revoke_upgrade(&client, &enclave_id, &upgrade_id).await?;
+            print_upgrade_revoke(&result);
+            Ok(())
+        }
     }
 }
 
@@ -779,4 +849,69 @@ fn print_chain_link(link: &upgrade::VerifiedLink) {
     if let Err(msg) = &link.validation {
         println!("      validation error: {msg}");
     }
+}
+
+/// Print a table of staged upgrades. One row per upgrade, newest first.
+fn print_upgrade_list(rows: &[upgrade::StagedUpgradeJson]) {
+    if rows.is_empty() {
+        println!("No staged upgrades for this enclave.");
+        return;
+    }
+    // Header
+    println!(
+        "{:<38} {:<12} {:<44} {:<16} {:<26} CREATED",
+        "UPGRADE ID", "STATUS", "IMAGE", "DIGEST", "VALID FROM",
+    );
+    println!("{}", "-".repeat(160));
+    for r in rows {
+        // Keep the image ref short: if it contains a slash, show only
+        // the part after the last slash (the `repo:tag` portion). Full
+        // ref on truncation would be confusing, so we shorten.
+        let image_short = r
+            .docker_image
+            .rsplit('/')
+            .next()
+            .unwrap_or(&r.docker_image);
+        // Digest: show the 12-char hex after "sha256:" for brevity.
+        let digest_short = r
+            .image_digest
+            .as_deref()
+            .and_then(|d| d.strip_prefix("sha256:"))
+            .map(|h| format!("sha256:{}", &h[..h.len().min(12)]))
+            .unwrap_or_else(|| "-".to_string());
+        let valid_from = r
+            .valid_from
+            .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let created = r.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
+        let status = format!("{:?}", r.status).to_lowercase();
+        println!(
+            "{:<38} {:<12} {:<44} {:<16} {:<26} {}",
+            r.id, status, image_short, digest_short, valid_from, created,
+        );
+    }
+}
+
+/// Print the result of a successful `upgrade confirm` call.
+fn print_upgrade_confirm(r: &upgrade::StagedUpgradeJson) {
+    let status = format!("{:?}", r.status).to_lowercase();
+    println!("Upgrade {} confirmed.", r.id);
+    println!("  Status:     {status}");
+    if let Some(vf) = r.valid_from {
+        println!(
+            "  Valid from: {}",
+            vf.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        println!(
+            "  The enclave will swap to the new version automatically at that time."
+        );
+    }
+}
+
+/// Print the result of a successful `upgrade revoke` call.
+fn print_upgrade_revoke(r: &upgrade::StagedUpgradeJson) {
+    let status = format!("{:?}", r.status).to_lowercase();
+    println!("Upgrade {} revoked.", r.id);
+    println!("  Status:     {status}");
+    println!("  The upgrade has been cancelled; the enclave keeps running the current version.");
 }

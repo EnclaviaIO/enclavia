@@ -1,4 +1,5 @@
-//! Public upgrade-chain CLI surface (#47 phase 3c).
+//! Public upgrade-chain CLI surface (#47 phase 3c) and staged-upgrade
+//! management commands (#47 phase 4c).
 //!
 //! `enclavia upgrade chain <enclave-id>` fetches the chain from the
 //! backend and re-validates each link locally using the same
@@ -6,8 +7,14 @@
 //! route applies. The CLI's per-link verification verdict reflects this
 //! local re-check, not a server claim.
 //!
-//! The function returns a typed [`ChainSummary`] the binary's
-//! pretty-printer renders and MCP can serialise verbatim.
+//! `enclavia upgrade list <enclave-id>` lists all staged upgrades.
+//! `enclavia upgrade confirm <enclave-id> <upgrade-id>` confirms a staged
+//! upgrade, optionally scheduling it with `--at` or `--immediate`.
+//! `enclavia upgrade revoke <enclave-id> <upgrade-id>` cancels a confirmed
+//! upgrade before it fires.
+//!
+//! All three new functions return typed values; the binary is the only
+//! place that prints to the terminal.
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -15,6 +22,7 @@ use enclavia_protocol::chain::{
     BootPayload, ChainContext, ChainLink, ChainLinkKind, PcrsHex, RevocationPayload,
     UpgradePayload, validate_chain_link,
 };
+pub use enclavia_protocol::staging::{StagedUpgradeJson, StagedUpgradeStatus};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -237,6 +245,41 @@ fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Staged-upgrade management (#47 phase 4c)
+// ---------------------------------------------------------------------------
+
+/// Fetch all staged upgrades for an enclave, newest first.
+pub async fn list_upgrades(
+    client: &ApiClient,
+    enclave_id: &str,
+) -> Result<Vec<StagedUpgradeJson>, CliError> {
+    client.list_upgrades(enclave_id).await
+}
+
+/// Confirm a staged upgrade, optionally scheduling its `valid_from` time.
+///
+/// - `valid_from = None` lets the server default to `now + 7 days`.
+/// - A past timestamp is clamped to `now` by the server.
+pub async fn confirm_upgrade(
+    client: &ApiClient,
+    enclave_id: &str,
+    upgrade_id: &str,
+    valid_from: Option<DateTime<Utc>>,
+) -> Result<StagedUpgradeJson, CliError> {
+    client.confirm_upgrade(enclave_id, upgrade_id, valid_from).await
+}
+
+/// Revoke a confirmed upgrade before it fires. The running enclave keeps
+/// its current version.
+pub async fn revoke_upgrade(
+    client: &ApiClient,
+    enclave_id: &str,
+    upgrade_id: &str,
+) -> Result<StagedUpgradeJson, CliError> {
+    client.revoke_upgrade(enclave_id, upgrade_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +480,72 @@ mod tests {
         let enclave = serde_json::json!({});
         let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
         assert!(err.contains("pcrs"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged-upgrade DTO parsing
+    // -----------------------------------------------------------------------
+
+    /// `StagedUpgradeJson` round-trips through JSON without loss.
+    #[test]
+    fn staged_upgrade_json_round_trips() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "enclave_id": "00000000-0000-0000-0000-000000000002",
+            "status": "staged",
+            "docker_image": "registry.example.com/owner/app:v2",
+            "created_at": "2026-06-09T10:00:00Z"
+        });
+        let v: StagedUpgradeJson = serde_json::from_value(json).unwrap();
+        assert_eq!(v.status, StagedUpgradeStatus::Staged);
+        assert!(v.valid_from.is_none());
+        assert!(v.pcrs.is_none());
+        assert!(v.image_digest.is_none());
+    }
+
+    /// Optional fields on `StagedUpgradeJson` deserialize when present.
+    /// Note: `PcrsHex` uses `PCR0`/`PCR1`/`PCR2` as serde field names
+    /// (uppercase, matching the backend wire shape).
+    #[test]
+    fn staged_upgrade_json_with_optional_fields() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "enclave_id": "00000000-0000-0000-0000-000000000002",
+            "status": "confirmed",
+            "docker_image": "registry.example.com/owner/app:v2",
+            "image_digest": "sha256:abcdef1234567890",
+            "pcrs": {
+                "PCR0": "aa".repeat(48),
+                "PCR1": "bb".repeat(48),
+                "PCR2": "cc".repeat(48)
+            },
+            "valid_from": "2026-06-16T10:00:00Z",
+            "upgrade_link_id": "00000000-0000-0000-0000-000000000003",
+            "created_at": "2026-06-09T10:00:00Z"
+        });
+        let v: StagedUpgradeJson = serde_json::from_value(json).unwrap();
+        assert_eq!(v.status, StagedUpgradeStatus::Confirmed);
+        assert!(v.valid_from.is_some());
+        assert!(v.pcrs.is_some());
+        assert_eq!(v.image_digest.as_deref(), Some("sha256:abcdef1234567890"));
+    }
+
+    /// `StagedUpgradeStatus` deserializes from all known lowercase strings.
+    #[test]
+    fn staged_upgrade_status_deserializes_all_variants() {
+        let cases = [
+            ("building", StagedUpgradeStatus::Building),
+            ("staged", StagedUpgradeStatus::Staged),
+            ("confirmed", StagedUpgradeStatus::Confirmed),
+            ("promoted", StagedUpgradeStatus::Promoted),
+            ("revoked", StagedUpgradeStatus::Revoked),
+            ("failed", StagedUpgradeStatus::Failed),
+            ("expired", StagedUpgradeStatus::Expired),
+        ];
+        for (s, expected) in &cases {
+            let got: StagedUpgradeStatus =
+                serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(got, *expected, "variant {s}");
+        }
     }
 }
