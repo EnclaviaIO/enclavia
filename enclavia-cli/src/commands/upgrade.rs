@@ -77,6 +77,12 @@ pub struct ChainSummary {
     /// Base64 of the 65-byte uncompressed SEC1 P-256 public key.
     /// `None` when the enclave is non-upgradable.
     pub control_public_key: Option<String>,
+    /// True when the enclave row reports `mode == "debug"`. Links are
+    /// then re-validated with `debug_mode = true`, mirroring the
+    /// backend's ingest: attestation documents are checked structurally
+    /// but NOT against the AWS Nitro CA chain (QEMU enclaves can only
+    /// produce fake, unsigned documents).
+    pub debug_mode: bool,
     pub links: Vec<VerifiedLink>,
 }
 
@@ -99,6 +105,7 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         .get("upgradable")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let debug_mode = debug_mode_from_enclave_row(&enclave);
     let image_digest = enclave
         .get("image_digest")
         .and_then(|v| v.as_str())
@@ -129,7 +136,7 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
             upgradable,
             prior_chain: &prior,
         };
-        let validation = validate_chain_link(&link, &ctx, now, false)
+        let validation = validate_chain_link(&link, &ctx, now, debug_mode)
             .map(|o| match o {
                 enclavia_protocol::chain::Outcome::Append { sequence } => {
                     VerificationOk::Append { sequence }
@@ -158,8 +165,19 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         image_digest,
         pcrs,
         control_public_key: control_public_key_b64,
+        debug_mode,
         links: out,
     })
+}
+
+/// `mode` field off the enclave row. The backend stamps its
+/// deployment-wide mode here (`"debug"` for the QEMU launcher) and uses
+/// the same flag at chain-ingest time, so the local re-validation must
+/// run with it too: debug enclaves can only produce fake attestation
+/// documents, which the validator then checks structurally instead of
+/// against the AWS Nitro CA chain.
+fn debug_mode_from_enclave_row(enclave: &serde_json::Value) -> bool {
+    enclave.get("mode").and_then(|v| v.as_str()) == Some("debug")
 }
 
 fn pcrs_from_enclave_row(enclave: &serde_json::Value) -> Result<PcrsHex, CliError> {
@@ -557,6 +575,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a byte"), "{err}");
+    }
+
+    /// The chain walker mirrors the backend's ingest-time `debug_mode`
+    /// flag, read off the enclave row's `mode` field.
+    #[test]
+    fn debug_mode_from_enclave_row_matches_mode_field() {
+        let debug_row = serde_json::json!({ "mode": "debug" });
+        assert!(debug_mode_from_enclave_row(&debug_row));
+        let prod_row = serde_json::json!({ "mode": "production" });
+        assert!(!debug_mode_from_enclave_row(&prod_row));
+        let absent_row = serde_json::json!({});
+        assert!(!debug_mode_from_enclave_row(&absent_row));
     }
 
     // -----------------------------------------------------------------------

@@ -775,6 +775,11 @@ fn print_chain(summary: &upgrade::ChainSummary) {
     if !summary.upgradable {
         println!("  upgradable:   no (only the genesis boot is valid)");
     }
+    if summary.debug_mode {
+        println!(
+            "  mode:         debug (attestations checked structurally only, NOT rooted in AWS Nitro hardware)"
+        );
+    }
     println!();
 
     let mut verified = 0usize;
