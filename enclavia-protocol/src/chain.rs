@@ -103,6 +103,42 @@ mod serde_bytes_opt {
     }
 }
 
+/// JSON wire shape of a chain link on the public `GET
+/// /enclaves/{id}/upgrade-chain` route. The opaque byte fields are
+/// carried as base64 strings here (vs. the raw-bytes [`ChainLink`] used
+/// at rest and inside the validator). Consumed by the CLI today and, after
+/// the enclavia-crates follow-up, by the backend + chain-host so all three
+/// surfaces share one definition.
+///
+/// `payload`, `attestation`, and `signature` are standard base64 with
+/// padding. Decode them before handing the bytes to [`validate_chain_link`]
+/// for re-verification.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChainLinkJson {
+    /// Assigned by the backend on insert; absent on the wire shape
+    /// `chain-host` sends to the ingest route.
+    #[serde(default)]
+    pub id: Option<uuid::Uuid>,
+    pub kind: ChainLinkKind,
+    /// Monotonic per-enclave, starts at 0 for the boot link.
+    #[serde(default)]
+    pub sequence: Option<i64>,
+    /// Base64 of the CBOR-encoded kind-specific payload.
+    pub payload: String,
+    /// Base64 of the COSE_Sign1 NSM attestation document. `user_data`
+    /// is bound to `sha256(payload_bytes)`.
+    pub attestation: String,
+    /// Base64 of the raw 64-byte ECDSA P-256 r||s signature. Absent on
+    /// boot links (they're authenticated by the attestation alone),
+    /// required on upgrade/revocation links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Wall-clock time the backend appended this link. `None` on the
+    /// chain-host ingest direction.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Payload shape for a [`ChainLinkKind::Boot`] link.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootPayload {
