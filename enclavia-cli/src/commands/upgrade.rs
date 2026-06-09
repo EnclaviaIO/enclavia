@@ -106,27 +106,15 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
             CliError::Other("enclave row missing `image_digest`".to_string())
         })?
         .to_string();
-    let control_public_key_b64 = enclave
-        .get("control_public_key")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // PCRs come back as `{"pcr0": "hex", "pcr1": "hex", "pcr2": "hex"}`
-    // on the enclave row. The protocol's PcrsHex uses serde-renames for
-    // uppercase keys on the wire shape it owns, but we're constructing
-    // by field here so the casing on the JSON side doesn't matter.
+    // The enclave row stores the builder's pcr.json verbatim, so the keys
+    // arrive in nitro-cli casing (`PCR0`); the extractor tolerates both
+    // casings rather than coupling to that detail.
     let pcrs = pcrs_from_enclave_row(&enclave)?;
 
-    let control_public_key_bytes: Option<Vec<u8>> = match control_public_key_b64.as_deref() {
-        Some(s) => Some(
-            base64::engine::general_purpose::STANDARD
-                .decode(s.as_bytes())
-                .map_err(|e| {
-                    CliError::Other(format!("control_public_key base64 decode: {e}"))
-                })?,
-        ),
-        None => None,
-    };
+    let control_public_key_bytes = control_key_bytes_from_enclave_row(&enclave)?;
+    let control_public_key_b64 = control_public_key_bytes
+        .as_deref()
+        .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
 
     let now = Utc::now();
     let mut prior: Vec<ChainLink> = Vec::with_capacity(wire_links.len());
@@ -178,18 +166,54 @@ fn pcrs_from_enclave_row(enclave: &serde_json::Value) -> Result<PcrsHex, CliErro
     let pcrs_obj = enclave.get("pcrs").ok_or_else(|| {
         CliError::Other("enclave row missing `pcrs`".to_string())
     })?;
-    let field = |name: &str| -> Result<String, CliError> {
+    // The backend persists the builder's pcr.json verbatim, which uses the
+    // nitro-cli `PCR0`/`PCR1`/`PCR2` casing. Accept lowercase as well so a
+    // future normalization on the row can't break the walker.
+    let field = |upper: &str, lower: &str| -> Result<String, CliError> {
         pcrs_obj
-            .get(name)
+            .get(upper)
+            .or_else(|| pcrs_obj.get(lower))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| CliError::Other(format!("enclave.pcrs missing `{name}`")))
+            .ok_or_else(|| CliError::Other(format!("enclave.pcrs missing `{upper}`")))
     };
     Ok(PcrsHex {
-        pcr0: field("pcr0")?,
-        pcr1: field("pcr1")?,
-        pcr2: field("pcr2")?,
+        pcr0: field("PCR0", "pcr0")?,
+        pcr1: field("PCR1", "pcr1")?,
+        pcr2: field("PCR2", "pcr2")?,
     })
+}
+
+/// Extract the control public key bytes from the enclave row.
+///
+/// The column is a BYTEA, so the authenticated row serializes it as a JSON
+/// array of numbers; tolerate a base64 string too in case the row shape is
+/// ever normalized. `None`/`null` means the enclave is non-upgradable.
+fn control_key_bytes_from_enclave_row(
+    enclave: &serde_json::Value,
+) -> Result<Option<Vec<u8>>, CliError> {
+    match enclave.get("control_public_key") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Some)
+            .map_err(|e| CliError::Other(format!("control_public_key base64 decode: {e}"))),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut bytes = Vec::with_capacity(arr.len());
+            for v in arr {
+                let n = v.as_u64().filter(|n| *n <= 255).ok_or_else(|| {
+                    CliError::Other(
+                        "control_public_key array element is not a byte".to_string(),
+                    )
+                })?;
+                bytes.push(n as u8);
+            }
+            Ok(Some(bytes))
+        }
+        Some(other) => Err(CliError::Other(format!(
+            "control_public_key has unexpected JSON shape: {other}"
+        ))),
+    }
 }
 
 fn wire_to_chain_link(w: &ChainLinkJson) -> Result<ChainLink, CliError> {
@@ -463,6 +487,23 @@ mod tests {
         assert_eq!(pcrs.pcr2, "cc".repeat(48));
     }
 
+    /// The shape the backend actually serves: the row stores the builder's
+    /// pcr.json verbatim, so keys arrive in nitro-cli casing.
+    #[test]
+    fn pcrs_from_enclave_row_accepts_nitro_cli_casing() {
+        let enclave = serde_json::json!({
+            "pcrs": {
+                "PCR0": "aa".repeat(48),
+                "PCR1": "bb".repeat(48),
+                "PCR2": "cc".repeat(48),
+            }
+        });
+        let pcrs = pcrs_from_enclave_row(&enclave).unwrap();
+        assert_eq!(pcrs.pcr0, "aa".repeat(48));
+        assert_eq!(pcrs.pcr1, "bb".repeat(48));
+        assert_eq!(pcrs.pcr2, "cc".repeat(48));
+    }
+
     #[test]
     fn pcrs_from_enclave_row_errors_on_missing_field() {
         let enclave = serde_json::json!({
@@ -472,7 +513,7 @@ mod tests {
             }
         });
         let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
-        assert!(err.contains("pcr2"), "{err}");
+        assert!(err.contains("PCR2"), "{err}");
     }
 
     #[test]
@@ -480,6 +521,42 @@ mod tests {
         let enclave = serde_json::json!({});
         let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
         assert!(err.contains("pcrs"), "{err}");
+    }
+
+    /// `control_public_key` is a BYTEA on the row, so the authenticated
+    /// endpoint serializes it as a JSON array of numbers.
+    #[test]
+    fn control_key_from_enclave_row_accepts_byte_array() {
+        let enclave = serde_json::json!({ "control_public_key": [4, 100, 255, 0] });
+        let bytes = control_key_bytes_from_enclave_row(&enclave).unwrap();
+        assert_eq!(bytes, Some(vec![4u8, 100, 255, 0]));
+    }
+
+    #[test]
+    fn control_key_from_enclave_row_accepts_base64_string() {
+        let enclave = serde_json::json!({ "control_public_key": "BGT/AA==" });
+        let bytes = control_key_bytes_from_enclave_row(&enclave).unwrap();
+        assert_eq!(bytes, Some(vec![4u8, 100, 255, 0]));
+    }
+
+    #[test]
+    fn control_key_from_enclave_row_none_when_null_or_absent() {
+        let null_row = serde_json::json!({ "control_public_key": null });
+        assert_eq!(control_key_bytes_from_enclave_row(&null_row).unwrap(), None);
+        let absent_row = serde_json::json!({});
+        assert_eq!(
+            control_key_bytes_from_enclave_row(&absent_row).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn control_key_from_enclave_row_rejects_out_of_range() {
+        let enclave = serde_json::json!({ "control_public_key": [4, 256] });
+        let err = control_key_bytes_from_enclave_row(&enclave)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a byte"), "{err}");
     }
 
     // -----------------------------------------------------------------------
