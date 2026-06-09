@@ -39,3 +39,10 @@ open = "5"
 # share, so all three agree on what is well-formed for the
 # --egress-allow / --egress-resolver / --egress-config flags.
 enclavia-egress = { path = "../enclavia-egress" }
+# Public upgrade-chain wire types + pure validator (#47). Used by
+# `enclavia upgrade chain` to re-verify a chain locally against the
+# same rules the backend ingest applies.
+enclavia-protocol = { path = "../enclavia-protocol" }
+# CBOR decoder for the per-link payloads the upgrade-chain
+# pretty-printer surfaces.
+ciborium = { workspace = true }

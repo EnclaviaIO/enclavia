@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Read, Write};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use enclavia_cli::api::{ApiClient, EnclaveSummary};
-use enclavia_cli::commands::{auth, enclave as enclave_cmds, push, reproduce, secrets};
+use enclavia_cli::commands::{auth, enclave as enclave_cmds, push, reproduce, secrets, upgrade};
 use enclavia_cli::error::CliError;
 
 /// Local clap-friendly mirror of the lib's `InstanceTypeArg`. We can't
@@ -79,6 +79,16 @@ enum Command {
     Secret {
         #[command(subcommand)]
         cmd: SecretCmd,
+    },
+    /// Inspect an enclave's public upgrade chain (#47). The chain is
+    /// the append-only, attested log of every boot / upgrade /
+    /// revocation the enclave has recorded. The CLI re-validates each
+    /// link locally with the same rules the backend ingest applies,
+    /// so the "verified" badge in the output reflects this client's
+    /// own check, not a server claim.
+    Upgrade {
+        #[command(subcommand)]
+        cmd: UpgradeCmd,
     },
 }
 
@@ -230,6 +240,18 @@ enum SecretCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum UpgradeCmd {
+    /// Fetch and pretty-print an enclave's public upgrade chain. Walks
+    /// every link, re-validates locally against the enclave's recorded
+    /// PCRs / image digest / control public key, and prints a tree of
+    /// boot → upgrades → revocations.
+    Chain {
+        /// Target enclave id. Accepts a unique prefix.
+        enclave_id: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -242,6 +264,7 @@ async fn main() {
         Command::Push { local_image, enclave_id } => push::push(&local_image, &enclave_id).await,
         Command::Reproduce { enclave_id } => run_reproduce(&enclave_id).await,
         Command::Secret { cmd } => run_secret(cmd).await,
+        Command::Upgrade { cmd } => run_upgrade(cmd).await,
     };
 
     if let Err(e) = result {
@@ -654,5 +677,106 @@ fn print_enclave_status(e: &serde_json::Value) {
         for (k, v) in pcrs {
             println!("    {k}: {}", v.as_str().unwrap_or("-"));
         }
+    }
+}
+
+async fn run_upgrade(cmd: UpgradeCmd) -> Result<(), CliError> {
+    match cmd {
+        UpgradeCmd::Chain { enclave_id } => {
+            let client = ApiClient::new()?;
+            let summary = upgrade::chain(&client, &enclave_id).await?;
+            print_chain(&summary);
+            Ok(())
+        }
+    }
+}
+
+/// Pretty-print a [`upgrade::ChainSummary`].
+///
+/// One section per link with kind, sequence, timestamp, decoded
+/// payload fields, attestation/signature sizes, and a verdict line
+/// summarising the local re-validation. Trailing "Chain is valid"
+/// line iff every link verified.
+fn print_chain(summary: &upgrade::ChainSummary) {
+    println!();
+    let n = summary.links.len();
+    let label = if n == 1 { "link" } else { "links" };
+    println!("Chain for enclave {} ({n} {label})", summary.enclave_id);
+    if !summary.upgradable {
+        println!("  upgradable:   no (only the genesis boot is valid)");
+    }
+    println!();
+
+    let mut verified = 0usize;
+    for link in &summary.links {
+        print_chain_link(link);
+        if link.validation.is_ok() {
+            verified += 1;
+        }
+        println!();
+    }
+
+    if verified == n {
+        println!("Chain is valid. {n} {label}, all verified locally.");
+    } else {
+        let rejected = n - verified;
+        println!(
+            "Chain has rejected links: {verified}/{n} verified, {rejected} failed local validation."
+        );
+    }
+}
+
+fn print_chain_link(link: &upgrade::VerifiedLink) {
+    let seq = link
+        .sequence
+        .map(|s| format!("#{s}"))
+        .unwrap_or_else(|| "#?".to_string());
+    let kind = match link.kind {
+        enclavia_protocol::chain::ChainLinkKind::Boot => "boot",
+        enclavia_protocol::chain::ChainLinkKind::Upgrade => "upgrade",
+        enclavia_protocol::chain::ChainLinkKind::Revocation => "revocation",
+    };
+    let when = link
+        .created_at
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let badge = match &link.validation {
+        Ok(_) => "[verified]",
+        Err(_) => "[REJECTED]",
+    };
+    println!("  {seq:<4} {kind:<10} {when}  {badge}");
+
+    match &link.payload {
+        Some(upgrade::DecodedPayload::Boot(p)) => {
+            println!("      image:       {}", p.image_digest);
+            println!("      booted_at:   {}", p.booted_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("      PCR0:        {}", p.pcrs.pcr0);
+            println!("      PCR1:        {}", p.pcrs.pcr1);
+            println!("      PCR2:        {}", p.pcrs.pcr2);
+        }
+        Some(upgrade::DecodedPayload::Upgrade(p)) => {
+            println!("      target:      {}", p.image_digest);
+            println!("      valid_from:  {}", p.valid_from.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("      issued_at:   {}", p.issued_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("      to.PCR0:     {}", p.to_pcrs.pcr0);
+            println!("      to.PCR1:     {}", p.to_pcrs.pcr1);
+            println!("      to.PCR2:     {}", p.to_pcrs.pcr2);
+        }
+        Some(upgrade::DecodedPayload::Revocation(p)) => {
+            println!("      revokes:     {}", p.revokes);
+            println!("      issued_at:   {}", p.issued_at.format("%Y-%m-%d %H:%M:%S UTC"));
+        }
+        None => {
+            println!("      payload:     <undecodable>");
+        }
+    }
+
+    println!("      attestation: {} bytes", link.attestation_bytes);
+    if let Some(n) = link.signature_bytes {
+        println!("      signature:   {n} bytes");
+    }
+
+    if let Err(msg) = &link.validation {
+        println!("      validation error: {msg}");
     }
 }
