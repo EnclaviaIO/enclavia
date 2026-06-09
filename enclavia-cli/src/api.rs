@@ -48,42 +48,18 @@ pub struct NotifyPushResponse {
 
 /// Per-link record on the public upgrade chain (#47 phase 3a).
 ///
-/// Mirrors `enclavia_backend::routes::chain::ChainLinkJson` and the
-/// matching shape `enclavia_crates::chain-host` POSTs to the backend.
-/// We don't import the backend type because the CLI has no business
-/// depending on `enclavia-backend`; the canonical wire spec lives in
-/// `enclavia-protocol::chain` and a follow-up will move this type
-/// there so backend, chain-host, and the CLI share one definition.
+/// The canonical wire spec now lives in `enclavia_protocol::chain`
+/// (re-exported here so existing `crate::api::ChainLinkJson` paths keep
+/// resolving). It mirrors `enclavia_backend::routes::chain::ChainLinkJson`
+/// and the matching shape `enclavia_crates::chain-host` POSTs to the
+/// backend; an enclavia-crates follow-up switches those two onto this
+/// shared definition so backend, chain-host, and the CLI share one type.
 ///
 /// `payload`, `attestation`, and `signature` are standard base64 with
 /// padding. The CLI decodes them before handing the bytes to
 /// `enclavia_protocol::chain::validate_chain_link` for local
 /// re-verification.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChainLinkJson {
-    /// Assigned by the backend on insert; absent on the wire shape
-    /// `chain-host` sends to the ingest route.
-    #[serde(default)]
-    pub id: Option<uuid::Uuid>,
-    pub kind: enclavia_protocol::chain::ChainLinkKind,
-    /// Monotonic per-enclave, starts at 0 for the boot link.
-    #[serde(default)]
-    pub sequence: Option<i64>,
-    /// Base64 of the CBOR-encoded kind-specific payload.
-    pub payload: String,
-    /// Base64 of the COSE_Sign1 NSM attestation document. `user_data`
-    /// is bound to `sha256(payload_bytes)`.
-    pub attestation: String,
-    /// Base64 of the raw 64-byte ECDSA P-256 r||s signature. Absent on
-    /// boot links (they're authenticated by the attestation alone),
-    /// required on upgrade/revocation links.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    /// Wall-clock time the backend appended this link. `None` on the
-    /// chain-host ingest direction.
-    #[serde(default)]
-    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-}
+pub use enclavia_protocol::chain::ChainLinkJson;
 
 /// Lightweight projection of a backend enclave row. We keep the raw JSON
 /// alongside the typed fields so callers that need a backend-only field
