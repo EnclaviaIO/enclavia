@@ -41,8 +41,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tokio::io::AsyncReadExt;
-use tracing::{error, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{error, info, warn};
 
 /// Vsock CID of the host: `VMADDR_CID_HOST = 2` per the Linux vsock
 /// contract (`<linux/vm_sockets.h>`). Works on both real Nitro (CID 2
@@ -54,6 +54,21 @@ const VSOCK_HOST_CID: u32 = 2;
 
 /// Port the host-side `enclavia-secrets-host` daemon listens on (#169).
 const SECRETS_HOST_PORT: u32 = 5004;
+
+/// One-byte ACK we send back to `secrets-host` after we have read the
+/// payload. The host blocks on this byte before exiting; without it
+/// the host's close (FIN) can race the receiver's reads at the
+/// vhost-device-vsock UDS↔virtio bridge and surface as ENOTCONN.
+/// Value `0x06` matches the constant in `secrets-host/src/main.rs`.
+/// Don't change one without the other.
+const ACK_BYTE: u8 = 0x06;
+
+/// Upper bound on the secrets payload size we'll accept off the wire.
+/// 1 MiB is several orders of magnitude beyond any realistic CBOR map
+/// the backend would emit (a few hundred bytes per secret with the
+/// per-secret value cap), and prevents a misbehaving or hostile host
+/// from pinning the whole 4 GiB-CID address space.
+const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 
 /// How long we wait for the host-side daemon's `accept`. The host
 /// always spawns `secrets-host` (even for enclaves with no secrets,
@@ -144,10 +159,46 @@ async fn fetch_secrets()
         }
     };
 
-    let mut bytes = Vec::with_capacity(1024);
-    stream.read_to_end(&mut bytes).await?;
-    if bytes.is_empty() {
-        return Err("host closed connection with empty payload (expected at least an empty CBOR map)".into());
+    // Length-prefixed framing on the host→init direction: 4-byte BE
+    // length, then exactly N bytes of CBOR. Replaces the older
+    // `read_to_end` + `shutdown(WRITE)` shape, which relied on EOF
+    // for end-of-payload and raced the host's FIN against our first
+    // read at the vhost-device-vsock bridge — for a 1-byte empty
+    // CBOR map (`0xa0`) the data and FIN coalesce into a single
+    // virtio frame and the read surfaces as ENOTCONN. With length
+    // framing the host doesn't shutdown(WRITE) at all; it stays in
+    // its `await_ack` blocked on our ack byte below, so by the time
+    // the kernel-level close happens we've already read the payload.
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "secrets payload length {len} exceeds max {MAX_PAYLOAD_BYTES}"
+        )
+        .into());
+    }
+    let mut bytes = vec![0u8; len];
+    stream.read_exact(&mut bytes).await?;
+
+    // ACK as soon as we have the bytes in our address space. The host
+    // is waiting on this byte; parsing + bundle write are local to
+    // our process. Best-effort: if the ack write fails the host will
+    // time out and log, but we already have the data so boot can
+    // proceed.
+    if let Err(e) = stream.write_all(&[ACK_BYTE]).await {
+        warn!("sending ack to secrets-host: {e}");
+    }
+    // No explicit shutdown: the host's `read_exact(1)` returns as
+    // soon as the ack byte arrives, regardless of whether we have
+    // sent a FIN. Dropping `stream` at the end of this function
+    // closes the socket; the kernel-level FIN is what cleans things
+    // up on the host side too.
+
+    if len == 0 {
+        // CBOR empty map is `0xa0`, not zero bytes. Zero-length is a
+        // malformed host response, not a "no secrets" case.
+        return Err("host sent zero-length payload (expected at least an empty CBOR map)".into());
     }
     let map: BTreeMap<String, Vec<u8>> = ciborium::de::from_reader(&bytes[..])?;
     info!(count = map.len(), bytes = bytes.len(), "received secrets payload from host");

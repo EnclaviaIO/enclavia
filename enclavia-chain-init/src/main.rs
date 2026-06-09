@@ -57,6 +57,14 @@ const VSOCK_HOST_CID: u32 = 2;
 /// Port the host-side `chain-host` daemon listens on (#47, phase 3b).
 const CHAIN_HOST_PORT: u32 = 5005;
 
+/// One-byte ACK `chain-host` writes after the backend has accepted the
+/// link. We read this byte explicitly instead of relying on socket
+/// close ordering: under TCG/QEMU the host's `shutdown` can race with
+/// our own read and surface as ENOTCONN. Value `0x06` matches the
+/// constant in `chain-host/src/main.rs` in enclavia-crates. Don't
+/// change one without the other.
+const ACK_BYTE: u8 = 0x06;
+
 /// Vsock connect ceiling. The host-side daemon is launched by the
 /// parent's systemd unit before the QEMU boot starts and stays up for
 /// the enclave's life, so a healthy parent responds in milliseconds.
@@ -65,10 +73,10 @@ const CHAIN_HOST_PORT: u32 = 5005;
 /// grows under contention).
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Half-close drain ceiling: how long we wait for the host to ack and
-/// EOF after we shutdown(WRITE). The host writes back at most a tiny
-/// JSON response from the backend; 5s is generous.
-const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long we wait for the host's 1-byte ACK after we shutdown(WRITE).
+/// The ack is the host telling us the backend POST completed; a healthy
+/// path is single-digit milliseconds. 5s is generous slack.
+const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Default path for the enclavia in-enclave config. Same path the
 /// secrets-init and enclavia-server read.
@@ -190,32 +198,33 @@ async fn submit(
         .map_err(|_| "chain link too large to encode as u32-prefixed frame".to_string())?;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(link_bytes).await?;
-    // Half-close the write side so the host's read loop sees EOF on the
-    // frame and can return the response. AsyncWriteExt::shutdown is the
-    // tokio analogue of shutdown(2, SHUT_WR); tokio-vsock implements
-    // it via the underlying socket call.
+    // Half-close the write side so the host's read loop sees EOF on
+    // the frame and can return. AsyncWriteExt::shutdown is the tokio
+    // analogue of shutdown(2, SHUT_WR); tokio-vsock implements it via
+    // the underlying socket call.
     tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
 
-    // Drain to EOF so the host can finish its end-of-message ack
-    // sequence. A bounded read here avoids hanging if the host
-    // misbehaves; 5s is generous given the host's response is at most
-    // a tiny acknowledgement.
-    let mut sink = [0u8; 64];
-    loop {
-        match tokio::time::timeout(DRAIN_TIMEOUT, stream.read(&mut sink)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => return Err(Box::new(e)),
-            Err(_) => {
-                // Drain timed out. The frame already went out and the
-                // host has no further obligation, so this is best-effort
-                // cleanup; promote to a warning instead of a hard fail.
-                tracing::warn!(
-                    timeout = ?DRAIN_TIMEOUT,
-                    "draining chain-host response timed out; continuing"
-                );
-                break;
+    // Read the host's 1-byte application-level ACK. We bound the wait
+    // (a wedged host shouldn't block boot indefinitely) and keep the
+    // timeout / unexpected-byte cases warn-not-fail: in either case
+    // the link bytes already went out on our side and an absent ACK
+    // doesn't tell us whether the backend accepted them. The chain is
+    // verifiable from the backend side regardless.
+    let mut ack = [0u8; 1];
+    match tokio::time::timeout(ACK_TIMEOUT, stream.read_exact(&mut ack)).await {
+        Ok(Ok(_)) => {
+            if ack[0] != ACK_BYTE {
+                tracing::warn!(byte = ack[0], "chain-host sent unexpected ack byte");
             }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("chain-host closed before ack: {e}; continuing");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?ACK_TIMEOUT,
+                "chain-host ack timed out; continuing"
+            );
         }
     }
     Ok(())
