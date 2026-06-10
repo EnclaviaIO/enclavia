@@ -40,10 +40,31 @@ pub struct RegistryInfo {
 /// carries the enclave UUIDs whose build the call kicked off; `matched`
 /// is the count of caller-owned enclaves that were waiting on this exact
 /// reference (whether or not we ended up starting a build for them).
+///
+/// `staged` and `rejected_non_upgradable` are additive fields added for
+/// the staged-upgrade flow (#47 phase 4c). They are `#[serde(default)]`
+/// so the CLI keeps working against older backends that omit them.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotifyPushResponse {
     pub matched: usize,
     pub triggered: Vec<String>,
+    /// Staged upgrades that were queued as a result of this push. Each
+    /// entry carries the enclave id, upgrade id, and canonical image ref.
+    #[serde(default)]
+    pub staged: Vec<StagedPushEntry>,
+    /// Enclave UUIDs for which a push landed but the enclave is
+    /// non-upgradable (no control key baked in). The push was accepted
+    /// by the registry but the backend rejected the upgrade attempt.
+    #[serde(default)]
+    pub rejected_non_upgradable: Vec<String>,
+}
+
+/// One entry in `NotifyPushResponse::staged`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StagedPushEntry {
+    pub enclave_id: String,
+    pub upgrade_id: String,
+    pub image: String,
 }
 
 /// Per-link record on the public upgrade chain (#47 phase 3a).
@@ -370,6 +391,69 @@ impl ApiClient {
             reqwest::Method::POST,
             &format!("/enclaves/{id}/restart"),
             "restart",
+        )
+        .await
+    }
+
+    // --- Staged upgrades (#47) ------------------------------------------
+
+    /// List all staged upgrades for an enclave, newest first.
+    pub async fn list_upgrades(
+        &self,
+        enclave_id: &str,
+    ) -> Result<Vec<enclavia_protocol::staging::StagedUpgradeJson>, CliError> {
+        self.request(reqwest::Method::GET, &format!("/enclaves/{enclave_id}/upgrades"))
+            .await
+    }
+
+    /// Fetch a single staged upgrade by id.
+    pub async fn get_upgrade(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+    ) -> Result<enclavia_protocol::staging::StagedUpgradeJson, CliError> {
+        self.request(
+            reqwest::Method::GET,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}"),
+        )
+        .await
+    }
+
+    /// Confirm a staged upgrade, optionally setting the `valid_from` time.
+    ///
+    /// `valid_from = None` omits the field from the request body; the backend
+    /// then defaults to `now + 7 days`. A past timestamp is clamped to `now`
+    /// server-side.
+    pub async fn confirm_upgrade(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<enclavia_protocol::staging::StagedUpgradeJson, CliError> {
+        let body: serde_json::Value = match valid_from {
+            Some(t) => serde_json::json!({ "valid_from": t }),
+            None => serde_json::json!({}),
+        };
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}/confirm"),
+            &body,
+        )
+        .await
+    }
+
+    /// Revoke a staged upgrade. The backend sends a `RevokeUpgrade` control
+    /// command to the running enclave and records the revocation chain link.
+    pub async fn revoke_upgrade(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+    ) -> Result<enclavia_protocol::staging::StagedUpgradeJson, CliError> {
+        let body = serde_json::json!({});
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}/revoke"),
+            &body,
         )
         .await
     }

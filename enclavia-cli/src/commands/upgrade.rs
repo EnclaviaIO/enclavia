@@ -1,4 +1,5 @@
-//! Public upgrade-chain CLI surface (#47 phase 3c).
+//! Public upgrade-chain CLI surface (#47 phase 3c) and staged-upgrade
+//! management commands (#47 phase 4c).
 //!
 //! `enclavia upgrade chain <enclave-id>` fetches the chain from the
 //! backend and re-validates each link locally using the same
@@ -6,15 +7,22 @@
 //! route applies. The CLI's per-link verification verdict reflects this
 //! local re-check, not a server claim.
 //!
-//! The function returns a typed [`ChainSummary`] the binary's
-//! pretty-printer renders and MCP can serialise verbatim.
+//! `enclavia upgrade list <enclave-id>` lists all staged upgrades.
+//! `enclavia upgrade confirm <enclave-id> <upgrade-id>` confirms a staged
+//! upgrade, optionally scheduling it with `--at` or `--immediate`.
+//! `enclavia upgrade revoke <enclave-id> <upgrade-id>` cancels a confirmed
+//! upgrade before it fires.
+//!
+//! All three new functions return typed values; the binary is the only
+//! place that prints to the terminal.
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
-    BootPayload, ChainContext, ChainLink, ChainLinkKind, PcrsHex, RevocationPayload,
-    UpgradePayload, validate_chain_link,
+    BootPayload, ChainLink, ChainLinkKind, PcrsHex, RecordedLink, RevocationPayload,
+    UpgradePayload, validate_chain,
 };
+pub use enclavia_protocol::staging::{StagedUpgradeJson, StagedUpgradeStatus};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -69,6 +77,18 @@ pub struct ChainSummary {
     /// Base64 of the 65-byte uncompressed SEC1 P-256 public key.
     /// `None` when the enclave is non-upgradable.
     pub control_public_key: Option<String>,
+    /// True when the enclave row reports `mode == "debug"`. Links are
+    /// then re-validated with `debug_mode = true`, mirroring the
+    /// backend's ingest: attestation documents are checked structurally
+    /// but NOT against the AWS Nitro CA chain (QEMU enclaves can only
+    /// produce fake, unsigned documents).
+    pub debug_mode: bool,
+    /// Whether the walk's final in-force state (genesis advanced by
+    /// every verified promotion boot) equals the enclave row's current
+    /// `pcrs` + `image_digest`. `false` means the chain does not
+    /// explain what the row records: treat the chain as NOT verified
+    /// even if every individual link validated.
+    pub tip_matches_row: bool,
     pub links: Vec<VerifiedLink>,
 }
 
@@ -76,9 +96,12 @@ pub struct ChainSummary {
 ///
 /// Two backend round-trips: `GET /enclaves/{id}` for the validator
 /// context (PCRs, image digest, control pubkey, upgradable flag) and
-/// `GET /enclaves/{id}/upgrade-chain` for the link list. We walk the
-/// chain in order, accumulating `prior_chain` so each link sees the
-/// same context the backend ingest saw at insert time.
+/// `GET /enclaves/{id}/upgrade-chain` for the link list. The links are
+/// handed to `enclavia_protocol::chain::validate_chain`, which
+/// reconstructs the historical context each link saw at ingest time
+/// (the row state changes across upgrades, so validating history
+/// against today's row would reject perfectly good links) and ties the
+/// walk's final state back to the row (`tip_matches_row`).
 ///
 /// Per-link validation failures are recorded on the link and do not
 /// abort the walk — the user wants to see the whole chain even when a
@@ -91,6 +114,7 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         .get("upgradable")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let debug_mode = debug_mode_from_enclave_row(&enclave);
     let image_digest = enclave
         .get("image_digest")
         .and_then(|v| v.as_str())
@@ -98,42 +122,45 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
             CliError::Other("enclave row missing `image_digest`".to_string())
         })?
         .to_string();
-    let control_public_key_b64 = enclave
-        .get("control_public_key")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // PCRs come back as `{"pcr0": "hex", "pcr1": "hex", "pcr2": "hex"}`
-    // on the enclave row. The protocol's PcrsHex uses serde-renames for
-    // uppercase keys on the wire shape it owns, but we're constructing
-    // by field here so the casing on the JSON side doesn't matter.
+    // The enclave row stores the builder's pcr.json verbatim, so the keys
+    // arrive in nitro-cli casing (`PCR0`); the extractor tolerates both
+    // casings rather than coupling to that detail.
     let pcrs = pcrs_from_enclave_row(&enclave)?;
 
-    let control_public_key_bytes: Option<Vec<u8>> = match control_public_key_b64.as_deref() {
-        Some(s) => Some(
-            base64::engine::general_purpose::STANDARD
-                .decode(s.as_bytes())
-                .map_err(|e| {
-                    CliError::Other(format!("control_public_key base64 decode: {e}"))
-                })?,
-        ),
-        None => None,
-    };
+    let control_public_key_bytes = control_key_bytes_from_enclave_row(&enclave)?;
+    let control_public_key_b64 = control_public_key_bytes
+        .as_deref()
+        .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
 
     let now = Utc::now();
-    let mut prior: Vec<ChainLink> = Vec::with_capacity(wire_links.len());
+    let mut links: Vec<RecordedLink> = Vec::with_capacity(wire_links.len());
+    for wire in &wire_links {
+        links.push(RecordedLink {
+            link: wire_to_chain_link(wire)?,
+            // Ingest timestamp: time-dependent rules (revocations must
+            // precede their target's valid_from) are judged against the
+            // clock at ingest, not the walk's.
+            recorded_at: wire.created_at,
+        });
+    }
+    let walk = validate_chain(
+        &links,
+        &pcrs,
+        &image_digest,
+        control_public_key_bytes.as_deref(),
+        upgradable,
+        now,
+        debug_mode,
+    );
+
     let mut out: Vec<VerifiedLink> = Vec::with_capacity(wire_links.len());
-    for wire in wire_links {
-        let link = wire_to_chain_link(&wire)?;
-        let payload = decode_payload(&link.kind, &link.payload);
-        let ctx = ChainContext {
-            enclave_pcrs: &pcrs,
-            enclave_image_digest: &image_digest,
-            control_public_key: control_public_key_bytes.as_deref(),
-            upgradable,
-            prior_chain: &prior,
-        };
-        let validation = validate_chain_link(&link, &ctx, now, false)
+    for ((wire, rl), outcome) in wire_links
+        .iter()
+        .zip(links.iter())
+        .zip(walk.outcomes.into_iter())
+    {
+        let payload = decode_payload(&rl.link.kind, &rl.link.payload);
+        let validation = outcome
             .map(|o| match o {
                 enclavia_protocol::chain::Outcome::Append { sequence } => {
                     VerificationOk::Append { sequence }
@@ -141,17 +168,14 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
                 enclavia_protocol::chain::Outcome::Dedup => VerificationOk::Dedup,
             })
             .map_err(|e| e.to_string());
-        let attestation_bytes = link.attestation.len();
-        let signature_bytes = link.signature.as_ref().map(|s| s.len());
-        prior.push(link);
         out.push(VerifiedLink {
             id: wire.id,
             sequence: wire.sequence,
             kind: wire.kind,
             created_at: wire.created_at,
             payload,
-            attestation_bytes,
-            signature_bytes,
+            attestation_bytes: rl.link.attestation.len(),
+            signature_bytes: rl.link.signature.as_ref().map(|s| s.len()),
             validation,
         });
     }
@@ -162,26 +186,74 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         image_digest,
         pcrs,
         control_public_key: control_public_key_b64,
+        debug_mode,
+        tip_matches_row: walk.tip_matches_row,
         links: out,
     })
+}
+
+/// `mode` field off the enclave row. The backend stamps its
+/// deployment-wide mode here (`"debug"` for the QEMU launcher) and uses
+/// the same flag at chain-ingest time, so the local re-validation must
+/// run with it too: debug enclaves can only produce fake attestation
+/// documents, which the validator then checks structurally instead of
+/// against the AWS Nitro CA chain.
+fn debug_mode_from_enclave_row(enclave: &serde_json::Value) -> bool {
+    enclave.get("mode").and_then(|v| v.as_str()) == Some("debug")
 }
 
 fn pcrs_from_enclave_row(enclave: &serde_json::Value) -> Result<PcrsHex, CliError> {
     let pcrs_obj = enclave.get("pcrs").ok_or_else(|| {
         CliError::Other("enclave row missing `pcrs`".to_string())
     })?;
-    let field = |name: &str| -> Result<String, CliError> {
+    // The backend persists the builder's pcr.json verbatim, which uses the
+    // nitro-cli `PCR0`/`PCR1`/`PCR2` casing. Accept lowercase as well so a
+    // future normalization on the row can't break the walker.
+    let field = |upper: &str, lower: &str| -> Result<String, CliError> {
         pcrs_obj
-            .get(name)
+            .get(upper)
+            .or_else(|| pcrs_obj.get(lower))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| CliError::Other(format!("enclave.pcrs missing `{name}`")))
+            .ok_or_else(|| CliError::Other(format!("enclave.pcrs missing `{upper}`")))
     };
     Ok(PcrsHex {
-        pcr0: field("pcr0")?,
-        pcr1: field("pcr1")?,
-        pcr2: field("pcr2")?,
+        pcr0: field("PCR0", "pcr0")?,
+        pcr1: field("PCR1", "pcr1")?,
+        pcr2: field("PCR2", "pcr2")?,
     })
+}
+
+/// Extract the control public key bytes from the enclave row.
+///
+/// The column is a BYTEA, so the authenticated row serializes it as a JSON
+/// array of numbers; tolerate a base64 string too in case the row shape is
+/// ever normalized. `None`/`null` means the enclave is non-upgradable.
+fn control_key_bytes_from_enclave_row(
+    enclave: &serde_json::Value,
+) -> Result<Option<Vec<u8>>, CliError> {
+    match enclave.get("control_public_key") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Some)
+            .map_err(|e| CliError::Other(format!("control_public_key base64 decode: {e}"))),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut bytes = Vec::with_capacity(arr.len());
+            for v in arr {
+                let n = v.as_u64().filter(|n| *n <= 255).ok_or_else(|| {
+                    CliError::Other(
+                        "control_public_key array element is not a byte".to_string(),
+                    )
+                })?;
+                bytes.push(n as u8);
+            }
+            Ok(Some(bytes))
+        }
+        Some(other) => Err(CliError::Other(format!(
+            "control_public_key has unexpected JSON shape: {other}"
+        ))),
+    }
 }
 
 fn wire_to_chain_link(w: &ChainLinkJson) -> Result<ChainLink, CliError> {
@@ -235,6 +307,41 @@ fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> 
                 .map(DecodedPayload::Revocation)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Staged-upgrade management (#47 phase 4c)
+// ---------------------------------------------------------------------------
+
+/// Fetch all staged upgrades for an enclave, newest first.
+pub async fn list_upgrades(
+    client: &ApiClient,
+    enclave_id: &str,
+) -> Result<Vec<StagedUpgradeJson>, CliError> {
+    client.list_upgrades(enclave_id).await
+}
+
+/// Confirm a staged upgrade, optionally scheduling its `valid_from` time.
+///
+/// - `valid_from = None` lets the server default to `now + 7 days`.
+/// - A past timestamp is clamped to `now` by the server.
+pub async fn confirm_upgrade(
+    client: &ApiClient,
+    enclave_id: &str,
+    upgrade_id: &str,
+    valid_from: Option<DateTime<Utc>>,
+) -> Result<StagedUpgradeJson, CliError> {
+    client.confirm_upgrade(enclave_id, upgrade_id, valid_from).await
+}
+
+/// Revoke a confirmed upgrade before it fires. The running enclave keeps
+/// its current version.
+pub async fn revoke_upgrade(
+    client: &ApiClient,
+    enclave_id: &str,
+    upgrade_id: &str,
+) -> Result<StagedUpgradeJson, CliError> {
+    client.revoke_upgrade(enclave_id, upgrade_id).await
 }
 
 #[cfg(test)]
@@ -420,6 +527,23 @@ mod tests {
         assert_eq!(pcrs.pcr2, "cc".repeat(48));
     }
 
+    /// The shape the backend actually serves: the row stores the builder's
+    /// pcr.json verbatim, so keys arrive in nitro-cli casing.
+    #[test]
+    fn pcrs_from_enclave_row_accepts_nitro_cli_casing() {
+        let enclave = serde_json::json!({
+            "pcrs": {
+                "PCR0": "aa".repeat(48),
+                "PCR1": "bb".repeat(48),
+                "PCR2": "cc".repeat(48),
+            }
+        });
+        let pcrs = pcrs_from_enclave_row(&enclave).unwrap();
+        assert_eq!(pcrs.pcr0, "aa".repeat(48));
+        assert_eq!(pcrs.pcr1, "bb".repeat(48));
+        assert_eq!(pcrs.pcr2, "cc".repeat(48));
+    }
+
     #[test]
     fn pcrs_from_enclave_row_errors_on_missing_field() {
         let enclave = serde_json::json!({
@@ -429,7 +553,7 @@ mod tests {
             }
         });
         let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
-        assert!(err.contains("pcr2"), "{err}");
+        assert!(err.contains("PCR2"), "{err}");
     }
 
     #[test]
@@ -437,5 +561,120 @@ mod tests {
         let enclave = serde_json::json!({});
         let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
         assert!(err.contains("pcrs"), "{err}");
+    }
+
+    /// `control_public_key` is a BYTEA on the row, so the authenticated
+    /// endpoint serializes it as a JSON array of numbers.
+    #[test]
+    fn control_key_from_enclave_row_accepts_byte_array() {
+        let enclave = serde_json::json!({ "control_public_key": [4, 100, 255, 0] });
+        let bytes = control_key_bytes_from_enclave_row(&enclave).unwrap();
+        assert_eq!(bytes, Some(vec![4u8, 100, 255, 0]));
+    }
+
+    #[test]
+    fn control_key_from_enclave_row_accepts_base64_string() {
+        let enclave = serde_json::json!({ "control_public_key": "BGT/AA==" });
+        let bytes = control_key_bytes_from_enclave_row(&enclave).unwrap();
+        assert_eq!(bytes, Some(vec![4u8, 100, 255, 0]));
+    }
+
+    #[test]
+    fn control_key_from_enclave_row_none_when_null_or_absent() {
+        let null_row = serde_json::json!({ "control_public_key": null });
+        assert_eq!(control_key_bytes_from_enclave_row(&null_row).unwrap(), None);
+        let absent_row = serde_json::json!({});
+        assert_eq!(
+            control_key_bytes_from_enclave_row(&absent_row).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn control_key_from_enclave_row_rejects_out_of_range() {
+        let enclave = serde_json::json!({ "control_public_key": [4, 256] });
+        let err = control_key_bytes_from_enclave_row(&enclave)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a byte"), "{err}");
+    }
+
+    /// The chain walker mirrors the backend's ingest-time `debug_mode`
+    /// flag, read off the enclave row's `mode` field.
+    #[test]
+    fn debug_mode_from_enclave_row_matches_mode_field() {
+        let debug_row = serde_json::json!({ "mode": "debug" });
+        assert!(debug_mode_from_enclave_row(&debug_row));
+        let prod_row = serde_json::json!({ "mode": "production" });
+        assert!(!debug_mode_from_enclave_row(&prod_row));
+        let absent_row = serde_json::json!({});
+        assert!(!debug_mode_from_enclave_row(&absent_row));
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged-upgrade DTO parsing
+    // -----------------------------------------------------------------------
+
+    /// `StagedUpgradeJson` round-trips through JSON without loss.
+    #[test]
+    fn staged_upgrade_json_round_trips() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "enclave_id": "00000000-0000-0000-0000-000000000002",
+            "status": "staged",
+            "docker_image": "registry.example.com/owner/app:v2",
+            "created_at": "2026-06-09T10:00:00Z"
+        });
+        let v: StagedUpgradeJson = serde_json::from_value(json).unwrap();
+        assert_eq!(v.status, StagedUpgradeStatus::Staged);
+        assert!(v.valid_from.is_none());
+        assert!(v.pcrs.is_none());
+        assert!(v.image_digest.is_none());
+    }
+
+    /// Optional fields on `StagedUpgradeJson` deserialize when present.
+    /// Note: `PcrsHex` uses `PCR0`/`PCR1`/`PCR2` as serde field names
+    /// (uppercase, matching the backend wire shape).
+    #[test]
+    fn staged_upgrade_json_with_optional_fields() {
+        let json = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "enclave_id": "00000000-0000-0000-0000-000000000002",
+            "status": "confirmed",
+            "docker_image": "registry.example.com/owner/app:v2",
+            "image_digest": "sha256:abcdef1234567890",
+            "pcrs": {
+                "PCR0": "aa".repeat(48),
+                "PCR1": "bb".repeat(48),
+                "PCR2": "cc".repeat(48)
+            },
+            "valid_from": "2026-06-16T10:00:00Z",
+            "upgrade_link_id": "00000000-0000-0000-0000-000000000003",
+            "created_at": "2026-06-09T10:00:00Z"
+        });
+        let v: StagedUpgradeJson = serde_json::from_value(json).unwrap();
+        assert_eq!(v.status, StagedUpgradeStatus::Confirmed);
+        assert!(v.valid_from.is_some());
+        assert!(v.pcrs.is_some());
+        assert_eq!(v.image_digest.as_deref(), Some("sha256:abcdef1234567890"));
+    }
+
+    /// `StagedUpgradeStatus` deserializes from all known lowercase strings.
+    #[test]
+    fn staged_upgrade_status_deserializes_all_variants() {
+        let cases = [
+            ("building", StagedUpgradeStatus::Building),
+            ("staged", StagedUpgradeStatus::Staged),
+            ("confirmed", StagedUpgradeStatus::Confirmed),
+            ("promoted", StagedUpgradeStatus::Promoted),
+            ("revoked", StagedUpgradeStatus::Revoked),
+            ("failed", StagedUpgradeStatus::Failed),
+            ("expired", StagedUpgradeStatus::Expired),
+        ];
+        for (s, expected) in &cases {
+            let got: StagedUpgradeStatus =
+                serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(got, *expected, "variant {s}");
+        }
     }
 }

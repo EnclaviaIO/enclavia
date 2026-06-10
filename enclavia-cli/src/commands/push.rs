@@ -65,17 +65,8 @@ pub async fn push(local_image: &str, enclave_id_or_prefix: &str) -> Result<(), C
     // *event* signal that bypasses that. Best-effort: the push itself
     // succeeded, so we still print a status hint on notify failure.
     match client.notify_push(&enclave.id).await {
-        Ok(resp) if !resp.triggered.is_empty() => {
-            let n = resp.triggered.len();
-            let plural = if n == 1 { "build" } else { "builds" };
-            println!("Notified backend; {n} {plural} now starting:");
-            for id in &resp.triggered {
-                println!("  enclavia enclave status {id}");
-            }
-        }
-        Ok(_) => {
-            println!("Notified backend; check build progress with:");
-            println!("  enclavia enclave status {}", enclave.id);
+        Ok(resp) => {
+            print_notify_result(&resp, &enclave.id)?;
         }
         Err(e) => {
             eprintln!("warning: failed to notify backend of push: {e}");
@@ -84,6 +75,56 @@ pub async fn push(local_image: &str, enclave_id_or_prefix: &str) -> Result<(), C
             println!("  enclavia enclave status {}", enclave.id);
         }
     }
+    Ok(())
+}
+
+/// Print the result of a `POST /me/registry/push-notify` response and
+/// return an error if the enclave is non-upgradable and nothing was
+/// triggered or staged.
+///
+/// Visible for testing.
+pub(crate) fn print_notify_result(
+    resp: &crate::api::NotifyPushResponse,
+    fallback_enclave_id: &str,
+) -> Result<(), crate::error::CliError> {
+    // Non-upgradable rejection: warn and exit non-zero when nothing
+    // useful happened at all.
+    if !resp.rejected_non_upgradable.is_empty()
+        && resp.triggered.is_empty()
+        && resp.staged.is_empty()
+    {
+        return Err(crate::error::CliError::Other(
+            "this enclave is non-upgradable, create a new one".into(),
+        ));
+    }
+
+    // Normal build(s) started.
+    if !resp.triggered.is_empty() {
+        let n = resp.triggered.len();
+        let plural = if n == 1 { "build" } else { "builds" };
+        println!("Notified backend; {n} {plural} now starting:");
+        for id in &resp.triggered {
+            println!("  enclavia enclave status {id}");
+        }
+    } else if resp.staged.is_empty() {
+        // Neither triggered nor staged: generic hint.
+        println!("Notified backend; check build progress with:");
+        println!("  enclavia enclave status {fallback_enclave_id}");
+    }
+
+    // Staged upgrades queued by this push.
+    for entry in &resp.staged {
+        println!();
+        println!(
+            "Staged upgrade {} for enclave {}",
+            entry.upgrade_id, entry.enclave_id
+        );
+        println!(
+            "Confirm with: enclavia upgrade confirm {} {}",
+            entry.enclave_id, entry.upgrade_id
+        );
+    }
+
     Ok(())
 }
 
@@ -329,5 +370,99 @@ mod tests {
         let mut s = summary("aaaa", None);
         s.raw = serde_json::json!({});
         assert!(extract_push_target(&s).is_err());
+    }
+
+    // Helpers for constructing NotifyPushResponse values in tests.
+    fn notify_resp(
+        matched: usize,
+        triggered: Vec<&str>,
+        staged: Vec<crate::api::StagedPushEntry>,
+        rejected: Vec<&str>,
+    ) -> crate::api::NotifyPushResponse {
+        crate::api::NotifyPushResponse {
+            matched,
+            triggered: triggered.into_iter().map(str::to_string).collect(),
+            staged,
+            rejected_non_upgradable: rejected.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    fn staged_entry(enclave_id: &str, upgrade_id: &str) -> crate::api::StagedPushEntry {
+        crate::api::StagedPushEntry {
+            enclave_id: enclave_id.to_string(),
+            upgrade_id: upgrade_id.to_string(),
+            image: "registry.example.com/owner/app:latest".to_string(),
+        }
+    }
+
+    /// The push-notify response deserializes correctly when the new fields
+    /// are absent (backward compat with older backends).
+    #[test]
+    fn notify_push_response_backward_compat_missing_new_fields() {
+        let json = serde_json::json!({
+            "matched": 1,
+            "triggered": ["enc-uuid-1"]
+        });
+        let resp: crate::api::NotifyPushResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.matched, 1);
+        assert_eq!(resp.triggered, vec!["enc-uuid-1"]);
+        assert!(resp.staged.is_empty(), "staged should default to empty");
+        assert!(
+            resp.rejected_non_upgradable.is_empty(),
+            "rejected should default to empty"
+        );
+    }
+
+    /// When both staged and triggered are empty, `rejected_non_upgradable`
+    /// causes a non-zero exit (the push hit a non-upgradable enclave).
+    #[test]
+    fn print_notify_result_errors_on_non_upgradable_only() {
+        let resp = notify_resp(1, vec![], vec![], vec!["enc-uuid-non-upgradable"]);
+        let err = print_notify_result(&resp, "enc-uuid-non-upgradable")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-upgradable"),
+            "expected non-upgradable in error, got: {err}"
+        );
+    }
+
+    /// When `staged` is non-empty alongside `rejected_non_upgradable`,
+    /// the call still succeeds (at least one enclave accepted the push).
+    #[test]
+    fn print_notify_result_ok_when_staged_and_rejected_mix() {
+        let resp = notify_resp(
+            2,
+            vec![],
+            vec![staged_entry("enc-1", "upg-1")],
+            vec!["enc-2"],
+        );
+        assert!(
+            print_notify_result(&resp, "enc-1").is_ok(),
+            "should succeed when at least one staged entry exists"
+        );
+    }
+
+    /// The response deserializes the new staged and rejected arrays when
+    /// they are present.
+    #[test]
+    fn notify_push_response_parses_new_fields() {
+        let json = serde_json::json!({
+            "matched": 2,
+            "triggered": [],
+            "staged": [
+                {
+                    "enclave_id": "enc-111",
+                    "upgrade_id": "upg-222",
+                    "image": "registry.example.com/owner/app:v2"
+                }
+            ],
+            "rejected_non_upgradable": ["enc-333"]
+        });
+        let resp: crate::api::NotifyPushResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.staged.len(), 1);
+        assert_eq!(resp.staged[0].enclave_id, "enc-111");
+        assert_eq!(resp.staged[0].upgrade_id, "upg-222");
+        assert_eq!(resp.rejected_non_upgradable, vec!["enc-333"]);
     }
 }
