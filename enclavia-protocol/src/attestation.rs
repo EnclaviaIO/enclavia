@@ -84,7 +84,9 @@ pub enum AttestationError {
     /// uncompressed SEC1 ECDSA P-256 verifying key (#47). Required by
     /// [`verify_and_extract`] — the synchronizer needs the control
     /// pubkey to verify `Transition` signatures later in the session.
-    #[error("attestation document user_data is missing or not a 65-byte uncompressed SEC1 P-256 pubkey")]
+    #[error(
+        "attestation document user_data is missing or not a 65-byte uncompressed SEC1 P-256 pubkey"
+    )]
     InvalidControlPubkey,
     /// The doc's `user_data` field is missing or not the 32-byte
     /// SHA-256 hash of the chain link's `payload`. Required by
@@ -93,6 +95,14 @@ pub enum AttestationError {
     /// means either the payload or the attestation has been swapped.
     #[error("attestation document user_data does not match sha256(payload)")]
     PayloadBindingMismatch,
+    /// The doc's `user_data` field is missing or not exactly 32 bytes
+    /// where a control nonce was expected. Returned by
+    /// [`verify_control_nonce_attestation`]: the in-enclave server's
+    /// `RequestAttestation` reply always embeds the current 32-byte
+    /// control nonce as `user_data`, so any other shape means the
+    /// document was produced for a different purpose (or tampered with).
+    #[error("attestation document user_data is not a 32-byte control nonce")]
+    InvalidControlNonce,
 }
 
 /// Length of an ECDSA P-256 verifying key in uncompressed SEC1 form
@@ -150,6 +160,50 @@ pub fn verify_against(
     Ok(())
 }
 
+/// Verify a control-nonce attestation and return the attested nonce.
+///
+/// Backend control-dispatch entry point (#47 hardening). Before signing
+/// and sending a control command, the dispatcher requests an attestation
+/// over the control channel; the in-enclave server's reply binds the
+/// live Noise session (doc `nonce` = `base64(handshake_hash)`) and
+/// carries the current 32-byte control nonce in `user_data`. Verifying
+/// the document before dispatch gives the caller two guarantees a bare
+/// `GetControlNonce` round-trip cannot:
+///
+/// 1. The Noise session terminates inside the enclave whose PCRs the
+///    caller expected, with no host in the middle, so the eventual
+///    `ControlResult` is authentic rather than the relay's word.
+/// 2. The nonce embedded in the signed command was minted by that
+///    enclave, not substituted on the way through the host.
+///
+/// Verification is [`verify_against`] (COSE chain in production mode,
+/// session-nonce binding, PCR equality) plus a requirement that
+/// `user_data` is exactly 32 bytes, returned as the attested control
+/// nonce.
+pub fn verify_control_nonce_attestation(
+    attestation_data: &[u8],
+    handshake_hash: &[u8],
+    expected_pcrs: &Pcrs,
+    debug_mode: bool,
+) -> Result<[u8; 32], AttestationError> {
+    let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
+    let doc = parse_and_validate(attestation_data, debug_mode)?;
+
+    check_nonce(&doc, handshake_hash)?;
+
+    validate_expected_pcrs(&doc, &pcrs_hex)
+        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+
+    let user_data = doc
+        .user_data
+        .as_ref()
+        .ok_or(AttestationError::InvalidControlNonce)?;
+    user_data
+        .as_slice()
+        .try_into()
+        .map_err(|_| AttestationError::InvalidControlNonce)
+}
+
 /// Verify an attestation document and return the enclave identity it
 /// embeds.
 ///
@@ -177,8 +231,7 @@ pub fn verify_and_extract(
 
     check_nonce(&doc, handshake_hash)?;
 
-    let hex_pcrs =
-        att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
+    let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
 
     let pcrs = Pcrs {
         pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
@@ -450,6 +503,77 @@ pub mod test_utils {
         }
     }
 
+    /// Builder for synthetic control-nonce attestation documents
+    /// accepted by
+    /// [`verify_control_nonce_attestation`](super::verify_control_nonce_attestation)
+    /// in debug mode. Mirrors the in-enclave server's
+    /// `RequestAttestation` reply shape: `nonce` carries the Noise
+    /// handshake hash, `user_data` carries the 32-byte control nonce.
+    pub struct FakeControlNonceAttestation {
+        pub pcr0: Vec<u8>,
+        pub pcr1: Vec<u8>,
+        pub pcr2: Vec<u8>,
+        /// Raw Noise handshake hash, encoded verbatim into the doc's
+        /// `nonce` field (the verifier base64-encodes before comparing).
+        pub handshake_hash: Vec<u8>,
+        /// Encoded into the doc's `user_data` field. 32 bytes on the
+        /// happy path; tests exercising the length check can override.
+        pub control_nonce: Vec<u8>,
+    }
+
+    impl FakeControlNonceAttestation {
+        /// Build a fixture with all three PCRs derived from `seed`.
+        pub fn with_seed(seed: u8, handshake_hash: Vec<u8>, control_nonce: [u8; 32]) -> Self {
+            Self {
+                pcr0: vec![seed; 48],
+                pcr1: vec![seed.wrapping_add(1); 48],
+                pcr2: vec![seed.wrapping_add(2); 48],
+                handshake_hash,
+                control_nonce: control_nonce.to_vec(),
+            }
+        }
+
+        /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
+        /// `debug_mode` verify path.
+        pub fn encode(&self) -> Vec<u8> {
+            assert_eq!(self.pcr0.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
+            assert_eq!(self.pcr1.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
+            assert_eq!(self.pcr2.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
+
+            let mut pcrs = BTreeMap::new();
+            pcrs.insert(0usize, self.pcr0.clone());
+            pcrs.insert(1usize, self.pcr1.clone());
+            pcrs.insert(2usize, self.pcr2.clone());
+            pcrs.insert(8usize, vec![0u8; 48]);
+
+            let doc = AttestationDoc::new(
+                "test-module".to_string(),
+                Digest::SHA384,
+                0,
+                pcrs,
+                vec![0u8; 64],
+                vec![vec![0u8; 64]],
+                Some(self.control_nonce.clone()),
+                Some(self.handshake_hash.clone()),
+                None,
+            );
+
+            let mut payload = Vec::new();
+            ciborium::into_writer(&doc, &mut payload).expect("ciborium encode AttestationDoc");
+
+            let cose = CborValue::Array(vec![
+                CborValue::Bytes(vec![0xa0]),
+                CborValue::Map(Vec::new()),
+                CborValue::Bytes(payload),
+                CborValue::Bytes(vec![0u8; 96]),
+            ]);
+
+            let mut out = Vec::new();
+            ciborium::into_writer(&cose, &mut out).expect("ciborium encode COSE_Sign1");
+            out
+        }
+    }
+
     /// Builder for synthetic chain-link attestation documents accepted
     /// by [`verify_chain_attestation`](super::verify_chain_attestation)
     /// in debug mode. Differs from [`FakeAttestation`] in two ways:
@@ -550,6 +674,68 @@ mod tests {
         assert_eq!(identity.pcrs.pcr1, fake.pcr1);
         assert_eq!(identity.pcrs.pcr2, fake.pcr2);
         assert_eq!(identity.control_pubkey, fake.control_pubkey);
+    }
+
+    #[test]
+    fn verify_control_nonce_attestation_returns_attested_nonce() {
+        let nonce = [0xab; 32];
+        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), nonce);
+        let expected = Pcrs {
+            pcr0: fake.pcr0.clone(),
+            pcr1: fake.pcr1.clone(),
+            pcr2: fake.pcr2.clone(),
+        };
+
+        let got = verify_control_nonce_attestation(&fake.encode(), &hh(), &expected, true)
+            .expect("verify");
+        assert_eq!(got, nonce);
+    }
+
+    #[test]
+    fn verify_control_nonce_attestation_rejects_wrong_pcrs() {
+        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
+        let wrong = Pcrs {
+            pcr0: vec![0xff; 48],
+            pcr1: fake.pcr1.clone(),
+            pcr2: fake.pcr2.clone(),
+        };
+
+        let err =
+            verify_control_nonce_attestation(&fake.encode(), &hh(), &wrong, true).unwrap_err();
+        assert!(matches!(err, AttestationError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn verify_control_nonce_attestation_rejects_wrong_handshake_hash() {
+        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
+        let expected = Pcrs {
+            pcr0: fake.pcr0.clone(),
+            pcr1: fake.pcr1.clone(),
+            pcr2: fake.pcr2.clone(),
+        };
+        let other_hh: Vec<u8> = (100u8..132).collect();
+
+        let err = verify_control_nonce_attestation(&fake.encode(), &other_hh, &expected, true)
+            .unwrap_err();
+        assert!(matches!(err, AttestationError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn verify_control_nonce_attestation_rejects_non_32_byte_user_data() {
+        let mut fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
+        fake.control_nonce = vec![0xab; 16]; // wrong length
+        let expected = Pcrs {
+            pcr0: fake.pcr0.clone(),
+            pcr1: fake.pcr1.clone(),
+            pcr2: fake.pcr2.clone(),
+        };
+
+        let err =
+            verify_control_nonce_attestation(&fake.encode(), &hh(), &expected, true).unwrap_err();
+        assert!(
+            matches!(err, AttestationError::InvalidControlNonce),
+            "{err}"
+        );
     }
 
     #[test]

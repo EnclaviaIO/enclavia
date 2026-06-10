@@ -23,7 +23,35 @@ use tokio_vsock::VsockListener;
 use tokio_vsock::VsockStream;
 
 const VSOCK_PORT: u32 = 5000;
+
+/// Control-channel vsock port. Same Noise responder as the public port,
+/// but only `GetControlNonce` / `Control` (plus `RequestAttestation`)
+/// are accepted here, and the public port rejects them in turn. The
+/// router only ever bridges port 5000, so this port is reachable
+/// exclusively from the host side (the backend's control dispatch).
+/// Isolating the control surface means an anonymous internet client can
+/// no longer churn the single-use control nonce (each `Control` attempt
+/// rotates it before the signature check, so public reachability allowed
+/// a trivial unauthenticated DoS of confirm/revoke) and never reaches
+/// the control parser/verifier at all. 5001-5006 are taken by storage,
+/// meta, kms, secrets, chain, and egress; 5007 is the first free slot.
+const CONTROL_VSOCK_PORT: u32 = 5007;
+
 const VSOCK_CID: u32 = u32::MAX; // VMADDR_CID_ANY — accept connections on any CID
+
+/// Which listener a connection arrived on. Decides which message
+/// variants `handle_client` accepts: the public channel proxies data and
+/// serves attestations; the control channel additionally accepts signed
+/// control commands but refuses to proxy anything to the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelKind {
+    /// Router-bridged port 5000: anyone who can reach the enclave's
+    /// public hostname terminates a Noise session here.
+    Public,
+    /// Host-only port 5007: only the backend (via the vsock proxy
+    /// socket) can reach it.
+    Control,
+}
 
 /// CID 2 is VMADDR_CID_HOST per the Linux vsock contract. Same value in
 /// real Nitro and QEMU debug mode.
@@ -42,6 +70,12 @@ const MAX_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 
 /// Maximum number of in-flight requests per connection.
 const MAX_IN_FLIGHT: usize = 64;
+
+/// Maximum number of concurrent control-channel connections. The
+/// backend dials one connection per control dispatch; 4 leaves room for
+/// a retry racing a half-closed predecessor. Deliberately separate from
+/// the public admission semaphore (see `main`).
+const MAX_CONTROL_CLIENTS: usize = 4;
 
 /// Maximum number of concurrent client connections (default: 2 per CPU core).
 fn max_concurrent_clients() -> usize {
@@ -574,12 +608,13 @@ async fn pump_bidirectional(
 #[instrument(skip(stream, container_addr, control_pubkey, nonce))]
 async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
+    kind: ChannelKind,
     container_addr: String,
     control_pubkey: Option<Arc<VerifyingKey>>,
     nonce: ControlNonce,
     crypto_bin: Arc<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Client connected, performing handshake");
+    info!(?kind, "Client connected, performing handshake");
 
     let (mut transport, handshake_hash) = perform_cbor_handshake_as_responder(&mut stream).await?;
     info!("Handshake completed successfully");
@@ -616,6 +651,46 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 };
 
                 trace!(?msg, "Received message from client");
+
+                // Channel gating (#47 hardening). Control messages are
+                // only accepted on the host-only control listener: a
+                // `Control` attempt rotates the single-use nonce before
+                // the signature is checked, so accepting them from the
+                // router-bridged public port let any internet client
+                // starve legitimate confirm/revoke dispatches (and, in
+                // the revoke case, run out the clock to `valid_from`).
+                // Conversely the control listener never proxies bytes to
+                // the container. Either violation closes the connection
+                // without touching the nonce or the container.
+                let allowed = !matches!(
+                    (&msg, kind),
+                    (
+                        ClientMessage::GetControlNonce | ClientMessage::Control { .. },
+                        ChannelKind::Public,
+                    ) | (
+                        ClientMessage::Data { .. }
+                            | ClientMessage::OpenStream { .. }
+                            | ClientMessage::StreamData { .. }
+                            | ClientMessage::StreamClose { .. },
+                        ChannelKind::Control,
+                    )
+                );
+                if !allowed {
+                    warn!(?kind, "message variant not allowed on this channel, closing");
+                    let _ = transport
+                        .send(&ServerMessage::ControlResult {
+                            success: false,
+                            message: format!(
+                                "message not accepted on the {} channel",
+                                match kind {
+                                    ChannelKind::Public => "public",
+                                    ChannelKind::Control => "control",
+                                }
+                            ),
+                        })
+                        .await;
+                    break;
+                }
 
                 match msg {
                     ClientMessage::RequestAttestation => {
@@ -820,12 +895,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting enclavia server",
     );
 
-    let mut listener = VsockListener::bind(VSOCK_CID, VSOCK_PORT)?;
+    let public_listener = VsockListener::bind(VSOCK_CID, VSOCK_PORT)?;
     info!(
         "Server listening on vsock port: {} (CID: {})",
         VSOCK_PORT, VSOCK_CID
     );
+    let control_listener = VsockListener::bind(VSOCK_CID, CONTROL_VSOCK_PORT)?;
+    info!(
+        "Control channel listening on vsock port: {} (CID: {})",
+        CONTROL_VSOCK_PORT, VSOCK_CID
+    );
 
+    // The control channel gets its own small admission semaphore: a
+    // public connection flood must not be able to starve the backend's
+    // control dispatch out of a permit.
+    let control_semaphore = Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS));
+
+    let public_task = tokio::spawn(accept_loop(
+        public_listener,
+        ChannelKind::Public,
+        container_addr.clone(),
+        semaphore,
+        control_pubkey.clone(),
+        Arc::clone(&nonce),
+        Arc::clone(&crypto_bin),
+    ));
+    let control_task = tokio::spawn(accept_loop(
+        control_listener,
+        ChannelKind::Control,
+        container_addr,
+        control_semaphore,
+        control_pubkey,
+        nonce,
+        crypto_bin,
+    ));
+
+    // Both loops run forever; if either task exits the server is in an
+    // unrecoverable state and should die loudly so init restarts it.
+    let (a, b) = tokio::join!(public_task, control_task);
+    a?;
+    b?;
+    Ok(())
+}
+
+async fn accept_loop(
+    mut listener: VsockListener,
+    kind: ChannelKind,
+    container_addr: String,
+    semaphore: Arc<Semaphore>,
+    control_pubkey: Option<Arc<VerifyingKey>>,
+    nonce: ControlNonce,
+    crypto_bin: Arc<String>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -842,8 +963,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                     };
-                    info!("Client admitted (permit acquired)");
-                    if let Err(e) = handle_client(stream, addr, pubkey, nonce, crypto).await {
+                    info!(?kind, "Client admitted (permit acquired)");
+                    if let Err(e) = handle_client(stream, kind, addr, pubkey, nonce, crypto).await {
                         error!(error = %e, "Error handling client");
                     }
                 });
@@ -868,7 +989,7 @@ mod tests {
     use enclavia_protocol::ControlCommand;
     use p256::ecdsa::{SigningKey, signature::Signer};
 
-    fn fixed_pair() -> (SigningKey, VerifyingKey) {
+    pub(super) fn fixed_pair() -> (SigningKey, VerifyingKey) {
         // Deterministic 32-byte scalar in (0, n). Seeds with `i+1` so
         // the first byte is 1 — guarantees a non-zero scalar that is
         // also far below the P-256 group order (n is just under 2^256;
@@ -1309,5 +1430,150 @@ mod stream_tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), stream)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod channel_gating_tests {
+    //! Channel-split tests (#47 hardening): control variants are only
+    //! accepted on the host-only control listener, data variants only on
+    //! the public listener, and a public `Control` attempt must not spin
+    //! the single-use nonce.
+    use super::tests::fixed_pair;
+    use super::*;
+
+    /// Spawn `handle_client` over an in-memory duplex on the given
+    /// channel kind and return an initiator-side CBOR transport into it.
+    /// `container_addr` points nowhere; channel-gating tests never reach
+    /// the proxy path.
+    async fn connect_to_channel(
+        kind: ChannelKind,
+        pk: VerifyingKey,
+        nonce: ControlNonce,
+    ) -> enclavia_protocol::CborTransport<tokio::io::DuplexStream> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = handle_client(
+                server,
+                kind,
+                "127.0.0.1:1".into(),
+                Some(Arc::new(pk)),
+                nonce,
+                Arc::new("true".to_string()),
+            )
+            .await;
+        });
+        let (cbor, _hh) = enclavia_protocol::perform_cbor_handshake_as_initiator(client)
+            .await
+            .expect("initiator handshake");
+        cbor
+    }
+
+    #[tokio::test]
+    async fn public_channel_rejects_control_without_rotating_nonce() {
+        let nonce_value = [7u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (_sk, pk) = fixed_pair();
+
+        let mut cbor = connect_to_channel(ChannelKind::Public, pk, Arc::clone(&nonce)).await;
+        cbor.send(&ClientMessage::Control {
+            payload: vec![1, 2, 3],
+            signature: vec![0u8; 64],
+        })
+        .await
+        .expect("send");
+
+        match cbor.receive::<ServerMessage>().await.expect("receive") {
+            ServerMessage::ControlResult { success, message } => {
+                assert!(!success);
+                assert!(message.contains("public channel"), "message = {message}");
+            }
+            other => panic!("expected ControlResult, got {other:?}"),
+        }
+
+        // The defining regression: a public Control attempt must NOT spin
+        // the nonce. Before the channel split, any internet client could
+        // rotate it out from under a legitimate dispatch.
+        assert_eq!(*nonce.lock().await, nonce_value);
+
+        // And the connection is closed.
+        assert!(cbor.receive::<ServerMessage>().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn public_channel_rejects_get_control_nonce() {
+        let nonce: ControlNonce = Arc::new(Mutex::new([9u8; 32]));
+        let (_sk, pk) = fixed_pair();
+
+        let mut cbor = connect_to_channel(ChannelKind::Public, pk, nonce).await;
+        cbor.send(&ClientMessage::GetControlNonce)
+            .await
+            .expect("send");
+
+        match cbor.receive::<ServerMessage>().await.expect("receive") {
+            ServerMessage::ControlResult { success, message } => {
+                assert!(!success);
+                assert!(message.contains("public channel"), "message = {message}");
+            }
+            other => panic!("expected ControlResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_channel_serves_nonce_and_consumes_it_on_attempt() {
+        let nonce_value = [3u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (_sk, pk) = fixed_pair();
+
+        let mut cbor = connect_to_channel(ChannelKind::Control, pk, Arc::clone(&nonce)).await;
+
+        cbor.send(&ClientMessage::GetControlNonce)
+            .await
+            .expect("send");
+        match cbor.receive::<ServerMessage>().await.expect("receive") {
+            ServerMessage::ControlNonce { nonce: got } => assert_eq!(got, nonce_value),
+            other => panic!("expected ControlNonce, got {other:?}"),
+        }
+
+        // A (garbage) Control attempt on the control channel still
+        // rotates the nonce: single-use semantics are unchanged where
+        // control messages are actually allowed.
+        cbor.send(&ClientMessage::Control {
+            payload: vec![1, 2, 3],
+            signature: vec![0u8; 10],
+        })
+        .await
+        .expect("send");
+        match cbor.receive::<ServerMessage>().await.expect("receive") {
+            ServerMessage::ControlResult { success, message } => {
+                assert!(!success);
+                assert!(message.contains("64 bytes"), "message = {message}");
+            }
+            other => panic!("expected ControlResult, got {other:?}"),
+        }
+        assert_ne!(*nonce.lock().await, nonce_value);
+    }
+
+    #[tokio::test]
+    async fn control_channel_rejects_data_proxying() {
+        let nonce: ControlNonce = Arc::new(Mutex::new([5u8; 32]));
+        let (_sk, pk) = fixed_pair();
+
+        let mut cbor = connect_to_channel(ChannelKind::Control, pk, nonce).await;
+        cbor.send(&ClientMessage::Data {
+            id: 1,
+            payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        })
+        .await
+        .expect("send");
+
+        match cbor.receive::<ServerMessage>().await.expect("receive") {
+            ServerMessage::ControlResult { success, message } => {
+                assert!(!success);
+                assert!(message.contains("control channel"), "message = {message}");
+            }
+            other => panic!("expected ControlResult, got {other:?}"),
+        }
+        assert!(cbor.receive::<ServerMessage>().await.is_err());
     }
 }
