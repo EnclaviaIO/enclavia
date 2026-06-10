@@ -280,8 +280,9 @@ pub fn verify_and_extract(
 /// validated and the COSE signature is verified by the upstream
 /// `attestation-doc-validation` crate, same as the existing entry
 /// points. In `debug_mode`, only structural validity is required —
-/// matching the dev-loop where the `FakeAttestor` test-utils path
-/// produces unsigned-but-well-formed documents.
+/// matching QEMU's emulated NSM device, which signs documents with its
+/// own key instead of the AWS CA (and the `test-utils` doc builders,
+/// which carry placeholder signatures).
 ///
 /// The doc's `nonce` field is **not** checked here. The chain-link
 /// attestations are not produced in the context of a Noise session, so

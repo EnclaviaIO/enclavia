@@ -140,7 +140,9 @@ async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
 }
 
 /// Build a chain attestation for the given payload bytes.
-/// `user_data = sha256(payload)`. Uses NSM in production, FakeAttestor under QEMU.
+/// `user_data = sha256(payload)`. Talks to `/dev/nsm` in both
+/// environments: real hardware on Nitro, QEMU's emulated NSM device in
+/// debug (same wire shape, self-signed instead of AWS-CA-signed).
 fn build_chain_attestation(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let user_data: [u8; 32] = {
         let mut h = Sha256::new();
