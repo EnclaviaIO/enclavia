@@ -3,23 +3,37 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
 use enclavia_protocol::{
-    perform_cbor_handshake_as_responder, ClientMessage, ControlCommand, ServerMessage, StreamHalf,
+    CHAIN_LINK_ACK, ClientMessage, ControlCommand, RekeyParams, ServerMessage, StreamHalf,
+    perform_cbor_handshake_as_responder,
 };
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{error, info, instrument, trace, warn};
 
 mod attestation;
 mod config;
 
 use tokio_vsock::VsockListener;
+use tokio_vsock::VsockStream;
 
 const VSOCK_PORT: u32 = 5000;
 const VSOCK_CID: u32 = u32::MAX; // VMADDR_CID_ANY — accept connections on any CID
+
+/// CID 2 is VMADDR_CID_HOST per the Linux vsock contract. Same value in
+/// real Nitro and QEMU debug mode.
+const VSOCK_HOST_CID: u32 = 2;
+
+/// Port the host-side `chain-host` daemon listens on (#47).
+const CHAIN_HOST_PORT: u32 = 5005;
+
+/// How long we wait for the chain-host ACK byte after sending a link.
+const CHAIN_HOST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_CONTAINER_ADDR: &str = "127.0.0.1:8080";
 
@@ -50,6 +64,63 @@ fn fresh_nonce() -> [u8; 32] {
     buf
 }
 
+/// Connect to the host-side `chain-host` daemon (vsock CID 2 port 5005),
+/// write the chain link, and wait for the ACK.
+///
+/// Returns `Ok(())` on success, `Err(message)` if the link could not be
+/// submitted. An error here means the backend has NOT yet ingested the link;
+/// callers should reply error to the client so the operation can be retried.
+///
+/// The vsock write is chunked at 32 KiB per the per-write limit documented
+/// in the repository conventions (single writes over AF_VSOCK fail above
+/// ~32 KiB). The shared `submit_chain_link` helper in enclavia-protocol
+/// handles chunking automatically.
+async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(30),
+        VsockStream::connect(VSOCK_HOST_CID, CHAIN_HOST_PORT),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(format!(
+                "vsock {VSOCK_HOST_CID}:{CHAIN_HOST_PORT} connect failed: {e}"
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "vsock {VSOCK_HOST_CID}:{CHAIN_HOST_PORT} connect timed out"
+            ));
+        }
+    };
+
+    let ack = enclavia_protocol::submit_chain_link(&mut stream, link, CHAIN_HOST_ACK_TIMEOUT)
+        .await
+        .map_err(|e| format!("chain-host submit failed: {e}"))?;
+
+    if ack != CHAIN_LINK_ACK {
+        warn!(ack_byte = ack, "chain-host sent unexpected ACK byte");
+    }
+    Ok(())
+}
+
+/// Build a chain attestation for the given payload bytes.
+/// `user_data = sha256(payload)`. Uses NSM in production, FakeAttestor under QEMU.
+fn build_chain_attestation(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let user_data: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(payload);
+        h.finalize().into()
+    };
+    // Random nonce: the chain ingest verifier does not check the document's
+    // nonce field (there is no Noise session at this point), but we populate
+    // it with random bytes to avoid a deterministic value.
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    attestation::get_chain_attestation(&user_data, &nonce)
+}
+
 /// Verify and dispatch a signed control command. Returns the user-visible
 /// result message; rotates the nonce regardless of outcome.
 async fn handle_control(
@@ -68,7 +139,12 @@ async fn handle_control(
 
     let pubkey = match control_pubkey {
         Some(k) => k,
-        None => return (false, "control channel disabled (no control_public_key configured)".into()),
+        None => {
+            return (
+                false,
+                "control channel disabled (no control_public_key configured)".into(),
+            );
+        }
     };
 
     // Locked-in wire format (#47): 64-byte raw `r || s`, each 32 B
@@ -89,19 +165,195 @@ async fn handle_control(
     };
 
     match cmd {
-        ControlCommand::PrepareUpgrade { new_public_key, new_key_id, nonce: cmd_nonce } => {
+        ControlCommand::PrepareUpgrade {
+            payload: chain_payload,
+            payload_signature,
+            rekey,
+            nonce: cmd_nonce,
+        } => {
             if cmd_nonce != expected {
-                return (false, "stale nonce — fetch a fresh attestation".into());
+                return (false, "stale nonce, fetch a fresh attestation".into());
             }
-            run_prepare_upgrade(&new_public_key, &new_key_id, crypto_bin).await
+            run_prepare_upgrade(
+                pubkey,
+                &chain_payload,
+                &payload_signature,
+                rekey.as_ref(),
+                crypto_bin,
+            )
+            .await
+        }
+        ControlCommand::RevokeUpgrade {
+            payload: chain_payload,
+            payload_signature,
+            rollback,
+            nonce: cmd_nonce,
+        } => {
+            if cmd_nonce != expected {
+                return (false, "stale nonce, fetch a fresh attestation".into());
+            }
+            run_revoke_upgrade(
+                pubkey,
+                &chain_payload,
+                &payload_signature,
+                rollback,
+                crypto_bin,
+            )
+            .await
         }
     }
+}
+
+/// Execute the `PrepareUpgrade` flow:
+/// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
+/// 2. Validate the CBOR payload decodes as `UpgradePayload`.
+/// 3. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
+/// 4. Get a chain attestation binding `sha256(payload)`.
+/// 5. Submit the `Upgrade` chain link to `chain-host`; wait for ACK.
+///
+/// The chain link is submitted BEFORE returning success so the backend sees
+/// the link already ingested when the reply arrives on the Noise channel.
+///
+/// If the LUKS re-key fails, NO chain link is emitted and an error is returned.
+/// If chain-host submission fails, an error is returned; the backend should
+/// retry. For storage enclaves, `prepare-upgrade` will reject a repeat call
+/// if a rollback stash already exists (see `enclavia-crypto`); the backend
+/// enforces at most one in-flight upgrade.
+async fn run_prepare_upgrade(
+    pubkey: &VerifyingKey,
+    chain_payload: &[u8],
+    payload_signature: &[u8],
+    rekey: Option<&RekeyParams>,
+    bin: &str,
+) -> (bool, String) {
+    // Defence-in-depth: verify payload_signature against the control pubkey.
+    let sig = match Signature::from_slice(payload_signature) {
+        Ok(s) => s,
+        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
+    };
+    if pubkey.verify(chain_payload, &sig).is_err() {
+        return (
+            false,
+            "payload_signature does not verify under the control pubkey".into(),
+        );
+    }
+
+    // Validate the chain payload shape. Fail before touching storage.
+    if let Err(e) =
+        ciborium::from_reader::<enclavia_protocol::chain::UpgradePayload, _>(chain_payload)
+    {
+        return (
+            false,
+            format!("chain payload is not a valid UpgradePayload: {e}"),
+        );
+    }
+
+    // Storage re-key (only for storage enclaves).
+    if let Some(rk) = rekey {
+        let (ok, msg) =
+            run_enclavia_crypto_prepare_upgrade(&rk.new_public_key, &rk.new_key_id, bin).await;
+        if !ok {
+            // Do NOT emit a chain link if the LUKS step failed.
+            return (false, format!("storage re-key failed: {msg}"));
+        }
+        info!("storage re-key succeeded");
+    }
+
+    // Get chain attestation.
+    let attestation = match build_chain_attestation(chain_payload) {
+        Ok(a) => a,
+        Err(e) => return (false, format!("chain attestation failed: {e}")),
+    };
+
+    let link = ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Upgrade,
+        payload: chain_payload.to_vec(),
+        attestation,
+        signature: Some(payload_signature.to_vec()),
+    };
+
+    // Submit to chain-host and wait for ACK BEFORE replying to the client.
+    if let Err(e) = submit_chain_link_to_host(&link).await {
+        return (false, format!("chain-host submission failed: {e}"));
+    }
+
+    (
+        true,
+        "prepare-upgrade completed: chain link submitted".into(),
+    )
+}
+
+/// Execute the `RevokeUpgrade` flow:
+/// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
+/// 2. Validate the CBOR payload decodes as `RevocationPayload`.
+/// 3. Optionally run `enclavia-crypto revoke-upgrade` (storage enclaves).
+/// 4. Get a chain attestation.
+/// 5. Submit the `Revocation` chain link to `chain-host`; wait for ACK.
+async fn run_revoke_upgrade(
+    pubkey: &VerifyingKey,
+    chain_payload: &[u8],
+    payload_signature: &[u8],
+    rollback: bool,
+    bin: &str,
+) -> (bool, String) {
+    let sig = match Signature::from_slice(payload_signature) {
+        Ok(s) => s,
+        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
+    };
+    if pubkey.verify(chain_payload, &sig).is_err() {
+        return (
+            false,
+            "payload_signature does not verify under the control pubkey".into(),
+        );
+    }
+
+    if let Err(e) =
+        ciborium::from_reader::<enclavia_protocol::chain::RevocationPayload, _>(chain_payload)
+    {
+        return (
+            false,
+            format!("chain payload is not a valid RevocationPayload: {e}"),
+        );
+    }
+
+    if rollback {
+        let (ok, msg) = run_enclavia_crypto_revoke_upgrade(bin).await;
+        if !ok {
+            return (false, format!("storage rollback failed: {msg}"));
+        }
+        info!("storage rollback succeeded");
+    }
+
+    let attestation = match build_chain_attestation(chain_payload) {
+        Ok(a) => a,
+        Err(e) => return (false, format!("chain attestation failed: {e}")),
+    };
+
+    let link = ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Revocation,
+        payload: chain_payload.to_vec(),
+        attestation,
+        signature: Some(payload_signature.to_vec()),
+    };
+
+    if let Err(e) = submit_chain_link_to_host(&link).await {
+        return (false, format!("chain-host submission failed: {e}"));
+    }
+
+    (
+        true,
+        "revoke-upgrade completed: chain link submitted".into(),
+    )
 }
 
 /// Spawn `enclavia-crypto prepare-upgrade` and translate its exit status into
 /// a user-visible result. The new public key is base64-encoded for the CLI;
 /// the key id is passed through unchanged.
-async fn run_prepare_upgrade(
+async fn run_enclavia_crypto_prepare_upgrade(
     new_public_key: &[u8],
     new_key_id: &str,
     bin: &str,
@@ -129,8 +381,46 @@ async fn run_prepare_upgrade(
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let trimmed = stderr.trim();
-        let suffix = if trimmed.is_empty() { String::new() } else { format!(": {trimmed}") };
-        (false, format!("enclavia-crypto exited with {}{}", output.status, suffix))
+        let suffix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(": {trimmed}")
+        };
+        (
+            false,
+            format!("enclavia-crypto exited with {}{}", output.status, suffix),
+        )
+    }
+}
+
+/// Spawn `enclavia-crypto revoke-upgrade` and translate its exit status.
+async fn run_enclavia_crypto_revoke_upgrade(bin: &str) -> (bool, String) {
+    let output = match tokio::process::Command::new(bin)
+        .arg("revoke-upgrade")
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return (false, format!("failed to spawn {bin}: {e}")),
+    };
+
+    if output.status.success() {
+        (true, "revoke-upgrade completed".into())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        let suffix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(": {trimmed}")
+        };
+        (
+            false,
+            format!(
+                "enclavia-crypto revoke-upgrade exited with {}{}",
+                output.status, suffix
+            ),
+        )
     }
 }
 
@@ -165,7 +455,9 @@ enum StreamCommand {
 /// workload close after responding; `read_to_end` returns once the workload
 /// sends its FIN.
 async fn forward_to_container(container_addr: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-    let mut stream = TcpStream::connect(container_addr).await.map_err(|e| e.to_string())?;
+    let mut stream = TcpStream::connect(container_addr)
+        .await
+        .map_err(|e| e.to_string())?;
     stream.write_all(payload).await.map_err(|e| e.to_string())?;
 
     let mut response = Vec::new();
@@ -207,7 +499,10 @@ async fn pump_bidirectional(
         Ok(s) => s,
         Err(e) => {
             let _ = response_tx
-                .send(ServerMessage::Error { id, message: e.to_string() })
+                .send(ServerMessage::Error {
+                    id,
+                    message: e.to_string(),
+                })
                 .await;
             return;
         }
@@ -216,7 +511,10 @@ async fn pump_bidirectional(
 
     if let Err(e) = tcp_w.write_all(&initial_payload).await {
         let _ = response_tx
-            .send(ServerMessage::Error { id, message: e.to_string() })
+            .send(ServerMessage::Error {
+                id,
+                message: e.to_string(),
+            })
             .await;
         return;
     }
@@ -332,6 +630,18 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                         };
                         if let Err(e) = transport.send(&response).await {
                             warn!(error = %e, "Failed to send attestation response");
+                        }
+                    }
+                    ClientMessage::GetControlNonce => {
+                        // Return the current nonce without consuming it. The
+                        // nonce is only consumed when a Control message is
+                        // processed. This lets the backend learn the nonce
+                        // before signing without needing a full attestation
+                        // round-trip.
+                        let control_nonce = *nonce.lock().await;
+                        let response = ServerMessage::ControlNonce { nonce: control_nonce };
+                        if let Err(e) = transport.send(&response).await {
+                            warn!(error = %e, "Failed to send ControlNonce response");
                         }
                     }
                     ClientMessage::Control { payload, signature } => {
@@ -492,16 +802,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_clients = max_concurrent_clients();
     let semaphore = Arc::new(Semaphore::new(max_clients));
 
-    let server_config = config::load(Path::new(config::CONFIG_PATH))
-        .unwrap_or_else(|e| {
-            warn!(error = %e, "Failed to load enclavia config, control channel will be disabled");
-            config::ServerConfig::default()
-        });
+    let server_config = config::load(Path::new(config::CONFIG_PATH)).unwrap_or_else(|e| {
+        warn!(error = %e, "Failed to load enclavia config, control channel will be disabled");
+        config::ServerConfig::default()
+    });
     let control_pubkey = server_config.control_public_key.map(Arc::new);
     let nonce: ControlNonce = Arc::new(Mutex::new(fresh_nonce()));
     let crypto_bin = Arc::new(
-        std::env::var("ENCLAVIA_CRYPTO_BIN")
-            .unwrap_or_else(|_| "/bin/enclavia-crypto".into()),
+        std::env::var("ENCLAVIA_CRYPTO_BIN").unwrap_or_else(|_| "/bin/enclavia-crypto".into()),
     );
 
     info!(
@@ -513,7 +821,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut listener = VsockListener::bind(VSOCK_CID, VSOCK_PORT)?;
-    info!("Server listening on vsock port: {} (CID: {})", VSOCK_PORT, VSOCK_CID);
+    info!(
+        "Server listening on vsock port: {} (CID: {})",
+        VSOCK_PORT, VSOCK_CID
+    );
 
     loop {
         match listener.accept().await {
@@ -549,9 +860,13 @@ mod tests {
     //! Tests for the signed Control channel: signature verification,
     //! single-use nonce semantics, malformed input handling, and dispatch
     //! to an enclavia-crypto subprocess (stubbed with `true`/`false`).
+    //!
+    //! Chain-host submission will fail in these tests (no daemon running);
+    //! tests that check the full happy-path would need an in-process mock
+    //! chain-host. The nonce rotation and rejection paths don't need it.
     use super::*;
-    use p256::ecdsa::{signature::Signer, SigningKey};
     use enclavia_protocol::ControlCommand;
+    use p256::ecdsa::{SigningKey, signature::Signer};
 
     fn fixed_pair() -> (SigningKey, VerifyingKey) {
         // Deterministic 32-byte scalar in (0, n). Seeds with `i+1` so
@@ -582,10 +897,66 @@ mod tests {
         out
     }
 
-    fn make_command(nonce: [u8; 32]) -> Vec<u8> {
+    fn sample_upgrade_payload(nonce_seed: u8) -> Vec<u8> {
+        use enclavia_protocol::chain::{PcrsHex, UpgradePayload};
+        let pcrs = PcrsHex {
+            pcr0: "aa".repeat(24),
+            pcr1: "bb".repeat(24),
+            pcr2: "cc".repeat(24),
+        };
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from_pcrs: pcrs.clone(),
+            to_pcrs: pcrs,
+            image_digest: "sha256:test".into(),
+            valid_from: chrono::Utc::now() + chrono::Duration::days(1),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![nonce_seed; 32],
+        };
+        let mut out = Vec::new();
+        ciborium::into_writer(&payload, &mut out).unwrap();
+        out
+    }
+
+    fn sample_revocation_payload(nonce_seed: u8) -> Vec<u8> {
+        use enclavia_protocol::chain::RevocationPayload;
+        let payload = RevocationPayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            revokes: uuid::Uuid::new_v4(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![nonce_seed; 32],
+        };
+        let mut out = Vec::new();
+        ciborium::into_writer(&payload, &mut out).unwrap();
+        out
+    }
+
+    fn make_prepare_upgrade_command(
+        nonce: [u8; 32],
+        sk: &SigningKey,
+        chain_payload: Vec<u8>,
+        rekey: Option<RekeyParams>,
+    ) -> Vec<u8> {
+        let payload_signature = sign_raw(sk, &chain_payload);
         cbor_encode(&ControlCommand::PrepareUpgrade {
-            new_public_key: vec![0xAB; 16],
-            new_key_id: "test-key".into(),
+            payload: chain_payload,
+            payload_signature,
+            rekey,
+            nonce,
+        })
+    }
+
+    fn make_revoke_upgrade_command(
+        nonce: [u8; 32],
+        sk: &SigningKey,
+        chain_payload: Vec<u8>,
+        rollback: bool,
+    ) -> Vec<u8> {
+        let payload_signature = sign_raw(sk, &chain_payload);
+        cbor_encode(&ControlCommand::RevokeUpgrade {
+            payload: chain_payload,
+            payload_signature,
+            rollback,
             nonce,
         })
     }
@@ -595,7 +966,8 @@ mod tests {
         let nonce_value = [42u8; 32];
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
         let (sk, _) = fixed_pair();
-        let payload = make_command(nonce_value);
+        let chain_payload = sample_upgrade_payload(0x01);
+        let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, None, &nonce, "true").await;
@@ -610,8 +982,9 @@ mod tests {
     async fn rejects_bad_signature_length() {
         let nonce_value = [1u8; 32];
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
-        let (_, pk) = fixed_pair();
-        let payload = make_command(nonce_value);
+        let (sk, pk) = fixed_pair();
+        let chain_payload = sample_upgrade_payload(0x02);
+        let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
 
         let (ok, msg) = handle_control(&payload, &[0u8; 5], Some(&pk), &nonce, "true").await;
         assert!(!ok);
@@ -623,19 +996,14 @@ mod tests {
         let nonce_value = [1u8; 32];
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
         let (_, pk) = fixed_pair();
-        let payload = make_command(nonce_value);
-
-        // Sign the payload with a DIFFERENT key, producing 64 bytes that
-        // parse as a valid `Signature` (well-formed `r || s`) but don't
-        // verify under `pk`. All-zero bytes won't work here: P-256
-        // rejects (r=0, s=0) at construction time, which would land on
-        // the "64 bytes raw" path instead of "signature verification
-        // failed".
+        // Sign the payload with a DIFFERENT key.
         let mut wrong_seed = [0u8; 32];
         for (i, b) in wrong_seed.iter_mut().enumerate() {
             *b = (i + 2) as u8;
         }
         let wrong_sk = SigningKey::from_slice(&wrong_seed).unwrap();
+        let chain_payload = sample_upgrade_payload(0x03);
+        let payload = make_prepare_upgrade_command(nonce_value, &wrong_sk, chain_payload, None);
         let signature = sign_raw(&wrong_sk, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
@@ -663,7 +1031,8 @@ mod tests {
         let (sk, pk) = fixed_pair();
 
         // Sign a payload bearing the *wrong* nonce — server must reject it.
-        let payload = make_command([0u8; 32]);
+        let chain_payload = sample_upgrade_payload(0x04);
+        let payload = make_prepare_upgrade_command([0u8; 32], &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
@@ -677,12 +1046,13 @@ mod tests {
         let nonce: ControlNonce = Arc::new(Mutex::new(initial));
         let (sk, pk) = fixed_pair();
 
-        // First call: sign with the initial nonce. Underlying enclavia-crypto
-        // is stubbed to `true` so dispatch reports success.
-        let payload = make_command(initial);
+        // First call: sign with the initial nonce. enclavia-crypto is stubbed
+        // to `true` but chain-host connect will fail (no daemon in tests).
+        // Nonce rotation does not depend on downstream success.
+        let chain_payload = sample_upgrade_payload(0x05);
+        let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
-        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
-        assert!(ok, "expected success, got: {msg}");
+        let _ = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
 
         // Server nonce should have rotated to something new.
         let after = *nonce.lock().await;
@@ -700,13 +1070,84 @@ mod tests {
         let nonce: ControlNonce = Arc::new(Mutex::new(initial));
         let (sk, pk) = fixed_pair();
 
-        let payload = make_command(initial);
+        let chain_payload = sample_upgrade_payload(0x06);
+        let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
         // `false` exits 1 — verifies that enclavia-crypto failure is
         // reported back rather than silently masked.
+        // Chain attestation (NSM) also fails in unit-test context (no /dev/nsm),
+        // so any of those error strings is a valid signal that failures surface.
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "false").await;
         assert!(!ok);
-        assert!(msg.contains("enclavia-crypto exited"), "msg = {msg}");
+        assert!(
+            msg.contains("enclavia-crypto exited")
+                || msg.contains("chain-host")
+                || msg.contains("chain attestation"),
+            "msg = {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_upgrade_rejects_stale_nonce() {
+        let server_nonce = [0xCCu8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+        let (sk, pk) = fixed_pair();
+
+        let chain_payload = sample_revocation_payload(0x07);
+        let payload = make_revoke_upgrade_command([0u8; 32], &sk, chain_payload, false);
+        let signature = sign_raw(&sk, &payload);
+
+        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
+        assert!(!ok);
+        assert!(msg.contains("stale nonce"), "msg = {msg}");
+    }
+
+    #[tokio::test]
+    async fn revoke_upgrade_rejects_wrong_payload_shape() {
+        let server_nonce = [0xDDu8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+        let (sk, pk) = fixed_pair();
+
+        // Use an UpgradePayload as the chain payload for a RevokeUpgrade command.
+        let wrong_payload = sample_upgrade_payload(0x08);
+        let payload_signature = sign_raw(&sk, &wrong_payload);
+        let cmd = cbor_encode(&ControlCommand::RevokeUpgrade {
+            payload: wrong_payload,
+            payload_signature,
+            rollback: false,
+            nonce: server_nonce,
+        });
+        let signature = sign_raw(&sk, &cmd);
+
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true").await;
+        assert!(!ok, "msg = {msg}");
+        assert!(msg.contains("RevocationPayload"), "msg = {msg}");
+    }
+
+    #[tokio::test]
+    async fn prepare_upgrade_bad_chain_payload_signature() {
+        let server_nonce = [0xEEu8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+        let (sk, pk) = fixed_pair();
+        let mut wrong_seed = [0u8; 32];
+        for (i, b) in wrong_seed.iter_mut().enumerate() {
+            *b = (i + 50) as u8;
+        }
+        let sk2 = SigningKey::from_slice(&wrong_seed).unwrap();
+
+        let chain_payload = sample_upgrade_payload(0x09);
+        let wrong_payload_sig = sign_raw(&sk2, &chain_payload);
+        let cmd = cbor_encode(&ControlCommand::PrepareUpgrade {
+            payload: chain_payload,
+            payload_signature: wrong_payload_sig,
+            rekey: None,
+            nonce: server_nonce,
+        });
+        let signature = sign_raw(&sk, &cmd);
+
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true").await;
+        assert!(!ok, "msg = {msg}");
+        assert!(msg.contains("payload_signature"), "msg = {msg}");
     }
 }
 
@@ -734,14 +1175,18 @@ mod stream_tests {
             let mut buf = vec![0u8; 1024];
             let _ = socket.read(&mut buf).await.unwrap();
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
                 .await
                 .unwrap();
             // Drop closes the socket -> EOF on the reader side.
         });
 
         let request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec();
-        let resp = forward_to_container(&addr, &request).await.expect("forward");
+        let resp = forward_to_container(&addr, &request)
+            .await
+            .expect("forward");
         let s = String::from_utf8_lossy(&resp);
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
         assert!(s.ends_with("hello"), "got: {s}");
@@ -780,7 +1225,9 @@ mod stream_tests {
 
         let (resp_tx, mut resp_rx) = mpsc::channel::<ServerMessage>(16);
         let (cmd_tx, cmd_rx) = mpsc::channel::<StreamCommand>(16);
-        let request = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_vec();
+        let request =
+            b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                .to_vec();
         let stream = tokio::spawn({
             let addr = addr.clone();
             async move { pump_bidirectional(7, &addr, request, resp_tx, cmd_rx).await }
@@ -795,7 +1242,10 @@ mod stream_tests {
                 Ok(Some(ServerMessage::StreamData { id, payload })) => {
                     assert_eq!(id, 7);
                     accumulated.extend_from_slice(&payload);
-                    if accumulated.windows(b"FIRST-PUSH".len()).any(|w| w == b"FIRST-PUSH") {
+                    if accumulated
+                        .windows(b"FIRST-PUSH".len())
+                        .any(|w| w == b"FIRST-PUSH")
+                    {
                         break;
                     }
                 }
@@ -803,12 +1253,19 @@ mod stream_tests {
             }
         }
         assert!(accumulated.starts_with(b"HTTP/1.1 101 "));
-        assert!(accumulated.windows(b"\r\n\r\n".len()).any(|w| w == b"\r\n\r\n"));
+        assert!(
+            accumulated
+                .windows(b"\r\n\r\n".len())
+                .any(|w| w == b"\r\n\r\n")
+        );
 
         // Send a few stream payloads, expect each to come back as StreamData.
         let payloads = [b"hello".to_vec(), b"world".to_vec(), b"ws-tunnel".to_vec()];
         for chunk in &payloads {
-            cmd_tx.send(StreamCommand::Data(chunk.clone())).await.unwrap();
+            cmd_tx
+                .send(StreamCommand::Data(chunk.clone()))
+                .await
+                .unwrap();
         }
 
         let expected: Vec<u8> = payloads.iter().flatten().copied().collect();
@@ -828,7 +1285,10 @@ mod stream_tests {
 
         // Half-close the write side from the client; the loopback server reads
         // EOF and closes its socket, which closes the workload->client half too.
-        cmd_tx.send(StreamCommand::Close(StreamHalf::Write)).await.unwrap();
+        cmd_tx
+            .send(StreamCommand::Close(StreamHalf::Write))
+            .await
+            .unwrap();
 
         // Expect a StreamClose for the workload-side EOF.
         loop {
@@ -846,6 +1306,8 @@ mod stream_tests {
 
         // After workload EOF we tear down the stream from our side too.
         drop(cmd_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), stream).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream)
+            .await
+            .unwrap();
     }
 }

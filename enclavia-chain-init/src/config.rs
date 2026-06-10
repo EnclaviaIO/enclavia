@@ -23,20 +23,16 @@ pub struct ChainInitConfig {
     pub image_digest: String,
 }
 
-pub fn load(
-    path: &Path,
-) -> Result<ChainInitConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+pub fn load(path: &Path) -> Result<ChainInitConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let raw: RawConfig = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parsing {} as JSON: {e}", path.display()))?;
 
     let enclave_id_str = raw
         .enclave_id
         .ok_or("enclavia-config.json is missing required `enclave_id` field")?;
-    let enclave_id = Uuid::parse_str(&enclave_id_str).map_err(|e| {
-        format!("enclavia-config.json `enclave_id` is not a UUID: {e}")
-    })?;
+    let enclave_id = Uuid::parse_str(&enclave_id_str)
+        .map_err(|e| format!("enclavia-config.json `enclave_id` is not a UUID: {e}"))?;
 
     let image_digest = raw
         .image_digest
@@ -87,12 +83,13 @@ mod tests {
         TempJson(path)
     }
 
-    static COUNTER: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     #[test]
     fn rejects_missing_enclave_id() {
-        let f = write_config(r#"{"image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#);
+        let f = write_config(
+            r#"{"image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#,
+        );
         let err = load(f.path()).unwrap_err().to_string();
         assert!(err.contains("enclave_id"), "{err}");
     }

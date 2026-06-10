@@ -41,10 +41,10 @@
 use std::path::{Path, PathBuf};
 
 use enclavia_protocol::chain::{BootPayload, ChainLink, ChainLinkKind, PcrsHex};
+use enclavia_protocol::{CHAIN_LINK_ACK, submit_chain_link};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod attestation;
 mod config;
@@ -56,14 +56,6 @@ const VSOCK_HOST_CID: u32 = 2;
 
 /// Port the host-side `chain-host` daemon listens on (#47, phase 3b).
 const CHAIN_HOST_PORT: u32 = 5005;
-
-/// One-byte ACK `chain-host` writes after the backend has accepted the
-/// link. We read this byte explicitly instead of relying on socket
-/// close ordering: under TCG/QEMU the host's `shutdown` can race with
-/// our own read and surface as ENOTCONN. Value `0x06` matches the
-/// constant in `chain-host/src/main.rs` in enclavia-crates. Don't
-/// change one without the other.
-const ACK_BYTE: u8 = 0x06;
 
 /// Vsock connect ceiling. The host-side daemon is launched by the
 /// parent's systemd unit before the QEMU boot starts and stays up for
@@ -86,8 +78,7 @@ const CONFIG_PATH: &str = "/etc/enclavia/config.json";
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -153,29 +144,20 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
         signature: None,
     };
 
-    let mut link_bytes = Vec::with_capacity(1024);
-    ciborium::ser::into_writer(&link, &mut link_bytes)?;
-
-    submit(&link_bytes).await?;
-    info!(
-        link_bytes = link_bytes.len(),
-        "boot chain link submitted; exiting"
-    );
+    submit(&link).await?;
+    info!("boot chain link submitted; exiting");
     Ok(())
 }
 
 /// Connect to the host-side `chain-host` daemon, write the
-/// length-prefixed CBOR link, and drain the response to EOF.
+/// length-prefixed CBOR link, and wait for the ACK byte.
 ///
-/// The host always answers, even when ingest is disabled (it just
-/// writes nothing and closes), so a successful drain means the bytes
-/// landed on the parent's TCP buffer to the backend. Failures here
-/// surface verbatim because every step is unrecoverable: a connect
-/// refused means the launcher mis-wired the daemon, a write error
-/// means the parent dropped us mid-stream, etc.
-async fn submit(
-    link_bytes: &[u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Uses the shared `enclavia_protocol::submit_chain_link` helper so the
+/// wire format is guaranteed to match what `chain-host` (and
+/// `enclavia-server`) expect. Failures here are fatal: a connect refused
+/// means the launcher mis-wired the daemon; a write error means the parent
+/// dropped us mid-stream.
+async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_vsock::VsockStream::connect(VSOCK_HOST_CID, CHAIN_HOST_PORT),
@@ -192,39 +174,20 @@ async fn submit(
         }
     };
 
-    let len: u32 = link_bytes
-        .len()
-        .try_into()
-        .map_err(|_| "chain link too large to encode as u32-prefixed frame".to_string())?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(link_bytes).await?;
-    // Half-close the write side so the host's read loop sees EOF on
-    // the frame and can return. AsyncWriteExt::shutdown is the tokio
-    // analogue of shutdown(2, SHUT_WR); tokio-vsock implements it via
-    // the underlying socket call.
-    tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
-
-    // Read the host's 1-byte application-level ACK. We bound the wait
-    // (a wedged host shouldn't block boot indefinitely) and keep the
-    // timeout / unexpected-byte cases warn-not-fail: in either case
-    // the link bytes already went out on our side and an absent ACK
-    // doesn't tell us whether the backend accepted them. The chain is
-    // verifiable from the backend side regardless.
-    let mut ack = [0u8; 1];
-    match tokio::time::timeout(ACK_TIMEOUT, stream.read_exact(&mut ack)).await {
-        Ok(Ok(_)) => {
-            if ack[0] != ACK_BYTE {
-                tracing::warn!(byte = ack[0], "chain-host sent unexpected ack byte");
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("chain-host closed before ack: {e}; continuing");
-        }
-        Err(_) => {
-            tracing::warn!(
-                timeout = ?ACK_TIMEOUT,
-                "chain-host ack timed out; continuing"
+    // The shared helper serialises, writes the length-prefix+body in chunks
+    // safe for AF_VSOCK, calls shutdown(WRITE), and reads the ACK byte.
+    match submit_chain_link(&mut stream, link, ACK_TIMEOUT).await {
+        Ok(ack) if ack != CHAIN_LINK_ACK => {
+            warn!(
+                byte = ack,
+                "chain-host sent unexpected ack byte; continuing"
             );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // ACK errors are warn-not-fail: the link bytes already went out and
+            // an absent ACK doesn't tell us whether the backend accepted them.
+            warn!("chain-host ack failed: {e}; continuing");
         }
     }
     Ok(())

@@ -29,6 +29,142 @@ use tracing::{error, info, warn};
 const BLOB_VERSION: u32 = 1;
 const PASSPHRASE_BYTES: usize = 32;
 
+/// Path where `prepare-upgrade` writes rollback state so `revoke-upgrade`
+/// can undo the LUKS change. Lives in tmpfs so it is automatically cleaned up
+/// on reboot. Override via `UPGRADE_ROLLBACK_STASH` env var.
+const DEFAULT_ROLLBACK_STASH_PATH: &str = "/run/enclavia/upgrade-rollback.json";
+
+/// Stash written by `prepare-upgrade` before touching LUKS.
+/// `revoke-upgrade` reads this to find the keyslot to kill and the blob to
+/// restore.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpgradeRollbackStash {
+    /// The key blob as it was BEFORE the prepare-upgrade change.
+    /// `revoke-upgrade` writes this back verbatim.
+    pub pre_prepare_blob: String,
+    /// The LUKS keyslot number that was added for the new passphrase.
+    /// `revoke-upgrade` runs `cryptsetup luksKillSlot` on this slot.
+    pub new_keyslot: u32,
+}
+
+/// Load the rollback stash path from the environment (with default).
+fn rollback_stash_path() -> std::path::PathBuf {
+    PathBuf::from(
+        std::env::var("UPGRADE_ROLLBACK_STASH")
+            .unwrap_or_else(|_| DEFAULT_ROLLBACK_STASH_PATH.into()),
+    )
+}
+
+/// Write the rollback stash. Ensures the parent directory exists.
+pub fn write_rollback_stash(
+    stash: &UpgradeRollbackStash,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = rollback_stash_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(stash)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Read the rollback stash. Returns `None` if it does not exist.
+pub fn read_rollback_stash() -> Result<Option<UpgradeRollbackStash>, Box<dyn std::error::Error>> {
+    let path = rollback_stash_path();
+    match std::fs::read_to_string(&path) {
+        Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+/// Remove the rollback stash (called by `revoke-upgrade` on success).
+fn remove_rollback_stash() -> Result<(), Box<dyn std::error::Error>> {
+    let path = rollback_stash_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+/// Parse the `Keyslots:` section of a plain `cryptsetup luksDump` (LUKS2)
+/// and return the occupied keyslot indices. Returns `None` when the dump
+/// has no `Keyslots:` section at all (not a LUKS2 dump).
+///
+/// Section-aware on purpose: other sections (`Data segments:`, `Digests:`)
+/// also contain numbered `  0: <type>` entries, so we only collect entries
+/// between the `Keyslots:` header and the next unindented section header.
+fn parse_occupied_keyslots(dump: &str) -> Option<Vec<u32>> {
+    let mut in_keyslots = false;
+    let mut seen_section = false;
+    let mut slots = Vec::new();
+    for line in dump.lines() {
+        if !line.is_empty() && !line.starts_with([' ', '\t']) {
+            // Unindented non-empty line: a section header or preamble field.
+            in_keyslots = line.trim_end() == "Keyslots:";
+            if in_keyslots {
+                seen_section = true;
+            }
+            continue;
+        }
+        if !in_keyslots {
+            continue;
+        }
+        // Slot entries look like `  0: luks2`; attribute lines under a slot
+        // are tab-indented key/value pairs whose key is not an integer.
+        if let Some((idx, _)) = line.trim_start().split_once(':') {
+            if let Ok(n) = idx.parse::<u32>() {
+                slots.push(n);
+            }
+        }
+    }
+    seen_section.then_some(slots)
+}
+
+/// Smallest keyslot index not present in `occupied`.
+fn first_free_from_occupied(occupied: &[u32]) -> u32 {
+    let mut n = 0u32;
+    while occupied.contains(&n) {
+        n += 1;
+    }
+    n
+}
+
+/// Determine the keyslot `prepare-upgrade` will assign to the new
+/// passphrase. The caller passes this number to `luksAddKey --new-key-slot`
+/// AND records it in the rollback stash, so the slot `revoke-upgrade` kills
+/// is the slot that actually holds the new passphrase, by construction.
+///
+/// Errors instead of guessing: an earlier version of this function fell
+/// back to "slot 1" when its dump parsing failed (it passed `--dump-json`,
+/// which is not a cryptsetup option, so it ALWAYS fell back). That guess is
+/// only right for the first upgrade on a fresh volume; on the second
+/// upgrade the stash pointed at the RUNNING version's slot, which both
+/// broke revoke ("No key available with this passphrase": cryptsetup wants
+/// a surviving slot's passphrase to authorize the kill) and, had the kill
+/// gone through, would have removed the running passphrase instead of the
+/// staged one.
+fn first_free_keyslot(device: &str, cryptsetup: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new(cryptsetup)
+        .args(["luksDump", device])
+        .output()
+        .map_err(|e| format!("failed to spawn {cryptsetup} luksDump: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("cryptsetup luksDump exited with {}", out.status).into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let occupied = parse_occupied_keyslots(&text)
+        .ok_or("luksDump output has no Keyslots section: not a LUKS2 volume?")?;
+    if occupied.is_empty() {
+        return Err(
+            "luksDump reports no occupied keyslots, but the volume is open: refusing to guess"
+                .into(),
+        );
+    }
+    Ok(first_free_from_occupied(&occupied))
+}
+
 #[derive(Parser)]
 #[command(name = "enclavia-crypto")]
 struct Cli {
@@ -41,10 +177,20 @@ enum Command {
     /// Bootstrap or recover the LUKS passphrase and write it to LUKS_KEY_FILE.
     Init,
     /// Rotate the LUKS wrapping key to a new KMS key. Generates a fresh raw
-    /// passphrase, runs `cryptsetup luksChangeKey`, encrypts the new
-    /// passphrase to the supplied public key, and updates the on-disk key
-    /// blob (recording the previous key ID for deletion at the new enclave's
-    /// first boot).
+    /// passphrase, adds it to the first free LUKS keyslot (`cryptsetup
+    /// luksAddKey --new-key-slot`; the current slot is left untouched so a
+    /// revoke can roll back), encrypts the new passphrase to the supplied
+    /// public key, and updates the on-disk key blob (recording the previous
+    /// key ID for deletion at the new enclave's first boot).
+    ///
+    /// A rollback stash is written to `UPGRADE_ROLLBACK_STASH` (default
+    /// `/run/enclavia/upgrade-rollback.json`) before any LUKS changes so
+    /// `revoke-upgrade` can undo them.
+    ///
+    /// If a stash already exists (previous prepare not yet revoked), the
+    /// command rejects with an error. The backend enforces at most one
+    /// in-flight upgrade per enclave so this path should not be reachable in
+    /// normal operation.
     PrepareUpgrade {
         /// Base64-encoded SubjectPublicKeyInfo (DER) of the new RSA-OAEP key,
         /// as returned by KMS::GetPublicKey for the new key.
@@ -54,14 +200,19 @@ enum Command {
         #[arg(long)]
         new_key_id: String,
     },
+    /// Roll back a pending upgrade. Kills the LUKS keyslot added at
+    /// `prepare-upgrade` time and restores the key blob to its pre-prepare
+    /// state by reading the rollback stash written by `prepare-upgrade`.
+    ///
+    /// Errors if no stash exists (nothing to revoke).
+    RevokeUpgrade,
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_ansi(false)
         .init();
@@ -69,9 +220,11 @@ async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Init => init().await,
-        Command::PrepareUpgrade { new_public_key, new_key_id } => {
-            prepare_upgrade(&new_public_key, &new_key_id).await
-        }
+        Command::PrepareUpgrade {
+            new_public_key,
+            new_key_id,
+        } => prepare_upgrade(&new_public_key, &new_key_id).await,
+        Command::RevokeUpgrade => revoke_upgrade().await,
     };
 
     if let Err(e) = result {
@@ -93,9 +246,8 @@ struct KeyBlob {
 }
 
 async fn init() -> Result<(), Box<dyn std::error::Error>> {
-    let key_file = PathBuf::from(
-        std::env::var("LUKS_KEY_FILE").unwrap_or_else(|_| "/tmp/luks.key".into()),
-    );
+    let key_file =
+        PathBuf::from(std::env::var("LUKS_KEY_FILE").unwrap_or_else(|_| "/tmp/luks.key".into()));
 
     let raw = meta_get().await?;
 
@@ -161,6 +313,13 @@ async fn prepare_upgrade(
         return Err("new_key_id must not be empty".into());
     }
 
+    // Reject if a rollback stash already exists: a previous prepare-upgrade
+    // has not yet been revoked or committed. The backend enforces at most one
+    // in-flight upgrade per enclave, so this is a safety guard.
+    if read_rollback_stash()?.is_some() {
+        return Err("upgrade rollback stash already exists: a previous prepare-upgrade is still pending; revoke it first".into());
+    }
+
     // 1. Read the current blob — this is what the new enclave version will
     //    boot from after the swap.
     let raw = meta_get().await?;
@@ -182,7 +341,7 @@ async fn prepare_upgrade(
 
     // 2. Re-derive the *current* passphrase via KMS. init wipes /tmp/luks.key
     //    after mount, so cryptsetup needs a fresh copy to authenticate the
-    //    luksChangeKey call. One extra Decrypt per upgrade is negligible.
+    //    luksAddKey call. One extra Decrypt per upgrade is negligible.
     let current_ct = B64.decode(current_ct_b64.as_bytes())?;
     let current_passphrase = kms_decrypt(&blob.kms_key_id, &current_ct).await?;
     if current_passphrase.len() != PASSPHRASE_BYTES {
@@ -200,12 +359,12 @@ async fn prepare_upgrade(
     let new_passphrase = random_passphrase();
     let new_ct = rsa_oaep_encrypt(&new_pubkey_der, &new_passphrase)?;
 
-    // 4. Stage both passphrases in tmpfs files. luksChangeKey wants
+    // 4. Stage both passphrases in tmpfs files. luksAddKey wants
     //    --key-file (current) and a positional path (new).
-    let current_key_path = std::env::var("LUKS_CURRENT_KEY_FILE")
-        .unwrap_or_else(|_| "/tmp/luks.current.key".into());
-    let new_key_path = std::env::var("LUKS_NEW_KEY_FILE")
-        .unwrap_or_else(|_| "/tmp/luks.new.key".into());
+    let current_key_path =
+        std::env::var("LUKS_CURRENT_KEY_FILE").unwrap_or_else(|_| "/tmp/luks.current.key".into());
+    let new_key_path =
+        std::env::var("LUKS_NEW_KEY_FILE").unwrap_or_else(|_| "/tmp/luks.new.key".into());
     let current_pb = PathBuf::from(&current_key_path);
     let new_pb = PathBuf::from(&new_key_path);
     write_keyfile(&current_pb, &current_passphrase).await?;
@@ -224,27 +383,92 @@ async fn prepare_upgrade(
 
     let device = std::env::var("NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".into());
     let cryptsetup = std::env::var("CRYPTSETUP_BIN").unwrap_or_else(|_| "cryptsetup".into());
-    // luksChangeKey atomically replaces the current keyslot's contents with
-    // the new keyfile. From the host's perspective the change is durable as
-    // soon as cryptsetup returns 0.
+
+    // 4b. Save rollback stash BEFORE touching LUKS. We record the pre-prepare
+    //     blob and the keyslot luksAddKey is about to be TOLD to use (via
+    //     --new-key-slot), so the slot `revoke-upgrade` kills is the slot
+    //     that actually holds the new passphrase, by construction rather
+    //     than by guesswork.
+    let new_keyslot = first_free_keyslot(&device, &cryptsetup)?;
+    let slot_str = new_keyslot.to_string();
+    let stash = UpgradeRollbackStash {
+        pre_prepare_blob: String::from_utf8_lossy(&raw).into_owned(),
+        new_keyslot,
+    };
+    write_rollback_stash(&stash)?;
+    info!(new_keyslot, "rollback stash written");
+
+    // 5. Add the new passphrase as an additional LUKS keyslot (luksAddKey)
+    //    rather than replacing the current slot. This is important: at revoke
+    //    time we can kill only the new slot; the old slot (carrying the
+    //    current running passphrase) is untouched throughout the prepare
+    //    phase. The slot index is pinned with --new-key-slot so it is the
+    //    slot recorded in the stash, not whatever cryptsetup picks. The new
+    //    enclave version will unlock via the new slot; the old slot is left
+    //    in place and becomes undecryptable garbage once the old KMS key is
+    //    deleted after the post-upgrade boot.
     let status = std::process::Command::new(&cryptsetup)
         .args([
-            "luksChangeKey",
+            "luksAddKey",
             "--batch-mode",
+            "--new-key-slot",
+            &slot_str,
             "--key-file",
             &current_key_path,
             &device,
             &new_key_path,
         ])
         .status()
-        .map_err(|e| format!("failed to spawn {cryptsetup} luksChangeKey: {e}"))?;
+        .map_err(|e| format!("failed to spawn {cryptsetup} luksAddKey: {e}"))?;
     if !status.success() {
-        return Err(format!("cryptsetup luksChangeKey exited with {status}").into());
+        // Remove stash on failure so a retry is possible.
+        let _ = remove_rollback_stash();
+        return Err(format!("cryptsetup luksAddKey exited with {status}").into());
     }
 
-    // 5. Volume is now wrapped with the new passphrase — finalise the
-    //    on-disk blob. `prev_key_id` carries the old KMS key forward so the
-    //    post-upgrade boot of the new enclave can call ScheduleKeyDeletion.
+    // 5b. Verify the new passphrase actually opens the slot recorded in the
+    //     stash (`--test-passphrase` checks without creating a mapping). If
+    //     this fails the stash points at the wrong slot and a later revoke
+    //     would kill an innocent one: undo the add and bail out now, while
+    //     the volume is still in its pre-prepare state.
+    let verify = std::process::Command::new(&cryptsetup)
+        .args([
+            "luksOpen",
+            "--test-passphrase",
+            "--batch-mode",
+            "--key-slot",
+            &slot_str,
+            "--key-file",
+            &new_key_path,
+            &device,
+        ])
+        .status()
+        .map_err(|e| format!("failed to spawn {cryptsetup} luksOpen --test-passphrase: {e}"))?;
+    if !verify.success() {
+        // Best-effort cleanup: kill the slot we just added (authorized by
+        // the still-valid current passphrase) and drop the stash so a retry
+        // is possible.
+        let _ = std::process::Command::new(&cryptsetup)
+            .args([
+                "luksKillSlot",
+                "--batch-mode",
+                "--key-file",
+                &current_key_path,
+                &device,
+                &slot_str,
+            ])
+            .status();
+        let _ = remove_rollback_stash();
+        return Err(format!(
+            "new keyslot verification failed: passphrase does not open slot {new_keyslot}"
+        )
+        .into());
+    }
+
+    // 6. Volume is now unlockable with both the old and new passphrase,
+    //    finalise the on-disk blob to point at the new KMS key.
+    //    `prev_key_id` carries the old KMS key forward so the post-upgrade
+    //    boot of the new enclave can call ScheduleKeyDeletion.
     let prev_key_id = std::mem::replace(&mut blob.kms_key_id, new_key_id.to_string());
     blob.ciphertext = Some(B64.encode(&new_ct));
     blob.prev_key_id = Some(prev_key_id);
@@ -252,8 +476,132 @@ async fn prepare_upgrade(
 
     info!(
         new_key_id = %new_key_id,
-        "rotation complete: volume rewrapped, blob updated, prev key marked for deletion",
+        new_keyslot,
+        "prepare-upgrade complete: new keyslot added, blob updated, rollback stash written",
     );
+    Ok(())
+}
+
+/// Roll back a pending upgrade:
+/// 1. Read the rollback stash.
+/// 2. Kill the LUKS keyslot added at `prepare-upgrade` time.
+/// 3. Restore the pre-prepare key blob.
+/// 4. Remove the stash.
+async fn revoke_upgrade() -> Result<(), Box<dyn std::error::Error>> {
+    let stash = read_rollback_stash()?
+        .ok_or("no upgrade rollback stash found at UPGRADE_ROLLBACK_STASH, nothing to revoke")?;
+
+    let device = std::env::var("NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".into());
+    let cryptsetup = std::env::var("CRYPTSETUP_BIN").unwrap_or_else(|_| "cryptsetup".into());
+
+    // We need the current passphrase to authenticate luksKillSlot. The
+    // pre-prepare blob still has the original KMS key id and ciphertext.
+    let pre_blob: KeyBlob = serde_json::from_str(&stash.pre_prepare_blob)?;
+    let ct_b64 = pre_blob
+        .ciphertext
+        .as_ref()
+        .ok_or("pre-prepare blob has no ciphertext, unexpected state")?;
+    let ct = B64.decode(ct_b64.as_bytes())?;
+    let passphrase = kms_decrypt(&pre_blob.kms_key_id, &ct).await?;
+
+    // Stage the passphrase for cryptsetup.
+    let key_path =
+        std::env::var("LUKS_CURRENT_KEY_FILE").unwrap_or_else(|_| "/tmp/luks.current.key".into());
+    let key_pb = PathBuf::from(&key_path);
+    write_keyfile(&key_pb, &passphrase).await?;
+    struct KeyFileGuard(PathBuf);
+    impl Drop for KeyFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = KeyFileGuard(key_pb);
+
+    // Guard: the stash slot must NOT open with the current (pre-upgrade)
+    // passphrase. If it does, the stash points at the live slot (the
+    // historical failure mode of the old slot-guessing code) and killing it
+    // would lock the running version out of its own volume. Refuse loudly
+    // instead; the staged slot then needs manual cleanup, which beats an
+    // unbootable enclave.
+    let slot_str = stash.new_keyslot.to_string();
+    let stash_slot_is_live = std::process::Command::new(&cryptsetup)
+        .args([
+            "luksOpen",
+            "--test-passphrase",
+            "--batch-mode",
+            "--key-slot",
+            &slot_str,
+            "--key-file",
+            &key_path,
+            &device,
+        ])
+        .status()
+        .map_err(|e| format!("failed to spawn {cryptsetup} luksOpen --test-passphrase: {e}"))?
+        .success();
+    if stash_slot_is_live {
+        return Err(format!(
+            "refusing to kill keyslot {}: the current passphrase opens it (stash points at the live slot)",
+            stash.new_keyslot
+        )
+        .into());
+    }
+
+    // Kill the new keyslot. cryptsetup authorizes the kill with a passphrase
+    // from a REMAINING slot, which the guard above just proved the current
+    // passphrase is.
+    let status = std::process::Command::new(&cryptsetup)
+        .args([
+            "luksKillSlot",
+            "--batch-mode",
+            "--key-file",
+            &key_path,
+            &device,
+            &slot_str,
+        ])
+        .status()
+        .map_err(|e| format!("failed to spawn {cryptsetup} luksKillSlot: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "cryptsetup luksKillSlot (slot {}) exited with {status}",
+            stash.new_keyslot
+        )
+        .into());
+    }
+    info!(slot = stash.new_keyslot, "new keyslot killed");
+
+    // Sanity: the volume must still open with the pre-upgrade passphrase
+    // (any slot). The guard above makes a failure here unreachable in
+    // theory; if it fires anyway, do NOT restore the pre-prepare blob and
+    // do NOT remove the stash, so the volume can still be opened via the
+    // staged key at next boot and the state is preserved for inspection.
+    let still_opens = std::process::Command::new(&cryptsetup)
+        .args([
+            "luksOpen",
+            "--test-passphrase",
+            "--batch-mode",
+            "--key-file",
+            &key_path,
+            &device,
+        ])
+        .status()
+        .map_err(|e| format!("failed to spawn {cryptsetup} luksOpen --test-passphrase: {e}"))?
+        .success();
+    if !still_opens {
+        return Err(format!(
+            "volume no longer opens with the pre-upgrade passphrase after killing slot {}: \
+             leaving blob and stash untouched, manual recovery required",
+            stash.new_keyslot
+        )
+        .into());
+    }
+
+    // Restore the pre-prepare blob.
+    meta_put(stash.pre_prepare_blob.as_bytes()).await?;
+    info!("pre-prepare key blob restored");
+
+    // Remove stash so a fresh prepare-upgrade can run.
+    remove_rollback_stash()?;
+    info!("rollback stash removed; revoke-upgrade complete");
     Ok(())
 }
 
@@ -264,7 +612,10 @@ fn random_passphrase() -> Vec<u8> {
     buf
 }
 
-fn rsa_oaep_encrypt(pubkey_der: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn rsa_oaep_encrypt(
+    pubkey_der: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let pubkey = RsaPublicKey::from_public_key_der(pubkey_der)?;
     let mut rng = rand::rngs::OsRng;
     let padding = Oaep::new::<sha2::Sha256>();
@@ -372,7 +723,10 @@ async fn kms_get_public_key(key_id: &str) -> Result<Vec<u8>, Box<dyn std::error:
     Ok(B64.decode(parsed.public_key.as_bytes())?)
 }
 
-async fn kms_decrypt(key_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+async fn kms_decrypt(
+    key_id: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let req = DecryptReq {
         key_id,
         ciphertext_blob: B64.encode(ciphertext),
@@ -385,7 +739,10 @@ async fn kms_decrypt(key_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, Box<dyn
 }
 
 async fn kms_schedule_deletion(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let req = ScheduleDeletionReq { key_id, pending_window_in_days: 7 };
+    let req = ScheduleDeletionReq {
+        key_id,
+        pending_window_in_days: 7,
+    };
     let body = serde_json::to_vec(&req)?;
     let _ = kms_call("TrentService.ScheduleKeyDeletion", body).await?;
     Ok(())
@@ -424,4 +781,80 @@ async fn kms_connect() -> Result<tokio_vsock::VsockStream, Box<dyn std::error::E
         .unwrap_or_else(|_| "5003".into())
         .parse()?;
     Ok(tokio_vsock::VsockStream::connect(2, port).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Handcrafted from a real `cryptsetup luksDump` of a LUKS2 volume with
+    /// three occupied keyslots. The `Data segments:` and `Digests:` sections
+    /// contain numbered `  0: <type>` entries on purpose: the parser must
+    /// only count entries under `Keyslots:`.
+    const LUKS2_DUMP_THREE_SLOTS: &str = "\
+LUKS header information
+Version:       \t2
+Epoch:         \t5
+Metadata area: \t16384 [bytes]
+Keyslots area: \t16744448 [bytes]
+UUID:          \t11111111-2222-3333-4444-555555555555
+Label:         \t(no label)
+Subsystem:     \t(no subsystem)
+Flags:         \t(no flags)
+
+Data segments:
+  0: crypt
+\toffset: 16777216 [bytes]
+\tlength: (whole device)
+\tcipher: aes-xts-plain64
+\tsector: 512 [bytes]
+
+Keyslots:
+  0: luks2
+\tKey:        512 bits
+\tPriority:   normal
+\tCipher:     aes-xts-plain64
+\tCipher key: 512 bits
+\tPBKDF:      argon2id
+  1: luks2
+\tKey:        512 bits
+\tPriority:   normal
+\tCipher:     aes-xts-plain64
+  2: luks2
+\tKey:        512 bits
+\tPriority:   normal
+Tokens:
+Digests:
+  0: pbkdf2
+\tHash:       sha256
+\tIterations: 129747
+";
+
+    #[test]
+    fn parses_only_the_keyslots_section() {
+        assert_eq!(
+            parse_occupied_keyslots(LUKS2_DUMP_THREE_SLOTS),
+            Some(vec![0, 1, 2])
+        );
+    }
+
+    #[test]
+    fn dump_without_keyslots_section_is_none() {
+        let dump = "LUKS header information\nVersion:       \t2\n";
+        assert_eq!(parse_occupied_keyslots(dump), None);
+    }
+
+    #[test]
+    fn empty_keyslots_section_is_some_empty() {
+        let dump = "Keyslots:\nTokens:\nDigests:\n  0: pbkdf2\n";
+        assert_eq!(parse_occupied_keyslots(dump), Some(vec![]));
+    }
+
+    #[test]
+    fn first_free_slot_selection() {
+        assert_eq!(first_free_from_occupied(&[0, 1, 2]), 3);
+        assert_eq!(first_free_from_occupied(&[0, 2]), 1);
+        assert_eq!(first_free_from_occupied(&[1, 2]), 0);
+        assert_eq!(first_free_from_occupied(&[]), 0);
+    }
 }

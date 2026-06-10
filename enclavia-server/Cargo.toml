@@ -25,6 +25,7 @@ serde_json.workspace = true
 p256 = { workspace = true }
 rand.workspace = true
 base64.workspace = true
+sha2.workspace = true
 tokio-vsock = { workspace = true }
 # Re-enable the `nix` feature: enclavia-server is the one place that
 # actually drives `/dev/nsm` to produce attestations.
@@ -33,3 +34,7 @@ aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 [[bin]]
 name = "enclavia-server"
 path = "src/main.rs"
+
+[dev-dependencies]
+uuid = { workspace = true }
+chrono = { workspace = true }

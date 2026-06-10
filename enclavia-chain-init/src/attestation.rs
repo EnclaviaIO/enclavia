@@ -38,9 +38,7 @@ impl Nsm {
     pub fn open() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let fd = nsm_init();
         if fd < 0 {
-            return Err(
-                "nsm_init returned a negative fd: /dev/nsm missing or unreadable".into(),
-            );
+            return Err("nsm_init returned a negative fd: /dev/nsm missing or unreadable".into());
         }
         Ok(Self { fd })
     }
@@ -49,9 +47,7 @@ impl Nsm {
     /// than later from the attestation document because the attestation
     /// document doesn't expose PCRs in a typed shape (they're nested in
     /// CBOR), and the BootPayload needs them serialised as hex strings.
-    pub fn read_pcrs(
-        &self,
-    ) -> Result<Pcrs, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn read_pcrs(&self) -> Result<Pcrs, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Pcrs {
             pcr0: self.read_one_pcr(0)?,
             pcr1: self.read_one_pcr(1)?,
@@ -69,10 +65,7 @@ impl Nsm {
             Response::Error(error) => {
                 Err(format!("NSM DescribePCR({index}) error: {error:?}").into())
             }
-            other => Err(format!(
-                "NSM DescribePCR({index}) unexpected response: {other:?}"
-            )
-            .into()),
+            other => Err(format!("NSM DescribePCR({index}) unexpected response: {other:?}").into()),
         }
     }
 
@@ -96,9 +89,7 @@ impl Nsm {
         };
         match nsm_process_request(self.fd, request) {
             Response::Attestation { document } => Ok(document),
-            Response::Error(error) => {
-                Err(format!("NSM Attestation error: {error:?}").into())
-            }
+            Response::Error(error) => Err(format!("NSM Attestation error: {error:?}").into()),
             other => Err(format!("NSM Attestation unexpected response: {other:?}").into()),
         }
     }

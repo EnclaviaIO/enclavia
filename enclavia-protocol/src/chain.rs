@@ -35,11 +35,11 @@
 //! a tampered host-side daemon would carry no valid signature.
 
 use chrono::{DateTime, Utc};
-use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::attestation::{verify_chain_attestation, AttestationError, Pcrs};
+use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
 
 /// Kind of a chain entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +80,11 @@ pub struct ChainLink {
     /// 64-byte raw `r || s` ECDSA P-256 signature over `payload` under
     /// the enclave's control private key. Required for upgrade /
     /// revocation, absent on boot.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes_opt"
+    )]
     pub signature: Option<Vec<u8>>,
 }
 
@@ -198,12 +202,12 @@ pub struct PcrsHex {
 impl PcrsHex {
     /// Decode to raw bytes for the attestation verifier.
     pub fn to_pcrs(&self) -> Result<Pcrs, ChainValidationError> {
-        let pcr0 = hex::decode(&self.pcr0)
-            .map_err(|_| ChainValidationError::CorruptStoredPcrHex(0))?;
-        let pcr1 = hex::decode(&self.pcr1)
-            .map_err(|_| ChainValidationError::CorruptStoredPcrHex(1))?;
-        let pcr2 = hex::decode(&self.pcr2)
-            .map_err(|_| ChainValidationError::CorruptStoredPcrHex(2))?;
+        let pcr0 =
+            hex::decode(&self.pcr0).map_err(|_| ChainValidationError::CorruptStoredPcrHex(0))?;
+        let pcr1 =
+            hex::decode(&self.pcr1).map_err(|_| ChainValidationError::CorruptStoredPcrHex(1))?;
+        let pcr2 =
+            hex::decode(&self.pcr2).map_err(|_| ChainValidationError::CorruptStoredPcrHex(2))?;
         Ok(Pcrs { pcr0, pcr1, pcr2 })
     }
 }
@@ -261,10 +265,7 @@ pub enum ChainValidationError {
     EmptyAttestation,
     /// CBOR-decode of `payload` failed against the kind's struct.
     #[error("{kind:?} payload not CBOR-decodable: {msg}")]
-    PayloadDecode {
-        kind: ChainLinkKind,
-        msg: String,
-    },
+    PayloadDecode { kind: ChainLinkKind, msg: String },
     /// `payload.enclave_id` does not match the validator's context.
     #[error("payload enclave_id does not match the URL")]
     EnclaveIdMismatch,
@@ -390,12 +391,9 @@ fn validate_boot(
             })
         }
         Some(prev) => {
-            let prev_payload: BootPayload =
-                ciborium::from_reader(prev.payload.as_slice()).map_err(|e| {
-                    ChainValidationError::CorruptStoredPayload(
-                        ChainLinkKind::Boot,
-                        e.to_string(),
-                    )
+            let prev_payload: BootPayload = ciborium::from_reader(prev.payload.as_slice())
+                .map_err(|e| {
+                    ChainValidationError::CorruptStoredPayload(ChainLinkKind::Boot, e.to_string())
                 })?;
             if prev_payload.image_digest == parsed.image_digest {
                 return Ok(Outcome::Dedup);
@@ -446,12 +444,10 @@ fn validate_signed(
                 })?;
         }
         ChainLinkKind::Revocation => {
-            let revoke: RevocationPayload =
-                ciborium::from_reader(link.payload.as_slice()).map_err(|e| {
-                    ChainValidationError::PayloadDecode {
-                        kind: ChainLinkKind::Revocation,
-                        msg: e.to_string(),
-                    }
+            let revoke: RevocationPayload = ciborium::from_reader(link.payload.as_slice())
+                .map_err(|e| ChainValidationError::PayloadDecode {
+                    kind: ChainLinkKind::Revocation,
+                    msg: e.to_string(),
                 })?;
             // Target lookup, kind check, activation check, double-revoke.
             let target = ctx
@@ -462,13 +458,10 @@ fn validate_signed(
             if target.kind != ChainLinkKind::Upgrade {
                 return Err(ChainValidationError::RevokeTargetWrongKind(target.kind));
             }
-            let target_upgrade: UpgradePayload =
-                ciborium::from_reader(target.payload.as_slice()).map_err(|e| {
-                    ChainValidationError::CorruptStoredPayload(
-                        ChainLinkKind::Upgrade,
-                        e.to_string(),
-                    )
-                })?;
+            let target_upgrade: UpgradePayload = ciborium::from_reader(target.payload.as_slice())
+                .map_err(|e| {
+                ChainValidationError::CorruptStoredPayload(ChainLinkKind::Upgrade, e.to_string())
+            })?;
             if target_upgrade.valid_from <= now {
                 return Err(ChainValidationError::RevokePastActivation);
             }
@@ -505,7 +498,7 @@ mod tests {
     use super::*;
     use crate::attestation::test_utils::FakeChainAttestation;
     use chrono::Duration;
-    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::Signer};
 
     fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
         PcrsHex {
@@ -518,7 +511,11 @@ mod tests {
     fn keypair() -> (SigningKey, Vec<u8>) {
         let seed: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
         let sk = SigningKey::from_slice(&seed).unwrap();
-        let pk = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
         (sk, pk)
     }
 
@@ -621,9 +618,13 @@ mod tests {
         let pcrs = pcrs_hex_from_seed(0x10);
         let id = Uuid::new_v4();
         let link = boot_link(id, "sha256:aaa", 0x10);
-        let outcome =
-            validate_chain_link(&link, &ctx(&pcrs, "sha256:aaa", None, false, &[]), chrono::Utc::now(), true)
-                .unwrap();
+        let outcome = validate_chain_link(
+            &link,
+            &ctx(&pcrs, "sha256:aaa", None, false, &[]),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap();
         assert_eq!(outcome, Outcome::Append { sequence: 0 });
     }
 
@@ -664,7 +665,13 @@ mod tests {
         let first = boot_link(id, "sha256:bbb", 0x13);
         let outcome = validate_chain_link(
             &first,
-            &ctx(&pcrs, "sha256:bbb", None, false, std::slice::from_ref(&first)),
+            &ctx(
+                &pcrs,
+                "sha256:bbb",
+                None,
+                false,
+                std::slice::from_ref(&first),
+            ),
             chrono::Utc::now(),
             true,
         )
@@ -714,7 +721,13 @@ mod tests {
         let reboot = boot_link(id, "sha256:new", 0x15);
         let err = validate_chain_link(
             &reboot,
-            &ctx(&pcrs, "sha256:new", None, false, std::slice::from_ref(&genesis)),
+            &ctx(
+                &pcrs,
+                "sha256:new",
+                None,
+                false,
+                std::slice::from_ref(&genesis),
+            ),
             chrono::Utc::now(),
             true,
         )
@@ -727,7 +740,13 @@ mod tests {
         let pcrs = pcrs_hex_from_seed(0x16);
         let (sk, _) = keypair();
         let id = Uuid::new_v4();
-        let link = upgrade_link(id, "sha256:v2", 0x16, &sk, chrono::Utc::now() + Duration::days(7));
+        let link = upgrade_link(
+            id,
+            "sha256:v2",
+            0x16,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
         let err = validate_chain_link(
             &link,
             &ctx(&pcrs, "sha256:v1", None, false, &[]),
@@ -753,10 +772,22 @@ mod tests {
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
 
-        let link = upgrade_link(id, "sha256:v2", 0x17, &other_sk, chrono::Utc::now() + Duration::days(7));
+        let link = upgrade_link(
+            id,
+            "sha256:v2",
+            0x17,
+            &other_sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, std::slice::from_ref(&genesis)),
+            &ctx(
+                &pcrs,
+                "sha256:v1",
+                Some(&pk),
+                true,
+                std::slice::from_ref(&genesis),
+            ),
             chrono::Utc::now(),
             true,
         )
@@ -769,7 +800,13 @@ mod tests {
         let pcrs = pcrs_hex_from_seed(0x18);
         let (sk, pk) = keypair();
         let id = Uuid::new_v4();
-        let link = upgrade_link(id, "sha256:v2", 0x18, &sk, chrono::Utc::now() + Duration::days(7));
+        let link = upgrade_link(
+            id,
+            "sha256:v2",
+            0x18,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
         let err = validate_chain_link(
             &link,
             &ctx(&pcrs, "sha256:v1", Some(&pk), true, &[]),
@@ -789,10 +826,22 @@ mod tests {
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
 
-        let link = upgrade_link(id, "sha256:v2", 0x19, &sk, chrono::Utc::now() + Duration::days(7));
+        let link = upgrade_link(
+            id,
+            "sha256:v2",
+            0x19,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
         let outcome = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, std::slice::from_ref(&genesis)),
+            &ctx(
+                &pcrs,
+                "sha256:v1",
+                Some(&pk),
+                true,
+                std::slice::from_ref(&genesis),
+            ),
             chrono::Utc::now(),
             true,
         )
@@ -808,7 +857,13 @@ mod tests {
         let mut genesis = boot_link(id, "sha256:v1", 0x1a);
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
-        let mut upgrade = upgrade_link(id, "sha256:v2", 0x1a, &sk, chrono::Utc::now() + Duration::days(7));
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x1a,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
@@ -853,7 +908,13 @@ mod tests {
         let mut genesis = boot_link(id, "sha256:v1", 0x1c);
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
-        let mut upgrade = upgrade_link(id, "sha256:v2", 0x1c, &sk, chrono::Utc::now() - Duration::seconds(1));
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x1c,
+            &sk,
+            chrono::Utc::now() - Duration::seconds(1),
+        );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
@@ -877,7 +938,13 @@ mod tests {
         let mut genesis = boot_link(id, "sha256:v1", 0x1d);
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
-        let mut upgrade = upgrade_link(id, "sha256:v2", 0x1d, &sk, chrono::Utc::now() + Duration::days(7));
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x1d,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         let mut prior_revoke = revocation_link(id, upgrade.id.unwrap(), 0x1d, &sk);

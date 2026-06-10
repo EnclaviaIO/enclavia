@@ -1107,6 +1107,7 @@ dependencies = [
  "p256",
  "serde",
  "serde_bytes",
+ "serde_json",
  "sha2",
  "snow",
  "thiserror 2.0.18",
@@ -1133,16 +1134,19 @@ version = "0.1.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
+ "chrono",
  "ciborium",
  "enclavia-protocol",
  "p256",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
