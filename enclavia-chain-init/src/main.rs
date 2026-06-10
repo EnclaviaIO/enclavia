@@ -80,6 +80,10 @@ async fn main() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // Output lands on the serial console; ANSI escapes turn into
+        // literal garbage there. Same setting as every other in-enclave
+        // daemon.
+        .with_ansi(false)
         .init();
 
     if let Err(e) = run(Path::new(CONFIG_PATH)).await {
