@@ -3,9 +3,9 @@
 //!
 //! This is the "single-node, no-Raft, no-mesh" version of the synchronizer.
 //! It handles the request/response dispatch, the session-binding check,
-//! and the Ed25519 `Transition`-signature verification — the actual
-//! transport (Noise over vsock) and the NSM attestation pipeline live in
-//! the binary (part 4).
+//! and `Transition`-link verification (the #47 upgrade chain link), the
+//! actual transport (Noise over vsock) and the NSM attestation pipeline
+//! live in the binary (part 4).
 //!
 //! ## Contract with the listener
 //!
@@ -13,45 +13,38 @@
 //!
 //! 1. Performed the Noise handshake with the caller.
 //! 2. Verified the caller's Nitro attestation document, derived a
-//!    [`PcrKey`] from its PCRs, and extracted the raw 32-byte Ed25519
-//!    control pubkey from `user_data`.
+//!    [`PcrKey`] from its PCRs, and extracted the 65-byte SEC1 P-256
+//!    control pubkey from `user_data` (`AttestedIdentity::control_pubkey`).
 //! 3. Called [`Node::observe_attestation`] for the caller's key + pubkey.
-//!    For `Transition` requests, the *new* key also has to have called
-//!    `observe_attestation` in its own session beforehand.
+//!
+//! For a `Transition` the SUBMITTING session is the NEW enclave: it
+//! authenticates as `new_key`, and that is the session whose
+//! `observe_attestation` the listener calls. The OLD enclave does NOT
+//! hold a session at cutover (it has stopped); instead it earlier
+//! registered `old_key` (`Pin`), which froze its control pubkey, and it
+//! emitted the upgrade link the new enclave now presents. So the only
+//! attestation observed for a Transition is the new enclave's own.
 //!
 //! In other words: the Node trusts that the [`PcrKey`] it sees as
 //! `session_key` is genuinely the caller's attested identity, and that
 //! the pubkey passed to `observe_attestation` was sourced from a
 //! cryptographically verified NSM document. The Node itself owns
-//! verifying `Transition` signatures against the registered pubkey — the
-//! listener no longer needs to do that step (and importantly, no longer
-//! observes Transition signatures unconditionally, which was the #111
-//! pre-fix insecurity).
+//! verifying a `Transition`'s chain link, deriving `old_key`/`new_key`
+//! from the link payload, requiring `new_key == session_key`, and
+//! checking the link's signature against the pubkey frozen for the
+//! derived `old_key`, via [`crate::wire::decode_transition_link`] +
+//! [`crate::wire::verify_transition_link`]. The listener no longer needs
+//! to do that step (and importantly, no longer observes Transition
+//! authorizations unconditionally, which was the #111 pre-fix insecurity).
 
 use std::sync::Arc;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tokio::sync::Mutex;
 
-use crate::wire::{Request, Response, RpcError};
-use crate::{Op, PcrKey, StateMachine, ValidationError};
-
-/// Domain-separation prefix mixed into every `Transition` signature
-/// payload. The signed bytes are `TRANSITION_SIG_PREFIX || old_key.0 ||
-/// new_key.0` — 11 + 32 + 32 = 75 bytes. The wire docs in
-/// `crate::wire::Request::Transition` are the single source of truth for
-/// the format; `enclavia-crypto`'s `prepare-upgrade` flow must build
-/// exactly the same bytes.
-const TRANSITION_SIG_PREFIX: &[u8] = b"transition:";
-
-/// Build the canonical bytes a `Transition` signature must cover.
-fn transition_signing_payload(old_key: PcrKey, new_key: PcrKey) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(TRANSITION_SIG_PREFIX.len() + 32 + 32);
-    buf.extend_from_slice(TRANSITION_SIG_PREFIX);
-    buf.extend_from_slice(&old_key.0);
-    buf.extend_from_slice(&new_key.0);
-    buf
-}
+use crate::wire::{
+    ChainLink, Request, Response, RpcError, decode_transition_link, verify_transition_link,
+};
+use crate::{CONTROL_PUBKEY_LEN, Op, PcrKey, StateMachine, ValidationError};
 
 /// Single-node synchronizer.
 ///
@@ -64,70 +57,82 @@ fn transition_signing_payload(old_key: PcrKey, new_key: PcrKey) -> Vec<u8> {
 #[derive(Default)]
 pub struct Node {
     inner: Arc<Mutex<StateMachine>>,
+    /// Selects the debug (skip-cert-chain, QEMU/test NSM) vs production
+    /// (full Nitro CA chain) attestation-validation path used when
+    /// verifying a `Transition`'s chain link. The binary derives it from
+    /// its `debug`/`enclave` Cargo feature; `Default`/`new()` use `false`
+    /// (production) so a caller has to opt into the debug path explicitly.
+    debug_mode: bool,
 }
 
 impl Node {
-    /// Create a fresh, empty single-node synchronizer.
+    /// Create a fresh, empty single-node synchronizer in production
+    /// (full-chain) attestation mode.
     pub fn new() -> Self {
+        Self::with_debug_mode(false)
+    }
+
+    /// Create a fresh, empty single-node synchronizer, selecting the
+    /// attestation-validation path. `debug_mode = true` skips the Nitro
+    /// CA-chain check (QEMU / test NSM docs); `false` requires the full
+    /// chain.
+    pub fn with_debug_mode(debug_mode: bool) -> Self {
         Self {
             inner: Arc::new(Mutex::new(StateMachine::new())),
+            debug_mode,
         }
     }
 
     /// Record that `key` has produced a valid Nitro attestation and
-    /// announced `control_pubkey` as its Ed25519 verifying key. The
-    /// listener calls this once per session, immediately after the
-    /// attestation document is verified.
+    /// announced `control_pubkey` as its 65-byte SEC1 P-256 verifying key
+    /// (`AttestedIdentity::control_pubkey`). The listener calls this once
+    /// per session, immediately after the attestation document is
+    /// verified.
     ///
-    /// The pubkey is what `Transition` signatures from `key` will be
-    /// checked against. If `key` is already committed in the state
-    /// machine, its frozen `KeyState.control_pubkey` wins — this method
-    /// only updates the pending-attestation map.
-    pub async fn observe_attestation(&self, key: PcrKey, control_pubkey: [u8; 32]) {
+    /// When `key` later registers (`Pin` of an unseen key), this pubkey is
+    /// frozen into its `KeyState.control_pubkey`. A `Transition` link that
+    /// names this `key` as its `old_key` (via `from_pcrs`) is checked
+    /// against that frozen pubkey, even though the submitting session is a
+    /// different (new) enclave. If `key` is already committed in the state
+    /// machine, its frozen `KeyState.control_pubkey` wins, this method only
+    /// updates the pending-attestation map.
+    pub async fn observe_attestation(&self, key: PcrKey, control_pubkey: [u8; CONTROL_PUBKEY_LEN]) {
         self.inner
             .lock()
             .await
             .observe_attestation(key, control_pubkey);
     }
 
-    /// Record that the enclave running under `old_key` has produced a
-    /// valid Ed25519 signature authorizing `new_key` as its successor.
+    /// Record that the caller has verified an upgrade chain link from the
+    /// enclave running under `old_key` authorizing `new_key` as its
+    /// successor.
     ///
     /// In production this is called internally by
-    /// [`Node::handle_request`] after it verifies the signature in a
+    /// [`Node::handle_request`] after it verifies the chain link in a
     /// `Transition` RPC. It's exposed at the Node API for tests and for
     /// the future replicated-state-machine driver, which will need to
     /// replay observations across Raft followers without re-running the
-    /// signature verification on every node.
-    pub async fn observe_transition_sig(&self, old_key: PcrKey, new_key: PcrKey) {
-        self.inner
-            .lock()
-            .await
-            .observe_transition_sig(old_key, new_key);
+    /// link verification on every node.
+    pub async fn observe_transition(&self, old_key: PcrKey, new_key: PcrKey) {
+        self.inner.lock().await.observe_transition(old_key, new_key);
     }
 
     /// Handle one [`Request`] from a session authenticated as
     /// `session_key`.
     ///
-    /// Every request body carries a redundant `key` (or `old_key`); we
-    /// reject the request with [`RpcError::Unauthorized`] when that
-    /// doesn't match `session_key`. This is a belt-and-braces check —
-    /// the session binding already establishes the authorized key — but
-    /// it catches client bugs and makes wire traces self-explanatory.
+    /// `Get` / `Pin` carry a redundant `key`; we reject the request with
+    /// [`RpcError::Unauthorized`] when it doesn't match `session_key`.
+    /// This is a belt-and-braces check, the session binding already
+    /// establishes the authorized key, but it catches client bugs and
+    /// makes wire traces self-explanatory. `Transition` carries no
+    /// redundant key (only the upgrade link); its session binding is the
+    /// `new_key == session_key` check inside the verifier, since the NEW
+    /// enclave is the submitter.
     pub async fn handle_request(&self, session_key: PcrKey, req: Request) -> Response {
         match req {
             Request::Get { key } => self.handle_get(session_key, key).await,
-            Request::Pin { key, commitment } => {
-                self.handle_pin(session_key, key, commitment).await
-            }
-            Request::Transition {
-                old_key,
-                new_key,
-                signature,
-            } => {
-                self.handle_transition(session_key, old_key, new_key, &signature)
-                    .await
-            }
+            Request::Pin { key, commitment } => self.handle_pin(session_key, key, commitment).await,
+            Request::Transition { link } => self.handle_transition(session_key, link).await,
         }
     }
 
@@ -172,58 +177,65 @@ impl Node {
         }
     }
 
-    async fn handle_transition(
-        &self,
-        session_key: PcrKey,
-        old_key: PcrKey,
-        new_key: PcrKey,
-        signature: &[u8],
-    ) -> Response {
-        // The session must be the *old* enclave — only it can sign and
-        // authorize the transition into its successor.
-        if old_key != session_key {
-            return err(RpcError::Unauthorized);
-        }
+    async fn handle_transition(&self, session_key: PcrKey, link: ChainLink) -> Response {
         let mut inner = self.inner.lock().await;
 
-        // Look up `old_key`'s registered control pubkey. If `old_key`
-        // isn't currently registered (never registered, or retired by
-        // a prior Transition) we report the wire-level transition
-        // rejection rather than NotFound — Transition isn't a query.
-        let pubkey_bytes = match inner.get(&old_key) {
+        // Phase one: structurally decode the (still-untrusted) link to
+        // learn the derived old_key / new_key. The NEW enclave submits a
+        // Transition, so the session is bound to new_key; the OLD key is
+        // whatever the payload's from_pcrs hashes to, and is the key whose
+        // FROZEN control pubkey must have authorized the link. Any
+        // structural failure (wrong kind, missing signature, undecodable
+        // payload, malformed PCRs) folds to TransitionRejected.
+        let decoded = match decode_transition_link(&link) {
+            Ok(d) => d,
+            Err(_) => return err(RpcError::TransitionRejected),
+        };
+
+        // Look up the control pubkey frozen for the DERIVED old_key. That
+        // enclave must already be registered: only a live key can be
+        // transitioned away from. If it isn't (never registered, or
+        // retired by a prior Transition) we report the wire-level
+        // transition rejection rather than NotFound; a Transition isn't a
+        // query.
+        let old_control_pubkey = match inner.get(&decoded.old_key) {
             Some(state) => state.control_pubkey,
             None => return err(RpcError::TransitionRejected),
         };
 
-        // Verify the Ed25519 signature over `b"transition:" || old_key
-        // || new_key` against the registered pubkey. Any failure path
-        // (malformed pubkey, malformed signature bytes, invalid
-        // signature) folds into a single TransitionRejected — we don't
-        // tell the caller *which* check failed.
-        let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes) {
-            Ok(k) => k,
+        // Phase two: cryptographically verify the link. This enforces the
+        // full contract: new_key (derived from to_pcrs) equals the
+        // submitting session, it is not a self-transition, the link's
+        // control signature verifies under old_key's frozen pubkey, and
+        // the chain attestation binds `user_data == sha256(payload)` and
+        // the OLD enclave's PCRs (from_pcrs). Both keys are re-derived
+        // from the signed payload, never from an untrusted wire field.
+        // Any failure folds to a single TransitionRejected.
+        let verified = match verify_transition_link(
+            &link,
+            decoded,
+            session_key,
+            &old_control_pubkey,
+            self.debug_mode,
+        ) {
+            Ok(v) => v,
             Err(_) => return err(RpcError::TransitionRejected),
         };
-        let parsed_sig = match Signature::from_slice(signature) {
-            Ok(s) => s,
-            Err(_) => return err(RpcError::TransitionRejected),
-        };
-        let payload = transition_signing_payload(old_key, new_key);
-        if verifying_key.verify(&payload, &parsed_sig).is_err() {
-            return err(RpcError::TransitionRejected);
-        }
 
-        // Signature verified — record the observation and apply the op
-        // through the pure state machine, which still enforces the
-        // remaining structural checks (new_key attested, not retired,
-        // not already registered, etc.).
-        inner.observe_transition_sig(old_key, new_key);
-        match inner.apply(Op::Transition { old_key, new_key }) {
+        // Link verified, record the observation and apply the op through
+        // the pure state machine, which still enforces the remaining
+        // structural checks (new_key attested, not retired, not already
+        // registered, etc.).
+        inner.observe_transition(verified.old_key, verified.new_key);
+        match inner.apply(Op::Transition {
+            old_key: verified.old_key,
+            new_key: verified.new_key,
+        }) {
             Ok(state) => Response::TransitionOk {
                 version: state.version,
             },
             // `KeyNotCurrent` from a Transition means the old key isn't
-            // registered — that's a transition rejection, not a Get-style
+            // registered, that's a transition rejection, not a Get-style
             // NotFound. The default `From<ValidationError>` impl maps to
             // NotFound (the Pin/Get sense), so we override here.
             Err(ValidationError::KeyNotCurrent) => err(RpcError::TransitionRejected),
@@ -240,8 +252,14 @@ fn err(error: RpcError) -> Response {
 mod tests {
     use super::*;
     use crate::{Commitment, Version};
-    use ed25519_dalek::{Signer, SigningKey};
+    use enclavia_protocol::attestation::Pcrs;
+    use enclavia_protocol::attestation::test_utils::FakeChainAttestation;
+    use enclavia_protocol::chain::{ChainLinkKind, PcrsHex, UpgradePayload};
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 
+    /// Arbitrary PcrKey for the Pin/Get/session-binding tests that never
+    /// go through transition-link verification. These never have to match
+    /// a PCR-hash, so a flat byte pattern is fine.
     fn k(b: u8) -> PcrKey {
         PcrKey([b; 32])
     }
@@ -250,40 +268,122 @@ mod tests {
         Commitment([b; 32])
     }
 
-    /// Deterministic Ed25519 keypair derived from `seed`. Returns the
-    /// signing key plus the raw 32-byte verifying-key bytes that should
-    /// be passed to `observe_attestation`.
-    fn keypair(seed: u8) -> (SigningKey, [u8; 32]) {
-        let sk = SigningKey::from_bytes(&[seed; 32]);
-        let pk = sk.verifying_key().to_bytes();
+    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
+        PcrsHex {
+            pcr0: hex::encode(vec![seed; 48]),
+            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
+            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
+        }
+    }
+
+    /// The PcrKey a seed's PcrsHex hashes to, matching `Pcrs::digest()`
+    /// and `verify_transition_link`'s key derivation.
+    fn key_from_seed(seed: u8) -> PcrKey {
+        let raw = Pcrs {
+            pcr0: vec![seed; 48],
+            pcr1: vec![seed.wrapping_add(1); 48],
+            pcr2: vec![seed.wrapping_add(2); 48],
+        };
+        PcrKey(raw.digest())
+    }
+
+    /// Deterministic P-256 keypair; returns the signing key and the
+    /// 65-byte uncompressed SEC1 verifying-key bytes that should be passed
+    /// to `observe_attestation`.
+    fn keypair(seed: u8) -> (SigningKey, [u8; CONTROL_PUBKEY_LEN]) {
+        // A reliably-valid, nonzero P-256 scalar: a small big-endian
+        // integer (0x01, seed, 0, ...) is always below the curve order.
+        let mut scalar = [0u8; 32];
+        scalar[0] = 0x01;
+        scalar[1] = seed;
+        let sk = SigningKey::from_slice(&scalar).unwrap();
+        let pk_vec = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let mut pk = [0u8; CONTROL_PUBKEY_LEN];
+        pk.copy_from_slice(&pk_vec);
         (sk, pk)
     }
 
-    /// Sign the canonical Transition payload for `(old_key, new_key)`
-    /// using `sk`, mirroring what `enclavia-crypto` produces on the
-    /// retiring enclave.
-    fn sign_transition(sk: &SigningKey, old: PcrKey, new: PcrKey) -> Vec<u8> {
-        sk.sign(&transition_signing_payload(old, new))
-            .to_bytes()
-            .to_vec()
+    /// A throwaway 65-byte SEC1 pubkey for tests that only Pin/Get and
+    /// never verify a transition signature. Derived from a real keypair so
+    /// it is a valid point, but the signing half is discarded.
+    fn dummy_pubkey(seed: u8) -> [u8; CONTROL_PUBKEY_LEN] {
+        keypair(seed).1
+    }
+
+    /// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by
+    /// `signing` (the OLD enclave's control key) and attested for the OLD
+    /// measurements (`from_seed`): the old enclave emits the link during
+    /// its PrepareUpgrade flow, so it attests its own PCRs. Mirrors what
+    /// `enclavia-server::run_prepare_upgrade` / `chain-host` produce.
+    fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from_pcrs: pcrs_hex_from_seed(from_seed),
+            to_pcrs: pcrs_hex_from_seed(to_seed),
+            image_digest: "sha256:to".into(),
+            valid_from: chrono::Utc::now(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x5a; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation,
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    /// Register an OLD key (attest + Pin) so it is live with a frozen
+    /// control pubkey, ready to be a transition's `from`. The submitting
+    /// session in the corrected flow is the NEW enclave, so the old key is
+    /// set up by a separate (earlier) session, modelled here by driving
+    /// the node directly as `key_old`.
+    async fn register_old(
+        node: &Node,
+        seed: u8,
+        signing_pubkey: [u8; CONTROL_PUBKEY_LEN],
+    ) -> PcrKey {
+        let key_old = key_from_seed(seed);
+        node.observe_attestation(key_old, signing_pubkey).await;
+        node.handle_request(
+            key_old,
+            Request::Pin {
+                key: key_old,
+                commitment: c(0xaa),
+            },
+        )
+        .await;
+        key_old
+    }
+
+    /// Debug-mode node so `verify_chain_attestation` accepts the synthetic
+    /// `FakeChainAttestation` docs (no real Nitro CA chain).
+    fn debug_node() -> Node {
+        Node::with_debug_mode(true)
     }
 
     #[tokio::test]
     async fn get_unknown_key_returns_not_found() {
         let node = Node::new();
-        let (_, pk1) = keypair(1);
-        node.observe_attestation(k(1), pk1).await;
-        let resp = node
-            .handle_request(k(1), Request::Get { key: k(1) })
-            .await;
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        let resp = node.handle_request(k(1), Request::Get { key: k(1) }).await;
         assert_eq!(resp, err(RpcError::NotFound));
     }
 
     #[tokio::test]
     async fn pin_registers_unseen_key_at_version_zero() {
         let node = Node::new();
-        let (_, pk1) = keypair(1);
-        node.observe_attestation(k(1), pk1).await;
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
         let resp = node
             .handle_request(
                 k(1),
@@ -293,15 +393,18 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(resp, Response::PinOk { version: Version(0) });
+        assert_eq!(
+            resp,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
     }
 
     #[tokio::test]
     async fn pin_bumps_version_on_repeat() {
         let node = Node::new();
-        let (_, pk1) = keypair(1);
-        node.observe_attestation(k(1), pk1).await;
-        // First pin: registers.
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
         let _ = node
             .handle_request(
                 k(1),
@@ -311,7 +414,6 @@ mod tests {
                 },
             )
             .await;
-        // Second pin: bumps.
         let resp = node
             .handle_request(
                 k(1),
@@ -321,8 +423,12 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(resp, Response::PinOk { version: Version(1) });
-        // Third pin: bumps again.
+        assert_eq!(
+            resp,
+            Response::PinOk {
+                version: Version(1)
+            }
+        );
         let resp = node
             .handle_request(
                 k(1),
@@ -332,14 +438,18 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(resp, Response::PinOk { version: Version(2) });
+        assert_eq!(
+            resp,
+            Response::PinOk {
+                version: Version(2)
+            }
+        );
     }
 
     #[tokio::test]
     async fn get_after_pin_returns_latest() {
         let node = Node::new();
-        let (_, pk1) = keypair(1);
-        node.observe_attestation(k(1), pk1).await;
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
         node.handle_request(
             k(1),
             Request::Pin {
@@ -356,9 +466,7 @@ mod tests {
             },
         )
         .await;
-        let resp = node
-            .handle_request(k(1), Request::Get { key: k(1) })
-            .await;
+        let resp = node.handle_request(k(1), Request::Get { key: k(1) }).await;
         assert_eq!(
             resp,
             Response::GetOk {
@@ -373,23 +481,17 @@ mod tests {
     #[tokio::test]
     async fn session_binding_rejects_cross_key_get() {
         let node = Node::new();
-        let (_, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        let resp = node
-            .handle_request(k(1), Request::Get { key: k(2) })
-            .await;
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        node.observe_attestation(k(2), dummy_pubkey(2)).await;
+        let resp = node.handle_request(k(1), Request::Get { key: k(2) }).await;
         assert_eq!(resp, err(RpcError::Unauthorized));
     }
 
     #[tokio::test]
     async fn session_binding_rejects_cross_key_pin() {
         let node = Node::new();
-        let (_, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        node.observe_attestation(k(2), dummy_pubkey(2)).await;
         let resp = node
             .handle_request(
                 k(1),
@@ -400,189 +502,160 @@ mod tests {
             )
             .await;
         assert_eq!(resp, err(RpcError::Unauthorized));
-        // And no side effect on k(2).
-        let resp = node
-            .handle_request(k(2), Request::Get { key: k(2) })
-            .await;
+        let resp = node.handle_request(k(2), Request::Get { key: k(2) }).await;
         assert_eq!(resp, err(RpcError::NotFound));
     }
 
-    /// Session-binding fires before crypto verification: even with a
-    /// valid signature for `(k1, k3)`, a session authenticated as k(2)
-    /// can't retire k(1).
+    /// Session-binding fires inside the link verifier: even with a valid
+    /// link for (from=A -> to=C), a session authenticated as B (not the
+    /// link's to=C) can't drive it. The link's to_pcrs hashes to C, not B,
+    /// so the SessionKeyMismatch path rejects it as TransitionRejected.
     #[tokio::test]
-    async fn session_binding_rejects_transition_signed_for_someone_else() {
-        let node = Node::new();
-        let (sk1, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        let (_, pk3) = keypair(3);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.observe_attestation(k(3), pk3).await;
-        // k(1) registers.
+    async fn session_binding_rejects_transition_for_someone_else() {
+        let node = debug_node();
+        let (sk_a, pk_a) = keypair(0x10);
+        let (_, pk_b) = keypair(0x20);
+        // A (the old enclave) is registered and live.
+        register_old(&node, 0x10, pk_a).await;
+        // B is some unrelated registered session.
+        let key_b = key_from_seed(0x20);
+        node.observe_attestation(key_b, pk_b).await;
         node.handle_request(
-            k(1),
+            key_b,
             Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        // Session for k(2) tries to perform k(1) -> k(3) with a
-        // *valid* sig from k(1). Still disallowed: only k(1)'s own
-        // session can authorize its retirement.
-        let sig = sign_transition(&sk1, k(1), k(3));
-        let resp = node
-            .handle_request(
-                k(2),
-                Request::Transition {
-                    old_key: k(1),
-                    new_key: k(3),
-                    signature: sig,
-                },
-            )
-            .await;
-        assert_eq!(resp, err(RpcError::Unauthorized));
-    }
-
-    /// A Transition with the wrong-length / unparseable signature bytes
-    /// is rejected before any state machine call.
-    #[tokio::test]
-    async fn transition_with_malformed_signature_is_rejected() {
-        let node = Node::new();
-        let (_, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        let resp = node
-            .handle_request(
-                k(1),
-                Request::Transition {
-                    old_key: k(1),
-                    new_key: k(2),
-                    signature: vec![0xde, 0xad],
-                },
-            )
-            .await;
-        assert_eq!(resp, err(RpcError::TransitionRejected));
-    }
-
-    /// A 64-byte signature that simply doesn't verify against `old_key`'s
-    /// registered control pubkey is rejected.
-    #[tokio::test]
-    async fn transition_with_invalid_signature_is_rejected() {
-        let node = Node::new();
-        let (sk_wrong, _) = keypair(99); // attacker's keypair
-        let (_, pk1) = keypair(1); // k(1) registers pk1, not pk_wrong
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        let sig = sign_transition(&sk_wrong, k(1), k(2));
-        let resp = node
-            .handle_request(
-                k(1),
-                Request::Transition {
-                    old_key: k(1),
-                    new_key: k(2),
-                    signature: sig,
-                },
-            )
-            .await;
-        assert_eq!(resp, err(RpcError::TransitionRejected));
-    }
-
-    /// A signature that is well-formed and from the right key but
-    /// covers a *different* `new_key` than the one in the request is
-    /// rejected. Guards against an attacker capturing a sig the enclave
-    /// produced for one upgrade target and replaying it for another.
-    #[tokio::test]
-    async fn transition_with_signature_over_wrong_payload_is_rejected() {
-        let node = Node::new();
-        let (sk1, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        let (_, pk3) = keypair(3);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.observe_attestation(k(3), pk3).await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        // Signed over (k(1) -> k(3)) but request asks for (k(1) -> k(2)).
-        let sig = sign_transition(&sk1, k(1), k(3));
-        let resp = node
-            .handle_request(
-                k(1),
-                Request::Transition {
-                    old_key: k(1),
-                    new_key: k(2),
-                    signature: sig,
-                },
-            )
-            .await;
-        assert_eq!(resp, err(RpcError::TransitionRejected));
-    }
-
-    /// A Transition with a valid signature, an attested target, and a
-    /// registered old_key succeeds and rotates state to new_key.
-    #[tokio::test]
-    async fn transition_succeeds_with_valid_signature() {
-        let node = Node::new();
-        let (sk1, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
+                key: key_b,
                 commitment: c(0xbb),
             },
         )
         .await;
-        let sig = sign_transition(&sk1, k(1), k(2));
-        let resp = node
-            .handle_request(
-                k(1),
-                Request::Transition {
-                    old_key: k(1),
-                    new_key: k(2),
-                    signature: sig,
-                },
-            )
+        // Pre-attest the genuine target C (the new enclave).
+        node.observe_attestation(key_from_seed(0x30), dummy_pubkey(0x30))
             .await;
-        assert_eq!(resp, Response::TransitionOk { version: Version(1) });
+        // A genuine link for A -> C, but presented by B's session (B is
+        // neither the old key A nor the new key C).
+        let link = upgrade_link(0x10, 0x30, &sk_a);
+        let resp = node
+            .handle_request(key_b, Request::Transition { link })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A transition link with a malformed (wrong-length) signature is
+    /// rejected. The NEW key (0x21) is the submitting session; old key
+    /// (0x11) is registered separately.
+    #[tokio::test]
+    async fn transition_with_malformed_signature_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x11);
+        register_old(&node, 0x11, pk).await;
+        let key_new = key_from_seed(0x21);
+        node.observe_attestation(key_new, dummy_pubkey(0x21)).await;
+        let mut link = upgrade_link(0x11, 0x21, &sk);
+        link.signature = Some(vec![0xde, 0xad]); // not 64 bytes
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A 64-byte signature that doesn't verify against old_key's frozen
+    /// control pubkey is rejected.
+    #[tokio::test]
+    async fn transition_with_invalid_signature_is_rejected() {
+        let node = debug_node();
+        let (_sk_real, pk_real) = keypair(0x12);
+        let (sk_attacker, _) = keypair(0xab);
+        register_old(&node, 0x12, pk_real).await;
+        let key_new = key_from_seed(0x22);
+        node.observe_attestation(key_new, dummy_pubkey(0x22)).await;
+        // Link signed by the attacker, not old_key's registered key.
+        let link = upgrade_link(0x12, 0x22, &sk_attacker);
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A transition whose derived old_key isn't registered is rejected
+    /// (you cannot retire a key that was never pinned), even though the
+    /// new enclave's session is perfectly valid.
+    #[tokio::test]
+    async fn transition_against_unregistered_old_key_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x13);
+        let key_old = key_from_seed(0x13);
+        // Attest old_key but never Pin/Register it.
+        node.observe_attestation(key_old, pk).await;
+        let key_new = key_from_seed(0x23);
+        node.observe_attestation(key_new, dummy_pubkey(0x23)).await;
+        let link = upgrade_link(0x13, 0x23, &sk);
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A transition whose target (the submitting session) hasn't attested
+    /// in this run is rejected (the pure state machine refuses
+    /// NewKeyNotAttested). We force this by driving handle_transition with
+    /// a session_key that was never observed.
+    #[tokio::test]
+    async fn transition_with_unattested_new_key_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x14);
+        register_old(&node, 0x14, pk).await;
+        let key_new = key_from_seed(0x24);
+        // Deliberately do NOT attest the new key (0x24), but still submit
+        // as that session.
+        let link = upgrade_link(0x14, 0x24, &sk);
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A valid link, attested submitting (new) session, and registered old
+    /// key succeeds and rotates state to new_key, carrying commitment +
+    /// version.
+    #[tokio::test]
+    async fn transition_succeeds_with_valid_link() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x15);
+        let key_old = key_from_seed(0x15);
+        let key_new = key_from_seed(0x25);
+        // Old enclave registers and pins twice (commitment 0xbb, version 1).
+        node.observe_attestation(key_old, pk).await;
+        node.handle_request(
+            key_old,
+            Request::Pin {
+                key: key_old,
+                commitment: c(0xaa),
+            },
+        )
+        .await;
+        node.handle_request(
+            key_old,
+            Request::Pin {
+                key: key_old,
+                commitment: c(0xbb),
+            },
+        )
+        .await;
+        // New enclave attests in its own session and submits.
+        node.observe_attestation(key_new, dummy_pubkey(0x25)).await;
+        let link = upgrade_link(0x15, 0x25, &sk);
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert_eq!(
+            resp,
+            Response::TransitionOk {
+                version: Version(1)
+            }
+        );
         // The new key now owns the commitment + version.
         let resp = node
-            .handle_request(k(2), Request::Get { key: k(2) })
+            .handle_request(key_new, Request::Get { key: key_new })
             .await;
         assert_eq!(
             resp,
@@ -593,46 +666,30 @@ mod tests {
         );
         // The old key is gone.
         let resp = node
-            .handle_request(k(1), Request::Get { key: k(1) })
+            .handle_request(key_old, Request::Get { key: key_old })
             .await;
         assert_eq!(resp, err(RpcError::NotFound));
     }
 
-    /// "Control pubkey substitution": after k(1) is Registered with
-    /// pubkey pk1, the attacker re-attests k(1) with their own pubkey
-    /// and signs a Transition with the matching signing key. The
-    /// pubkey registered in `KeyState` is frozen, so verification
-    /// against pk1 fails and the Transition is rejected.
+    /// "Control pubkey substitution": after old_key registers with pk_real,
+    /// the attacker re-attests old_key with their own pubkey and signs a
+    /// link with the matching key, submitting from the new enclave's
+    /// session. The pubkey in old_key's KeyState is frozen, so
+    /// verification against pk_real fails and the link is rejected.
     #[tokio::test]
     async fn transition_rejects_control_pubkey_substitution() {
-        let node = Node::new();
-        let (_sk1_genuine, pk1) = keypair(1);
-        let (sk_attacker, pk_attacker) = keypair(0xff);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        // Now the attacker re-attests k(1) (somehow) with their own
-        // pubkey. observe_attestation overwrites the pending map but
-        // not KeyState — k(1)'s registered authorizer is still pk1.
-        node.observe_attestation(k(1), pk_attacker).await;
-        let sig = sign_transition(&sk_attacker, k(1), k(2));
+        let node = debug_node();
+        let (_sk_genuine, pk_real) = keypair(0x16);
+        let (sk_attacker, pk_attacker) = keypair(0xfe);
+        let key_old = register_old(&node, 0x16, pk_real).await;
+        let key_new = key_from_seed(0x26);
+        node.observe_attestation(key_new, dummy_pubkey(0x26)).await;
+        // Attacker re-attests old_key with their own pubkey. This updates
+        // the pending map but NOT old_key's frozen KeyState pubkey.
+        node.observe_attestation(key_old, pk_attacker).await;
+        let link = upgrade_link(0x16, 0x26, &sk_attacker);
         let resp = node
-            .handle_request(
-                k(1),
-                Request::Transition {
-                    old_key: k(1),
-                    new_key: k(2),
-                    signature: sig,
-                },
-            )
+            .handle_request(key_new, Request::Transition { link })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -640,37 +697,22 @@ mod tests {
     /// Once a key transitions, any further session bound to it is dead.
     #[tokio::test]
     async fn retired_key_cannot_pin() {
-        let node = Node::new();
-        let (sk1, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
-        node.handle_request(
-            k(1),
-            Request::Pin {
-                key: k(1),
-                commitment: c(0xaa),
-            },
-        )
-        .await;
-        let sig = sign_transition(&sk1, k(1), k(2));
-        node.handle_request(
-            k(1),
-            Request::Transition {
-                old_key: k(1),
-                new_key: k(2),
-                signature: sig,
-            },
-        )
-        .await;
-        // After retirement, k(1) tries to Pin. Should not bring it back.
-        // Mapped to Register (since k(1) is not registered), which the
-        // state machine refuses because the key is retired.
+        let node = debug_node();
+        let (sk, pk) = keypair(0x17);
+        let key_old = register_old(&node, 0x17, pk).await;
+        let key_new = key_from_seed(0x27);
+        node.observe_attestation(key_new, dummy_pubkey(0x27)).await;
+        let link = upgrade_link(0x17, 0x27, &sk);
+        node.handle_request(key_new, Request::Transition { link })
+            .await;
+        // After retirement, old_key tries to Pin. Mapped to Register
+        // (since old_key is not registered), which the state machine
+        // refuses because the key is retired.
         let resp = node
             .handle_request(
-                k(1),
+                key_old,
                 Request::Pin {
-                    key: k(1),
+                    key: key_old,
                     commitment: c(0xee),
                 },
             )
@@ -678,15 +720,13 @@ mod tests {
         assert_eq!(resp, err(RpcError::OperationRejected));
     }
 
-    /// Two sessions pinning their own keys concurrently both succeed —
+    /// Two sessions pinning their own keys concurrently both succeed ,
     /// the Mutex serializes them in some order without losing writes.
     #[tokio::test]
     async fn concurrent_pins_on_disjoint_keys_serialize() {
         let node = Arc::new(Node::new());
-        let (_, pk1) = keypair(1);
-        let (_, pk2) = keypair(2);
-        node.observe_attestation(k(1), pk1).await;
-        node.observe_attestation(k(2), pk2).await;
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        node.observe_attestation(k(2), dummy_pubkey(2)).await;
 
         let n1 = Arc::clone(&node);
         let n2 = Arc::clone(&node);
@@ -711,16 +751,21 @@ mod tests {
             .await
         });
         let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
-        assert_eq!(r1, Response::PinOk { version: Version(0) });
-        assert_eq!(r2, Response::PinOk { version: Version(0) });
+        assert_eq!(
+            r1,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+        assert_eq!(
+            r2,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
 
-        // Both keys are now registered with their own commitments.
-        let g1 = node
-            .handle_request(k(1), Request::Get { key: k(1) })
-            .await;
-        let g2 = node
-            .handle_request(k(2), Request::Get { key: k(2) })
-            .await;
+        let g1 = node.handle_request(k(1), Request::Get { key: k(1) }).await;
+        let g2 = node.handle_request(k(2), Request::Get { key: k(2) }).await;
         assert_eq!(
             g1,
             Response::GetOk {

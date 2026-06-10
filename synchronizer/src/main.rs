@@ -5,18 +5,19 @@
 //! time via the `debug` and `enclave` features (mutually exclusive in
 //! practice; the rest of the workspace follows the same pattern):
 //!
-//! - `debug`   — listens on a Unix domain socket (env: `LISTEN_PATH`).
-//!               The attestation verifier uses the
-//!               `decode_attestation_document` debug path (skip cert
-//!               chain), matching what QEMU's self-signing NSM emits.
-//! - `enclave` — listens on vsock (env: `VSOCK_PORT`, default 5004).
-//!               The verifier requires a full Nitro CA-chain-signed
-//!               attestation document.
+//! - `debug` listens on a Unix domain socket (env: `LISTEN_PATH`). The
+//!   attestation verifier uses the `decode_attestation_document` debug
+//!   path (skip cert chain), matching what QEMU's self-signing NSM emits.
+//! - `enclave` listens on vsock (env: `VSOCK_PORT`, default
+//!   [`SYNCHRONIZER_CLIENT_PORT`] = 5010). The verifier requires a full
+//!   Nitro CA-chain-signed attestation document.
 
 use std::sync::Arc;
 
-use synchronizer::listener::handle_connection;
+#[cfg(feature = "enclave")]
+use enclavia_protocol::mesh::SYNCHRONIZER_CLIENT_PORT;
 use synchronizer::Node;
+use synchronizer::listener::handle_connection;
 use tracing::{error, info, warn};
 
 #[cfg(all(feature = "debug", feature = "enclave"))]
@@ -25,8 +26,11 @@ compile_error!("synchronizer: enable exactly one of the `debug` and `enclave` fe
 #[cfg(not(any(feature = "debug", feature = "enclave")))]
 compile_error!("synchronizer: enable one of the `debug` or `enclave` features");
 
+/// Default vsock port the in-enclave listener serves customer RPC on.
+/// Settled in the #16 design pass (the interim 5004 collided with
+/// `secrets-host`); see [`enclavia_protocol::mesh::SYNCHRONIZER_CLIENT_PORT`].
 #[cfg(feature = "enclave")]
-const DEFAULT_VSOCK_PORT: u32 = 5004;
+const DEFAULT_VSOCK_PORT: u32 = SYNCHRONIZER_CLIENT_PORT;
 
 /// Picked at compile time from the `debug`/`enclave` feature pair. Passed
 /// to [`handle_connection`] so the listener picks the matching
@@ -40,13 +44,15 @@ const DEBUG_MODE: bool = false;
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_ansi(false)
         .init();
 
-    let node = Arc::new(Node::new());
+    // The Node carries the same `debug_mode` the listener passes to
+    // `handle_connection`: it selects the skip-cert-chain vs full-Nitro-CA
+    // path used when verifying a `Transition`'s chain-link attestation.
+    let node = Arc::new(Node::with_debug_mode(DEBUG_MODE));
 
     #[cfg(feature = "debug")]
     {

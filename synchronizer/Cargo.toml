@@ -9,35 +9,51 @@ description = "In-enclave multi-node storage synchronizer: mesh replication of L
 [dependencies]
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
+# (De)serialize the 65-byte SEC1 control pubkey in `KeyState`: serde's
+# derive only covers fixed arrays up to length 32. Same crate
+# enclavia-protocol already uses for its byte fields. Pulled in by `serde`.
+serde_bytes = { version = "0.11", optional = true }
 ciborium = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["sync"] }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 tokio-vsock = { workspace = true, optional = true }
-# Noise responder helpers + attestation verifier. The listener wraps
-# every accepted stream in a Noise_NN tunnel, then derives the session's
-# PcrKey from a Nitro NSM document whose nonce is bound to the Noise
-# handshake hash.
+# Wire types + the pure transition-link verifier. The `Transition` RPC
+# carries a #47 upgrade `ChainLink`; verifying it needs `ChainLink` /
+# `UpgradePayload` / `verify_chain_attestation` plus the 65-byte SEC1
+# P-256 control-pubkey contract from `AttestedIdentity`. `default-features
+# = false` strips the async-transport (tokio) bits the `wire` feature does
+# not need; the `node` feature turns `async-transport` back on for the
+# Noise responder helpers the listener uses.
 enclavia-protocol = { path = "../enclavia-protocol", optional = true, default-features = false }
 snow = { workspace = true, optional = true }
-# Verifies Ed25519 control-key signatures on Transition requests
-# against the pubkey registered at first attestation. Pulled in by the
-# `node` feature — the pure state machine stays crypto-free. NB: the
-# synchronizer mesh's notion of control-key is independent from the
-# upgrade-chain control-key (#47), which is ECDSA P-256; the latter
-# is the key in `AttestationDoc::user_data`. The listener boundary
-# slices the SEC1-prefix off identity.control_pubkey before handing
-# it to observe_attestation. To be unified in a follow-up.
-ed25519-dalek = { workspace = true, optional = true }
+# Verifies the OLD key's 64-byte raw r||s ECDSA P-256 control signature
+# over the transition-link payload, against the pubkey registered at
+# first attestation. Pulled in by the `wire` feature alongside the
+# verifier; the pure state machine (no features) stays crypto-free.
+p256 = { workspace = true, optional = true }
+# SHA-256 of each PcrsHex's PCR triple, to bind payload.from_pcrs /
+# to_pcrs to the (old_key, new_key) the Transition op names. Pulled in
+# by the `wire` feature.
+sha2 = { workspace = true, optional = true }
 
 [features]
 default = []
-serde = ["dep:serde"]
-wire = ["serde", "dep:ciborium"]
-# Async single-node RPC surface. Pulls in tokio, the Noise responder
-# helpers, and the attestation verifier from `enclavia-protocol`.
-# Implies `wire`.
-node = ["wire", "dep:tokio", "tokio/io-util", "dep:enclavia-protocol", "enclavia-protocol/async-transport", "dep:snow", "dep:ed25519-dalek"]
+serde = ["dep:serde", "dep:serde_bytes"]
+# Wire RPC types + the pure transition-link verifier. Carries a #47
+# upgrade `ChainLink`, so it pulls in `enclavia-protocol` (chain +
+# attestation, no async transport), `p256`, and `sha2`. No tokio, no
+# Noise: that is the `node` feature's job.
+wire = [
+    "serde",
+    "dep:ciborium",
+    "dep:enclavia-protocol",
+    "dep:p256",
+    "dep:sha2",
+]
+# Async single-node RPC surface. Adds tokio + the Noise responder
+# helpers (async-transport) on top of `wire`. Implies `wire`.
+node = ["wire", "dep:tokio", "tokio/io-util", "enclavia-protocol/async-transport", "dep:snow"]
 # Build the listener binary. Pick one of `debug` (UDS) or `enclave`
 # (vsock) — same pattern as the other in-enclave crates.
 debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber"]
@@ -47,13 +63,17 @@ enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tr
 ciborium = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "io-util"] }
+# Tests construct real P-256 keypairs from deterministic seeds, sign
+# transition-link payloads, and build `FakeChainAttestation` fixtures to
+# drive the listener/Node verifier end to end. P-256 is the upgrade-chain
+# control-key algorithm (#21/#47).
 enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }
-# Tests construct real Ed25519 keypairs from deterministic seeds so they
-# can sign canonical transition payloads and exercise the listener/Node
-# verifier end to end. Matches the synchronizer's own mesh-control-key
-# algorithm; the upgrade-chain control-key (#47, ECDSA P-256) is
-# verified by enclavia-server, not by synchronizer.
-ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+# Tests build `PcrsHex` fixtures from raw byte seeds and hex-encode them
+# to match `verify_transition_link`'s key derivation.
+hex = { workspace = true }
 
 [[bin]]
 name = "enclavia-synchronizer"
