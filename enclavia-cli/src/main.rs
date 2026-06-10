@@ -148,7 +148,7 @@ enum EnclaveCmd {
         #[arg(long = "egress-config", value_name = "PATH")]
         egress_config: Option<std::path::PathBuf>,
         /// Mark this enclave as upgradable (#47). The backend mints an
-        /// Ed25519 control keypair, bakes the public half into every
+        /// ECDSA P-256 control keypair, bakes the public half into every
         /// EIF for this enclave, and accepts staged v2+ pushes against
         /// it. Without this flag the enclave is non-upgradable: it has
         /// a single genesis push, no control pubkey is baked in, and
