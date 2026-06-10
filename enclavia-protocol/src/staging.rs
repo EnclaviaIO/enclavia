@@ -97,6 +97,19 @@ pub struct StagedUpgradeJson {
     /// Human-readable error details. Non-empty only on `status == Failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Git rev of the `builder` flake input the backend was running when
+    /// it built this upgrade's EIF. Recorded alongside `pcrs` when the
+    /// build completes, mirroring the genesis `enclaves.builder_rev`
+    /// stamping. Lets `enclavia reproduce --upgrade <id>` pin the local
+    /// rebuild to the exact sources, so a superseded version stays
+    /// deterministically reproducible. `None` on rows staged before this
+    /// field existed, or whose build never completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_rev: Option<String>,
+    /// Git rev of the `enclavia` flake input. Same null semantics as
+    /// `builder_rev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crates_rev: Option<String>,
     /// Wall-clock time this upgrade record was created.
     pub created_at: DateTime<Utc>,
 }
@@ -122,6 +135,8 @@ mod tests {
             upgrade_link_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap()),
             revocation_link_id: None,
             error_message: None,
+            builder_rev: Some("08cc66bf46b79981253011725b9e792d6353a586".into()),
+            crates_rev: Some("842b3394f1699b1fc7ae376ec7741fa9e4029621".into()),
             created_at: Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         }
     }
@@ -202,6 +217,8 @@ mod tests {
             upgrade_link_id: None,
             revocation_link_id: None,
             error_message: None,
+            builder_rev: None,
+            crates_rev: None,
             created_at: Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         };
         let v = serde_json::to_value(&building).unwrap();
@@ -209,5 +226,51 @@ mod tests {
         assert!(v.get("pcrs").is_none());
         assert!(v.get("valid_from").is_none());
         assert!(v.get("upgrade_link_id").is_none());
+        // Revs are skipped when None too.
+        assert!(v.get("builder_rev").is_none());
+        assert!(v.get("crates_rev").is_none());
+    }
+
+    /// The revs serialise when present and round-trip back.
+    #[test]
+    fn revs_round_trip_when_present() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert_eq!(
+            v.get("builder_rev").and_then(|x| x.as_str()),
+            Some("08cc66bf46b79981253011725b9e792d6353a586")
+        );
+        assert_eq!(
+            v.get("crates_rev").and_then(|x| x.as_str()),
+            Some("842b3394f1699b1fc7ae376ec7741fa9e4029621")
+        );
+        let back: StagedUpgradeJson = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.builder_rev.as_deref(),
+            Some("08cc66bf46b79981253011725b9e792d6353a586")
+        );
+        assert_eq!(
+            back.crates_rev.as_deref(),
+            Some("842b3394f1699b1fc7ae376ec7741fa9e4029621")
+        );
+    }
+
+    /// Old backend JSON (no `builder_rev` / `crates_rev` keys at all) still
+    /// deserialises: the serde defaults fill in `None`. This is the
+    /// backwards-compatibility guarantee for rows staged before the
+    /// per-version provenance work landed.
+    #[test]
+    fn deserialises_payload_without_revs() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "enclave_id": "00000000-0000-0000-0000-000000000002",
+            "status": "staged",
+            "docker_image": "registry.example.com/owner/app:v2",
+            "image_digest": "sha256:abcdef",
+            "created_at": "2024-12-31T00:00:00Z"
+        }"#;
+        let back: StagedUpgradeJson = serde_json::from_str(json).unwrap();
+        assert!(back.builder_rev.is_none());
+        assert!(back.crates_rev.is_none());
+        assert_eq!(back.image_digest.as_deref(), Some("sha256:abcdef"));
     }
 }
