@@ -3,7 +3,7 @@
 //! Wire format on a connection:
 //!
 //! - `Noise_NN_25519_ChaChaPoly_BLAKE2s` handshake (responder side) before
-//!   any framing — see `enclavia-protocol::perform_handshake_as_responder`.
+//!   any framing, see `enclavia-protocol::perform_handshake_as_responder`.
 //! - Then, repeatedly: 4-byte big-endian length prefix followed by that
 //!   many bytes of Noise-encrypted ciphertext. The plaintext is a
 //!   CBOR-encoded [`Frame`].
@@ -13,35 +13,38 @@
 //!   [`enclavia_protocol::attestation::verify_and_extract`] with the
 //!   Noise handshake hash as the expected nonce, derives
 //!   `PcrKey = SHA-256(PCR0||PCR1||PCR2)` from the verified document,
-//!   pulls the Ed25519 control pubkey out of the doc's `user_data`,
-//!   and binds the session to that key for life.
+//!   pulls the 65-byte SEC1 P-256 control pubkey out of the doc's
+//!   `user_data` (`AttestedIdentity::control_pubkey`), and binds the
+//!   session to that key for life.
 //! - Subsequent frames are [`Frame::Rpc`] with a [`Request`] payload;
 //!   the server replies with an encrypted CBOR [`Response`].
 //!
 //! The Noise handshake hash binds the attestation document to *this*
-//! specific session — a document captured from a previous handshake
+//! specific session, a document captured from a previous handshake
 //! can't be replayed because it would carry the wrong hash in its
 //! nonce field. No explicit server-side challenge frame is needed.
 //!
 //! `Transition` requests are dispatched straight to [`Node::handle_request`],
-//! which performs the Ed25519 signature check against the pubkey
-//! registered for `old_key` at first attestation — the listener no
-//! longer pre-observes attestations or transition signatures on behalf
-//! of the caller.
+//! which decodes the #47 upgrade chain link to derive `old_key`/`new_key`,
+//! requires the submitting session to be bound to `new_key` (the NEW
+//! enclave submits the transition), and verifies the link's signature
+//! against the control pubkey frozen for the derived `old_key` at its
+//! registration. The listener no longer pre-observes attestations or
+//! transition authorizations on behalf of the caller.
 
-use enclavia_protocol::{attestation, perform_handshake_as_responder, NoiseTransport};
+use enclavia_protocol::{NoiseTransport, attestation, perform_handshake_as_responder};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::PcrKey;
 use crate::node::Node;
 use crate::wire::{Request, Response, RpcError};
-use crate::PcrKey;
 
 /// Maximum size (bytes) of an inbound ENCRYPTED frame on the wire.
 ///
 /// `Noise_NN_25519_ChaChaPoly_BLAKE2s` has a 65535-byte hard cap per
 /// message, so we use that as the outer bound. Anything larger is a
-/// protocol error — a malicious peer can't OOM the node by claiming a
+/// protocol error, a malicious peer can't OOM the node by claiming a
 /// giant length. A typical Nitro attestation document is ~5 KiB, well
 /// within budget.
 pub const MAX_FRAME_SIZE: u32 = 65535;
@@ -127,30 +130,26 @@ where
 
     // 1. First frame must authenticate: a Nitro NSM document whose
     //    nonce binds it to the handshake hash. Derive the session key
-    //    from the verified PCRs, pull the Ed25519 control pubkey out
-    //    of `user_data`, and announce the (key, pubkey) pair to the
-    //    Node so Register and (later, for *another* enclave's session)
-    //    Transition-target checks pass.
+    //    from the verified PCRs, pull the 65-byte SEC1 P-256 control
+    //    pubkey out of `user_data`, and announce the (key, pubkey) pair
+    //    to the Node so this session's Register passes and, when this
+    //    session is a NEW enclave submitting a Transition, the
+    //    `new_key == session_key` and NewKeyNotAttested checks pass.
+    //
+    //    The pubkey is `AttestedIdentity::control_pubkey` verbatim, the
+    //    same 65-byte uncompressed SEC1 ECDSA P-256 key (#21/#47) the
+    //    `Transition` chain-link verifier checks the upgrade payload's
+    //    signature against (it checks it against the OLD key's frozen
+    //    pubkey, registered when the old enclave first attested). No
+    //    slicing / algorithm bridging: the synchronizer's transition
+    //    credential IS the #47 upgrade link, so one P-256 key serves
+    //    throughout.
     let session_key = match read_frame(&mut stream, &mut transport).await? {
         Some(Frame::Authenticate { nsm_doc }) => {
-            let identity =
-                attestation::verify_and_extract(&nsm_doc, &handshake_hash, debug_mode)
-                    .map_err(|e| ConnError::Attestation(e.to_string()))?;
+            let identity = attestation::verify_and_extract(&nsm_doc, &handshake_hash, debug_mode)
+                .map_err(|e| ConnError::Attestation(e.to_string()))?;
             let key = PcrKey(identity.pcrs.digest());
-            // The protocol layer now extracts a 65-byte uncompressed
-            // SEC1 ECDSA P-256 pubkey from `user_data` (#47), but the
-            // synchronizer mesh's own control-key concept is a separate
-            // (Ed25519, 32-byte) thing that has not been migrated yet.
-            // Until that migration lands, hand `observe_attestation` a
-            // 32-byte slice derived from the SEC1 bytes — specifically
-            // the last 32 bytes (the Y coordinate) — so the synchronizer
-            // continues to compile and the mesh-level identity stays
-            // stable per attested enclave. This identity will not verify
-            // any real signature in this state; production mesh use is
-            // gated on a follow-up that aligns the algorithms.
-            let mut mesh_pubkey = [0u8; 32];
-            mesh_pubkey.copy_from_slice(&identity.control_pubkey[33..65]);
-            node.observe_attestation(key, mesh_pubkey).await;
+            node.observe_attestation(key, identity.control_pubkey).await;
             key
         }
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
@@ -158,7 +157,7 @@ where
     };
 
     // 2. Subsequent frames: RPC dispatch. Transition signature
-    //    verification lives in `Node::handle_request` — the listener
+    //    verification lives in `Node::handle_request`, the listener
     //    deliberately no longer pre-observes attestation or
     //    transition-sig events on behalf of the caller (that was the
     //    #111 pre-fix hole: any session could forge a Transition by
@@ -167,7 +166,7 @@ where
         let request = match frame {
             Frame::Rpc { request } => request,
             Frame::Authenticate { .. } => {
-                // Treat re-auth as a protocol error — the session is
+                // Treat re-auth as a protocol error, the session is
                 // bound to one key for life.
                 let resp = Response::Err {
                     error: RpcError::Unauthorized,
@@ -209,8 +208,8 @@ where
         .read_message(&ciphertext, &mut plaintext)
         .map_err(|e| ConnError::Crypto(format!("{e}")))?;
 
-    let frame: Frame = ciborium::from_reader(&plaintext[..pt_len])
-        .map_err(|e| ConnError::Cbor(format!("{e}")))?;
+    let frame: Frame =
+        ciborium::from_reader(&plaintext[..pt_len]).map_err(|e| ConnError::Cbor(format!("{e}")))?;
     Ok(Some(frame))
 }
 
@@ -241,10 +240,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{ChainLink, ChainLinkKind, UpgradePayload};
     use crate::{Commitment, Version};
-    use ed25519_dalek::{Signer, SigningKey};
-    use enclavia_protocol::attestation::test_utils::FakeAttestation;
+    use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
+    use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
+    use enclavia_protocol::chain::PcrsHex;
     use enclavia_protocol::perform_handshake_as_initiator;
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use std::sync::Arc;
     use tokio::io::duplex;
 
@@ -252,72 +254,57 @@ mod tests {
         Commitment([b; 32])
     }
 
-    /// Deterministic Ed25519 keypair derived from `seed`. Tests sign
-    /// transition payloads with the returned `SigningKey` and feed the
-    /// matching pubkey bytes into the NSM doc's `user_data`.
-    fn keypair(seed: u8) -> (SigningKey, [u8; 32]) {
-        let sk = SigningKey::from_bytes(&[seed; 32]);
-        let pk = sk.verifying_key().to_bytes();
+    /// Deterministic P-256 keypair; returns the signing key and the
+    /// 65-byte uncompressed SEC1 verifying-key bytes that go in the NSM
+    /// doc's `user_data`.
+    fn keypair(seed: u8) -> (SigningKey, [u8; CONTROL_PUBKEY_LEN]) {
+        // A reliably-valid, nonzero P-256 scalar: a small big-endian
+        // integer (0x01, seed, 0, ...) is always below the curve order.
+        let mut scalar = [0u8; 32];
+        scalar[0] = 0x01;
+        scalar[1] = seed;
+        let sk = SigningKey::from_slice(&scalar).unwrap();
+        let pk_vec = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let mut pk = [0u8; CONTROL_PUBKEY_LEN];
+        pk.copy_from_slice(&pk_vec);
         (sk, pk)
     }
 
-    /// Build a [`Frame::Authenticate`] from a [`FakeAttestation`] whose
-    /// nonce is set to the supplied handshake hash and whose `user_data`
-    /// carries the seed-derived stub pubkey from
-    /// [`FakeAttestation::with_seed`]. Use this for tests that don't
-    /// care about Transition signing.
-    fn auth_frame(seed: u8, handshake_hash: &[u8]) -> (Frame, PcrKey) {
-        let fake = FakeAttestation::with_seed(seed, handshake_hash.to_vec());
-        let key = PcrKey(
-            attestation::Pcrs {
-                pcr0: fake.pcr0.clone(),
-                pcr1: fake.pcr1.clone(),
-                pcr2: fake.pcr2.clone(),
-            }
-            .digest(),
-        );
-        (
-            Frame::Authenticate {
-                nsm_doc: fake.encode(),
-            },
-            key,
-        )
+    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
+        PcrsHex {
+            pcr0: hex::encode(vec![seed; 48]),
+            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
+            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
+        }
     }
 
-    /// Like [`auth_frame`] but embeds a specific Ed25519 verifying-key
-    /// in `user_data`. Use this for Transition tests where the
-    /// signature has to verify against the registered pubkey.
-    ///
-    /// The protocol layer (post-#47) extracts a 65-byte uncompressed
-    /// SEC1 ECDSA P-256 pubkey from `user_data`, and the listener then
-    /// slices bytes `[33..65]` (the Y coordinate position) before
-    /// handing them to `observe_attestation`. Mirror that here: pack
-    /// the 32-byte Ed25519 verifying key into the Y-coordinate slot of
-    /// a synthetic SEC1 blob, so the listener slicing recovers the
-    /// exact 32 bytes the test holds the signing key for. The blob
-    /// will not decode as a valid P-256 point, but synchronizer's
-    /// listener doesn't decode it — it just slices and stores.
-    fn auth_frame_with_pubkey(
+    /// The PcrKey a seed's PcrsHex hashes to. Matches both `FakeAttestation::
+    /// with_seed(seed)`'s PCRs and `verify_transition_link`'s derivation.
+    fn key_from_seed(seed: u8) -> PcrKey {
+        let raw = Pcrs {
+            pcr0: vec![seed; 48],
+            pcr1: vec![seed.wrapping_add(1); 48],
+            pcr2: vec![seed.wrapping_add(2); 48],
+        };
+        PcrKey(raw.digest())
+    }
+
+    /// Build a [`Frame::Authenticate`] from a [`FakeAttestation`] whose
+    /// nonce is the supplied handshake hash and whose `user_data` carries a
+    /// real 65-byte SEC1 P-256 pubkey, so a Transition link signed by the
+    /// matching key verifies. The session key is `sha256` over the seed's
+    /// PCR triple, equal to `key_from_seed(seed)`.
+    fn auth_frame(
         seed: u8,
         handshake_hash: &[u8],
-        control_pubkey: [u8; 32],
+        pubkey: [u8; CONTROL_PUBKEY_LEN],
     ) -> (Frame, PcrKey) {
-        let mut sec1 = [0u8; 65];
-        sec1[0] = 0x04;
-        sec1[33..65].copy_from_slice(&control_pubkey);
-        let fake = FakeAttestation::with_seed_and_pubkey(
-            seed,
-            handshake_hash.to_vec(),
-            sec1,
-        );
-        let key = PcrKey(
-            attestation::Pcrs {
-                pcr0: fake.pcr0.clone(),
-                pcr1: fake.pcr1.clone(),
-                pcr2: fake.pcr2.clone(),
-            }
-            .digest(),
-        );
+        let fake = FakeAttestation::with_seed_and_pubkey(seed, handshake_hash.to_vec(), pubkey);
+        let key = key_from_seed(seed);
         (
             Frame::Authenticate {
                 nsm_doc: fake.encode(),
@@ -326,15 +313,53 @@ mod tests {
         )
     }
 
-    /// Sign the canonical Transition payload (`b"transition:" ||
-    /// old_key || new_key`) the same way `enclavia-crypto` does on the
-    /// retiring enclave.
-    fn sign_transition(sk: &SigningKey, old: PcrKey, new: PcrKey) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(11 + 32 + 32);
-        payload.extend_from_slice(b"transition:");
-        payload.extend_from_slice(&old.0);
-        payload.extend_from_slice(&new.0);
-        sk.sign(&payload).to_bytes().to_vec()
+    /// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by the
+    /// OLD enclave's control key and attested for the OLD measurements
+    /// (`from_seed`): the old enclave emits the link, so it attests its
+    /// own PCRs.
+    fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from_pcrs: pcrs_hex_from_seed(from_seed),
+            to_pcrs: pcrs_hex_from_seed(to_seed),
+            image_digest: "sha256:to".into(),
+            valid_from: chrono::Utc::now(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x5a; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation,
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    /// Register an OLD enclave's key into a shared node: attest it with the
+    /// supplied control pubkey and Pin it so its `KeyState.control_pubkey`
+    /// is frozen. Models the old enclave's earlier (now-stopped) session.
+    async fn register_old(
+        node: &Node,
+        seed: u8,
+        control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+    ) -> PcrKey {
+        let key_old = key_from_seed(seed);
+        node.observe_attestation(key_old, control_pubkey).await;
+        node.handle_request(
+            key_old,
+            Request::Pin {
+                key: key_old,
+                commitment: c(0xaa),
+            },
+        )
+        .await;
+        key_old
     }
 
     async fn write_frame<S>(stream: &mut S, transport: &mut NoiseTransport, frame: &Frame)
@@ -363,31 +388,24 @@ mod tests {
         let mut ciphertext = vec![0u8; len];
         stream.read_exact(&mut ciphertext).await.unwrap();
         let mut plaintext = vec![0u8; MAX_FRAME_SIZE as usize];
-        let pt_len = transport
-            .read_message(&ciphertext, &mut plaintext)
-            .unwrap();
+        let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
         ciborium::from_reader(&plaintext[..pt_len]).unwrap()
     }
 
-    /// Spawn `handle_connection` against one half of a duplex pair and
-    /// drive the initiator handshake on the other half. Returns the
-    /// client stream + client-side `NoiseTransport` + handshake hash +
-    /// server `JoinHandle`. Tests use the handshake hash to build a
-    /// [`FakeAttestation`] whose nonce matches what the server will
-    /// expect.
+    /// Spawn `handle_connection` against one half of a duplex pair (debug
+    /// mode) and drive the initiator handshake on the other half.
     async fn connect() -> (
         tokio::io::DuplexStream,
         NoiseTransport,
         Vec<u8>,
         tokio::task::JoinHandle<Result<(), ConnError>>,
     ) {
-        connect_with_node(Arc::new(Node::new())).await
+        connect_with_node(Arc::new(Node::with_debug_mode(true))).await
     }
 
-    /// Like [`connect`] but uses a caller-supplied [`Node`], so a test
-    /// can seed it with extra `observe_attestation` calls (mimicking
-    /// another session attesting in parallel) before opening a
-    /// connection.
+    /// Like [`connect`] but uses a caller-supplied [`Node`], so a test can
+    /// seed it with extra `observe_attestation` calls (mimicking another
+    /// session attesting in parallel) before opening a connection.
     async fn connect_with_node(
         node: Arc<Node>,
     ) -> (
@@ -397,9 +415,8 @@ mod tests {
         tokio::task::JoinHandle<Result<(), ConnError>>,
     ) {
         let (mut client, server) = duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            handle_connection(node.as_ref(), server, true).await
-        });
+        let server_task =
+            tokio::spawn(async move { handle_connection(node.as_ref(), server, true).await });
         let (transport, hash) = perform_handshake_as_initiator(&mut client).await.unwrap();
         (client, transport, hash, server_task)
     }
@@ -408,7 +425,8 @@ mod tests {
     async fn happy_path_authenticate_pin_get() {
         let (mut client, mut ct, hash, server_task) = connect().await;
 
-        let (auth, key) = auth_frame(0x11, &hash);
+        let (_, pk) = keypair(0x11);
+        let (auth, key) = auth_frame(0x11, &hash, pk);
         write_frame(&mut client, &mut ct, &auth).await;
         write_frame(
             &mut client,
@@ -422,7 +440,12 @@ mod tests {
         )
         .await;
         let resp = read_response(&mut client, &mut ct).await;
-        assert_eq!(resp, Response::PinOk { version: Version(0) });
+        assert_eq!(
+            resp,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
 
         write_frame(
             &mut client,
@@ -448,9 +471,9 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_before_authenticate_is_rejected() {
-        let (mut client, mut ct, hash, server_task) = connect().await;
+        let (mut client, mut ct, _hash, server_task) = connect().await;
 
-        let (_, key) = auth_frame(0x22, &hash);
+        let key = key_from_seed(0x22);
         write_frame(
             &mut client,
             &mut ct,
@@ -468,8 +491,10 @@ mod tests {
     async fn re_authentication_is_rejected() {
         let (mut client, mut ct, hash, server_task) = connect().await;
 
-        let (auth1, _) = auth_frame(0x33, &hash);
-        let (auth2, _) = auth_frame(0x44, &hash);
+        let (_, pk1) = keypair(0x33);
+        let (_, pk2) = keypair(0x44);
+        let (auth1, _) = auth_frame(0x33, &hash, pk1);
+        let (auth2, _) = auth_frame(0x44, &hash, pk2);
         write_frame(&mut client, &mut ct, &auth1).await;
         write_frame(&mut client, &mut ct, &auth2).await;
         let resp = read_response(&mut client, &mut ct).await;
@@ -486,10 +511,6 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_frame_is_rejected() {
-        // Complete the handshake first, then lie about the length on
-        // the next encrypted frame. The listener should reject the
-        // length-prefix check before ever calling into the Noise
-        // transport.
         let (mut client, _ct, _hash, server_task) = connect().await;
 
         let bogus_len = (MAX_FRAME_SIZE + 1).to_be_bytes();
@@ -501,17 +522,15 @@ mod tests {
         assert!(matches!(result, Err(ConnError::FrameTooLarge(_))));
     }
 
-    /// Document bound to a *different* handshake hash than the one the
-    /// current session produced is rejected — guards against replaying
-    /// an attestation document captured from another session.
+    /// Document bound to a *different* handshake hash than the current
+    /// session is rejected, guards against replaying a captured doc.
     #[tokio::test]
     async fn nsm_doc_with_wrong_handshake_hash_is_rejected() {
         let (mut client, mut ct, _real_hash, server_task) = connect().await;
 
-        // Build the doc against a forged hash (what an attacker
-        // replaying a stale doc would have).
         let forged = vec![0xab; 32];
-        let (auth, _) = auth_frame(0x55, &forged);
+        let (_, pk) = keypair(0x55);
+        let (auth, _) = auth_frame(0x55, &forged, pk);
         write_frame(&mut client, &mut ct, &auth).await;
         drop(client);
 
@@ -522,9 +541,7 @@ mod tests {
         );
     }
 
-    /// A bag of random bytes that is not a valid NSM document is
-    /// rejected — checks the parse path fails closed, rather than
-    /// falling through to RPC dispatch under some zero-derived key.
+    /// Random bytes that are not a valid NSM document are rejected.
     #[tokio::test]
     async fn nsm_doc_with_garbage_bytes_is_rejected() {
         let (mut client, mut ct, _hash, server_task) = connect().await;
@@ -546,14 +563,14 @@ mod tests {
         );
     }
 
-    /// After authentication the session is bound to the PCR-derived
-    /// key, so RPC payloads must reference that same key. Belt-and-
-    /// braces over `Node::handle_request`'s session check.
+    /// After authentication the session is bound to the PCR-derived key,
+    /// so RPC payloads must reference that same key.
     #[tokio::test]
     async fn rpc_targeting_a_different_key_is_unauthorized() {
         let (mut client, mut ct, hash, server_task) = connect().await;
 
-        let (auth, _session_key) = auth_frame(0x66, &hash);
+        let (_, pk) = keypair(0x66);
+        let (auth, _session_key) = auth_frame(0x66, &hash, pk);
         write_frame(&mut client, &mut ct, &auth).await;
 
         let other_key = PcrKey([0u8; 32]);
@@ -577,103 +594,70 @@ mod tests {
         let _ = server_task.await.unwrap();
     }
 
-    /// End-to-end success: `old_key` attests through a Noise+NSM
-    /// session, registers, then issues a `Transition` signed with the
-    /// Ed25519 key embedded in its attestation doc's `user_data`.
-    /// `new_key` had to attest in a parallel "session" first — we
-    /// simulate that by seeding the shared [`Node`] up front.
+    /// End-to-end success: the OLD enclave (0x77) is already registered
+    /// (seeded into the shared [`Node`], modelling its now-stopped
+    /// session). The NEW enclave (0xee) attests through Noise+NSM in this
+    /// connection, then issues a `Transition` carrying the #47 upgrade
+    /// link the old enclave signed. The link is verified against the old
+    /// key's frozen pubkey; the submitting session is bound to new_key.
     #[tokio::test]
-    async fn transition_via_listener_with_valid_signature_succeeds() {
-        // new_key would normally attest via its own connection; we
-        // shortcut by calling Node::observe_attestation directly, which
-        // matches what the listener would have done for that session.
-        let node = Arc::new(Node::new());
-        let (_, new_pubkey) = keypair(0xee);
-        let new_key = PcrKey([0xee; 32]);
-        node.observe_attestation(new_key, new_pubkey).await;
+    async fn transition_via_listener_with_valid_link_succeeds() {
+        let node = Arc::new(Node::with_debug_mode(true));
+        let (sk_old, pk_old) = keypair(0x77);
+        register_old(&node, 0x77, pk_old).await;
 
         let (mut client, mut ct, hash, server_task) = connect_with_node(Arc::clone(&node)).await;
 
-        // old_key's attestation carries a real Ed25519 pubkey in
-        // user_data so the listener registers it.
-        let (sk_old, pk_old) = keypair(0x77);
-        let (auth, old_key) = auth_frame_with_pubkey(0x77, &hash, pk_old);
+        // The NEW enclave authenticates as new_key (0xee) and submits.
+        let (_, pk_new) = keypair(0xee);
+        let (auth, _new_key) = auth_frame(0xee, &hash, pk_new);
         write_frame(&mut client, &mut ct, &auth).await;
-        write_frame(
-            &mut client,
-            &mut ct,
-            &Frame::Rpc {
-                request: Request::Pin {
-                    key: old_key,
-                    commitment: c(0xaa),
-                },
-            },
-        )
-        .await;
-        let _ = read_response(&mut client, &mut ct).await;
 
-        // Sign the canonical payload with old_key's private key.
-        let sig = sign_transition(&sk_old, old_key, new_key);
+        let link = upgrade_link(0x77, 0xee, &sk_old);
         write_frame(
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Transition {
-                    old_key,
-                    new_key,
-                    signature: sig,
-                },
+                request: Request::Transition { link },
             },
         )
         .await;
         let resp = read_response(&mut client, &mut ct).await;
-        assert_eq!(resp, Response::TransitionOk { version: Version(0) });
+        assert_eq!(
+            resp,
+            Response::TransitionOk {
+                version: Version(0)
+            }
+        );
 
         drop(client);
         let _ = server_task.await.unwrap();
     }
 
-    /// An invalid Ed25519 signature (right length, but signed by the
-    /// wrong key) is rejected — the listener-Node path enforces what
-    /// pre-#111 it ignored.
+    /// An upgrade link signed by the wrong key (right length, attacker's
+    /// key) is rejected, the listener-Node path enforces the control
+    /// signature check against the OLD key's frozen pubkey.
     #[tokio::test]
     async fn transition_via_listener_with_invalid_signature_is_rejected() {
-        let node = Arc::new(Node::new());
-        let (_, new_pubkey) = keypair(0xee);
-        let new_key = PcrKey([0xee; 32]);
-        node.observe_attestation(new_key, new_pubkey).await;
+        let node = Arc::new(Node::with_debug_mode(true));
+        // old_key (0x77) registers pk_real, but the link is signed with a
+        // different key the attacker controls.
+        let (_sk_real, pk_real) = keypair(0x77);
+        let (sk_attacker, _) = keypair(0xab);
+        register_old(&node, 0x77, pk_real).await;
 
         let (mut client, mut ct, hash, server_task) = connect_with_node(Arc::clone(&node)).await;
 
-        // old_key registers with pk_real, but the test signs with a
-        // *different* key the attacker controls.
-        let (_sk_real, pk_real) = keypair(0x77);
-        let (sk_attacker, _) = keypair(0xab);
-        let (auth, old_key) = auth_frame_with_pubkey(0x77, &hash, pk_real);
+        let (_, pk_new) = keypair(0xee);
+        let (auth, _new_key) = auth_frame(0xee, &hash, pk_new);
         write_frame(&mut client, &mut ct, &auth).await;
-        write_frame(
-            &mut client,
-            &mut ct,
-            &Frame::Rpc {
-                request: Request::Pin {
-                    key: old_key,
-                    commitment: c(0xaa),
-                },
-            },
-        )
-        .await;
-        let _ = read_response(&mut client, &mut ct).await;
 
-        let sig = sign_transition(&sk_attacker, old_key, new_key);
+        let link = upgrade_link(0x77, 0xee, &sk_attacker);
         write_frame(
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Transition {
-                    old_key,
-                    new_key,
-                    signature: sig,
-                },
+                request: Request::Transition { link },
             },
         )
         .await;
@@ -689,44 +673,26 @@ mod tests {
         let _ = server_task.await.unwrap();
     }
 
-    /// A Transition whose target hasn't attested yet is rejected with
-    /// `TransitionRejected` — the listener used to paper over this by
-    /// pre-observing the new_key attestation unconditionally, which
-    /// was half of the #111 hole.
+    /// A Transition whose derived old_key was never registered is rejected,
+    /// even though the new enclave's session is valid.
     #[tokio::test]
-    async fn transition_via_listener_with_unattested_new_key_is_rejected() {
-        let node = Arc::new(Node::new());
-        // Deliberately do NOT pre-attest new_key.
-        let new_key = PcrKey([0xee; 32]);
+    async fn transition_via_listener_with_unregistered_old_key_is_rejected() {
+        let node = Arc::new(Node::with_debug_mode(true));
+        // Deliberately do NOT register old_key (0x77).
+        let (sk_old, _pk_old) = keypair(0x77);
 
         let (mut client, mut ct, hash, server_task) = connect_with_node(Arc::clone(&node)).await;
 
-        let (sk_old, pk_old) = keypair(0x77);
-        let (auth, old_key) = auth_frame_with_pubkey(0x77, &hash, pk_old);
+        let (_, pk_new) = keypair(0xee);
+        let (auth, _new_key) = auth_frame(0xee, &hash, pk_new);
         write_frame(&mut client, &mut ct, &auth).await;
-        write_frame(
-            &mut client,
-            &mut ct,
-            &Frame::Rpc {
-                request: Request::Pin {
-                    key: old_key,
-                    commitment: c(0xaa),
-                },
-            },
-        )
-        .await;
-        let _ = read_response(&mut client, &mut ct).await;
 
-        let sig = sign_transition(&sk_old, old_key, new_key);
+        let link = upgrade_link(0x77, 0xee, &sk_old);
         write_frame(
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Transition {
-                    old_key,
-                    new_key,
-                    signature: sig,
-                },
+                request: Request::Transition { link },
             },
         )
         .await;
