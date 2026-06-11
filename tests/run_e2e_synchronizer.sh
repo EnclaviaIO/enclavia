@@ -153,9 +153,13 @@ start_node() {
     echo "--- starting $name (CID $cid, inbound TCP ${TCP[$name]}) ---"
 
     # vhost-device-vsock (UDS mode): guest CID 2:PORT -> ${proxy}_PORT.
+    # Pid recorded for the restart leg: it must kill by PID, because
+    # pkill/pgrep (procps) are NOT on the CI runner's PATH and a
+    # pattern-kill silently no-ops there.
     vhost-device-vsock --vm "guest-cid=${cid},socket=${vhost},uds-path=${proxy}" \
         >"$d/vhost.log" 2>&1 &
     PIDS+=("$!")
+    echo "$!" > "$d/vhost.pid"
     wait_for_socket "$vhost" 50 || { echo "FATAL: vhost socket for $name" >&2; exit 1; }
 
     # Heartbeat responder (guest init -> CID 2:9000 -> ${proxy}_9000).
@@ -209,6 +213,7 @@ EOF
     fi
     nice qemu-system-x86_64 "${qemu_args[@]}" </dev/null >"$serial" 2>&1 &
     PIDS+=("$!")
+    echo "$!" > "$d/qemu.pid"
     echo "  $name QEMU pid $! -> serial $serial"
 }
 
@@ -294,24 +299,38 @@ if [ -n "${TEST_RESTART:-}" ]; then
     # mirrors a real node restart more faithfully: the per-port
     # listeners (${proxy}_9000 heartbeat, _5011 names, _5009 mesh-host)
     # are independent processes and serve the fresh daemons unchanged.
-    stop_proc() {
-        # pkill + wait-for-exit + SIGKILL fallback for a -f pattern.
-        local pat="$1"
-        pkill -f "$pat" 2>/dev/null || true
+    #
+    # Kill by PID, never by pkill/pgrep pattern: procps is not on the
+    # CI runner's PATH, where `pkill || true` swallows command-not-found
+    # and `pgrep || break` reads it as "process exited". That no-op left
+    # the ORIGINAL guest alive: it kept its outbound mesh dials, the
+    # leader's appends kept landing on the old (correctly self-evicted,
+    # core-stopped) instance, and the freshly admitted instance starved
+    # waiting for the membership that never reached it.
+    stop_pid() {
+        # SIGTERM + wait-for-exit + SIGKILL fallback, by PID. The pid is
+        # this shell's own child, so kill -0 tracks it reliably and the
+        # final `wait` reaps it.
+        local pid="$1"
+        [ -n "$pid" ] || return 0
+        kill "$pid" 2>/dev/null || true
         for _ in $(seq 1 100); do
-            pgrep -f "$pat" >/dev/null 2>&1 || return 0
+            kill -0 "$pid" 2>/dev/null || break
             sleep 0.2
         done
-        echo "  process '$pat' still alive after 20s; escalating to SIGKILL"
-        pkill -9 -f "$pat" 2>/dev/null || true
-        sleep 1
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  pid $pid still alive after 20s; escalating to SIGKILL"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
     }
-    stop_proc "qemu-system-x86_64.*sync-node-c"
-    stop_proc "vhost-device-vsock.*${DIR[node-c]}/vhost.sock"
+    stop_pid "$(cat "${DIR[node-c]}/qemu.pid" 2>/dev/null)"
+    stop_pid "$(cat "${DIR[node-c]}/vhost.pid" 2>/dev/null)"
     rm -f "${DIR[node-c]}/vhost.sock" "${DIR[node-c]}/proxy.sock"
     vhost-device-vsock --vm "guest-cid=${CID[node-c]},socket=${DIR[node-c]}/vhost.sock,uds-path=${DIR[node-c]}/proxy.sock" \
         >>"${DIR[node-c]}/vhost.log" 2>&1 &
     PIDS+=("$!")
+    echo "$!" > "${DIR[node-c]}/vhost.pid"
     wait_for_socket "${DIR[node-c]}/vhost.sock" 300 || {
         echo "BLOCKER: restarted vhost-device-vsock for node-c did not create its vhost socket; vhost log tail:" >&2
         tail -n 20 "${DIR[node-c]}/vhost.log" >&2 || true
@@ -327,6 +346,7 @@ if [ -n "${TEST_RESTART:-}" ]; then
     nice qemu-system-x86_64 "${qc[@]}" </dev/null >"${DIR[node-c]}/serial.log" 2>&1 &
     QEMU_C_PID="$!"
     PIDS+=("$QEMU_C_PID")
+    echo "$QEMU_C_PID" > "${DIR[node-c]}/qemu.pid"
     echo "  node-c relaunched (pid $QEMU_C_PID); waiting for re-join (up to 120s)..."
     sleep 2
     if ! kill -0 "$QEMU_C_PID" 2>/dev/null; then
