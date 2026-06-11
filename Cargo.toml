@@ -12,6 +12,7 @@ members = [
     "mock-kms",
     "nbd-client",
     "synchronizer",
+    "synchronizer-names-init",
 ]
 
 [workspace.package]

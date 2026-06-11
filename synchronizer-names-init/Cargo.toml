@@ -1,0 +1,20 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in CLAUDE.md before adding any
+# transport-related feature here.
+
+[package]
+name = "synchronizer-names-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave init helper: fetches this node's MESH_SELF_NAME + MESH_PEERS from the host over an unmeasured vsock side-channel, so all three nodes can run one identical EIF with identical PCRs."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio-vsock = { workspace = true }
+
+[[bin]]
+name = "synchronizer-names-init"
+path = "src/main.rs"

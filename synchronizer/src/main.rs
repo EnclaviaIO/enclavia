@@ -33,11 +33,15 @@ use synchronizer::Node;
 use synchronizer::listener::{SessionDispatch, handle_connection};
 use tracing::{error, info, warn};
 
+// `qemu` is an alias for `enclave` transport with skip-cert-chain
+// attestation (see Cargo.toml), so `qemu` + `enclave` together is fine
+// and expected; only `debug` + `enclave` is the contradictory pairing
+// (UDS listener vs vsock listener).
 #[cfg(all(feature = "debug", feature = "enclave"))]
-compile_error!("synchronizer: enable exactly one of the `debug` and `enclave` features");
+compile_error!("synchronizer: enable exactly one of the `debug` and `enclave`/`qemu` features");
 
 #[cfg(not(any(feature = "debug", feature = "enclave")))]
-compile_error!("synchronizer: enable one of the `debug` or `enclave` features");
+compile_error!("synchronizer: enable one of the `debug`, `enclave`, or `qemu` features");
 
 /// Default vsock port the in-enclave listener serves customer RPC on.
 /// Settled in the #16 design pass (the interim 5004 collided with
@@ -49,9 +53,12 @@ const DEFAULT_VSOCK_PORT: u32 = SYNCHRONIZER_CLIENT_PORT;
 /// to [`handle_connection`] so the listener picks the matching
 /// attestation-validation path (skip-cert-chain vs full chain), and to the
 /// Node / replicated dispatcher for the `Transition` chain-link check.
-#[cfg(feature = "debug")]
+// `debug` (UDS dev) and `qemu` (vsock under QEMU's self-signing NSM)
+// both skip the cert chain; only a real-Nitro `enclave` build (no
+// `qemu`) requires the full AWS CA chain.
+#[cfg(any(feature = "debug", feature = "qemu"))]
 const DEBUG_MODE: bool = true;
-#[cfg(feature = "enclave")]
+#[cfg(all(feature = "enclave", not(feature = "qemu")))]
 const DEBUG_MODE: bool = false;
 
 /// Host CID the in-enclave node dials to reach `mesh-host`. Always 2 (the
