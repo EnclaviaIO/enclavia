@@ -170,6 +170,18 @@ mod test_transport {
     #[derive(Clone, Default)]
     pub struct MeshHostStub {
         routes: Arc<Mutex<HashMap<String, PathBuf>>>,
+        /// Peer names the stub currently refuses to route to OR from. Used by
+        /// fault-injection tests (e.g. the Raft NodeViewConsistent harness) to
+        /// partition a node: a dial whose source or target is blocked is acked
+        /// FAILED, AND any already-established splice touching the peer is torn
+        /// down, exactly as if `mesh-host` (or the network) dropped the peer.
+        /// Empty in the steady state.
+        blocked: Arc<Mutex<std::collections::HashSet<String>>>,
+        /// Notified whenever the blocked set changes, so in-flight relay
+        /// splices can re-check and abort if their source/target just became
+        /// blocked (a real partition severs live connections, not just new
+        /// dials).
+        block_changed: Arc<tokio::sync::Notify>,
     }
 
     impl MeshHostStub {
@@ -189,9 +201,45 @@ mod test_transport {
             self.routes.lock().unwrap().get(peer).cloned()
         }
 
-        /// A dialer that resolves through this stub.
+        /// Partition `peer`: every dial to OR from it is refused (acked FAILED)
+        /// and every already-established splice touching it is torn down, until
+        /// [`unblock`](Self::unblock). Bidirectional, so it models a node whose
+        /// network is paused (it can neither receive nor send) the way a real
+        /// partition would, which is how the harness forces a leader change.
+        pub fn block(&self, peer: impl Into<String>) {
+            self.blocked.lock().unwrap().insert(peer.into());
+            self.block_changed.notify_waiters();
+        }
+
+        /// Heal a previously [`block`](Self::block)ed peer's partition.
+        pub fn unblock(&self, peer: &str) {
+            self.blocked.lock().unwrap().remove(peer);
+            self.block_changed.notify_waiters();
+        }
+
+        /// Whether `peer` is currently partitioned.
+        fn is_blocked(&self, peer: &str) -> bool {
+            self.blocked.lock().unwrap().contains(peer)
+        }
+
+        /// A dialer that resolves through this stub, with no source name (so
+        /// only the target's block state is consulted). Kept for the existing
+        /// mesh tests; the Raft harness uses [`dialer_for`](Self::dialer_for).
         pub fn dialer(&self) -> UdsMeshDialer {
-            UdsMeshDialer { host: self.clone() }
+            UdsMeshDialer {
+                host: self.clone(),
+                source: None,
+            }
+        }
+
+        /// A dialer tagged with its owning node's name `source`, so the relay
+        /// can drop a dial when EITHER end is partitioned (bidirectional
+        /// isolation). This is what the Raft fault-injection harness uses.
+        pub fn dialer_for(&self, source: impl Into<String>) -> UdsMeshDialer {
+            UdsMeshDialer {
+                host: self.clone(),
+                source: Some(source.into()),
+            }
         }
     }
 
@@ -201,6 +249,9 @@ mod test_transport {
     #[derive(Clone)]
     pub struct UdsMeshDialer {
         host: MeshHostStub,
+        /// The dialing node's own name, if known, so the relay can refuse a
+        /// dial when the SOURCE is partitioned (not just the target).
+        source: Option<String>,
     }
 
     #[async_trait]
@@ -214,8 +265,9 @@ mod test_transport {
             let (client, relay) = tokio::io::duplex(64 * 1024);
             let host = self.host.clone();
             let target = target_peer.to_string();
+            let source = self.source.clone();
             tokio::spawn(async move {
-                relay_one(host, relay).await;
+                relay_one(host, relay, source).await;
             });
 
             let mut client = client;
@@ -226,8 +278,10 @@ mod test_transport {
 
     /// One relay session: read the `Open` frame from the dialer side, resolve
     /// the target, dial its inbound UDS socket, ack accordingly, and splice.
-    async fn relay_one(host: MeshHostStub, relay: tokio::io::DuplexStream) {
-        relay_one_to(host, relay, None).await
+    /// `source` is the dialing node's name (if tagged), so the relay can refuse
+    /// a dial whose source is partitioned, not just one whose target is.
+    async fn relay_one(host: MeshHostStub, relay: tokio::io::DuplexStream, source: Option<String>) {
+        relay_one_to(host, relay, None, source).await
     }
 
     /// Like [`relay_one`] but, if `override_target` is `Some`, splices the
@@ -240,12 +294,21 @@ mod test_transport {
         host: MeshHostStub,
         mut relay: tokio::io::DuplexStream,
         override_target: Option<String>,
+        source: Option<String>,
     ) {
         let open = match read_open_frame(&mut relay).await {
             Ok(o) => o,
             Err(_) => return,
         };
         let resolve_name = override_target.as_deref().unwrap_or(&open.target_peer);
+        // Partition check: if either the dialing node (source) or the target
+        // is currently blocked, refuse the open exactly as if `mesh-host`
+        // could not reach the peer. This is how the fault-injection harness
+        // drops a link / isolates a node.
+        if source.as_deref().is_some_and(|s| host.is_blocked(s)) || host.is_blocked(resolve_name) {
+            let _ = write_open_ack(&mut relay, false).await;
+            return;
+        }
         let path = match host.resolve(resolve_name) {
             Some(p) => p,
             None => {
@@ -269,7 +332,29 @@ mod test_transport {
         if write_open_ack(&mut relay, true).await.is_err() {
             return;
         }
-        let _ = tokio::io::copy_bidirectional(&mut relay, &mut target).await;
+        // Splice, but abort the moment either end of this connection becomes
+        // partitioned: a real partition severs live connections, not just new
+        // dials. We race the byte pump against a watcher that wakes on every
+        // block-set change and re-checks. Dropping `relay`/`target` on abort
+        // closes both legs, so the peers see EOF and reconnect/re-elect.
+        let notify = Arc::clone(&host.block_changed);
+        let src = source.clone();
+        let tgt = resolve_name.to_string();
+        let host2 = host.clone();
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut relay, &mut target) => {}
+            _ = async move {
+                loop {
+                    let notified = notify.notified();
+                    if src.as_deref().is_some_and(|s| host2.is_blocked(s))
+                        || host2.is_blocked(&tgt)
+                    {
+                        return;
+                    }
+                    notified.await;
+                }
+            } => {}
+        }
     }
 
     /// Test inbound transport: a UDS listener. The stub's relay connects
@@ -358,7 +443,7 @@ mod test_transport {
             let host = self.host.clone();
             let target = target_peer.to_string();
             tokio::spawn(async move {
-                relay_one(host, relay).await;
+                relay_one(host, relay, None).await;
             });
             let mut client = client;
             open_and_await_ack(&mut client, &target).await?;
@@ -399,7 +484,7 @@ mod test_transport {
             let host = self.host.clone();
             let actual = self.actual_target.clone();
             tokio::spawn(async move {
-                relay_one_to(host, relay, Some(actual)).await;
+                relay_one_to(host, relay, Some(actual), None).await;
             });
             let mut client = client;
             open_and_await_ack(&mut client, target_peer).await?;

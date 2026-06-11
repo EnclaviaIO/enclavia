@@ -50,6 +50,9 @@ pub mod listener;
 #[cfg(feature = "mesh")]
 pub mod mesh;
 
+#[cfg(feature = "raft")]
+pub mod raft;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "serde")]
@@ -179,6 +182,7 @@ mod control_pubkey_serde {
 /// These are the negations of the `ValidOp` clauses in the TLA+ spec, named
 /// individually so callers can surface meaningful errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ValidationError {
     /// `Register` or `Transition` named a key without a recorded
     /// hardware attestation.
@@ -387,6 +391,89 @@ impl StateMachine {
     /// nodes).
     pub fn retired_keys(&self) -> impl Iterator<Item = &PcrKey> {
         self.retired.iter()
+    }
+
+    /// Capture the ENTIRE internal state as a serializable snapshot.
+    ///
+    /// Used by the Raft layer (slice 3) to compact the log: a hydrating node
+    /// installs the snapshot and resumes applying from it. The snapshot
+    /// carries not just the committed `(PcrKey -> KeyState)` projection but
+    /// also the `attested` and `transition_authorizations` observation sets,
+    /// because a post-snapshot `Transition` entry's `apply` checks them
+    /// (`NewKeyNotAttested`, `NoTransitionAuthorization`). Snapshotting the
+    /// observation sets too means a hydrated node behaves bit-for-bit
+    /// identically to one that replayed the whole log: this is the simplest
+    /// correct choice and is the one the design pass settled on.
+    #[cfg(feature = "serde")]
+    pub fn snapshot(&self) -> StateMachineSnapshot {
+        StateMachineSnapshot {
+            state: self.state.clone(),
+            attested: self
+                .attested
+                .iter()
+                .map(|(k, pk)| (*k, ControlPubkeyBytes(*pk)))
+                .collect(),
+            transition_authorizations: self.transition_authorizations.clone(),
+            retired: self.retired.clone(),
+        }
+    }
+
+    /// Replace the entire internal state with `snapshot`'s, discarding any
+    /// current contents. The inverse of [`StateMachine::snapshot`]. Used when
+    /// a Raft follower installs a leader-provided snapshot.
+    #[cfg(feature = "serde")]
+    pub fn restore_from_snapshot(&mut self, snapshot: StateMachineSnapshot) {
+        self.state = snapshot.state;
+        self.attested = snapshot
+            .attested
+            .into_iter()
+            .map(|(k, pk)| (k, pk.0))
+            .collect();
+        self.transition_authorizations = snapshot.transition_authorizations;
+        self.retired = snapshot.retired;
+    }
+}
+
+/// A fully-serializable capture of a [`StateMachine`]'s internal state,
+/// produced by [`StateMachine::snapshot`] and consumed by
+/// [`StateMachine::restore_from_snapshot`].
+///
+/// Includes the observation sets (`attested`, `transition_authorizations`),
+/// not just the committed projection, so a node hydrated from this snapshot
+/// applies subsequent `Transition` entries identically to one that replayed
+/// the entire log. See [`StateMachine::snapshot`] for the rationale.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StateMachineSnapshot {
+    state: BTreeMap<PcrKey, KeyState>,
+    attested: BTreeMap<PcrKey, ControlPubkeyBytes>,
+    transition_authorizations: BTreeSet<(PcrKey, PcrKey)>,
+    retired: BTreeSet<PcrKey>,
+}
+
+/// Newtype wrapping the 65-byte SEC1 control pubkey so it can live inside a
+/// `BTreeMap` value in [`StateMachineSnapshot`] with the same length-checked
+/// byte (de)serialization [`KeyState`] uses (serde's derive only covers fixed
+/// arrays up to length 32).
+#[cfg(feature = "serde")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControlPubkeyBytes([u8; CONTROL_PUBKEY_LEN]);
+
+#[cfg(feature = "serde")]
+impl Serialize for ControlPubkeyBytes {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::Bytes::new(&self.0).serialize(ser)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for ControlPubkeyBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let buf = serde_bytes::ByteBuf::deserialize(de)?;
+        let arr: [u8; CONTROL_PUBKEY_LEN] = buf.as_slice().try_into().map_err(|_| {
+            serde::de::Error::invalid_length(buf.len(), &"65-byte SEC1 P-256 control pubkey")
+        })?;
+        Ok(ControlPubkeyBytes(arr))
     }
 }
 
@@ -903,5 +990,84 @@ mod tests {
         assert!(state_a.contains_key(&k(3)));
         assert!(retired_a.contains(&k(2)));
         assert_eq!(state_a[&k(3)].commitment, c(0xcc));
+    }
+
+    /// A snapshot of a non-trivial state machine restores into a bit-for-bit
+    /// identical one, INCLUDING the observation sets: a key registered then
+    /// retired, a live key with a pinned version, and pending (observed but
+    /// not yet applied) attestations / transition authorizations all survive
+    /// the round-trip. This is what lets a Raft-hydrated node apply later
+    /// Transition entries identically to one that replayed the whole log.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_round_trips_full_state_including_observations() {
+        let mut sm = StateMachine::new();
+        sm.observe_attestation(k(1), pk(1));
+        sm.observe_attestation(k(2), pk(2));
+        sm.observe_attestation(k(3), pk(3));
+        // A pending attestation + transition authorization that has NOT been
+        // applied yet, so it only lives in the observation sets.
+        sm.observe_attestation(k(4), pk(4));
+        sm.observe_transition(k(1), k(4));
+        sm.apply(Op::Register {
+            key: k(1),
+            commitment: c(0xaa),
+        })
+        .unwrap();
+        sm.apply(Op::Pin {
+            key: k(1),
+            commitment: c(0xbb),
+        })
+        .unwrap();
+        sm.apply(Op::Register {
+            key: k(2),
+            commitment: c(0xcc),
+        })
+        .unwrap();
+        sm.observe_transition(k(2), k(3));
+        sm.apply(Op::Transition {
+            old_key: k(2),
+            new_key: k(3),
+        })
+        .unwrap();
+
+        // Round-trip through a snapshot.
+        let snap = sm.snapshot();
+        let mut buf = Vec::new();
+        ciborium::into_writer(&snap, &mut buf).unwrap();
+        let decoded: StateMachineSnapshot = ciborium::from_reader(&buf[..]).unwrap();
+        let mut restored = StateMachine::new();
+        restored.restore_from_snapshot(decoded);
+
+        // Same committed projection.
+        let orig: BTreeMap<_, _> = sm.head_keys().map(|k| (*k, *sm.get(k).unwrap())).collect();
+        let back: BTreeMap<_, _> = restored
+            .head_keys()
+            .map(|k| (*k, *restored.get(k).unwrap()))
+            .collect();
+        assert_eq!(orig, back, "head projection diverged after restore");
+        assert_eq!(
+            sm.retired_keys().copied().collect::<BTreeSet<_>>(),
+            restored.retired_keys().copied().collect::<BTreeSet<_>>(),
+            "retired set diverged after restore"
+        );
+
+        // The pending (observed-but-unapplied) transition authorization + the
+        // pre-attested key(4) survived, so the restored machine can apply the
+        // pending Transition exactly like the original would have.
+        let mut a = sm;
+        let mut b = restored;
+        assert_eq!(
+            a.apply(Op::Transition {
+                old_key: k(1),
+                new_key: k(4),
+            }),
+            b.apply(Op::Transition {
+                old_key: k(1),
+                new_key: k(4),
+            }),
+            "post-restore Transition diverged from the original"
+        );
+        assert_eq!(b.get(&k(4)).unwrap().control_pubkey, pk(4));
     }
 }
