@@ -40,6 +40,106 @@ const DEBUG_MODE: bool = true;
 #[cfg(feature = "enclave")]
 const DEBUG_MODE: bool = false;
 
+/// Host CID the in-enclave node dials to reach `mesh-host`. Always 2 (the
+/// parent under real Nitro; the vhost-device-vsock bridge under QEMU debug),
+/// so the mesh transport is vsock in both binary variants, regardless of the
+/// `debug`/`enclave` split (which only governs the customer-facing listener).
+const VSOCK_HOST_CID: u32 = 2;
+
+/// Start the mutually-attested peer mesh (#118) from the environment, if
+/// configured. Returns the running [`synchronizer::mesh::Mesh`] so `main`
+/// keeps it (and its dial / accept tasks) alive for the process lifetime;
+/// returns `None` when no peer set is configured (single-node deployments).
+///
+/// Env (all required together to enable the mesh):
+/// * `MESH_SELF_NAME`  - this node's logical name (matches what `mesh-host`
+///   resolves).
+/// * `MESH_PEERS`      - comma-separated logical names of the other nodes.
+/// * `MESH_SELF_PCR0`, `MESH_SELF_PCR1`, `MESH_SELF_PCR2` - hex-encoded PCR
+///   measurements of THIS node's own EIF (the build output). The self-PCR
+///   allowlist admits a peer only if its attested PCR digest equals
+///   `sha256(PCR0||PCR1||PCR2)` of these. Configured at launch because a
+///   debug enclave cannot trust its own fake attestation as a reference.
+///
+/// The node generates a fresh per-boot P-256 mesh identity, reaches
+/// `mesh-host` over vsock ([`enclavia_protocol::mesh::MESH_VSOCK_PORT`]) and
+/// listens for relayed-in peer connections on
+/// [`enclavia_protocol::mesh::SYNCHRONIZER_BOOTSTRAP_PORT`]. Inbound requests
+/// are served by an echo handler until slice 3 (openraft) supplies the real
+/// one.
+fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
+    use enclavia_protocol::attestation::Pcrs;
+    use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
+    use synchronizer::PcrKey;
+    use synchronizer::mesh::Mesh;
+    use synchronizer::mesh::attestation::NsmAttestor;
+    use synchronizer::mesh::config::MeshConfig;
+    use synchronizer::mesh::identity::MeshIdentity;
+    use synchronizer::mesh::rpc::EchoHandler;
+    use synchronizer::mesh::transport::{VsockMeshAcceptor, VsockMeshDialer};
+
+    let self_name = std::env::var("MESH_SELF_NAME").ok()?;
+    let peers_raw = std::env::var("MESH_PEERS").ok()?;
+    let peers: Vec<String> = peers_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if peers.is_empty() {
+        warn!("MESH_PEERS was empty, not starting the peer mesh");
+        return None;
+    }
+
+    let decode_pcr = |name: &str| -> Option<Vec<u8>> {
+        let hexed = std::env::var(name).ok()?;
+        match hex::decode(hexed.trim()) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                error!(var = name, error = %e, "MESH_SELF_PCR* is not valid hex");
+                None
+            }
+        }
+    };
+    let self_pcrs = Pcrs {
+        pcr0: decode_pcr("MESH_SELF_PCR0")?,
+        pcr1: decode_pcr("MESH_SELF_PCR1")?,
+        pcr2: decode_pcr("MESH_SELF_PCR2")?,
+    };
+    let self_digest = PcrKey(self_pcrs.digest());
+
+    let config = MeshConfig::new(self_name.clone(), peers.clone(), self_digest);
+    let identity = MeshIdentity::generate();
+    let attestor = NsmAttestor::new(&identity);
+    let dialer = VsockMeshDialer {
+        cid: VSOCK_HOST_CID,
+        port: MESH_VSOCK_PORT,
+    };
+    let acceptor = match VsockMeshAcceptor::bind(SYNCHRONIZER_BOOTSTRAP_PORT) {
+        Ok(a) => a,
+        Err(e) => {
+            error!(port = SYNCHRONIZER_BOOTSTRAP_PORT, error = %e, "failed to bind mesh bootstrap vsock listener");
+            return None;
+        }
+    };
+
+    info!(
+        self_name = %self_name,
+        peers = ?config.peers,
+        bootstrap_port = SYNCHRONIZER_BOOTSTRAP_PORT,
+        mesh_port = MESH_VSOCK_PORT,
+        "starting mutually-attested peer mesh"
+    );
+    Some(Mesh::start(
+        config,
+        dialer,
+        acceptor,
+        attestor,
+        identity,
+        EchoHandler,
+        DEBUG_MODE,
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -53,6 +153,13 @@ async fn main() {
     // `handle_connection`: it selects the skip-cert-chain vs full-Nitro-CA
     // path used when verifying a `Transition`'s chain-link attestation.
     let node = Arc::new(Node::with_debug_mode(DEBUG_MODE));
+
+    // Start the mutually-attested peer mesh (#118) if configured. Held in
+    // `_mesh` for the process lifetime: dropping it would abort the dial /
+    // accept tasks. Slice 2 only stands the mesh up (boot-time attestation,
+    // reconnect, the call/serve RPC surface); the Raft layer that drives it
+    // lands in slice 3, so nothing reads `_mesh` here yet.
+    let _mesh = start_mesh_from_env();
 
     #[cfg(feature = "debug")]
     {

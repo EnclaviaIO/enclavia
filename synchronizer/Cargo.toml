@@ -36,6 +36,22 @@ p256 = { workspace = true, optional = true }
 # to_pcrs to the (old_key, new_key) the Transition op names. Pulled in
 # by the `wire` feature.
 sha2 = { workspace = true, optional = true }
+# Mesh layer (#118) only. `async-trait` lets the AttestationProvider /
+# mesh-transport traits stay object-safe (dyn-dispatched) across the
+# vsock vs UDS/in-memory implementations; `rand` generates the per-boot
+# P-256 mesh keypair and the backoff jitter; `aws-nitro-enclaves-nsm-api`
+# drives `/dev/nsm` to produce the node's own attestation document; `hex`
+# decodes the launch-time MESH_SELF_PCR* env values into the self-PCR
+# allowlist digest. All four are pulled in only by the `mesh` feature
+# (implied by `node`).
+async-trait = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+# `nix` feature exposes the `/dev/nsm` driver module (nsm_init /
+# nsm_process_request / nsm_exit); the workspace pin strips it by default
+# (only the `api` data types are unconditionally needed elsewhere). The
+# production NsmAttestor drives the device, so it needs the driver.
+aws-nitro-enclaves-nsm-api = { workspace = true, optional = true, features = ["nix"] }
 
 [features]
 default = []
@@ -52,12 +68,45 @@ wire = [
     "dep:sha2",
 ]
 # Async single-node RPC surface. Adds tokio + the Noise responder
-# helpers (async-transport) on top of `wire`. Implies `wire`.
-node = ["wire", "dep:tokio", "tokio/io-util", "enclavia-protocol/async-transport", "dep:snow"]
+# helpers (async-transport) on top of `wire`. Implies `wire` and the
+# mesh layer (the peer mesh shares the Noise + attestation plumbing).
+node = ["wire", "mesh", "dep:tokio", "tokio/io-util", "enclavia-protocol/async-transport", "dep:snow"]
+# Mutually-attested peer mesh (#118). Boot-time peer attestation,
+# self-PCR allowlist, long-lived per-peer transport with reconnect +
+# backoff. Pulls in the async-trait-backed AttestationProvider /
+# mesh-transport abstractions, the `/dev/nsm` driver for the node's own
+# attestation, and `rand` for the per-boot mesh keypair + backoff jitter.
+# Always uses `tokio-vsock` in the production transport (this is an
+# in-enclave crate); a UDS/in-memory transport for dev-machine multi-node
+# tests lives behind `test-utils`, never in the production binary.
+mesh = [
+    "wire",
+    "dep:tokio",
+    "tokio/io-util",
+    "tokio/sync",
+    "tokio/time",
+    "tokio/rt",
+    "tokio/macros",
+    "enclavia-protocol/async-transport",
+    "dep:snow",
+    "dep:tracing",
+    "dep:async-trait",
+    "dep:rand",
+    "dep:p256",
+    "dep:hex",
+    "dep:aws-nitro-enclaves-nsm-api",
+    "dep:tokio-vsock",
+]
 # Build the listener binary. Pick one of `debug` (UDS) or `enclave`
 # (vsock) — same pattern as the other in-enclave crates.
 debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber"]
 enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "dep:tokio-vsock"]
+# Dev-machine multi-node mesh test support: UDS/in-memory transport +
+# FakeAttestor. Tests only, never compiled into the production binary.
+# Adds `tokio/net` for the UDS listener/stream and turns on
+# enclavia-protocol's `test-utils` so `FakeAttestation` fixtures are
+# reachable from the mesh `FakeAttestor`.
+test-utils = ["mesh", "tokio/net", "enclavia-protocol/test-utils"]
 
 [dev-dependencies]
 ciborium = { workspace = true }
@@ -74,6 +123,12 @@ uuid = { workspace = true }
 # Tests build `PcrsHex` fixtures from raw byte seeds and hex-encode them
 # to match `verify_transition_link`'s key derivation.
 hex = { workspace = true }
+# The 3-node mesh integration test (tests/mesh.rs, gated on `test-utils`)
+# gives each node its own temp dir for its inbound UDS socket.
+tempfile = "3"
+# The integration test's `TaggingHandler` implements the object-safe
+# `RequestHandler` trait, which is `#[async_trait]`.
+async-trait = { workspace = true }
 
 [[bin]]
 name = "enclavia-synchronizer"

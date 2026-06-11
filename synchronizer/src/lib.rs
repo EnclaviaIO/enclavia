@@ -47,6 +47,9 @@ pub use node::Node;
 #[cfg(feature = "node")]
 pub mod listener;
 
+#[cfg(feature = "mesh")]
+pub mod mesh;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "serde")]
