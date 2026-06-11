@@ -284,29 +284,36 @@ fi
 if [ -n "${TEST_RESTART:-}" ]; then
     echo ""
     echo "=== restart node-c and show re-join + Get ==="
-    # Kill node-c's QEMU only (leave its vhost/mesh-host/names alive),
-    # then WAIT for it to actually exit before relaunching: the new QEMU
-    # attaches to the same vhost-device-vsock socket, and on a loaded
-    # host the old process can outlive a fixed sleep, leaving the new
-    # one unable to attach (it dies instantly with an empty serial log).
-    pkill -f "qemu-system-x86_64.*sync-node-c" 2>/dev/null || true
-    for _ in $(seq 1 100); do
-        pgrep -f "qemu-system-x86_64.*sync-node-c" >/dev/null 2>&1 || break
-        sleep 0.2
-    done
-    if pgrep -f "qemu-system-x86_64.*sync-node-c" >/dev/null 2>&1; then
-        echo "  old node-c QEMU still alive after 20s; escalating to SIGKILL"
-        pkill -9 -f "qemu-system-x86_64.*sync-node-c" 2>/dev/null || true
+    # Bounce node-c's QEMU AND its vhost-device-vsock as a pair (leave
+    # mesh-host / heartbeat / names alive). vhost-device-vsock serves
+    # one frontend at a time and unlinks its listener socket while a
+    # QEMU is attached; whether it re-creates the listener after the
+    # frontend dies turned out to be unreliable (re-appears in seconds
+    # on an idle box, never within 30s on a loaded CI runner), so do
+    # not depend on its reconnect path at all. Restarting the pair also
+    # mirrors a real node restart more faithfully: the per-port
+    # listeners (${proxy}_9000 heartbeat, _5011 names, _5009 mesh-host)
+    # are independent processes and serve the fresh daemons unchanged.
+    stop_proc() {
+        # pkill + wait-for-exit + SIGKILL fallback for a -f pattern.
+        local pat="$1"
+        pkill -f "$pat" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            pgrep -f "$pat" >/dev/null 2>&1 || return 0
+            sleep 0.2
+        done
+        echo "  process '$pat' still alive after 20s; escalating to SIGKILL"
+        pkill -9 -f "$pat" 2>/dev/null || true
         sleep 1
-    fi
-    # vhost-device-vsock serves ONE frontend at a time: it unlinks its
-    # listener socket while a QEMU is attached and re-creates it a few
-    # seconds after the frontend disconnects (verified against 0.3.0).
-    # Relaunching before the socket reappears makes the new QEMU die
-    # instantly with "Failed to connect ... No such file or directory",
-    # so wait for it deterministically instead of sleeping.
+    }
+    stop_proc "qemu-system-x86_64.*sync-node-c"
+    stop_proc "vhost-device-vsock.*${DIR[node-c]}/vhost.sock"
+    rm -f "${DIR[node-c]}/vhost.sock" "${DIR[node-c]}/proxy.sock"
+    vhost-device-vsock --vm "guest-cid=${CID[node-c]},socket=${DIR[node-c]}/vhost.sock,uds-path=${DIR[node-c]}/proxy.sock" \
+        >>"${DIR[node-c]}/vhost.log" 2>&1 &
+    PIDS+=("$!")
     wait_for_socket "${DIR[node-c]}/vhost.sock" 300 || {
-        echo "BLOCKER: vhost-device-vsock did not re-create ${DIR[node-c]}/vhost.sock within 30s of node-c QEMU exiting" >&2
+        echo "BLOCKER: restarted vhost-device-vsock for node-c did not create its vhost socket; vhost log tail:" >&2
         tail -n 20 "${DIR[node-c]}/vhost.log" >&2 || true
         exit 4
     }
