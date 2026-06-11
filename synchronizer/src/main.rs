@@ -15,20 +15,33 @@
 //!
 //! ## Single-node vs replicated (#120 / #121, slice 4)
 //!
-//! Without the `raft` feature (or when the mesh env is not configured) the node
-//! is a single-node [`Node`](synchronizer::Node): it verifies + applies every
-//! request against one local state machine. With the `raft` feature AND a
-//! configured peer mesh, the node joins the 3-node replicated cluster: a
+//! Without the `raft` feature the node is a single-node
+//! [`Node`](synchronizer::Node): it verifies + applies every request against
+//! one local state machine. With the `raft` feature the node joins the
+//! replicated cluster: a
 //! [`ReplicatedDispatch`](synchronizer::raft::ReplicatedDispatch) routes each
 //! request to the cluster leader (forwarding over the mesh when this node is a
 //! follower) and serves reads linearizably. The exactly-one-node bootstrap and
 //! the hydrate-on-restart precondition are documented on
 //! [`start_replicated_from_env`].
+//!
+//! A `raft` build REQUIRES a valid mesh environment (`MESH_SELF_NAME` plus at
+//! least [`MIN_MESH_PEERS`] peers) and refuses to start without one. The mesh
+//! env reaches the node over host-controlled, unmeasured channels (env vars in
+//! dev, the names vsock side-channel in the dedicated EIF), and a node that
+//! silently fell back to single-node serving would have the SAME PCRs as a
+//! cluster member while acking Pins that vanish on restart: the exact rollback
+//! hazard the cluster exists to prevent, invisible to customer attestation. A
+//! host that withholds the mesh env must get a dead node, never an
+//! unreplicated oracle.
 
 use std::sync::Arc;
 
 #[cfg(feature = "enclave")]
 use enclavia_protocol::mesh::SYNCHRONIZER_CLIENT_PORT;
+// A raft build never constructs the single-node `Node` (a missing mesh env is
+// fatal, not a fallback), so the import only exists for non-raft builds.
+#[cfg(not(feature = "raft"))]
 use synchronizer::Node;
 use synchronizer::listener::{SessionDispatch, handle_connection};
 use tracing::{error, info, warn};
@@ -68,6 +81,14 @@ const DEBUG_MODE: bool = false;
 #[cfg(any(feature = "mesh", feature = "raft"))]
 const VSOCK_HOST_CID: u32 = 2;
 
+/// Minimum number of OTHER nodes a mesh-enabled build accepts in
+/// `MESH_PEERS`: two peers, i.e. the 3-node cluster the freshness oracle is
+/// designed around (quorum survives one loss). Fewer peers would let a
+/// host-served identity quietly shrink the cluster below its durability
+/// floor, so the env reader rejects it.
+#[cfg(any(feature = "mesh", feature = "raft"))]
+const MIN_MESH_PEERS: usize = 2;
+
 /// The pieces read from the mesh environment, shared by the single-node
 /// (echo-handler) and replicated (raft-handler) wiring paths.
 ///
@@ -93,8 +114,12 @@ struct MeshEnv {
 }
 
 /// Read the mesh environment, build the config + identity + transports. Returns
-/// `None` when no peer set is configured (single-node deployments), a required
-/// value is missing, or the startup self-attestation fails.
+/// `None` when the env is absent or invalid (missing vars, fewer than
+/// [`MIN_MESH_PEERS`] peers, failed startup self-attestation). What `None`
+/// means differs by build: a `mesh`-only (dev/echo) build just runs without
+/// the mesh; a `raft` build treats it as FATAL and exits (see the module docs;
+/// the env is host-controlled, so degrading to unreplicated serving would be a
+/// host-driven rollback hazard).
 ///
 /// ## Self-PCR digest: derived from `/dev/nsm`, never from the host
 ///
@@ -110,8 +135,8 @@ struct MeshEnv {
 /// this exact VM identically on real Nitro and under QEMU's nitro-enclave
 /// machine, so no cert-chain trust is needed (the node is reading its own
 /// hardware, not authenticating a remote party). If the NSM request or parse
-/// fails there is NO env fallback (that would reopen the hole): the mesh stays
-/// disabled and the node runs single-node, with a loud error log.
+/// fails there is NO env fallback (that would reopen the hole): the mesh
+/// config is refused with a loud error log (fatal in a `raft` build).
 #[cfg(any(feature = "mesh", feature = "raft"))]
 fn read_mesh_env() -> Option<MeshEnv> {
     use enclavia_protocol::attestation::extract_own_pcrs;
@@ -122,15 +147,25 @@ fn read_mesh_env() -> Option<MeshEnv> {
     use synchronizer::mesh::identity::MeshIdentity;
     use synchronizer::mesh::transport::{VsockMeshAcceptor, VsockMeshDialer};
 
-    let self_name = std::env::var("MESH_SELF_NAME").ok()?;
-    let peers_raw = std::env::var("MESH_PEERS").ok()?;
+    let (self_name, peers_raw) =
+        match (std::env::var("MESH_SELF_NAME"), std::env::var("MESH_PEERS")) {
+            (Ok(s), Ok(p)) => (s, p),
+            _ => {
+                warn!("MESH_SELF_NAME / MESH_PEERS not set; mesh not configured");
+                return None;
+            }
+        };
     let peers: Vec<String> = peers_raw
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if peers.is_empty() {
-        warn!("MESH_PEERS was empty, not starting the peer mesh");
+    if peers.len() < MIN_MESH_PEERS {
+        error!(
+            got = peers.len(),
+            required = MIN_MESH_PEERS,
+            "MESH_PEERS has fewer peers than the cluster minimum; refusing the mesh config"
+        );
         return None;
     }
 
@@ -141,14 +176,14 @@ fn read_mesh_env() -> Option<MeshEnv> {
     let self_doc = match request_own_attestation(None, None) {
         Ok(doc) => doc,
         Err(e) => {
-            error!(error = %e, "self-attestation from /dev/nsm failed; mesh disabled (single-node mode)");
+            error!(error = %e, "self-attestation from /dev/nsm failed; refusing the mesh config");
             return None;
         }
     };
     let self_pcrs = match extract_own_pcrs(&self_doc) {
         Ok(p) => p,
         Err(e) => {
-            error!(error = %e, "failed to parse own /dev/nsm attestation document; mesh disabled (single-node mode)");
+            error!(error = %e, "failed to parse own /dev/nsm attestation document; refusing the mesh config");
             return None;
         }
     };
@@ -217,7 +252,9 @@ fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
 ///
 /// Returns the running mesh (held for the process lifetime), the handle, and a
 /// [`ReplicatedDispatch`](synchronizer::raft::ReplicatedDispatch) the listener
-/// uses for every customer connection. `None` when no peer set is configured.
+/// uses for every customer connection. `None` when the mesh env is missing or
+/// invalid, which `main` treats as FATAL: the env is host-controlled, so a
+/// raft build never degrades to unreplicated serving (see the module docs).
 ///
 /// ## Discovery, join, and exactly-once initialize (#209)
 ///
@@ -345,24 +382,26 @@ async fn main() {
         .with_ansi(false)
         .init();
 
-    // Build the request dispatcher. With the `raft` feature AND a configured
-    // mesh, this is the replicated cluster; otherwise the single-node Node. The
-    // mesh / raft handle are held for the process lifetime (dropping them aborts
-    // the dial / accept / openraft tasks).
+    // Build the request dispatcher. A raft build serves ONLY through the
+    // replicated cluster; a missing/invalid mesh env is fatal, never a
+    // single-node fallback (the env arrives over host-controlled channels, and
+    // an unreplicated node has the same PCRs as a cluster member while its
+    // Pins vanish on restart: a host-driven rollback hazard, see module docs).
+    // The mesh / raft handle are held for the process lifetime (dropping them
+    // aborts the dial / accept / openraft tasks).
     #[cfg(feature = "raft")]
     let (dispatch, _mesh, _raft): (Arc<dyn SessionDispatch>, _, _) =
         match start_replicated_from_env().await {
             Some((mesh, raft, replicated)) => {
                 info!("serving customer RPC through the replicated cluster");
-                (Arc::new(replicated), Some(mesh), Some(raft))
+                (Arc::new(replicated), mesh, raft)
             }
             None => {
-                info!("no mesh configured, serving customer RPC as a single node");
-                (
-                    Arc::new(Node::with_debug_mode(DEBUG_MODE)),
-                    None::<Arc<synchronizer::mesh::Mesh>>,
-                    None::<synchronizer::raft::RaftHandle>,
-                )
+                error!(
+                    "raft build requires a valid mesh environment (MESH_SELF_NAME + at least \
+                     {MIN_MESH_PEERS} MESH_PEERS); refusing to serve unreplicated"
+                );
+                std::process::exit(1);
             }
         };
 

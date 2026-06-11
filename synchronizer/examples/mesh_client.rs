@@ -51,7 +51,9 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = std::env::args().skip(1);
-    let proxy = a.next().expect("usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] [--port P] [--seed S]");
+    let proxy = a
+        .next()
+        .expect("usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] [--port P] [--seed S]");
     let cmd = a.next().expect("missing command (pin|get)");
     let mut commitment_byte = 0xc0u8;
     let mut port = 5010u32;
@@ -66,17 +68,25 @@ fn parse_args() -> Args {
     while i < rest.len() {
         match rest[i].as_str() {
             "--port" => {
-                port = rest[i + 1].parse().expect("bad --port");
+                let v = rest.get(i + 1).expect("--port requires a value");
+                port = v.parse().expect("bad --port");
                 i += 2;
             }
             "--seed" => {
-                seed = parse_hex_byte(&rest[i + 1]);
+                let v = rest.get(i + 1).expect("--seed requires a value");
+                seed = parse_hex_byte(v);
                 i += 2;
             }
             other => panic!("unexpected arg {other}"),
         }
     }
-    Args { proxy, cmd, commitment_byte, port, seed }
+    Args {
+        proxy,
+        cmd,
+        commitment_byte,
+        port,
+        seed,
+    }
 }
 
 fn parse_hex_byte(s: &str) -> u8 {
@@ -110,8 +120,14 @@ async fn proxy_connect(proxy: &str, port: u32) -> UnixStream {
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
     reader.read_line(&mut line).await.expect("read OK line");
-    assert!(line.trim_start().starts_with("OK"), "vhost rejected connect: {line:?}");
-    eprintln!("[client] proxy connected to vsock port {port}: {}", line.trim());
+    assert!(
+        line.trim_start().starts_with("OK"),
+        "vhost rejected connect: {line:?}"
+    );
+    eprintln!(
+        "[client] proxy connected to vsock port {port}: {}",
+        line.trim()
+    );
     stream
 }
 
@@ -123,7 +139,10 @@ where
     ciborium::into_writer(frame, &mut plaintext).expect("cbor encode frame");
     let mut ct = vec![0u8; MAX_FRAME_SIZE];
     let n = t.write_message(&plaintext, &mut ct).expect("noise encrypt");
-    stream.write_all(&(n as u32).to_be_bytes()).await.expect("write len");
+    stream
+        .write_all(&(n as u32).to_be_bytes())
+        .await
+        .expect("write len");
     stream.write_all(&ct[..n]).await.expect("write ct");
     stream.flush().await.expect("flush");
 }
@@ -174,10 +193,15 @@ async fn main() {
     write_frame(
         &mut stream,
         &mut transport,
-        &Frame::Authenticate { nsm_doc: fake.encode() },
+        &Frame::Authenticate {
+            nsm_doc: fake.encode(),
+        },
     )
     .await;
-    eprintln!("[client] authenticated; session key = {}", hex(&session_key.0));
+    eprintln!(
+        "[client] authenticated; session key = {}",
+        hex(&session_key.0)
+    );
 
     let request = match args.cmd.as_str() {
         "pin" => Request::Pin {
@@ -201,7 +225,10 @@ async fn main() {
         Response::PinOk { version } => {
             println!("RESULT pin ok version={}", version.0);
         }
-        Response::GetOk { commitment, version } => {
+        Response::GetOk {
+            commitment,
+            version,
+        } => {
             println!(
                 "RESULT get ok commitment_byte=0x{:02x} version={}",
                 commitment.0[0], version.0

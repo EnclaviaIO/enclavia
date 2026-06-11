@@ -10,9 +10,10 @@
 //!
 //! That rules out baking each node's logical name (`MESH_SELF_NAME`) and
 //! peer set (`MESH_PEERS`) into the measured image, or passing them on
-//! the kernel command line: PCR1 measures the cmdline and PCR2 measures
-//! the application, so per-node identity in either place would give each
-//! node a different PCR set and the allowlist would reject every peer.
+//! the kernel command line: PCR1 measures the kernel + boot (including
+//! the cmdline) and PCR2 the application ramdisk, so per-node identity
+//! in either place would give each node a different PCR set and the
+//! allowlist would reject every peer.
 //!
 //! Instead we inject identity at RUNTIME over an UNMEASURED vsock
 //! side-channel, modelled on the existing per-enclave secrets path
@@ -27,7 +28,7 @@
 //!   open vsock CID 2 (host), port 5011 with a timeout
 //!     │
 //!     ▼
-//!   read the identity payload to EOF (small UTF-8 text)
+//!   read the length-prefixed identity payload (small UTF-8 text)
 //!     │
 //!     ▼
 //!   write it verbatim to argv[1] (an env file the init sources)
@@ -51,9 +52,10 @@
 //! length framing the host does NOT shutdown(WRITE); it blocks on our
 //! ACK byte instead, so by the time the socket closes we have already
 //! read the payload. This is a one-shot, fail-closed step: any error
-//! (connect, timeout, short read) is fatal, because a node that boots
-//! without its identity would silently fall back to single-node mode
-//! and never join the cluster, which is worse than refusing to start.
+//! (connect, timeout, short read) is fatal and fails the boot. The
+//! synchronizer itself also refuses to start without a valid mesh env
+//! (at least two peers), so this just surfaces the failure earlier and
+//! with a clearer error.
 //!
 //! Transport: one binary, one transport (`tokio-vsock` to host CID 2),
 //! per the in-enclave crate convention. `vhost-device-vsock` translates
@@ -131,8 +133,8 @@ fn parse_argv() -> Result<PathBuf, String> {
     Ok(PathBuf::from(out))
 }
 
-/// Connect to the host names responder and read the identity payload to
-/// EOF. Any failure is fatal (see module docs).
+/// Connect to the host names responder and read the length-prefixed
+/// identity payload. Any failure is fatal (see module docs).
 async fn fetch_names() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -158,7 +160,9 @@ async fn fetch_names() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Syn
         return Err("host sent zero-length identity payload".into());
     }
     if len > MAX_PAYLOAD_BYTES {
-        return Err(format!("identity payload length {len} exceeds max {MAX_PAYLOAD_BYTES}").into());
+        return Err(
+            format!("identity payload length {len} exceeds max {MAX_PAYLOAD_BYTES}").into(),
+        );
     }
     let mut bytes = vec![0u8; len];
     stream.read_exact(&mut bytes).await?;

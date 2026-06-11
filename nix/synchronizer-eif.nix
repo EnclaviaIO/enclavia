@@ -3,9 +3,8 @@
 # The synchronizer is the entire in-enclave payload: no customer OCI
 # image, no enclavia-server, no crun, no namespace stripping. So instead
 # of routing through the builder's OCI pipeline we assemble a minimal EIF
-# directly with monzo's `nitroLib.buildEif`, reusing the builder's
-# prebuilt kernel/init blobs (which carry the in-tree NSM driver for
-# /dev/nsm) and its patched init for QEMU debug.
+# directly with monzo's `nitroLib.buildEif`, using nitro-util's prebuilt
+# kernel/nsm.ko blobs and the builder's patched init for QEMU debug.
 #
 # Patched init (QEMU debug): the stock Nitro init heartbeats to CID 3
 # (the real Nitro parent), but under QEMU `vhost-device-vsock` only
@@ -51,16 +50,15 @@ let
     cp ${synchronizerPkg}/bin/enclavia-synchronizer $out/bin/
     cp ${namesInitPkg}/bin/synchronizer-names-init $out/bin/
 
-    # Minimal busybox for the init script (mount, ip, mkdir, sh, read).
+    # Minimal busybox for the init script (sh, mount, mkdir, ip; echo and
+    # read are sh builtins).
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox
     ln -s busybox $out/bin/sh
     ln -s busybox $out/bin/mount
     ln -s busybox $out/bin/mkdir
     ln -s busybox $out/bin/ip
-    ln -s busybox $out/bin/sleep
-    ln -s busybox $out/bin/cat
 
-    # Init script — must live in the rootfs since the init binary
+    # Init script: must live in the rootfs since the init binary
     # chroots to /rootfs before exec'ing the entrypoint.
     cp ${initScript} $out/bin/enclave-init
     chmod +x $out/bin/enclave-init
@@ -70,8 +68,9 @@ nitroLib.buildEif {
   name = "synchronizer-enclave";
   kernel = blobs.kernel;
   kernelConfig = blobs.kernelConfig;
-  # Modern kernels (6.8+) have the NSM guest driver built-in; no separate
-  # nsm.ko to insert.
+  # nitro-util's blob kernel is the AWS-provided one, which predates the
+  # in-tree NSM driver (kernel 6.8+), so monzo's init insmods this nsm.ko
+  # at boot to surface /dev/nsm.
   nsmKo = blobs.nsmKo;
   copyToRoot = rootfs;
   entrypoint = "/bin/enclave-init";

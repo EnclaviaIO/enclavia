@@ -217,24 +217,23 @@ start_node node-b
 start_node node-c
 
 # ---------------------------------------------------------------------------
-# 3. Wait for the cluster to form (leader elected + voters joined).
+# 3. Wait for the cluster to form: ALL THREE nodes must log "committed
+#    voter" (the discover_and_join exit line, hit by joiners and the
+#    initializer alike). Anything weaker races the Pin against formation:
+#    "initialized a fresh cluster" appears on the bootstrap node before
+#    the others join, and a 1-voter cluster accepts a durable Pin
+#    trivially while the Get target may not have joined yet.
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== waiting for cluster formation (up to ${CLUSTER_TIMEOUT}s) ==="
-LEADER=""
+FORMED=""
 deadline=$(( $(date +%s) + CLUSTER_TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    # Look for cluster-formation evidence across the three serial logs:
-    # the synchronizer logs "leader elected" (RaftHandle metrics wait),
-    # "initialized a fresh cluster", and "committed voter; discovery
-    # complete".
+    FORMED=yes
     for name in node-a node-b node-c; do
-        s="${DIR[$name]}/serial.log"
-        if grep -Eqi "leader elected|initialized a fresh cluster|committed voter" "$s" 2>/dev/null; then
-            LEADER="$name"
-        fi
+        grep -qi "committed voter" "${DIR[$name]}/serial.log" 2>/dev/null || FORMED=""
     done
-    if [ -n "$LEADER" ]; then break; fi
+    [ -n "$FORMED" ] && break
     sleep 3
 done
 
@@ -247,13 +246,13 @@ for name in node-a node-b node-c; do
     echo ""
 done
 
-if [ -z "$LEADER" ]; then
-    echo "BLOCKER: no Raft leader observed within ${CLUSTER_TIMEOUT}s. Serial tails above." >&2
+if [ -z "$FORMED" ]; then
+    echo "BLOCKER: not all three nodes became committed voters within ${CLUSTER_TIMEOUT}s. Serial tails above." >&2
     echo "Full serial logs under: $WORK/{a,b,c}/serial.log" >&2
     [ -n "${KEEP:-}" ] || echo "(set KEEP=1 to retain logs)"
     exit 2
 fi
-echo "Observed Raft leader activity (node reporting leadership: $LEADER)"
+echo "Cluster formed: all three nodes are committed voters"
 
 # ---------------------------------------------------------------------------
 # 4. Client round-trip: Pin on node-a, Get on node-b (cross-node).
@@ -297,12 +296,29 @@ if [ -n "${TEST_RESTART:-}" ]; then
     [ -e /dev/kvm ] && qc+=(--enable-kvm -cpu host) || qc+=(-cpu max)
     nice qemu-system-x86_64 "${qc[@]}" </dev/null >"${DIR[node-c]}/serial.log" 2>&1 &
     PIDS+=("$!")
-    echo "  node-c relaunched (pid $!); waiting for re-join..."
-    sleep 30
+    echo "  node-c relaunched (pid $!); waiting for re-join (up to 120s)..."
+    rejoin_deadline=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "$rejoin_deadline" ]; do
+        grep -qi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null && break
+        sleep 3
+    done
     grep -Ei "join|hydrat|snapshot|voter|cluster" "${DIR[node-c]}/serial.log" | tail -20 || true
+    if ! grep -qi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null; then
+        echo "BLOCKER: node-c did not re-join (no committed-voter line); see ${DIR[node-c]}/serial.log" >&2
+        exit 4
+    fi
     echo "--- Get on node-c after restart ---"
-    "$CLIENT" "${DIR[node-c]}/proxy.sock" get --port 5010 --seed "$SEED" || \
-        echo "(node-c Get failed; see ${DIR[node-c]}/serial.log)"
+    RESTART_OUT="$("$CLIENT" "${DIR[node-c]}/proxy.sock" get --port 5010 --seed "$SEED")" || {
+        echo "BLOCKER: node-c Get failed after restart; see ${DIR[node-c]}/serial.log" >&2
+        exit 4
+    }
+    echo "$RESTART_OUT"
+    if echo "$RESTART_OUT" | grep -q "get ok commitment_byte=$COMMIT"; then
+        echo "PASS: node-c re-joined with a fresh identity and served the pinned commitment (#209)"
+    else
+        echo "BLOCKER: node-c re-joined but returned the wrong value: $RESTART_OUT" >&2
+        exit 4
+    fi
 fi
 
 echo ""
