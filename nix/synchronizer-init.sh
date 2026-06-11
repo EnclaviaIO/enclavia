@@ -61,6 +61,9 @@ echo "synchronizer-init: MESH_SELF_NAME=${MESH_SELF_NAME} MESH_PEERS=${MESH_PEER
 # 4. Hand off to the synchronizer. RUST_LOG can be overridden by the
 #    launcher via the kernel cmdline-derived /env, but we set a useful
 #    default here so the serial log shows mesh + raft progress.
+#    RUST_BACKTRACE so a panic (openraft catches core panics and logs
+#    them) is diagnosable from the serial log alone.
 export RUST_LOG="${RUST_LOG:-info,synchronizer=debug,openraft=info}"
+export RUST_BACKTRACE=1
 echo "synchronizer-init: exec enclavia-synchronizer"
 exec /bin/enclavia-synchronizer

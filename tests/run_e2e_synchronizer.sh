@@ -231,7 +231,7 @@ deadline=$(( $(date +%s) + CLUSTER_TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
     FORMED=yes
     for name in node-a node-b node-c; do
-        grep -qi "committed voter" "${DIR[$name]}/serial.log" 2>/dev/null || FORMED=""
+        grep -aqi "committed voter" "${DIR[$name]}/serial.log" 2>/dev/null || FORMED=""
     done
     [ -n "$FORMED" ] && break
     sleep 3
@@ -242,7 +242,7 @@ echo "=== serial-log evidence ==="
 for name in node-a node-b node-c; do
     s="${DIR[$name]}/serial.log"
     echo "--- $name attestation / mesh / raft lines ---"
-    grep -Ei "self-attestation|self-PCR|/dev/nsm|mesh|attest|admitted|allowlist|peer|leader|term|vote|join|cluster|initialize|election" "$s" 2>/dev/null | tail -40 || true
+    grep -aEi "self-attestation|self-PCR|/dev/nsm|mesh|attest|admitted|allowlist|peer|leader|term|vote|join|cluster|initialize|election" "$s" 2>/dev/null | tail -40 || true
     echo ""
 done
 
@@ -336,13 +336,27 @@ if [ -n "${TEST_RESTART:-}" ]; then
     fi
     rejoin_deadline=$(( $(date +%s) + 120 ))
     while [ "$(date +%s)" -lt "$rejoin_deadline" ]; do
-        grep -qi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null && break
+        grep -aqi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null && break
         sleep 3
     done
-    grep -Ei "join|hydrat|snapshot|voter|cluster" "${DIR[node-c]}/serial.log" | tail -20 || true
-    if ! grep -qi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null; then
-        echo "BLOCKER: node-c did not re-join (no committed-voter line); serial tail:" >&2
+    grep -aEi "join|hydrat|snapshot|voter|cluster" "${DIR[node-c]}/serial.log" | tail -20 || true
+    if ! grep -aqi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null; then
+        echo "BLOCKER: node-c did not re-join (no committed-voter line)" >&2
+        # A stopped RaftCore on the fresh node is the known symptom
+        # shape here; openraft catches core panics and logs them, so
+        # surface the FIRST fatal evidence (a tail alone scrolls past
+        # it under the Err(Stopped) spam), then enough context to
+        # reconstruct the join from all three nodes.
+        echo "--- node-c first panic/fatal lines ---" >&2
+        grep -am 20 -E "panicked|panic|Fatal|backtrace|unreachable" "${DIR[node-c]}/serial.log" >&2 || true
+        echo "--- node-c serial (first 80 lines after boot) ---" >&2
+        head -n 80 "${DIR[node-c]}/serial.log" >&2 || true
+        echo "--- node-c serial tail ---" >&2
         tail -n 60 "${DIR[node-c]}/serial.log" >&2 || true
+        for n in node-a node-b; do
+            echo "--- $n admission/membership lines ---" >&2
+            grep -aEi "admit|admission|membership|evict|learner|change" "${DIR[$n]}/serial.log" 2>/dev/null | tail -25 >&2 || true
+        done
         exit 4
     fi
     echo "--- Get on node-c after restart ---"
