@@ -12,13 +12,21 @@
 //! exactly the node's own PCR digest, no successor-PCR admission, no
 //! config-driven list).
 //!
-//! The own-PCR digest is configured at launch (env / config file), not read
-//! back from the node's own attestation. A debug enclave self-signs its NSM
-//! document with a throwaway key, so a node cannot trust its own fake
-//! attestation as a reference for "what a legitimate peer looks like"; the
-//! operator supplies the expected digest out of band (it is the build output
-//! of the EIF, the same PCRs the backend records). In production the operator
-//! supplies the real PCRs the same way.
+//! The own-PCR digest is HARDWARE-derived at startup, not host-supplied. The
+//! node requests a fresh attestation document from its OWN `/dev/nsm` and reads
+//! back its PCR0/1/2 via
+//! [`enclavia_protocol::attestation::extract_own_pcrs`] (see `read_mesh_env` in
+//! the binary). This works identically in production and under QEMU: QEMU's
+//! nitro-enclave machine emulates `/dev/nsm` and measures the real PCR0/1/2 of
+//! the running VM (self-signed chain), and because the node is reading its OWN
+//! local device, inside its trusted computing base, no cert-chain trust is
+//! needed (the document authenticates nothing remote; it just reports this VM's
+//! own measurements). The earlier design read the digest from host-supplied env
+//! (`MESH_SELF_PCR*`), but the host is the adversary: a host-chosen digest could
+//! admit a rogue image into the mesh and Raft, so the env path was removed
+//! outright (an override would reopen the hole). Test-utils tests still pass an
+//! explicit digest to [`MeshConfig::new`]; only the production launcher path is
+//! hardware-derived.
 //!
 //! Logical peer names are opaque strings that match what `mesh-host` resolves
 //! to a concrete host endpoint. This module never sees host endpoints: it

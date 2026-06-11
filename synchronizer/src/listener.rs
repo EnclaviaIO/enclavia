@@ -24,21 +24,24 @@
 //! can't be replayed because it would carry the wrong hash in its
 //! nonce field. No explicit server-side challenge frame is needed.
 //!
-//! `Transition` requests are dispatched straight to [`Node::handle_request`],
-//! which decodes the #47 upgrade chain link to derive `old_key`/`new_key`,
-//! requires the submitting session to be bound to `new_key` (the NEW
-//! enclave submits the transition), and verifies the link's signature
-//! against the control pubkey frozen for the derived `old_key` at its
-//! registration. The listener no longer pre-observes attestations or
+//! Requests are dispatched through a [`SessionDispatch`]: the single-node
+//! [`Node`](crate::Node) (no Raft) verifies + applies them against one local
+//! state machine, while the replicated dispatcher (the `raft` feature) routes
+//! each request to the cluster leader (forwarding over the mesh when this node
+//! is a follower) and applies the verified conclusions through Raft. Either way
+//! a `Transition` request's #47 upgrade chain link is decoded to derive
+//! `old_key`/`new_key`, the submitting session is required to be bound to
+//! `new_key` (the NEW enclave submits the transition), and the link's signature
+//! is verified against the control pubkey frozen for the derived `old_key` at
+//! its registration. The listener no longer pre-observes attestations or
 //! transition authorizations on behalf of the caller.
 
 use enclavia_protocol::{NoiseTransport, attestation, perform_handshake_as_responder};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::PcrKey;
-use crate::node::Node;
 use crate::wire::{Request, Response, RpcError};
+use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 
 /// Maximum size (bytes) of an inbound ENCRYPTED frame on the wire.
 ///
@@ -71,6 +74,48 @@ pub enum Frame {
         /// RPC payload to dispatch against the session's bound key.
         request: Request,
     },
+}
+
+/// Dispatch one attested-session request to whatever backs this node: the
+/// single-node [`Node`](crate::Node), or (under the `raft` feature) the
+/// replicated cluster.
+///
+/// The listener does ALL session-level work, the Noise handshake, the NSM
+/// attestation verification, deriving the [`PcrKey`] and pulling the 65-byte
+/// SEC1 P-256 control pubkey, then hands the verified `(session_key,
+/// control_pubkey, request)` triple here. The implementor owns whatever happens
+/// next (observe + apply locally, or route to the leader). The 65-byte
+/// `control_pubkey` is the session's announced
+/// `AttestedIdentity::control_pubkey`; the single-node path observes it before
+/// applying, and the replicated path carries it into the `ReplicatedOp` so
+/// followers can freeze / record it without re-attesting.
+#[async_trait::async_trait]
+pub trait SessionDispatch: Send + Sync {
+    /// Handle one request from a session authenticated as `session_key` with
+    /// `control_pubkey`. Returns the wire [`Response`] to send back.
+    async fn dispatch(
+        &self,
+        session_key: PcrKey,
+        control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+        request: Request,
+    ) -> Response;
+}
+
+/// The single-node [`Node`](crate::Node) is a [`SessionDispatch`]: it observes
+/// the session's attestation into its local state machine, then runs the request
+/// through its own verifier + state machine. This keeps the no-Raft binary mode
+/// (the currently-shipped one) on exactly its prior code path.
+#[async_trait::async_trait]
+impl SessionDispatch for crate::node::Node {
+    async fn dispatch(
+        &self,
+        session_key: PcrKey,
+        control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+        request: Request,
+    ) -> Response {
+        self.observe_attestation(session_key, control_pubkey).await;
+        self.handle_request(session_key, request).await
+    }
 }
 
 /// Errors a single connection can hit. Propagated up to the top-level
@@ -113,13 +158,17 @@ pub enum ConnError {
 /// `debug_mode` selects the debug (skip-cert-chain) vs production
 /// (full chain) variant of the attestation validator. The binary
 /// derives it from the crate's `debug`/`enclave` Cargo feature.
-pub async fn handle_connection<S>(
-    node: &Node,
+///
+/// `dispatch` backs the request handling: the single-node
+/// [`Node`](crate::Node) or (under `raft`) the replicated cluster dispatcher.
+pub async fn handle_connection<S, D>(
+    dispatch: &D,
     mut stream: S,
     debug_mode: bool,
 ) -> Result<(), ConnError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    D: SessionDispatch + ?Sized,
 {
     // 0. Noise handshake. `handshake_hash` is the channel-binding token
     //    we feed to the attestation verifier as the expected nonce, so
@@ -144,24 +193,24 @@ where
     //    slicing / algorithm bridging: the synchronizer's transition
     //    credential IS the #47 upgrade link, so one P-256 key serves
     //    throughout.
-    let session_key = match read_frame(&mut stream, &mut transport).await? {
+    let (session_key, control_pubkey) = match read_frame(&mut stream, &mut transport).await? {
         Some(Frame::Authenticate { nsm_doc }) => {
             let identity = attestation::verify_and_extract(&nsm_doc, &handshake_hash, debug_mode)
                 .map_err(|e| ConnError::Attestation(e.to_string()))?;
             let key = PcrKey(identity.pcrs.digest());
-            node.observe_attestation(key, identity.control_pubkey).await;
-            key
+            (key, identity.control_pubkey)
         }
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
         None => return Ok(()),
     };
 
-    // 2. Subsequent frames: RPC dispatch. Transition signature
-    //    verification lives in `Node::handle_request`, the listener
-    //    deliberately no longer pre-observes attestation or
-    //    transition-sig events on behalf of the caller (that was the
-    //    #111 pre-fix hole: any session could forge a Transition by
-    //    relying on the listener's unconditional `observe_*` calls).
+    // 2. Subsequent frames: RPC dispatch. The dispatcher owns observing the
+    //    attestation (single-node) / carrying the verified facts to the leader
+    //    (replicated) and the `Transition` chain-link verification. The listener
+    //    deliberately no longer pre-observes attestation or transition-sig events
+    //    on behalf of the caller (that was the #111 pre-fix hole: any session
+    //    could forge a Transition by relying on the listener's unconditional
+    //    `observe_*` calls).
     while let Some(frame) = read_frame(&mut stream, &mut transport).await? {
         let request = match frame {
             Frame::Rpc { request } => request,
@@ -176,7 +225,9 @@ where
             }
         };
 
-        let response = node.handle_request(session_key, request).await;
+        let response = dispatch
+            .dispatch(session_key, control_pubkey, request)
+            .await;
         write_response(&mut stream, &mut transport, &response).await?;
     }
 
@@ -240,6 +291,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::Node;
     use crate::wire::{ChainLink, ChainLinkKind, UpgradePayload};
     use crate::{Commitment, Version};
     use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
