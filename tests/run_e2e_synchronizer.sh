@@ -299,6 +299,17 @@ if [ -n "${TEST_RESTART:-}" ]; then
         pkill -9 -f "qemu-system-x86_64.*sync-node-c" 2>/dev/null || true
         sleep 1
     fi
+    # vhost-device-vsock serves ONE frontend at a time: it unlinks its
+    # listener socket while a QEMU is attached and re-creates it a few
+    # seconds after the frontend disconnects (verified against 0.3.0).
+    # Relaunching before the socket reappears makes the new QEMU die
+    # instantly with "Failed to connect ... No such file or directory",
+    # so wait for it deterministically instead of sleeping.
+    wait_for_socket "${DIR[node-c]}/vhost.sock" 300 || {
+        echo "BLOCKER: vhost-device-vsock did not re-create ${DIR[node-c]}/vhost.sock within 30s of node-c QEMU exiting" >&2
+        tail -n 20 "${DIR[node-c]}/vhost.log" >&2 || true
+        exit 4
+    }
     : > "${DIR[node-c]}/serial.log"
     qc=(
         -M "nitro-enclave,vsock=c,id=sync-node-c"
