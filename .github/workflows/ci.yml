@@ -60,6 +60,29 @@ jobs:
       - name: cargo test (enclavia-egress test-utils)
         run: nix develop --command cargo test -p enclavia-egress --features test-utils
 
+      # The synchronizer ships `default = []`, so the workspace-wide
+      # steps above exercise almost none of it: the mesh, Raft, and
+      # membership suites are all feature-gated. This combo enables
+      # every in-process suite (lib, mesh integration,
+      # raft_client_routing, the NodeViewConsistent fuzz harness,
+      # raft_replication) on a dev machine, no QEMU needed. The full
+      # QEMU 3-node cluster e2e lives in e2e-synchronizer.yml.
+      - name: cargo test (synchronizer full suite)
+        run: nix develop --command cargo test -p synchronizer --features raft,test-utils,debug
+
+      # Clippy across the synchronizer's real build flavors. The
+      # debug / enclave / qemu features pick the customer transport
+      # and attestation-verification mode at compile time, so cfg
+      # drift (an import or const that only one flavor uses) only
+      # surfaces when each combo is compiled on its own.
+      - name: cargo clippy (synchronizer feature matrix)
+        run: |
+          for features in qemu,raft enclave,raft debug,raft debug,mesh debug enclave; do
+            echo "::group::clippy --features $features"
+            nix develop --command cargo clippy -p synchronizer --features "$features" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+
       # Doctests on the client SDK matter (per #158): the `enclavia`
       # crate's public API is documented with code examples that
       # users copy/paste, so a doctest break is a real-world break.

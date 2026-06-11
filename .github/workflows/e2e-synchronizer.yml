@@ -1,0 +1,122 @@
+# Full synchronizer cluster e2e: boots a REAL 3-node mutually-attested
+# Raft cluster in QEMU (one shared EIF, identical PCRs, runtime identity
+# injection) and drives a cross-node Pin/Get plus a kill-and-rejoin leg.
+# Wraps `tests/run_e2e_synchronizer.sh` as-is; see that script for the
+# full topology.
+#
+# Lives separately from `ci.yml` (mirroring enclavia-crates' e2e.yml)
+# because it targets the `kvm` runner label, pulls in two sibling repos,
+# and is minutes-slow where ci.yml is the cheap cargo loop.
+#
+# Sibling repos:
+#   - EnclaviaIO/builder (public): init-patched + heartbeat.py. Plain
+#     HTTPS clone.
+#   - EnclaviaIO/enclavia-crates (PRIVATE): the `mesh-host-debug` flake
+#     output the harness bridges the mesh with. The default
+#     GITHUB_TOKEN of this public repo cannot read it, so the clone
+#     needs the `E2E_CRATES_TOKEN` repo secret: a fine-grained PAT with
+#     Contents:read on EnclaviaIO/enclavia-crates. When the secret is
+#     not configured the job SKIPS (every step no-ops with a notice)
+#     rather than failing, so forks and fresh clones stay green; the
+#     run shows the skip notice, it does not pretend the e2e passed.
+#
+# TODO(flip after EnclaviaIO/enclavia-crates#207 merges): mesh-host is
+# still on the `synchronizer-5-mesh-host` branch, so the crates clone
+# pins that ref. Switch CRATES_REF to `master` once #207 lands.
+
+name: e2e-synchronizer
+
+on:
+  pull_request:
+    paths:
+      - "synchronizer/**"
+      - "synchronizer-names-init/**"
+      - "enclavia-protocol/**"
+      - "nix/**"
+      - "tests/run_e2e_synchronizer.sh"
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.lock"
+      - ".github/workflows/e2e-synchronizer.yml"
+  push:
+    branches: [master]
+    paths:
+      - "synchronizer/**"
+      - "synchronizer-names-init/**"
+      - "enclavia-protocol/**"
+      - "nix/**"
+      - "tests/run_e2e_synchronizer.sh"
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.lock"
+      - ".github/workflows/e2e-synchronizer.yml"
+
+# One run at a time GLOBALLY (fixed group, not per-ref): the harness
+# binds fixed localhost TCP ports (39001-39003) for the mesh triangle,
+# so two concurrent runs on the same runner host would collide. No
+# cancel-in-progress: with a fixed group that would let one PR's push
+# cancel another PR's running job. GitHub still collapses obsolete
+# PENDING runs in the group, so force-push chains don't pile up.
+concurrency:
+  group: e2e-synchronizer
+  cancel-in-progress: false
+
+env:
+  CRATES_REF: synchronizer-5-mesh-host
+
+jobs:
+  e2e:
+    name: 3-node QEMU cluster
+    # `kvm` implies `self-hosted` on EnclaviaIO's runner pool; explicit
+    # for readability and to guard against landing on another label.
+    runs-on: [self-hosted, kvm]
+    steps:
+      # secrets are not readable from job-level `if`, so gate every
+      # step on this probe instead.
+      - name: Probe for E2E_CRATES_TOKEN
+        id: tok
+        env:
+          T: ${{ secrets.E2E_CRATES_TOKEN }}
+        run: |
+          if [ -n "$T" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::E2E_CRATES_TOKEN secret not configured; skipping the synchronizer e2e (needs read access to the private enclavia-crates repo)"
+          fi
+
+      - name: Checkout enclavia
+        if: steps.tok.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Clone builder
+        if: steps.tok.outputs.run == 'true'
+        run: rm -rf "$RUNNER_TEMP/builder" && git clone --depth=1 https://github.com/EnclaviaIO/builder.git "$RUNNER_TEMP/builder"
+
+      - name: Clone enclavia-crates
+        if: steps.tok.outputs.run == 'true'
+        env:
+          T: ${{ secrets.E2E_CRATES_TOKEN }}
+        run: rm -rf "$RUNNER_TEMP/enclavia-crates" && git clone --depth=1 -b "$CRATES_REF" "https://x-access-token:${T}@github.com/EnclaviaIO/enclavia-crates.git" "$RUNNER_TEMP/enclavia-crates"
+
+      # The harness needs qemu / vhost-device-vsock / python3 / cargo,
+      # which the enclavia-crates dev shell provides (the enclavia repo
+      # shell is rust-only). Warm it once, then run the script
+      # unmodified. TEST_RESTART exercises the #209 kill-and-rejoin leg
+      # with its hard assertion.
+      - name: Warm crates dev shell
+        if: steps.tok.outputs.run == 'true'
+        run: nix develop "path:$RUNNER_TEMP/enclavia-crates" --command true
+
+      - name: Run synchronizer e2e
+        if: steps.tok.outputs.run == 'true'
+        env:
+          ENCLAVIA_DIR: ${{ github.workspace }}
+          CRATES_DIR: ${{ runner.temp }}/enclavia-crates
+          BUILDER_DIR: ${{ runner.temp }}/builder
+          TEST_RESTART: "1"
+        # `path:` (not a bare dir) on both develop calls and inside the
+        # script: the clones are shallow, and a bare directory flakeref
+        # on a git repo routes through the git fetcher, which refuses
+        # shallow repos.
+        run: nix develop "path:$RUNNER_TEMP/enclavia-crates" --command bash tests/run_e2e_synchronizer.sh
