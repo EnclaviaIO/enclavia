@@ -94,13 +94,24 @@ struct Node {
     /// directly after construction.
     _mesh: Arc<Mesh>,
     raft: RaftHandle,
+    /// The background #209 discovery/join + eviction-watch task. Aborted on
+    /// drop so a killed node's discovery does not linger.
+    _bootstrap: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self._bootstrap.abort();
+    }
 }
 
 /// Spin up one node over the shared stub: bind its inbound socket, build the
 /// mesh with a deferred Raft handler, then construct the Raft handle and
-/// install it into the handler. Bidirectional partitioning works because the
-/// dialer is tagged with this node's own name (`dialer_for`).
+/// install it into the handler, and drive #209 discovery/join in the
+/// background (the smallest-name node initializes a fresh cluster from peers'
+/// attested pubkeys; the others join). Bidirectional partitioning works
+/// because the dialer is tagged with this node's own name (`dialer_for`).
 async fn spawn_node(name: &str, host: &MeshHostStub) -> Node {
     let peers: Vec<String> = NODE_NAMES
         .iter()
@@ -115,6 +126,7 @@ async fn spawn_node(name: &str, host: &MeshHostStub) -> Node {
     host.register(name, &sock);
 
     let identity = MeshIdentity::generate();
+    let self_pubkey = identity.pubkey();
     let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
     let config = MeshConfig::new(
         name.to_string(),
@@ -133,14 +145,30 @@ async fn spawn_node(name: &str, host: &MeshHostStub) -> Node {
         /* debug_mode */ true,
     ));
 
-    let raft = RaftHandle::new(Arc::clone(&mesh), name, &peers, handler)
-        .await
-        .expect("RaftHandle::new");
+    let raft = RaftHandle::new(
+        Arc::clone(&mesh),
+        name,
+        self_pubkey,
+        &peers,
+        handler.clone(),
+    )
+    .await
+    .expect("RaftHandle::new");
+    raft.enable_serving(&handler, true);
+    let bootstrap = {
+        let raft = raft.clone();
+        let mesh = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            synchronizer::raft::discover_and_join(&raft, &mesh).await;
+            synchronizer::raft::watch_for_eviction(raft).await;
+        })
+    };
 
     Node {
         name: name.to_string(),
         _mesh: mesh,
         raft,
+        _bootstrap: bootstrap,
         _dir: dir,
     }
 }
@@ -247,13 +275,9 @@ async fn run_scenario(seed: u64) {
         nodes.push(spawn_node(name, &host).await);
     }
 
-    // Initialize the cluster on one node; it elects a leader within a few
-    // hundred ms.
-    nodes[0]
-        .raft
-        .initialize_cluster()
-        .await
-        .expect("initialize_cluster");
+    // The cluster bootstraps itself via #209 discovery (driven in spawn_node):
+    // the smallest-name node initializes from the peers' attested pubkeys, the
+    // others join. A leader is elected within a few hundred ms.
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
         "no leader elected at startup (seed {seed})"

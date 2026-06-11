@@ -56,6 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::CONTROL_PUBKEY_LEN;
@@ -74,17 +75,47 @@ pub fn instance_node_id(pubkey: &[u8; CONTROL_PUBKEY_LEN]) -> RaftNodeId {
 
 /// One member as recorded in the replicated membership: its routing name
 /// plus the instance pubkey its [`RaftNodeId`] derives from. This is the
-/// openraft `Node` payload for the cluster (the wiring layer implements
-/// `openraft::Node` for it), so every replica can re-derive and re-check
-/// ids and slots from committed state alone.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// openraft `Node` payload for the cluster (see the `openraft::Node`
+/// requirements satisfied just below), so every replica can re-derive and
+/// re-check ids and slots from committed state alone.
+///
+/// The `serde` / `Hash` derives and the `Default` / `Display` impls below are
+/// pure WIRING additions (openraft's `Node` trait bound is
+/// `Serialize + Deserialize + Default + Eq + Hash`-adjacent, and the network
+/// layer wants a `Display`); they add no decision logic and the kernel's
+/// admission semantics never touch them. `Default` exists ONLY because
+/// openraft requires it on the node payload type; a defaulted record (empty
+/// name, all-zero pubkey) is never a real member, and [`plan_admission`]
+/// never produces or accepts one (an all-zero pubkey is not a configured slot
+/// and its id does not match any live voter).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemberRecord {
     /// Routing label (what `mesh-host` resolves); one of the configured
     /// names. Carries no authority.
     pub name: String,
     /// 65-byte SEC1 P-256 per-boot instance pubkey. The member's
     /// [`RaftNodeId`] is [`instance_node_id`] of this value.
+    #[serde(with = "crate::raft::control_pubkey_bytes")]
     pub pubkey: [u8; CONTROL_PUBKEY_LEN],
+}
+
+/// Default member: empty name, all-zero pubkey. NOT a real member; present
+/// only to satisfy openraft's `Node: Default` bound. See the type docs.
+impl Default for MemberRecord {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            pubkey: [0u8; CONTROL_PUBKEY_LEN],
+        }
+    }
+}
+
+/// Human-readable label for logs / openraft diagnostics: the routing name and
+/// the derived [`RaftNodeId`]. Carries no authority and is never parsed back.
+impl std::fmt::Display for MemberRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{:016x}", self.name, instance_node_id(&self.pubkey))
+    }
 }
 
 /// Why an admission request was refused. Every variant is a deterministic

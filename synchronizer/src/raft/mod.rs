@@ -45,6 +45,33 @@
 //! exactly as far as the cluster trusts its own members, which the PCR
 //! allowlist already pins to "bit-for-bit us".
 //!
+//! ## Identity and membership: clone-resistant, per-boot instance keys (#209)
+//!
+//! A node's Raft member identity ([`RaftNodeId`]) is [`instance_node_id`] of
+//! its per-boot P-256 mesh instance pubkey, NOT a name-derived index. The
+//! openraft node payload is a [`MemberRecord`] (`{ name, pubkey }`) carried in
+//! the committed membership, so every replica re-derives ids and re-checks the
+//! one-instance-per-slot invariant from committed state alone, and id->name
+//! routing reads the leader's / target's record out of the membership rather
+//! than a static table. Logical names are pure routing labels that only bound
+//! the cluster shape (one member slot per configured name).
+//!
+//! Why: attestation proves WHAT runs, never WHICH instance, so a host can boot
+//! a second copy of the same measured image. A name-derived id would let two
+//! honest processes hold one vote (split-brain / rollback). A per-boot instance
+//! key cannot be impersonated (a clone has no copy of it), so the worst a clone
+//! can do is REQUEST a replacement through the same join path a genuine restart
+//! uses: membership churn (a DoS the host can already inflict), never two
+//! simultaneous holders of a slot's vote. The decision kernel
+//! ([`membership::plan_admission`]) is pure and frozen; its SECURITY CONTRACT
+//! is that the candidate pubkey comes from the candidate's mutually-attested
+//! mesh channel ([`crate::mesh::rpc::PeerContext::mesh_pubkey`]), never a
+//! request payload. The leader-side execution (`add_learner` then one atomic
+//! `change_membership`, [`RaftHandle::admit`]) linearizes replace-on-rejoin
+//! through the log. Boot discovery, the join state machine, and the eviction
+//! watch live in [`join`]; the threat model and invariant are in
+//! [`membership`].
+//!
 //! ## Snapshot / hydration semantics
 //!
 //! The state-machine snapshot serializes the ENTIRE pure-core state, the
@@ -92,12 +119,13 @@
 //! (which submit ops directly, not through the serve path).
 
 pub mod forward;
+pub mod join;
 pub mod membership;
 pub(crate) mod network;
 pub mod serve;
 mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,6 +139,10 @@ use crate::{CONTROL_PUBKEY_LEN, Commitment, KeyState, PcrKey, ValidationError};
 #[cfg(feature = "node")]
 pub use forward::ReplicatedDispatch;
 pub use forward::{ForwardedClientRequest, ForwardedClientResponse, route_client_request};
+pub use join::{discover_and_join, watch_for_eviction};
+pub use membership::{
+    AdmissionError, AdmissionPlan, MemberRecord, instance_node_id, plan_admission,
+};
 pub use network::{MeshRaftNetworkFactory, RaftRequestHandler};
 pub use store::{LogStore, StateMachineStore, control_pubkey_bytes};
 
@@ -120,9 +152,11 @@ pub use store::{LogStore, StateMachineStore, control_pubkey_bytes};
 /// depending on `openraft` directly.
 pub use openraft::{Config, SnapshotPolicy};
 
-/// openraft node id: a small integer derived from the logical peer's position
-/// in the cluster's sorted name list. The mesh keys connections by name; this
-/// id is purely openraft's internal handle. See [`NodeIdMap`].
+/// openraft node id: the clone-resistant per-boot member identity, derived
+/// from the node's mesh instance pubkey by [`instance_node_id`] (truncated
+/// SHA-256). NOT derived from the logical name (that was the host-replayable
+/// identity #209 kills); the name is a pure routing label that lives in the
+/// node's [`MemberRecord`] payload. See [`membership`] for the threat model.
 pub type RaftNodeId = u64;
 
 /// The replicated log entry: the verified CONCLUSIONS the leader reached after
@@ -189,15 +223,23 @@ pub enum ReplicatedOpResult {
 
 openraft::declare_raft_types!(
     /// Type configuration for the synchronizer Raft cluster: a [`ReplicatedOp`]
-    /// log entry, a [`ReplicatedOpResult`] response, [`RaftNodeId`] node ids,
-    /// [`openraft::BasicNode`] node metadata (the logical peer name lives in
-    /// its `addr`), and a `Cursor<Vec<u8>>` snapshot blob (the CBOR-then-JSON
-    /// serialized pure-core snapshot).
+    /// log entry, a [`ReplicatedOpResult`] response, [`RaftNodeId`] node ids
+    /// (clone-resistant instance ids, #209), [`MemberRecord`] node metadata
+    /// (the routing name + the instance pubkey the id derives from), and a
+    /// `Cursor<Vec<u8>>` snapshot blob (the CBOR-serialized pure-core
+    /// snapshot).
+    ///
+    /// The node payload moved from `openraft::BasicNode` (a bare `addr`
+    /// string) to [`MemberRecord`] so the committed membership carries each
+    /// voter's instance pubkey: every replica can re-derive the id from the
+    /// pubkey and re-check the one-instance-per-slot invariant from committed
+    /// state alone, and the join handler reads the leader / target name out of
+    /// the replicated records rather than a static name->id table.
     pub TypeConfig:
         D = ReplicatedOp,
         R = ReplicatedOpResult,
         NodeId = RaftNodeId,
-        Node = openraft::BasicNode,
+        Node = MemberRecord,
         SnapshotData = std::io::Cursor<Vec<u8>>,
 );
 
@@ -205,58 +247,7 @@ openraft::declare_raft_types!(
 pub type Raft = openraft::Raft<TypeConfig>;
 
 /// Convenience alias for openraft errors surfaced by [`RaftHandle`] methods.
-pub type RaftClientWriteError =
-    RaftError<RaftNodeId, ClientWriteError<RaftNodeId, openraft::BasicNode>>;
-
-/// Static map between logical peer names and openraft node ids.
-///
-/// Node ids are assigned by sorting `self_name` plus the peer set and taking
-/// each name's index, so every node in a same-config cluster computes the
-/// identical name <-> id mapping (the cluster membership is static 3-node from
-/// [`MeshConfig`](crate::mesh::config::MeshConfig)).
-#[derive(Clone, Debug)]
-pub struct NodeIdMap {
-    name_to_id: BTreeMap<PeerName, RaftNodeId>,
-    id_to_name: BTreeMap<RaftNodeId, PeerName>,
-}
-
-impl NodeIdMap {
-    /// Build the mapping from this node's own name and its peer set. The full
-    /// membership is `self_name` + `peers`, sorted, indexed.
-    pub fn new(self_name: &str, peers: &[PeerName]) -> Self {
-        let mut all: Vec<PeerName> = peers.to_vec();
-        all.push(self_name.to_string());
-        all.sort();
-        all.dedup();
-        let mut name_to_id = BTreeMap::new();
-        let mut id_to_name = BTreeMap::new();
-        for (i, name) in all.into_iter().enumerate() {
-            let id = i as RaftNodeId;
-            name_to_id.insert(name.clone(), id);
-            id_to_name.insert(id, name);
-        }
-        Self {
-            name_to_id,
-            id_to_name,
-        }
-    }
-
-    /// openraft node id for a logical peer name.
-    pub fn id_of(&self, name: &str) -> Option<RaftNodeId> {
-        self.name_to_id.get(name).copied()
-    }
-
-    /// Logical peer name for an openraft node id.
-    pub fn name_of(&self, id: RaftNodeId) -> Option<&str> {
-        self.id_to_name.get(&id).map(|s| s.as_str())
-    }
-
-    /// All `(id, name)` pairs, sorted by id. Used to build the initial cluster
-    /// membership for `Raft::initialize`.
-    pub fn members(&self) -> impl Iterator<Item = (RaftNodeId, &PeerName)> {
-        self.id_to_name.iter().map(|(id, name)| (*id, name))
-    }
-}
+pub type RaftClientWriteError = RaftError<RaftNodeId, ClientWriteError<RaftNodeId, MemberRecord>>;
 
 /// Errors surfaced by [`RaftHandle`] writes / reads.
 #[derive(Debug, thiserror::Error)]
@@ -285,6 +276,19 @@ pub enum RaftHandleError {
     /// the client confirms via `Get`).
     #[error("write committed but not yet replicated to all nodes: {0}")]
     NotFullyReplicated(String),
+    /// The kernel ([`plan_admission`](membership::plan_admission)) refused a
+    /// join request: an unknown slot name, an id collision with a live voter
+    /// of a different slot, or corrupt committed membership. Deterministic on
+    /// the leader; the joiner must NOT retry (the answer will not change), so
+    /// it is surfaced distinctly from a transient not-leader / quorum error.
+    #[error("join refused by admission kernel: {0}")]
+    JoinRefused(#[from] membership::AdmissionError),
+    /// This node is not currently the leader, so it cannot execute a join /
+    /// membership change. Carries the leader's routing name as a redirect hint
+    /// when one is known (the joiner retries against it). A `None` hint means
+    /// no leader is currently known (an election is in progress).
+    #[error("not the leader; redirect to {0:?}")]
+    NotLeader(Option<String>),
 }
 
 /// Handle the listener / slice-4 drives to submit ops and read state.
@@ -296,7 +300,15 @@ pub enum RaftHandleError {
 pub struct RaftHandle {
     raft: Raft,
     sm: Arc<StateMachineStore>,
-    ids: NodeIdMap,
+    /// This node's own committed-membership record: its routing name plus its
+    /// per-boot instance pubkey. The id is [`instance_node_id`] of the pubkey
+    /// (no name-derived id any more, #209).
+    self_record: MemberRecord,
+    /// The configured cluster shape: one member slot per name. Bounds
+    /// admission ([`plan_admission`] refuses any name outside this set) and
+    /// the discovery bootstrap (the lexicographically-smallest name is the
+    /// fresh-cluster initializer).
+    configured_names: BTreeSet<String>,
     self_id: RaftNodeId,
     /// Bounded wait used by
     /// [`client_write_durable`](Self::client_write_durable) for EVERY voter to
@@ -330,18 +342,35 @@ impl RaftHandle {
     /// the freshly-created `Raft` into it so peers' inbound RPCs start
     /// dispatching into the local instance.
     ///
+    /// `self_pubkey` is this node's 65-byte SEC1 per-boot mesh instance pubkey
+    /// (`MeshIdentity::pubkey`); its [`instance_node_id`] is this node's
+    /// clone-resistant Raft id (#209). `self_name` + `peers` define the
+    /// configured cluster shape (one slot per name), used to bound admission
+    /// and to pick the discovery bootstrap node.
+    ///
     /// Bootstrap order:
     /// 1. `let handler = RaftRequestHandler::deferred();`
     /// 2. `let mesh = Mesh::start(.., handler.clone(), ..);`
-    /// 3. `let raft = RaftHandle::new(mesh, self_name, peers, handler).await?;`
-    /// 4. on EXACTLY ONE node, `raft.initialize_cluster().await?`.
+    /// 3. `let raft = RaftHandle::new(mesh, self_name, self_pubkey, peers, handler).await?;`
+    /// 4. drive [`discover_and_join`](Self::discover_and_join) (which probes
+    ///    for a live cluster, joins it, or initializes a fresh one when this
+    ///    node holds the smallest configured name and no peer knows a cluster).
     pub async fn new(
         mesh: Arc<Mesh>,
         self_name: &str,
+        self_pubkey: [u8; CONTROL_PUBKEY_LEN],
         peers: &[PeerName],
         handler: RaftRequestHandler,
     ) -> Result<Self, RaftHandleError> {
-        Self::with_config(mesh, self_name, peers, handler, Self::default_config()).await
+        Self::with_config(
+            mesh,
+            self_name,
+            self_pubkey,
+            peers,
+            handler,
+            Self::default_config(),
+        )
+        .await
     }
 
     /// The default openraft tuning for the synchronizer cluster.
@@ -377,14 +406,20 @@ impl RaftHandle {
     pub async fn with_config(
         mesh: Arc<Mesh>,
         self_name: &str,
+        self_pubkey: [u8; CONTROL_PUBKEY_LEN],
         peers: &[PeerName],
         handler: RaftRequestHandler,
         config: openraft::Config,
     ) -> Result<Self, RaftHandleError> {
-        let ids = NodeIdMap::new(self_name, peers);
-        let self_id = ids
-            .id_of(self_name)
-            .expect("self_name is always in the membership");
+        let self_record = MemberRecord {
+            name: self_name.to_string(),
+            pubkey: self_pubkey,
+        };
+        let self_id = instance_node_id(&self_pubkey);
+
+        // Configured cluster shape: one slot per name (self + peers).
+        let mut configured_names: BTreeSet<String> = peers.iter().map(|p| p.to_string()).collect();
+        configured_names.insert(self_name.to_string());
 
         let config = Arc::new(
             config
@@ -394,7 +429,7 @@ impl RaftHandle {
 
         let log_store = LogStore::default();
         let sm = Arc::new(StateMachineStore::default());
-        let network = MeshRaftNetworkFactory::new(Arc::clone(&mesh), ids.clone());
+        let network = MeshRaftNetworkFactory::new(Arc::clone(&mesh));
 
         let raft = openraft::Raft::new(self_id, config, network, log_store, Arc::clone(&sm))
             .await
@@ -407,7 +442,8 @@ impl RaftHandle {
         Ok(Self {
             raft,
             sm,
-            ids,
+            self_record,
+            configured_names,
             self_id,
             replication_wait: DEFAULT_REPLICATION_WAIT,
         })
@@ -441,31 +477,57 @@ impl RaftHandle {
         handler.set_serve(self.clone(), debug_mode);
     }
 
-    /// Whether THIS node is the designated bootstrap node, the one that calls
-    /// [`initialize_cluster`](Self::initialize_cluster).
-    ///
-    /// Every node computes the identical [`NodeIdMap`] (sorted membership), so
-    /// the node with id 0 (lexicographically-smallest name) is the same on every
-    /// node and is the natural single initializer. This makes the
-    /// "exactly one node initializes" rule a pure function of the static config,
-    /// no coordination, no env flag. A non-bootstrap node simply waits for the
-    /// initial membership to replicate to it.
-    pub fn is_bootstrap_node(&self) -> bool {
-        self.self_id == 0
+    /// This node's own committed-membership record (routing name + instance
+    /// pubkey). Its id is [`Self::self_id`].
+    pub fn self_record(&self) -> &MemberRecord {
+        &self.self_record
     }
 
-    /// Initialize the static 3-node cluster. Call on EXACTLY ONE node (the
-    /// [`is_bootstrap_node`](Self::is_bootstrap_node) one) after every node's
-    /// `RaftRequestHandler` is wired into its mesh. The other nodes learn the
-    /// membership through the initial replication. Idempotent failure
-    /// (`NotAllowed` if already initialized) is mapped to `Ok(())`, so a
-    /// restarted bootstrap node that re-attempts it on a live cluster is benign.
-    pub async fn initialize_cluster(&self) -> Result<(), RaftHandleError> {
-        let members: BTreeMap<RaftNodeId, openraft::BasicNode> = self
-            .ids
-            .members()
-            .map(|(id, name)| (id, openraft::BasicNode::new(name.clone())))
-            .collect();
+    /// This node's clone-resistant Raft id ([`instance_node_id`] of its mesh
+    /// instance pubkey).
+    pub fn self_id(&self) -> RaftNodeId {
+        self.self_id
+    }
+
+    /// The configured cluster shape (one slot per name). Bounds admission and
+    /// picks the discovery bootstrap node.
+    pub fn configured_names(&self) -> &BTreeSet<String> {
+        &self.configured_names
+    }
+
+    /// Whether THIS node holds the lexicographically-smallest configured name.
+    ///
+    /// Names are pure routing labels (#209), so the smallest one is identical
+    /// on every node and is the natural single initializer of a FRESH cluster.
+    /// Note this is NOT "the node that always initializes": [`discover_and_join`]
+    /// only initializes when NO peer reports an existing cluster within the
+    /// discovery window. A restarted smallest-name node on a LIVE cluster
+    /// discovers the cluster (its Join is admitted, or it is already a member)
+    /// and never re-initializes. See [`discover_and_join`].
+    pub fn is_smallest_name(&self) -> bool {
+        self.configured_names
+            .iter()
+            .next()
+            .map(|n| n.as_str() == self.self_record.name)
+            .unwrap_or(false)
+    }
+
+    /// Initialize a fresh cluster with the given member records, keyed by their
+    /// derived ids. Call on EXACTLY ONE node (the discovery bootstrap), with
+    /// `members` containing this node plus every peer whose mesh channel is up
+    /// (so their instance pubkeys are known). The other nodes learn the
+    /// membership through the initial replication and so become voters WITHOUT
+    /// a join. Idempotent failure (`NotAllowed` if already initialized) is
+    /// mapped to `Ok(())`, so a re-attempt on a live cluster is benign.
+    ///
+    /// SECURITY: each record's pubkey MUST be the peer's attested
+    /// `PeerIdentity::mesh_pubkey` (the caller obtains it from the mesh
+    /// channel, never from a request payload), the same contract
+    /// [`plan_admission`] documents.
+    pub async fn initialize_cluster(
+        &self,
+        members: BTreeMap<RaftNodeId, MemberRecord>,
+    ) -> Result<(), RaftHandleError> {
         match self.raft.initialize(members).await {
             Ok(()) => Ok(()),
             // Already-initialized is benign on a retry.
@@ -582,7 +644,7 @@ impl RaftHandle {
     /// node is not (or no longer) the leader, so the caller keeps waiting until
     /// the deadline rather than falsely ACKing.
     fn all_voters_replicated(
-        metrics: &openraft::RaftMetrics<RaftNodeId, openraft::BasicNode>,
+        metrics: &openraft::RaftMetrics<RaftNodeId, MemberRecord>,
         self_id: RaftNodeId,
         target: u64,
     ) -> bool {
@@ -607,9 +669,65 @@ impl RaftHandle {
 
     /// The logical name of the node this node currently believes is the
     /// leader, if any. The write-routing redirect hint for slice 4.
+    ///
+    /// The id->name mapping now comes from the COMMITTED membership records
+    /// (the leader's [`MemberRecord`] in `metrics.membership_config`), not a
+    /// static name<->id table: an id is the leader's instance id, and its
+    /// routing name is whatever record the cluster committed for it.
     pub async fn leader_name(&self) -> Option<String> {
         let id = self.raft.current_leader().await?;
-        self.ids.name_of(id).map(|s| s.to_string())
+        self.name_of_committed(id).await
+    }
+
+    /// The routing name committed for `id` in the current membership, if `id`
+    /// is a member. Reads the replicated [`MemberRecord`]s out of
+    /// `metrics.membership_config`; returns `None` for a non-member id.
+    pub async fn name_of_committed(&self, id: RaftNodeId) -> Option<String> {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .get_node(&id)
+            .map(|rec| rec.name.clone())
+    }
+
+    /// The committed voter records, keyed by id, read live from
+    /// `metrics.membership_config`. This is the map the join handler feeds to
+    /// [`plan_admission`] (committed voters only, not learners): each entry's
+    /// id equals [`instance_node_id`] of its recorded pubkey, which the kernel
+    /// re-checks as defence in depth.
+    pub async fn committed_voters(&self) -> BTreeMap<RaftNodeId, MemberRecord> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let cfg = metrics.membership_config.membership();
+        let voters: BTreeSet<RaftNodeId> = cfg.voter_ids().collect();
+        cfg.nodes()
+            .filter(|(id, _)| voters.contains(id))
+            .map(|(id, rec)| (*id, rec.clone()))
+            .collect()
+    }
+
+    /// Whether `id` is a committed VOTER in the current membership. Used by a
+    /// joiner to detect "I am already a voter" (it was admitted, or an
+    /// initialize included its id) and stop retrying its Join.
+    pub async fn is_committed_voter(&self, id: RaftNodeId) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics.membership_config.voter_ids().any(|v| v == id)
+    }
+
+    /// Whether THIS node is a committed voter in the current membership. The
+    /// eviction watch ([`watch_for_eviction`](Self::watch_for_eviction)) and
+    /// the joiner's "already a member" detection both rest on it.
+    pub async fn self_is_committed_voter(&self) -> bool {
+        self.is_committed_voter(self.self_id).await
+    }
+
+    /// Whether the local node has observed an INITIALIZED cluster: it has a
+    /// committed membership with at least one voter (either it initialized,
+    /// joined, or learned the membership via replication / a snapshot). A
+    /// brand-new node that has not yet discovered the cluster reports `false`.
+    pub async fn cluster_is_initialized(&self) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics.membership_config.voter_ids().next().is_some()
     }
 
     /// Linearizable read: look up the current [`KeyState`] for `key`, only
@@ -654,6 +772,108 @@ impl RaftHandle {
             .and_then(|m| m.current_leader)
     }
 
+    /// LEADER-SIDE admission: run the frozen kernel
+    /// ([`plan_admission`](membership::plan_admission)) against the current
+    /// committed voters, then execute its plan through openraft (a blocking
+    /// `add_learner` followed by one `change_membership`), linearizing the
+    /// replace-on-rejoin atomically.
+    ///
+    /// SECURITY CONTRACT: `candidate_pubkey` MUST be the candidate's attested
+    /// `PeerIdentity::mesh_pubkey`, taken from its mutually-attested mesh
+    /// channel by the caller (the inbound join handler), NEVER from a request
+    /// payload. This method does no attestation itself; it trusts its caller to
+    /// have sourced the key from the channel, exactly as the kernel docs
+    /// require.
+    ///
+    /// Returns:
+    /// * `Ok(true)`: the candidate is now (or was already) the slot's voter;
+    /// * `Err(JoinRefused)`: the kernel refused (unknown slot / id collision /
+    ///   corrupt membership), deterministic, the joiner must not retry;
+    /// * `Err(NotLeader(hint))`: this node is not the leader (the membership
+    ///   change was rejected by openraft); the joiner retries against `hint`;
+    /// * `Err(Raft(..))`: a transient openraft error executing the plan.
+    pub async fn admit(
+        &self,
+        candidate_name: &str,
+        candidate_pubkey: &[u8; CONTROL_PUBKEY_LEN],
+    ) -> Result<bool, RaftHandleError> {
+        // Only the leader can change membership. Fail fast with a hint so the
+        // joiner redirects rather than running the kernel against a possibly
+        // stale follower view.
+        if !self.is_leader().await {
+            return Err(RaftHandleError::NotLeader(self.leader_name().await));
+        }
+
+        let voters = self.committed_voters().await;
+        let plan = plan_admission(
+            &self.configured_names,
+            &voters,
+            candidate_name,
+            candidate_pubkey,
+        )?;
+
+        // Idempotent re-join (a retry after a lost reply): the candidate is
+        // already the slot's live voter. Nothing to commit.
+        if plan.already_member {
+            return Ok(true);
+        }
+
+        // Execute the plan: add the candidate as a learner (block until it has
+        // caught up via log replay / InstallSnapshot), then one atomic
+        // change_membership to the kernel's exact voter set (joint consensus).
+        // `retain: false` DROPS the evicted previous holder entirely (not kept
+        // as a learner): a replaced instance must leave the cluster.
+        if let Err(e) = self
+            .raft
+            .add_learner(plan.added_id, plan.added.clone(), true)
+            .await
+        {
+            return Err(Self::membership_change_err(e, self).await);
+        }
+        if let Err(e) = self
+            .raft
+            .change_membership(plan.new_voter_ids.clone(), false)
+            .await
+        {
+            return Err(Self::membership_change_err(e, self).await);
+        }
+        Ok(true)
+    }
+
+    /// Map an openraft membership-change error to a [`RaftHandleError`]: a
+    /// `ForwardToLeader` (this node stepped down mid-change) becomes
+    /// [`RaftHandleError::NotLeader`] carrying the current leader hint so the
+    /// joiner redirects; everything else is a transient `Raft` error.
+    async fn membership_change_err(
+        e: RaftClientWriteError,
+        handle: &RaftHandle,
+    ) -> RaftHandleError {
+        let msg = format!("{e}");
+        if msg.contains("ForwardToLeader") || msg.contains("forward") {
+            RaftHandleError::NotLeader(handle.leader_name().await)
+        } else {
+            RaftHandleError::Raft(format!("membership change failed: {e}"))
+        }
+    }
+
+    /// Wait up to `window` for THIS node to observe an initialized cluster
+    /// (a committed membership with voters). Returns `true` if a cluster was
+    /// observed, `false` if the window elapsed with none. The discovery
+    /// bootstrap uses it: only when NO peer reports a cluster within the
+    /// window does the smallest-name node initialize a fresh one.
+    pub async fn await_cluster_observed(&self, window: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            if self.cluster_is_initialized().await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Cleanly stop the local openraft core task. Slice 4 / tests call this on
     /// node teardown so the openraft background task (which holds a clone of
     /// the mesh through its network) actually exits, rather than lingering and
@@ -680,24 +900,32 @@ mod tests {
         out
     }
 
-    /// Every node in a same-config cluster computes the identical name <-> id
-    /// mapping (sorted membership = self + peers), so the static 3-node cluster
-    /// agrees on ids without coordination.
+    /// The clone-resistant id is a function of the per-boot instance PUBKEY,
+    /// not the routing name (#209): two nodes sharing a name but holding
+    /// different keys get different ids, and the same key always yields the
+    /// same id. The full id-derivation rules are the kernel's; this only
+    /// confirms the wiring re-exports and uses [`instance_node_id`] for ids.
     #[test]
-    fn node_id_map_is_deterministic_across_nodes() {
-        let a = NodeIdMap::new("node-a", &["node-b".into(), "node-c".into()]);
-        let b = NodeIdMap::new("node-b", &["node-a".into(), "node-c".into()]);
-        let c = NodeIdMap::new("node-c", &["node-a".into(), "node-b".into()]);
-        for name in ["node-a", "node-b", "node-c"] {
-            assert_eq!(a.id_of(name), b.id_of(name));
-            assert_eq!(b.id_of(name), c.id_of(name));
-        }
-        // Sorted order assigns 0/1/2 to a/b/c.
-        assert_eq!(a.id_of("node-a"), Some(0));
-        assert_eq!(a.id_of("node-b"), Some(1));
-        assert_eq!(a.id_of("node-c"), Some(2));
-        assert_eq!(a.name_of(2), Some("node-c"));
-        assert_eq!(a.members().count(), 3);
+    fn id_derives_from_pubkey_not_name() {
+        // Same name, different keys -> different ids (the restart / clone case).
+        assert_ne!(instance_node_id(&pk(1)), instance_node_id(&pk(2)));
+        // Same key -> same id, regardless of which node computes it.
+        assert_eq!(instance_node_id(&pk(1)), instance_node_id(&pk(1)));
+    }
+
+    /// The [`MemberRecord`] node payload CBOR-round-trips (its 65-byte pubkey
+    /// rides the shared byte adapter), so committed membership decodes
+    /// identically on every replica.
+    #[test]
+    fn member_record_cbor_round_trips() {
+        let rec = MemberRecord {
+            name: "node-b".to_string(),
+            pubkey: pk(7),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&rec, &mut buf).unwrap();
+        let back: MemberRecord = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(rec, back);
     }
 
     /// Each [`ReplicatedOp`] variant CBOR-round-trips, including the 65-byte

@@ -21,12 +21,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    BasicNode, Entry, EntryPayload, LogId, LogState, RaftLogId, RaftLogReader, RaftSnapshotBuilder,
+    Entry, EntryPayload, LogId, LogState, RaftLogId, RaftLogReader, RaftSnapshotBuilder,
     SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::{Mutex, RwLock};
 
-use crate::raft::{RaftNodeId, ReplicatedOp, ReplicatedOpResult, TypeConfig};
+use crate::raft::{MemberRecord, RaftNodeId, ReplicatedOp, ReplicatedOpResult, TypeConfig};
 use crate::{KeyState, Op, PcrKey, StateMachine, StateMachineSnapshot};
 
 // ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 /// A stored snapshot blob plus its metadata.
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
-    meta: SnapshotMeta<RaftNodeId, BasicNode>,
+    meta: SnapshotMeta<RaftNodeId, MemberRecord>,
     /// CBOR-encoded [`StateMachineSnapshot`].
     data: Vec<u8>,
 }
@@ -192,7 +192,7 @@ struct StoredSnapshot {
 #[derive(Debug, Default)]
 struct AppliedState {
     last_applied_log: Option<LogId<RaftNodeId>>,
-    last_membership: StoredMembership<RaftNodeId, BasicNode>,
+    last_membership: StoredMembership<RaftNodeId, MemberRecord>,
 }
 
 /// [`RaftStateMachine`] wrapping the pure [`StateMachine`].
@@ -319,7 +319,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
     ) -> Result<
         (
             Option<LogId<RaftNodeId>>,
-            StoredMembership<RaftNodeId, BasicNode>,
+            StoredMembership<RaftNodeId, MemberRecord>,
         ),
         StorageError<RaftNodeId>,
     > {
@@ -372,7 +372,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<RaftNodeId, BasicNode>,
+        meta: &SnapshotMeta<RaftNodeId, MemberRecord>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<RaftNodeId>> {
         let data = snapshot.into_inner();
