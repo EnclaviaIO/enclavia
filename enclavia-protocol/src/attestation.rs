@@ -261,6 +261,49 @@ pub fn verify_and_extract(
     })
 }
 
+/// Extract PCR0/1/2 from an attestation document the caller JUST obtained from
+/// its OWN `/dev/nsm`, WITHOUT verifying the certificate chain or the nonce.
+///
+/// # This is NOT a verification function. Read before using.
+///
+/// Every other entry point in this module (`verify_against`,
+/// `verify_and_extract`, `verify_control_nonce_attestation`,
+/// `verify_chain_attestation`) authenticates a document that came from SOMEONE
+/// ELSE: in production it validates the AWS Nitro CA chain and the COSE
+/// signature, and it binds the document to a live Noise session via the nonce.
+/// This function does NONE of that. It only structurally decodes the COSE_Sign1
+/// envelope and pulls out the PCRs. A document fed to it could be a forgery and
+/// it would happily return whatever PCRs the forgery claims.
+///
+/// That is acceptable for, and ONLY for, one caller: a node deriving its OWN
+/// self-PCR digest from a document it just requested from its OWN local
+/// `/dev/nsm`. The local NSM device is inside the node's trusted computing base
+/// (on real Nitro it is the hardware module measuring this very VM; under
+/// QEMU's nitro-enclave machine it is the emulated module measuring the same),
+/// so there is no cert chain to trust (the node is reading its own hardware
+/// measurements, not authenticating a remote party) and there is no Noise
+/// session to bind to (the node generated the request itself, with an arbitrary
+/// nonce). This replaces a host-supplied PCR allowlist, which the host (the
+/// adversary) could otherwise choose to admit a rogue image into the mesh.
+///
+/// Do NOT use this on a document received over the network, ever: use
+/// [`verify_and_extract`] (peer attestation) or [`verify_against`] (pinned
+/// identity) for that.
+pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationError> {
+    // Structural decode only: no cert chain, no signature, no nonce. The
+    // `debug_mode = true` arm of `parse_and_validate` is exactly this
+    // (decode_attestation_document), and it is correct here on BOTH QEMU and
+    // real Nitro because the caller is reading its own local device, not
+    // authenticating a remote party.
+    let doc = parse_and_validate(attestation_data, true)?;
+    let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
+    Ok(Pcrs {
+        pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
+        pcr1: decode_pcr(&hex_pcrs.pcr_1, 1)?,
+        pcr2: decode_pcr(&hex_pcrs.pcr_2, 2)?,
+    })
+}
+
 /// Verify a chain-link attestation document.
 ///
 /// Used by the backend's `POST /enclaves/{id}/chain-links` ingest path
@@ -675,6 +718,47 @@ mod tests {
         assert_eq!(identity.pcrs.pcr1, fake.pcr1);
         assert_eq!(identity.pcrs.pcr2, fake.pcr2);
         assert_eq!(identity.control_pubkey, fake.control_pubkey);
+    }
+
+    #[test]
+    fn extract_own_pcrs_returns_doc_pcrs_without_nonce_or_chain() {
+        // A document the node "just got from its own /dev/nsm" (here a
+        // FakeAttestation fixture). extract_own_pcrs must return its PCR0/1/2
+        // verbatim with no nonce/cert-chain check, so the node can derive its
+        // own self-PCR digest regardless of the throwaway/self-signed key.
+        let fake = test_utils::FakeAttestation::with_seed(0x5a, hh());
+        let bytes = fake.encode();
+
+        let pcrs = extract_own_pcrs(&bytes).expect("extract own pcrs");
+        assert_eq!(pcrs.pcr0, fake.pcr0);
+        assert_eq!(pcrs.pcr1, fake.pcr1);
+        assert_eq!(pcrs.pcr2, fake.pcr2);
+
+        // The digest matches what verify_and_extract derives for the same doc,
+        // i.e. it is the SAME identity a peer would compute, just without the
+        // verification a peer document requires.
+        let verified = verify_and_extract(&bytes, &hh(), true).expect("verify");
+        assert_eq!(pcrs.digest(), verified.pcrs.digest());
+    }
+
+    #[test]
+    fn extract_own_pcrs_ignores_the_nonce_entirely() {
+        // Unlike verify_and_extract, extract_own_pcrs takes no handshake hash
+        // and never inspects the nonce: a doc minted with one nonce still
+        // yields its PCRs. (The node mints the request itself with an arbitrary
+        // nonce; there is no session to bind to.)
+        let fake = test_utils::FakeAttestation::with_seed(0x77, vec![0xde; 32]);
+        let pcrs = extract_own_pcrs(&fake.encode()).expect("extract own pcrs");
+        assert_eq!(pcrs.pcr0, fake.pcr0);
+    }
+
+    #[test]
+    fn extract_own_pcrs_rejects_garbage_bytes() {
+        let err = extract_own_pcrs(b"not a cose document").unwrap_err();
+        assert!(
+            matches!(err, AttestationError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
     }
 
     #[test]

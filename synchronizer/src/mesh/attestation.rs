@@ -57,6 +57,50 @@ pub enum AttestationProviderError {
     Nsm(String),
 }
 
+/// Request one attestation document from this node's own `/dev/nsm`, with a
+/// caller-chosen `nonce` and `user_data`. BLOCKING (the NSM driver is a
+/// blocking syscall): call it from a blocking context, or wrap it in
+/// `spawn_blocking` from async code.
+///
+/// This is the raw device call shared by two callers:
+///
+/// * [`NsmAttestor::attest`], per peer connection, with `nonce =
+///   handshake_hash` and `user_data = mesh_pubkey` (channel-bound document for
+///   a peer to verify).
+/// * the node's startup self-attestation, with an arbitrary `nonce` /
+///   `user_data`, to read back its OWN hardware-measured PCRs and derive its
+///   self-PCR allowlist (see `enclavia_protocol::attestation::extract_own_pcrs`).
+///   The local NSM device is inside the node's TCB and emulated identically by
+///   QEMU's nitro-enclave machine, so this works on both QEMU and real Nitro
+///   with no cert-chain trust required.
+pub fn request_own_attestation(
+    nonce: Option<Vec<u8>>,
+    user_data: Option<Vec<u8>>,
+) -> Result<Vec<u8>, AttestationProviderError> {
+    use aws_nitro_enclaves_nsm_api::api::{Request, Response};
+    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+
+    let fd = nsm_init();
+    if fd == -1 {
+        return Err(AttestationProviderError::Nsm("nsm_init failed".into()));
+    }
+    let request = Request::Attestation {
+        user_data: user_data.map(Into::into),
+        nonce: nonce.map(Into::into),
+        public_key: None,
+    };
+    let result = match nsm_process_request(fd, request) {
+        Response::Attestation { document } => Ok(document),
+        Response::Error(e) => Err(AttestationProviderError::Nsm(format!("{e:?}"))),
+        _ => Err(AttestationProviderError::Nsm(
+            "unexpected NSM response".into(),
+        )),
+    };
+    // Close the device on every exit path.
+    nsm_exit(fd);
+    result
+}
+
 /// Production attestation provider: drives the in-enclave `/dev/nsm` device.
 ///
 /// Holds a handle to the node's per-boot [`MeshIdentity`] so the document's
@@ -84,37 +128,14 @@ impl NsmAttestor {
 #[async_trait]
 impl AttestationProvider for NsmAttestor {
     async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, AttestationProviderError> {
-        use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-        use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
-
-        let handshake_hash = handshake_hash.to_vec();
+        let nonce = handshake_hash.to_vec();
         let user_data = self.mesh_pubkey.to_vec();
 
         // The NSM driver is a blocking syscall; run it off the async
         // runtime's worker so the per-peer task does not stall the reactor.
-        tokio::task::spawn_blocking(move || {
-            let fd = nsm_init();
-            if fd == -1 {
-                return Err(AttestationProviderError::Nsm("nsm_init failed".into()));
-            }
-            let request = Request::Attestation {
-                user_data: Some(user_data.into()),
-                nonce: Some(handshake_hash.into()),
-                public_key: None,
-            };
-            let result = match nsm_process_request(fd, request) {
-                Response::Attestation { document } => Ok(document),
-                Response::Error(e) => Err(AttestationProviderError::Nsm(format!("{e:?}"))),
-                _ => Err(AttestationProviderError::Nsm(
-                    "unexpected NSM response".into(),
-                )),
-            };
-            // Close the device on every exit path.
-            nsm_exit(fd);
-            result
-        })
-        .await
-        .map_err(|e| AttestationProviderError::Nsm(format!("join error: {e}")))?
+        tokio::task::spawn_blocking(move || request_own_attestation(Some(nonce), Some(user_data)))
+            .await
+            .map_err(|e| AttestationProviderError::Nsm(format!("join error: {e}")))?
     }
 
     fn mesh_pubkey(&self) -> [u8; CONTROL_PUBKEY_LEN] {

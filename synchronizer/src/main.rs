@@ -68,11 +68,14 @@ const VSOCK_HOST_CID: u32 = 2;
 /// * `MESH_SELF_NAME`  - this node's logical name (matches what `mesh-host`
 ///   resolves).
 /// * `MESH_PEERS`      - comma-separated logical names of the other nodes.
-/// * `MESH_SELF_PCR0`, `MESH_SELF_PCR1`, `MESH_SELF_PCR2` - hex-encoded PCR
-///   measurements of THIS node's own EIF (the build output). The self-PCR
-///   allowlist admits a peer only if its attested PCR digest equals
-///   `sha256(PCR0||PCR1||PCR2)` of these. Configured at launch because a
-///   debug enclave cannot trust its own fake attestation as a reference.
+///
+/// The self-PCR digest that gates the allowlist is NOT read from the
+/// environment: it is derived at startup from a fresh attestation document this
+/// node requests from its OWN `/dev/nsm` (see [`read_mesh_env`]). The host is
+/// the adversary, so a host-supplied digest would let it admit a rogue image
+/// into the mesh and Raft; the local NSM device is inside the TCB and measures
+/// this exact VM, identically on real Nitro and under QEMU's nitro-enclave
+/// machine.
 #[cfg(any(feature = "mesh", feature = "raft"))]
 struct MeshEnv {
     self_name: String,
@@ -83,13 +86,31 @@ struct MeshEnv {
 }
 
 /// Read the mesh environment, build the config + identity + transports. Returns
-/// `None` when no peer set is configured (single-node deployments) or a
-/// required value is missing / malformed.
+/// `None` when no peer set is configured (single-node deployments), a required
+/// value is missing, or the startup self-attestation fails.
+///
+/// ## Self-PCR digest: derived from `/dev/nsm`, never from the host
+///
+/// The self-PCR allowlist admits a peer only when the peer's attested PCR
+/// digest equals THIS node's own image measurements. Those measurements are
+/// obtained here by requesting a fresh attestation document from the node's own
+/// `/dev/nsm` (with an arbitrary nonce / user_data, since there is no session or
+/// peer to bind to) and reading back PCR0/1/2 with
+/// [`extract_own_pcrs`](enclavia_protocol::attestation::extract_own_pcrs). The
+/// host is the adversary: a host-supplied digest (the old `MESH_SELF_PCR*` env
+/// vars) would let it choose an allowlist that admits a rogue image into the
+/// mesh and Raft. The local NSM device is inside the node's TCB and measures
+/// this exact VM identically on real Nitro and under QEMU's nitro-enclave
+/// machine, so no cert-chain trust is needed (the node is reading its own
+/// hardware, not authenticating a remote party). If the NSM request or parse
+/// fails there is NO env fallback (that would reopen the hole): the mesh stays
+/// disabled and the node runs single-node, with a loud error log.
 #[cfg(any(feature = "mesh", feature = "raft"))]
 fn read_mesh_env() -> Option<MeshEnv> {
-    use enclavia_protocol::attestation::Pcrs;
+    use enclavia_protocol::attestation::extract_own_pcrs;
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::PcrKey;
+    use synchronizer::mesh::attestation::request_own_attestation;
     use synchronizer::mesh::config::MeshConfig;
     use synchronizer::mesh::identity::MeshIdentity;
     use synchronizer::mesh::transport::{VsockMeshAcceptor, VsockMeshDialer};
@@ -106,22 +127,26 @@ fn read_mesh_env() -> Option<MeshEnv> {
         return None;
     }
 
-    let decode_pcr = |name: &str| -> Option<Vec<u8>> {
-        let hexed = std::env::var(name).ok()?;
-        match hex::decode(hexed.trim()) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                error!(var = name, error = %e, "MESH_SELF_PCR* is not valid hex");
-                None
-            }
+    // Self-attestation: request a document from our own /dev/nsm and read back
+    // our hardware-measured PCRs. nonce/user_data are irrelevant here (no
+    // session, no peer to bind to), so we pass placeholders. No env fallback on
+    // failure: the host must not be able to pick this digest.
+    let self_doc = match request_own_attestation(None, None) {
+        Ok(doc) => doc,
+        Err(e) => {
+            error!(error = %e, "self-attestation from /dev/nsm failed; mesh disabled (single-node mode)");
+            return None;
         }
     };
-    let self_pcrs = Pcrs {
-        pcr0: decode_pcr("MESH_SELF_PCR0")?,
-        pcr1: decode_pcr("MESH_SELF_PCR1")?,
-        pcr2: decode_pcr("MESH_SELF_PCR2")?,
+    let self_pcrs = match extract_own_pcrs(&self_doc) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(error = %e, "failed to parse own /dev/nsm attestation document; mesh disabled (single-node mode)");
+            return None;
+        }
     };
     let self_digest = PcrKey(self_pcrs.digest());
+    info!("derived self-PCR digest from /dev/nsm for the mesh allowlist");
 
     let config = MeshConfig::new(self_name.clone(), peers, self_digest);
     let identity = MeshIdentity::generate();

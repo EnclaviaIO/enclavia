@@ -40,10 +40,11 @@ sha2 = { workspace = true, optional = true }
 # mesh-transport traits stay object-safe (dyn-dispatched) across the
 # vsock vs UDS/in-memory implementations; `rand` generates the per-boot
 # P-256 mesh keypair and the backoff jitter; `aws-nitro-enclaves-nsm-api`
-# drives `/dev/nsm` to produce the node's own attestation document; `hex`
-# decodes the launch-time MESH_SELF_PCR* env values into the self-PCR
-# allowlist digest. All four are pulled in only by the `mesh` feature
-# (implied by `node`).
+# drives `/dev/nsm` to produce the node's own attestation document (both
+# the per-peer channel-bound docs and the startup self-attestation that
+# derives the self-PCR allowlist digest); `hex` is used by the in-crate
+# test fixtures that build hex-encoded PCR triples. All four are pulled in
+# only by the `mesh` feature (implied by `node`).
 async-trait = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
