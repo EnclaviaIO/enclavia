@@ -67,10 +67,22 @@ enum Command {
     /// build out from under you. Owners can reproduce any of their
     /// enclaves; non-owners can reproduce only `public` enclaves
     /// (registry-enforced).
+    ///
+    /// Pass `--upgrade <upgrade-id>` to reproduce a SUPERSEDED or pending
+    /// version instead of the current one: the staged upgrade's recorded
+    /// digest, PCRs, and source revs drive the rebuild, so every version
+    /// in the public upgrade chain stays deterministically reproducible,
+    /// not just the one running now.
     Reproduce {
         /// Target enclave id. Accepts a unique prefix as long as it
         /// resolves to exactly one of your enclaves.
         enclave_id: String,
+        /// Reproduce this staged upgrade (from `upgrade list`) rather than
+        /// the enclave's current version. The enclave's version-invariant
+        /// build parameters (port, storage, control key, egress policy)
+        /// are still read from the enclave row.
+        #[arg(long, value_name = "UPGRADE_ID")]
+        upgrade: Option<String>,
     },
     /// Manage per-enclave environment-variable secrets. Values are
     /// encrypted at rest with the backend's master key and injected
@@ -301,7 +313,9 @@ async fn main() {
         },
         Command::Enclave { cmd } => run_enclave(cmd).await,
         Command::Push { local_image, enclave_id } => push::push(&local_image, &enclave_id).await,
-        Command::Reproduce { enclave_id } => run_reproduce(&enclave_id).await,
+        Command::Reproduce { enclave_id, upgrade } => {
+            run_reproduce(&enclave_id, upgrade.as_deref()).await
+        }
         Command::Secret { cmd } => run_secret(cmd).await,
         Command::Upgrade { cmd } => run_upgrade(cmd).await,
     };
@@ -591,7 +605,7 @@ fn print_secret_list(rows: &[secrets::SecretSummary]) {
     }
 }
 
-async fn run_reproduce(id_or_prefix: &str) -> Result<(), CliError> {
+async fn run_reproduce(id_or_prefix: &str, upgrade_id: Option<&str>) -> Result<(), CliError> {
     // Authenticated when possible (lets owners reproduce their own
     // private enclaves and resolve prefixes via the list endpoint),
     // anonymous fallback for users with no credentials reproducing a
@@ -601,9 +615,15 @@ async fn run_reproduce(id_or_prefix: &str) -> Result<(), CliError> {
         Err(CliError::NotLoggedIn) => ApiClient::anonymous(),
         Err(e) => return Err(e),
     };
-    let result = reproduce::reproduce(&client, id_or_prefix).await?;
+    let result = match upgrade_id {
+        Some(uid) => reproduce::reproduce_upgrade(&client, id_or_prefix, uid).await?,
+        None => reproduce::reproduce(&client, id_or_prefix).await?,
+    };
 
     println!("Enclave:        {}", result.enclave_id);
+    if let Some(uid) = upgrade_id {
+        println!("Upgrade:        {uid}");
+    }
     println!("Image digest:   {}", result.image_digest);
     if result.recorded_egress_allowlist.is_null() {
         println!("Egress policy:  none recorded (deny-all baked into EIF)");

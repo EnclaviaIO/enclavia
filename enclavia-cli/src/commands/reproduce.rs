@@ -74,6 +74,115 @@ pub struct PcrMismatch {
     pub actual: String,
 }
 
+/// The version-specific inputs that drive a single reproduce run. These
+/// pair a docker image + digest with the PCRs the backend recorded and
+/// the flake revs it built from. They come from one of two places:
+///
+/// - The `enclaves` row (the CURRENT running version), via the default
+///   `enclavia reproduce <id>` path.
+/// - A `staged_upgrades` row (a SUPERSEDED or pending version), via the
+///   `enclavia reproduce <id> --upgrade <upgrade-id>` path.
+///
+/// Everything else the builder needs (container_port, mode, storage,
+/// control pubkey, egress allowlist) is an enclave-level property that
+/// does not change across upgrades, so it is always read from the
+/// enclave row in [`run_builder`]. This struct carries only the bits
+/// that differ between versions.
+#[derive(Debug)]
+struct ReproduceInputs {
+    image_digest: String,
+    expected: PcrTriple,
+    docker_image: String,
+    builder_rev: Option<String>,
+    crates_rev: Option<String>,
+}
+
+impl ReproduceInputs {
+    /// Build inputs from the `enclaves` row (the current version). Errors
+    /// when the row has no recorded digest/PCRs (build never started).
+    fn from_enclave_row(enclave: &serde_json::Value, enclave_id: &str) -> Result<Self, CliError> {
+        let image_digest = enclave
+            .get("image_digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CliError::Other(format!(
+                "enclave {enclave_id} has no recorded image_digest (only enclaves whose build has started can be reproduced)"
+            )))?
+            .to_string();
+
+        let expected = expected_pcrs(enclave)?;
+
+        let docker_image = enclave
+            .get("docker_image")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CliError::Other("enclave is missing docker_image".into()))?
+            .to_string();
+
+        Ok(Self {
+            image_digest,
+            expected,
+            docker_image,
+            builder_rev: opt_str(enclave, "builder_rev"),
+            crates_rev: opt_str(enclave, "crates_rev"),
+        })
+    }
+
+    /// Build inputs from a `staged_upgrades` row (a historical or pending
+    /// version). The DTO is `StagedUpgradeJson`, so the typed fields are
+    /// already parsed.
+    ///
+    /// Two distinct failure modes get distinct, clear errors:
+    /// - No digest/PCRs: the build never completed (still `building`, or
+    ///   `failed`). There is nothing to reproduce.
+    /// - Digest + PCRs present but NULL revs: the upgrade was staged
+    ///   before per-version provenance was recorded, so the local rebuild
+    ///   can't be pinned to the exact sources.
+    fn from_staged_upgrade(
+        upgrade: &enclavia_protocol::staging::StagedUpgradeJson,
+    ) -> Result<Self, CliError> {
+        let image_digest = upgrade.image_digest.clone().ok_or_else(|| {
+            CliError::Other(format!(
+                "upgrade {} has no recorded image_digest: its build never completed (status {:?}), so there is nothing to reproduce",
+                upgrade.id, upgrade.status
+            ))
+        })?;
+
+        let pcrs = upgrade.pcrs.as_ref().ok_or_else(|| {
+            CliError::Other(format!(
+                "upgrade {} has no recorded PCRs: its build never completed (status {:?}), so there is nothing to reproduce",
+                upgrade.id, upgrade.status
+            ))
+        })?;
+        let expected = PcrTriple {
+            pcr0: pcrs.pcr0.clone(),
+            pcr1: pcrs.pcr1.clone(),
+            pcr2: pcrs.pcr2.clone(),
+        };
+
+        if upgrade.builder_rev.is_none() || upgrade.crates_rev.is_none() {
+            return Err(CliError::Other(format!(
+                "upgrade {} was staged before per-version provenance was recorded; cannot pin sources for a deterministic rebuild",
+                upgrade.id
+            )));
+        }
+
+        Ok(Self {
+            image_digest,
+            expected,
+            docker_image: upgrade.docker_image.clone(),
+            builder_rev: upgrade.builder_rev.clone(),
+            crates_rev: upgrade.crates_rev.clone(),
+        })
+    }
+}
+
+/// Pull an optional string field off a JSON object as an owned `String`.
+fn opt_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Resolve `<id-or-prefix>`, fetch the enclave row, run the local builder,
 /// and compare PCRs. Returns Ok even when the comparison fails — the
 /// caller decides how to surface a non-reproducible build (the binary
@@ -84,33 +193,36 @@ pub async fn reproduce(
 ) -> Result<ReproduceResult, CliError> {
     let summary = resolve_enclave(client, id_or_prefix).await?;
     let enclave = client.get_enclave(&summary.id).await?;
+    let inputs = ReproduceInputs::from_enclave_row(&enclave, &summary.id)?;
+    run_reproduce(&summary.id, &enclave, inputs).await
+}
 
-    let image_digest = enclave
-        .get("image_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CliError::Other(format!(
-            "enclave {} has no recorded image_digest — only enclaves whose build has started can be reproduced",
-            summary.id
-        )))?
-        .to_string();
+/// Reproduce a SUPERSEDED or pending version of an enclave from its
+/// `staged_upgrades` row instead of the current `enclaves` row. The
+/// enclave row is still fetched for the version-invariant build
+/// parameters (container_port, mode, storage, control pubkey, egress
+/// allowlist); only the digest/PCRs/revs come from the staged row.
+pub async fn reproduce_upgrade(
+    client: &ApiClient,
+    id_or_prefix: &str,
+    upgrade_id: &str,
+) -> Result<ReproduceResult, CliError> {
+    let summary = resolve_enclave(client, id_or_prefix).await?;
+    let enclave = client.get_enclave(&summary.id).await?;
+    let upgrade = client.get_upgrade(&summary.id, upgrade_id).await?;
+    let inputs = ReproduceInputs::from_staged_upgrade(&upgrade)?;
+    run_reproduce(&summary.id, &enclave, inputs).await
+}
 
-    let expected = expected_pcrs(&enclave)?;
-
-    let docker_image = enclave
-        .get("docker_image")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CliError::Other("enclave is missing docker_image".into()))?
-        .to_string();
-    let pinned_image = pin_to_digest(&docker_image, &image_digest);
-
-    let recorded_builder_rev = enclave
-        .get("builder_rev")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let recorded_crates_rev = enclave
-        .get("crates_rev")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+/// Shared tail of both reproduce paths: pin the image, run the local
+/// builder against the version-invariant enclave parameters plus the
+/// version-specific [`ReproduceInputs`], and diff the PCRs.
+async fn run_reproduce(
+    enclave_id: &str,
+    enclave: &serde_json::Value,
+    inputs: ReproduceInputs,
+) -> Result<ReproduceResult, CliError> {
+    let pinned_image = pin_to_digest(&inputs.docker_image, &inputs.image_digest);
 
     let recorded_egress_allowlist = enclave
         .get("egress_allowlist")
@@ -118,25 +230,26 @@ pub async fn reproduce(
         .unwrap_or(serde_json::Value::Null);
 
     let actual = run_builder(
-        &summary.id,
+        enclave_id,
         &pinned_image,
-        &enclave,
+        enclave,
+        &inputs.image_digest,
         &recorded_egress_allowlist,
-        recorded_builder_rev.as_deref(),
-        recorded_crates_rev.as_deref(),
+        inputs.builder_rev.as_deref(),
+        inputs.crates_rev.as_deref(),
     )
     .await?;
 
-    let mismatches = diff_pcrs(&expected, &actual);
+    let mismatches = diff_pcrs(&inputs.expected, &actual);
 
     Ok(ReproduceResult {
-        enclave_id: summary.id,
-        image_digest,
-        expected,
+        enclave_id: enclave_id.to_string(),
+        image_digest: inputs.image_digest,
+        expected: inputs.expected,
         actual,
         mismatches,
-        recorded_builder_rev,
-        recorded_crates_rev,
+        recorded_builder_rev: inputs.builder_rev,
+        recorded_crates_rev: inputs.crates_rev,
         recorded_egress_allowlist,
     })
 }
@@ -185,10 +298,12 @@ const ENCLAVIA_FLAKE_URL: &str = "github:EnclaviaIO/enclavia";
 /// the EIF is reconstructed from the exact sources the backend used.
 /// Without recorded revs we fall through to the caller's environment —
 /// reproduce won't reliably match in that case, but it still runs.
+#[allow(clippy::too_many_arguments)]
 async fn run_builder(
     enclave_id: &str,
     pinned_image: &str,
     enclave: &serde_json::Value,
+    image_digest: &str,
     egress_allowlist: &serde_json::Value,
     recorded_builder_rev: Option<&str>,
     recorded_crates_rev: Option<&str>,
@@ -228,14 +343,11 @@ async fn run_builder(
     // `enclavia-config.json` is byte-identical to the original.
     // Without this the chain-init path bakes a different config into
     // the initramfs, which moves PCR0 and PCR2 and makes the
-    // reproducibility check fail. The caller already validated the
-    // enclave has a recorded digest (the only path into here goes
-    // through the `image_digest` extraction in `reproduce`); pull it
-    // from the enclave JSON for consistency with the other fields
-    // this function reads (container_port, storage, etc.).
-    if let Some(digest) = enclave.get("image_digest").and_then(|v| v.as_str()) {
-        cmd.arg("--image-digest").arg(digest);
-    }
+    // reproducibility check fail. The digest is passed in explicitly:
+    // for the default path it is the enclave row's digest, for the
+    // `--upgrade` path it is the staged row's digest (which differs
+    // from the enclave row's once a later version has been promoted).
+    cmd.arg("--image-digest").arg(image_digest);
 
     if let Some(port) = enclave.get("container_port").and_then(|v| v.as_u64()) {
         cmd.arg("--container-port").arg(port.to_string());
@@ -599,5 +711,124 @@ mod tests {
             ..r
         };
         assert!(!r.is_reproducible());
+    }
+
+    // -- ReproduceInputs::from_enclave_row -----------------------------------
+
+    #[test]
+    fn from_enclave_row_extracts_all_fields() {
+        let enclave = serde_json::json!({
+            "image_digest": "sha256:abc",
+            "docker_image": "registry.local/alice/foo:v1",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+            "builder_rev": "bbb",
+            "crates_rev": "ccc",
+        });
+        let inputs = ReproduceInputs::from_enclave_row(&enclave, "eid").unwrap();
+        assert_eq!(inputs.image_digest, "sha256:abc");
+        assert_eq!(inputs.docker_image, "registry.local/alice/foo:v1");
+        assert_eq!(inputs.expected, triple("00", "11", "22"));
+        assert_eq!(inputs.builder_rev.as_deref(), Some("bbb"));
+        assert_eq!(inputs.crates_rev.as_deref(), Some("ccc"));
+    }
+
+    #[test]
+    fn from_enclave_row_errors_without_digest() {
+        let enclave = serde_json::json!({
+            "docker_image": "registry.local/alice/foo:v1",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+        });
+        let err = ReproduceInputs::from_enclave_row(&enclave, "eid").unwrap_err();
+        assert!(err.to_string().contains("image_digest"), "got: {err}");
+    }
+
+    // -- ReproduceInputs::from_staged_upgrade --------------------------------
+
+    fn staged(
+        status: enclavia_protocol::staging::StagedUpgradeStatus,
+        digest: Option<&str>,
+        pcrs: Option<enclavia_protocol::chain::PcrsHex>,
+        builder_rev: Option<&str>,
+        crates_rev: Option<&str>,
+    ) -> enclavia_protocol::staging::StagedUpgradeJson {
+        enclavia_protocol::staging::StagedUpgradeJson {
+            id: uuid::Uuid::nil(),
+            enclave_id: uuid::Uuid::nil(),
+            status,
+            docker_image: "registry.local/alice/foo:v2".into(),
+            image_digest: digest.map(|s| s.to_string()),
+            pcrs,
+            valid_from: None,
+            upgrade_link_id: None,
+            revocation_link_id: None,
+            error_message: None,
+            builder_rev: builder_rev.map(|s| s.to_string()),
+            crates_rev: crates_rev.map(|s| s.to_string()),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn pcrs_hex(p0: &str, p1: &str, p2: &str) -> enclavia_protocol::chain::PcrsHex {
+        enclavia_protocol::chain::PcrsHex {
+            pcr0: p0.into(),
+            pcr1: p1.into(),
+            pcr2: p2.into(),
+        }
+    }
+
+    #[test]
+    fn from_staged_upgrade_happy_path() {
+        use enclavia_protocol::staging::StagedUpgradeStatus;
+        let up = staged(
+            StagedUpgradeStatus::Promoted,
+            Some("sha256:def"),
+            Some(pcrs_hex("aa", "bb", "cc")),
+            Some("bbb"),
+            Some("ccc"),
+        );
+        let inputs = ReproduceInputs::from_staged_upgrade(&up).unwrap();
+        assert_eq!(inputs.image_digest, "sha256:def");
+        assert_eq!(inputs.docker_image, "registry.local/alice/foo:v2");
+        assert_eq!(inputs.expected, triple("aa", "bb", "cc"));
+        assert_eq!(inputs.builder_rev.as_deref(), Some("bbb"));
+        assert_eq!(inputs.crates_rev.as_deref(), Some("ccc"));
+    }
+
+    #[test]
+    fn from_staged_upgrade_errors_when_build_incomplete() {
+        use enclavia_protocol::staging::StagedUpgradeStatus;
+        // No digest, no pcrs: build never finished.
+        let up = staged(StagedUpgradeStatus::Building, None, None, None, None);
+        let err = ReproduceInputs::from_staged_upgrade(&up).unwrap_err();
+        assert!(err.to_string().contains("never completed"), "got: {err}");
+    }
+
+    #[test]
+    fn from_staged_upgrade_errors_when_revs_missing() {
+        use enclavia_protocol::staging::StagedUpgradeStatus;
+        // Digest + PCRs present (build completed) but the revs are NULL:
+        // this row predates per-version provenance.
+        let up = staged(
+            StagedUpgradeStatus::Staged,
+            Some("sha256:def"),
+            Some(pcrs_hex("aa", "bb", "cc")),
+            None,
+            None,
+        );
+        let err = ReproduceInputs::from_staged_upgrade(&up).unwrap_err();
+        assert!(
+            err.to_string().contains("per-version provenance"),
+            "got: {err}"
+        );
+
+        // One of the two missing also fails.
+        let up = staged(
+            StagedUpgradeStatus::Staged,
+            Some("sha256:def"),
+            Some(pcrs_hex("aa", "bb", "cc")),
+            Some("bbb"),
+            None,
+        );
+        assert!(ReproduceInputs::from_staged_upgrade(&up).is_err());
     }
 }
