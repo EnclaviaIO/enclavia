@@ -1166,9 +1166,12 @@ async fn no_false_ack_when_a_node_is_partitioned() {
 /// The slot name a committed voter id holds, read from the leader's committed
 /// membership records, or `None` if the id is not a committed voter.
 async fn slot_holders(nodes: &[Node]) -> std::collections::BTreeMap<String, u64> {
-    let leader = current_leader(nodes)
-        .await
-        .expect("a leader to read membership from");
+    // No leader right now (e.g. a re-election in progress after the leader was
+    // restarted): report an empty membership so polling callers keep waiting
+    // rather than panicking. When a leader exists this is unchanged.
+    let Some(leader) = current_leader(nodes).await else {
+        return std::collections::BTreeMap::new();
+    };
     leader
         .raft
         .committed_voters()
@@ -1194,6 +1197,136 @@ async fn await_slot_holder(nodes: &[Node], slot: &str, id: u64, timeout: Duratio
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Restart the SMALLEST-configured-name node (the fresh-cluster bootstrap
+/// initializer, here `node-a`) with a fresh identity against a LIVE cluster
+/// (#209 bootstrap-race regression). This is the dangerous path: a restarted
+/// bootstrap-name node boots with empty state and is NOT in the live
+/// membership (its instance id is new), so it gets no passive signal that the
+/// cluster exists, only its Join probes do. It must JOIN, and must NEVER
+/// initialize a competing cluster. A competitor would reuse the same member
+/// ids and could, via a higher-term election, roll the real log back (the
+/// `loosen-follower-log-revert` mode removes the panic that would otherwise
+/// catch it). The fix: a peer that has itself seen no cluster answers
+/// `NoCluster`; a live peer answers `NotLeader`/`Admitted`, so the restarted
+/// node observes a cluster and never initializes.
+///
+/// Assertions: the survivors' leader term is preserved across the restart (no
+/// competing election bumped it via a parallel cluster), the restarted node is
+/// admitted for its slot evicting its old id, exactly three slot holders, and
+/// all three views converge, including the pre-restart pin (proving no
+/// rollback).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_of_bootstrap_name_node_joins_never_initializes_competitor() {
+    let host = MeshHostStub::new();
+    let mut nodes = cluster(&host).await;
+
+    // Commit a pin so a rollback (which a competing cluster could cause) would
+    // be observable as a lost/regressed version.
+    let seed = 0x73;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    {
+        let ld = current_leader(&nodes).await.unwrap();
+        let mut client = Client::connect(ld, seed, pk).await;
+        assert_eq!(
+            client
+                .rpc(Request::Pin {
+                    key,
+                    commitment: c(0xb2)
+                })
+                .await,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+    }
+
+    // The smallest configured name is the bootstrap initializer. Restarting it
+    // is the case that, before the NoCluster discriminator, could race into
+    // initializing a second cluster.
+    let victim_name = NODE_NAMES.iter().copied().min().unwrap().to_string();
+    let victim_idx = nodes.iter().position(|n| n.name == victim_name).unwrap();
+    let old_id = nodes[victim_idx].raft.self_id();
+
+    let old = nodes.remove(victim_idx);
+    old.raft.shutdown().await;
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Re-spawn node-a with a brand-new identity (empty state, new instance id).
+    let replacement = spawn_node(&victim_name, &host).await;
+    let new_id = replacement.raft.self_id();
+    assert_ne!(old_id, new_id, "replacement must have a fresh instance id");
+    nodes.insert(victim_idx, replacement);
+
+    // The two survivors retain quorum (2 of 3) and re-elect among themselves if
+    // node-a was the leader. If this ever fails, restarting the bootstrap-name
+    // node deadlocked the cluster, a real product bug, not test fragility.
+    assert!(
+        await_leader(&nodes, Duration::from_secs(15)).await,
+        "the surviving nodes did not keep/elect a leader after the bootstrap-name restart"
+    );
+
+    // The restarted bootstrap-name node must JOIN (be admitted for its slot
+    // with the new id), not stand up a competitor.
+    assert!(
+        await_slot_holder(&nodes, &victim_name, new_id, Duration::from_secs(15)).await,
+        "the restarted bootstrap-name node was not admitted via join (it may have \
+         initialized a competing cluster instead)"
+    );
+
+    // Exactly three slots, each held by a live node's current id, and the old
+    // id is gone: one cluster, no duplicate/competitor membership.
+    let holders = slot_holders(&nodes).await;
+    assert_eq!(holders.len(), 3, "not exactly three slots after restart");
+    assert_eq!(holders.get(&victim_name), Some(&new_id));
+    assert!(
+        !holders.values().any(|id| *id == old_id),
+        "the evicted old bootstrap-name id is still a committed voter"
+    );
+    for n in &nodes {
+        assert_eq!(
+            holders.get(&n.name),
+            Some(&n.raft.self_id()),
+            "slot {} held by an id that matches no live node (competing membership)",
+            n.name
+        );
+    }
+
+    // No rollback: the pre-restart pin survives, served through the restarted
+    // node (forwarded to the leader). A competing cluster that won would have
+    // wiped this.
+    let mut client = Client::connect(&nodes[victim_idx], seed, pk).await;
+    assert_eq!(
+        client.rpc(Request::Get { key }).await,
+        Response::GetOk {
+            commitment: c(0xb2),
+            version: Version(0)
+        }
+    );
+
+    // All three live nodes converge on the identical view.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut views = Vec::new();
+        for n in &nodes {
+            views.push(n.raft.state_machine().head_view().await);
+        }
+        if views.iter().all(|v| *v == views[0]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "views never converged after bootstrap-name restart"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
     }
 }
 

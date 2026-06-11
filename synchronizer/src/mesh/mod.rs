@@ -157,6 +157,12 @@ impl Mesh {
         let mut peers = HashMap::new();
         let mut tasks = Vec::new();
 
+        // Instance pubkeys observed over ANY attested channel (inbound accept
+        // OR outbound dial). Created before the dial loops so they can record
+        // the peer pubkey they attested, which the #209 bootstrap needs to
+        // build a peer's MemberRecord after a successful Join round-trip.
+        let observed: ObservedPeers = Arc::new(Mutex::new(HashMap::new()));
+
         // One dial loop per peer (outbound, initiator + RPC client).
         for peer in &config.peers {
             let slot: PeerSlot = Arc::new(Mutex::new(None));
@@ -169,12 +175,12 @@ impl Mesh {
                 identity.clone(),
                 debug_mode,
                 slot,
+                Arc::clone(&observed),
             ));
             tasks.push(handle);
         }
 
         // One accept loop (inbound, responder + RPC server).
-        let observed: ObservedPeers = Arc::new(Mutex::new(HashMap::new()));
         let accept_handle = tokio::spawn(accept_loop(
             Arc::clone(&config),
             acceptor,
@@ -273,6 +279,7 @@ async fn dial_loop<D, A>(
     identity: MeshIdentity,
     debug_mode: bool,
     slot: PeerSlot,
+    observed: ObservedPeers,
 ) where
     D: MeshDialer + ?Sized,
     A: AttestationProvider + ?Sized,
@@ -287,6 +294,7 @@ async fn dial_loop<D, A>(
             &identity,
             debug_mode,
             &slot,
+            &observed,
         )
         .await
         {
@@ -322,6 +330,7 @@ async fn dial_once<D, A>(
     identity: &MeshIdentity,
     debug_mode: bool,
     slot: &PeerSlot,
+    observed: &ObservedPeers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     D: MeshDialer + ?Sized,
@@ -338,6 +347,17 @@ where
     )
     .await?;
     info!(peer = %peer, digest = ?peer_id.pcr_digest, "outbound peer attested, channel up");
+
+    // Record the peer's attested instance pubkey under the name we dialed (the
+    // mutual Hello below confirms the responder IS that name). The #209
+    // bootstrap reads this to build a peer's MemberRecord after a successful
+    // Join, so it must be available on the OUTBOUND path too, not only the
+    // accept side. The pubkey comes from the attestation handshake, never a
+    // payload.
+    observed
+        .lock()
+        .await
+        .insert(peer.to_string(), peer_id.mesh_pubkey);
 
     // Mutual Hello: send ours first (so the acceptor can attribute our
     // stream), then read the responder's and confirm the relay spliced us to

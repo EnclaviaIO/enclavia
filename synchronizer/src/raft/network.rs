@@ -84,6 +84,16 @@ pub enum JoinReply {
     /// leader stepped down mid-change, an internal Raft error). The joiner
     /// retries with backoff.
     Unavailable(String),
+    /// This node has itself never observed an initialized cluster (its own
+    /// committed membership is empty). The DEFINITIVE "no cluster exists here"
+    /// signal the #209 bootstrap needs: it distinguishes a genuinely
+    /// uninitialized peer (co-bootstrap) from a live cluster whose leader is
+    /// momentarily unknown (which returns [`NotLeader`](JoinReply::NotLeader)).
+    /// The smallest-name node initializes a fresh cluster ONLY when every peer
+    /// returns this, never on the mere ABSENCE of a reply, so a node restarted
+    /// with a fresh identity against a live cluster (whose peers never return
+    /// `NoCluster`) can never initialize a competitor.
+    NoCluster,
 }
 
 /// One Raft RPC envelope on the mesh wire. CBOR-encoded inside a
@@ -396,6 +406,15 @@ impl RaftRequestHandler {
         let Some((handle, _debug_mode)) = self.serve.get() else {
             return JoinReply::Unavailable("raft serve path not yet installed".to_string());
         };
+        // Definitive co-bootstrap signal: if THIS node has never observed an
+        // initialized cluster, say so explicitly (NoCluster), so a probing
+        // smallest-name node can tell genuine first-provision from a live
+        // cluster that is merely between leaders. Checked before `admit` (which
+        // would otherwise return NotLeader on an uninitialized node, the exact
+        // ambiguity NoCluster resolves).
+        if !handle.cluster_is_initialized().await {
+            return JoinReply::NoCluster;
+        }
         // SECURITY: candidate pubkey from the attested channel, not the payload.
         match handle.admit(&req.slot_name, &peer.mesh_pubkey).await {
             Ok(_admitted) => JoinReply::Admitted,

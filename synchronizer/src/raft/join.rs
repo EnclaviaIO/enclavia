@@ -10,37 +10,48 @@
 //! * [`discover_and_join`]: the boot state machine. Probe peers for a live
 //!   cluster (a Join attempt doubles as the probe); if a leader admits us (or
 //!   we are already a voter via an `initialize` that included our id), we are
-//!   done. If NO peer reports an initialized cluster within a bounded discovery
-//!   window AND this node holds the lexicographically-smallest configured name,
-//!   initialize a FRESH cluster from the peers' channel-attested pubkeys.
+//!   done. Initialize a FRESH cluster (from the peers' channel-attested
+//!   pubkeys) ONLY when this node holds the lexicographically-smallest
+//!   configured name AND every configured peer POSITIVELY reports it has no
+//!   cluster (a [`JoinReply::NoCluster`] reply).
 //! * [`watch_for_eviction`]: a background watch that detects this node's id
 //!   leaving the committed membership (it was replaced by a same-slot
 //!   instance) and stops it serving.
 //!
-//! ## The two startup races, and why they are safe
+//! ## The discriminator that makes the two startup races safe
 //!
-//! **First provision (all three boot fresh, empty).** Every node probes; no
-//! peer reports a cluster (none is initialized yet), so the window elapses on
-//! all three. Only the lexicographically-smallest-name node initializes, and
-//! it does so with the records of itself plus every peer whose mesh channel is
-//! up (it waits until both peers' channels are up so the initial membership is
-//! complete). The other two are voters from that single `initialize` (their
-//! ids were in it), so they discover the cluster via replication and never
-//! Join. Exactly one `initialize` runs because "smallest name" is a pure
-//! function of the static configured set, identical on every node; the larger
-//! names NEVER initialize.
+//! The whole bootstrap rests on telling "no cluster exists anywhere" apart from
+//! "a cluster exists but this peer is not its leader / is mid-election". Both
+//! used to look identical (a non-leader reply), so the initialize-vs-join
+//! decision came down to channel timing, and first-provision liveness and
+//! restart safety needed that timing to break in OPPOSITE directions. A peer
+//! now answers [`JoinReply::NoCluster`] only when its OWN committed membership
+//! is empty; a peer in a live cluster answers `Admitted` / `NotLeader` /
+//! `Unavailable`. The smallest-name node initializes only on POSITIVE
+//! confirmation: every peer answered `NoCluster` this pass. The mere ABSENCE of
+//! a reply (an unreachable peer) is never read as "no cluster".
+//!
+//! **First provision (all three boot fresh, empty).** Every node probes. The
+//! two larger-name nodes answer `NoCluster` once their channels are up; the
+//! smallest-name node, seeing `NoCluster` from BOTH (so it also has both
+//! attested pubkeys), initializes the complete three-node membership. The other
+//! two are voters from that single `initialize` (their ids were in it), so they
+//! discover the cluster via replication and never Join. Exactly one
+//! `initialize` runs because "smallest name" is a pure function of the static
+//! configured set, identical on every node; the larger names NEVER initialize.
 //!
 //! **Restart with a fresh key while the cluster lives (the whole point).** A
 //! node (even the smallest-name bootstrap node) restarts with empty state and a
-//! NEW instance key. It probes FIRST: it sends Join to its peers. A surviving
-//! leader admits it (replace-on-rejoin evicts the dead old instance for the
-//! slot, atomically), it hydrates from the survivors, done. Crucially, the
-//! restarted bootstrap-name node MUST NOT re-initialize: the probe-first window
-//! plus the "only initialize when NO peer reports a cluster" rule guarantee it
-//! observes the live cluster (its peers answer the Join, or it sees their
-//! AppendEntries) and joins instead of initializing a SECOND cluster over the
-//! live one. A fresh `initialize` on a live cluster would be a split brain;
-//! this is the safety rule the discovery window enforces.
+//! NEW instance key. It is not in the live membership (new id), so it gets no
+//! passive signal; it probes by sending Join. The surviving peers are in a live
+//! cluster, so they answer `Admitted` / `NotLeader`, never `NoCluster`. The
+//! restarted node therefore observes a cluster and joins (replace-on-rejoin
+//! atomically evicts the dead old instance for the slot), and CANNOT take the
+//! initialize path even if it is the bootstrap name: that path requires every
+//! peer to answer `NoCluster`, which a live cluster never does. This closes the
+//! split-brain a timing-based window would have left open (a competing
+//! `initialize` reusing the same member ids could, via a higher-term election,
+//! roll the real log back, which `loosen-follower-log-revert` would not catch).
 //!
 //! ## Eviction
 //!
@@ -63,23 +74,10 @@ use crate::mesh::Mesh;
 use crate::raft::network::{JoinReply, JoinRequest, MeshMessage};
 use crate::raft::{MemberRecord, RaftHandle, instance_node_id};
 
-/// How long each boot probe waits to observe a live cluster before the
-/// smallest-name node falls back to initializing a fresh one. Comfortably
-/// longer than a healthy election (300-600ms) and the mesh dial backoff, so a
-/// genuine live cluster is always observed first on a restart.
-pub const DISCOVERY_WINDOW: Duration = Duration::from_secs(3);
-
 /// Backoff between Join retries while waiting to be admitted (or to observe the
 /// cluster another way). Bounded per-attempt; the overall loop retries
 /// indefinitely (joins may retry forever, per the brief).
 pub const JOIN_RETRY_DELAY: Duration = Duration::from_millis(200);
-
-/// How long to wait for ALL peer channels to come up before the smallest-name
-/// node initializes a fresh cluster, so the initial membership is complete
-/// (every configured slot filled). If a peer never appears within this window
-/// the node initializes with whatever peers ARE up plus itself; the missing
-/// peer then Joins when it arrives (replace-on-rejoin / first-fill).
-pub const INITIAL_MEMBERSHIP_WAIT: Duration = Duration::from_secs(5);
 
 /// Drive the boot discovery + join state machine to completion: return once
 /// this node is a committed voter (admitted via Join, or included in the fresh
@@ -104,27 +102,35 @@ pub async fn discover_and_join(raft: &RaftHandle, mesh: &Mesh) {
             return;
         }
 
-        // Probe: send a Join to each peer. A leader admits us (or reports we are
-        // already a member); a follower hints the leader; an election-in-progress
-        // peer is Unavailable. Any successful Admitted (or observing ourselves as
-        // a voter) ends discovery.
+        // Probe: send a Join to each peer. The reply is the discriminator the
+        // whole bootstrap hinges on:
+        //
+        // * Admitted / NotLeader / Unavailable: a live cluster exists (or is
+        //   electing). We must NOT initialize; keep probing until admitted or
+        //   until the membership replicates to us.
+        // * Refused: a deterministic kernel rejection (unconfigured slot name).
+        //   This node can never be a voter; log and keep probing in case the
+        //   operator fixes the config, but never initialize.
+        // * NoCluster: this peer has itself never seen a cluster. The DEFINITIVE
+        //   "no cluster exists" signal: only this lets us initialize.
+        // * None (unreachable): NOT a signal. Absence of a reply must never be
+        //   read as "no cluster", or a node restarted with a fresh identity
+        //   whose Join channel is briefly down would initialize a competitor
+        //   against the live cluster it simply has not reached yet.
+        //
+        // So the smallest-name node initializes only on POSITIVE confirmation:
+        // every configured peer answered NoCluster this pass (so we have all
+        // their attested pubkeys AND know none holds a cluster). Any other
+        // outcome (a live-cluster reply, OR a single unreachable peer) keeps us
+        // off the initialize path.
         let mut observed_cluster = false;
-        for peer in peer_names(raft, &self_name) {
-            match send_join(mesh, &peer, &self_name).await {
-                Some(JoinReply::Admitted) => {
-                    observed_cluster = true;
-                    // The membership change is linearized; wait briefly for it to
-                    // replicate to us so the voter check above sees it next loop.
-                }
-                Some(JoinReply::NotLeader(_)) => {
-                    // The peer is up and in a cluster (it knows there is/should be
-                    // a leader): a live cluster exists, so we must NOT initialize.
-                    observed_cluster = true;
-                }
-                Some(JoinReply::Unavailable(_)) => {
-                    // Peer is up but mid-election / serve-not-ready: a cluster is
-                    // forming. Treat as "cluster observed" to stay off the
-                    // initialize path (the restart-race safety rule).
+        let peers = peer_names(raft, &self_name);
+        let mut peers_reporting_no_cluster = 0usize;
+        for peer in &peers {
+            match send_join(mesh, peer, &self_name).await {
+                Some(JoinReply::Admitted)
+                | Some(JoinReply::NotLeader(_))
+                | Some(JoinReply::Unavailable(_)) => {
                     observed_cluster = true;
                 }
                 Some(JoinReply::Refused(why)) => {
@@ -135,7 +141,10 @@ pub async fn discover_and_join(raft: &RaftHandle, mesh: &Mesh) {
                     );
                     observed_cluster = true;
                 }
-                None => { /* peer not reachable yet */ }
+                Some(JoinReply::NoCluster) => {
+                    peers_reporting_no_cluster += 1;
+                }
+                None => { /* peer not reachable yet: NOT a no-cluster signal */ }
             }
         }
 
@@ -152,59 +161,58 @@ pub async fn discover_and_join(raft: &RaftHandle, mesh: &Mesh) {
             continue;
         }
 
-        // No peer reports a cluster. Only the lexicographically-smallest-name
-        // node initializes a fresh one (exactly-once by construction). The
-        // larger-name nodes keep probing until the smallest one initializes and
-        // names them, or until they are admitted.
-        if raft.is_smallest_name() && try_initialize_fresh(raft, mesh, &self_name).await {
+        // Initialize a fresh cluster only on positive confirmation: this is the
+        // smallest-name node (exactly-once by construction) AND every configured
+        // peer answered NoCluster this pass.
+        let all_peers_report_no_cluster = peers_reporting_no_cluster == peers.len();
+        if raft.is_smallest_name()
+            && all_peers_report_no_cluster
+            && try_initialize_fresh(raft, mesh, &self_name).await
+        {
             continue; // re-check voter status at the top
         }
         tokio::time::sleep(JOIN_RETRY_DELAY).await;
     }
 }
 
-/// The smallest-name node's fresh-cluster initialize: wait for the peer
-/// channels to come up (so the initial membership is complete), build the
-/// member records from the peers' CHANNEL-attested pubkeys plus our own, and
-/// initialize. Returns `true` if it initialized (or the cluster became
-/// initialized while waiting), `false` to retry.
+/// The smallest-name node's fresh-cluster initialize, called ONLY after every
+/// configured peer answered `NoCluster` this pass (see the caller). That gate
+/// guarantees two things: no live cluster exists, and every peer's channel is
+/// up, so its attested instance pubkey is recorded. Build the COMPLETE initial
+/// membership (self plus all peers) from those pubkeys and initialize.
+///
+/// Deliberately all-or-nothing: it never initializes a SUBSET of the configured
+/// nodes. A partial-membership initialize (e.g. a 2-node cluster while the
+/// third is briefly unreachable) is itself a split-brain risk on a restart, so
+/// if any peer pubkey is somehow not yet recorded we simply retry rather than
+/// shrink the cluster. Returns `true` if it initialized (or the cluster became
+/// initialized concurrently), `false` to retry.
 async fn try_initialize_fresh(raft: &RaftHandle, mesh: &Mesh, self_name: &str) -> bool {
+    if raft.cluster_is_initialized().await {
+        return true; // someone (or we) initialized; stop trying to init
+    }
     let peers = peer_names(raft, self_name);
-
-    // Wait until every peer channel is up so the initial membership is complete.
-    // Re-check for a cluster on each tick: a peer may initialize / a Join may be
-    // admitted while we wait, in which case we abandon the initialize.
-    let deadline = tokio::time::Instant::now() + INITIAL_MEMBERSHIP_WAIT;
-    loop {
-        if raft.cluster_is_initialized().await {
-            return true; // someone (or we) initialized; stop trying to init
-        }
-        let mut records = vec![own_record(raft)];
-        let mut missing = Vec::new();
-        for peer in &peers {
-            match mesh.observed_peer_pubkey(peer).await {
-                Some(pk) => records.push(MemberRecord {
-                    name: peer.clone(),
-                    pubkey: pk,
-                }),
-                None => missing.push(peer.clone()),
+    let mut records = vec![own_record(raft)];
+    for peer in &peers {
+        match mesh.observed_peer_pubkey(peer).await {
+            Some(pk) => records.push(MemberRecord {
+                name: peer.clone(),
+                pubkey: pk,
+            }),
+            // A peer answered NoCluster this pass but its pubkey is not recorded
+            // yet (should not happen: the dial that carried the reply records it
+            // during attestation). Do NOT initialize a subset; retry.
+            None => {
+                warn!(
+                    node = %self_name, peer = %peer,
+                    "peer reported NoCluster but its attested pubkey is not yet recorded; \
+                     retrying rather than initializing an incomplete membership"
+                );
+                return false;
             }
         }
-        if missing.is_empty() {
-            return do_initialize(raft, self_name, records).await;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            // A peer never appeared. Initialize with whoever IS up plus self;
-            // the missing peer Joins when it arrives (first-fill admits it).
-            warn!(
-                node = %self_name, ?missing,
-                "initializing the fresh cluster without all peers' channels up; \
-                 missing peers will join when they appear"
-            );
-            return do_initialize(raft, self_name, records).await;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    do_initialize(raft, self_name, records).await
 }
 
 /// Initialize the cluster from `records` (keyed by their derived ids) and log
