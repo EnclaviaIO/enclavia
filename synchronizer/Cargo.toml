@@ -52,6 +52,24 @@ hex = { workspace = true, optional = true }
 # (only the `api` data types are unconditionally needed elsewhere). The
 # production NsmAttestor drives the device, so it needs the driver.
 aws-nitro-enclaves-nsm-api = { workspace = true, optional = true, features = ["nix"] }
+# Raft replication (#119, slice 3) only. `openraft` is the consensus
+# engine: in-memory log + state machine (no persistence per the #16
+# design), `serde` for CBOR-encoding the replicated ops + snapshots and
+# `storage-v2` for the split RaftLogStorage / RaftStateMachine traits the
+# in-memory store implements. `loosen-follower-log-revert` is REQUIRED by
+# the no-persistence design: a node that restarts wipes its in-memory log
+# (the log "reverts" to empty), and openraft otherwise panics the leader
+# on a follower log reversion. With it, the leader instead replays the log
+# / sends a snapshot to re-hydrate the restarted node, which is exactly the
+# #121 hydrate-from-peers behaviour ("erase a node's data and reboot it
+# without data loss" is the documented use case). The snapshot blob itself
+# is CBOR (`ciborium`), so no extra JSON dep is needed. Pulled in only by
+# `raft`.
+openraft = { version = "0.9.24", optional = true, features = [
+    "serde",
+    "storage-v2",
+    "loosen-follower-log-revert",
+] }
 
 [features]
 default = []
@@ -107,6 +125,17 @@ enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tr
 # enclavia-protocol's `test-utils` so `FakeAttestation` fixtures are
 # reachable from the mesh `FakeAttestor`.
 test-utils = ["mesh", "tokio/net", "enclavia-protocol/test-utils"]
+# Raft replication layer (#119, slice 3). Wraps the pure StateMachine in
+# an openraft state machine, drives an in-memory log, and rides the
+# AppendEntries / Vote / InstallSnapshot RPCs over the `mesh` transport's
+# `Mesh::call`. Library layer only: it does NOT rewire main.rs / the
+# listener onto Raft (that is slice 4). Implies `mesh` (transport +
+# RequestHandler) and pulls in openraft + serde_json for the snapshot blob.
+raft = [
+    "mesh",
+    "dep:openraft",
+    "dep:ciborium",
+]
 
 [dev-dependencies]
 ciborium = { workspace = true }
@@ -129,6 +158,10 @@ tempfile = "3"
 # The integration test's `TaggingHandler` implements the object-safe
 # `RequestHandler` trait, which is `#[async_trait]`.
 async-trait = { workspace = true }
+# The NodeViewConsistent Raft fuzz harness (tests/raft_node_view_consistent.rs,
+# gated on `raft` + `test-utils`) drives a randomized op / fault interleaving
+# from deterministic per-seed `StdRng`s, no external proptest dependency.
+rand = { workspace = true }
 
 [[bin]]
 name = "enclavia-synchronizer"

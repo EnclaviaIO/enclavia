@@ -347,7 +347,17 @@ where
 /// Inbound accept loop. Accepts peer connections forever; each one attests as
 /// responder, reads the dialer's `Hello` to learn the source name, then serves
 /// RPC requests through the shared handler. Each accepted connection runs in
-/// its own task so a slow or stuck peer cannot block the others.
+/// its own task (tracked in a [`JoinSet`](tokio::task::JoinSet)) so a slow or
+/// stuck peer cannot block the others.
+///
+/// The per-connection serve tasks are tracked in a `JoinSet` OWNED by this
+/// loop, so when the loop's task is aborted on [`Mesh::shutdown`] / drop, the
+/// `JoinSet` is dropped and every in-flight serve task is aborted too. Without
+/// this, a node that restarts would leave its old accept-side serve tasks
+/// running, still answering peers from a node that is supposed to be gone (the
+/// peer would never notice the connection should have dropped and would keep
+/// talking to the dead instance). Finished tasks are reaped opportunistically
+/// so the set does not grow without bound.
 async fn accept_loop<R, A, H>(
     config: Arc<MeshConfig>,
     mut acceptor: R,
@@ -360,7 +370,11 @@ async fn accept_loop<R, A, H>(
     A: AttestationProvider + ?Sized + 'static,
     H: RequestHandler + ?Sized + 'static,
 {
+    let mut conns = tokio::task::JoinSet::new();
     loop {
+        // Reap any finished serve tasks without blocking the accept path.
+        while conns.try_join_next().is_some() {}
+
         let stream = match acceptor.accept().await {
             Ok(s) => s,
             Err(e) => {
@@ -373,7 +387,7 @@ async fn accept_loop<R, A, H>(
         let attestor = Arc::clone(&attestor);
         let handler = Arc::clone(&handler);
         let identity = identity.clone();
-        tokio::spawn(async move {
+        conns.spawn(async move {
             if let Err(e) = handle_inbound(
                 &config,
                 stream,

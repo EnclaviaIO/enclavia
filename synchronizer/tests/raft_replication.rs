@@ -1,0 +1,358 @@
+//! Focused 3-node Raft replication tests (#119): leader election, single-op
+//! replication to all followers, the leader-hint / `is_leader` API, and the
+//! linearizable read path. The randomized fault-injection invariant lives in
+//! `raft_node_view_consistent.rs`; this file is the happy-path acceptance check
+//! and exercises the [`RaftHandle`] read / leader-hint surface slice 4 drives.
+//!
+//! Gated on `raft` + `test-utils`.
+#![cfg(all(feature = "raft", feature = "test-utils"))]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use synchronizer::mesh::Mesh;
+use synchronizer::mesh::attestation::FakeAttestor;
+use synchronizer::mesh::config::MeshConfig;
+use synchronizer::mesh::identity::MeshIdentity;
+use synchronizer::mesh::transport::{MeshHostStub, UdsMeshAcceptor};
+use synchronizer::raft::{RaftHandle, RaftRequestHandler, ReplicatedOp};
+use synchronizer::{Commitment, PcrKey, Version};
+
+const IMAGE_SEED: u8 = 0x42;
+const NODE_NAMES: [&str; 3] = ["node-a", "node-b", "node-c"];
+
+fn pubkey(seed: u64) -> [u8; 65] {
+    use p256::ecdsa::SigningKey;
+    let mut scalar = [0u8; 32];
+    scalar[0] = 0x01;
+    scalar[1..9].copy_from_slice(&seed.to_be_bytes());
+    let sk = SigningKey::from_slice(&scalar).unwrap();
+    let pk = sk.verifying_key().to_encoded_point(false);
+    let mut out = [0u8; 65];
+    out.copy_from_slice(pk.as_bytes());
+    out
+}
+fn key(idx: u64) -> PcrKey {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&idx.to_be_bytes());
+    b[31] = 0xab;
+    PcrKey(b)
+}
+fn commitment(n: u64) -> Commitment {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&n.to_be_bytes());
+    Commitment(b)
+}
+
+struct Node {
+    name: String,
+    _mesh: Arc<Mesh>,
+    raft: RaftHandle,
+    _dir: tempfile::TempDir,
+}
+
+async fn spawn_node(name: &str, host: &MeshHostStub) -> Node {
+    spawn_node_with_config(name, host, RaftHandle::default_config()).await
+}
+
+/// Like [`spawn_node`] but with a caller-chosen openraft config, so the
+/// hydration test can force aggressive snapshotting + log purging and thereby
+/// exercise the InstallSnapshot path on a restarted empty node.
+async fn spawn_node_with_config(
+    name: &str,
+    host: &MeshHostStub,
+    raft_config: synchronizer::raft::Config,
+) -> Node {
+    let peers: Vec<String> = NODE_NAMES
+        .iter()
+        .copied()
+        .filter(|n| *n != name)
+        .map(|s| s.to_string())
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join(format!("{name}.sock"));
+    let acceptor = UdsMeshAcceptor::bind(&sock).unwrap();
+    host.register(name, &sock);
+    let identity = MeshIdentity::generate();
+    let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
+    let config = MeshConfig::new(
+        name.to_string(),
+        peers.clone(),
+        FakeAttestor::pcr_digest(IMAGE_SEED),
+    );
+    let handler = RaftRequestHandler::deferred();
+    let mesh = Arc::new(Mesh::start(
+        config,
+        host.dialer_for(name),
+        acceptor,
+        attestor,
+        identity,
+        handler.clone(),
+        true,
+    ));
+    let raft = RaftHandle::with_config(Arc::clone(&mesh), name, &peers, handler, raft_config)
+        .await
+        .unwrap();
+    Node {
+        name: name.to_string(),
+        _mesh: mesh,
+        raft,
+        _dir: dir,
+    }
+}
+
+async fn leader(nodes: &[Node]) -> Option<&Node> {
+    for n in nodes {
+        if n.raft.is_leader().await {
+            return Some(n);
+        }
+    }
+    None
+}
+
+async fn await_leader(nodes: &[Node], timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if leader(nodes).await.is_some() {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+/// Acceptance: a 3-node cluster elects a leader quickly; an op submitted to the
+/// leader replicates to all three state machines; every node's linearizable /
+/// local view agrees; and the non-leaders report the leader as their hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_elect_and_replicate() {
+    let host = MeshHostStub::new();
+    let mut nodes = Vec::new();
+    for name in NODE_NAMES {
+        nodes.push(spawn_node(name, &host).await);
+    }
+    nodes[0].raft.initialize_cluster().await.unwrap();
+
+    // A leader is elected within a short window.
+    assert!(
+        await_leader(&nodes, Duration::from_secs(5)).await,
+        "no leader elected"
+    );
+
+    // Submit a Register on the leader; it must replicate to all three.
+    let ld = leader(&nodes).await.unwrap();
+    let st = ld
+        .raft
+        .client_write(ReplicatedOp::Register {
+            key: key(1),
+            commitment: commitment(7),
+            control_pubkey: pubkey(1),
+        })
+        .await
+        .expect("register applied on leader");
+    assert_eq!(st.version, Version(0));
+
+    // Every node converges to the same committed state for key(1).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut all_have = true;
+        for n in &nodes {
+            match n.raft.state_machine().get(&key(1)).await {
+                Some(s) if s.commitment == commitment(7) && s.version == Version(0) => {}
+                _ => all_have = false,
+            }
+        }
+        if all_have {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "op did not replicate to all nodes in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Leader-hint API: every non-leader names the actual leader.
+    let leader_name = leader(&nodes).await.unwrap().name.clone();
+    for n in &nodes {
+        if n.name != leader_name {
+            assert_eq!(
+                n.raft.leader_name().await.as_deref(),
+                Some(leader_name.as_str()),
+                "{} should redirect to {leader_name}",
+                n.name
+            );
+        }
+    }
+
+    // Linearizable read on the leader returns the committed value; on a
+    // follower it is refused (a follower cannot guarantee freshness, and a
+    // freshness oracle must not serve stale data).
+    let ld = leader(&nodes).await.unwrap();
+    let got = ld
+        .raft
+        .linearizable_get(&key(1))
+        .await
+        .expect("leader linearizable read");
+    assert_eq!(got.map(|s| s.commitment), Some(commitment(7)));
+
+    let follower = nodes.iter().find(|n| n.name != leader_name).unwrap();
+    assert!(
+        follower.raft.linearizable_get(&key(1)).await.is_err(),
+        "a follower must refuse a linearizable read"
+    );
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// Killing the leader triggers a re-election and the cluster keeps committing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_failure_reelects_and_keeps_committing() {
+    let host = MeshHostStub::new();
+    let mut nodes = Vec::new();
+    for name in NODE_NAMES {
+        nodes.push(spawn_node(name, &host).await);
+    }
+    nodes[0].raft.initialize_cluster().await.unwrap();
+    assert!(await_leader(&nodes, Duration::from_secs(5)).await);
+
+    // Commit one op, then KILL the current leader. We drop it (rather than
+    // partition it) so its mesh tasks and per-connection serve tasks abort,
+    // definitively severing the survivors' connections to it: a partition that
+    // only blocks new dials would leave the old leader's existing heartbeat
+    // splices alive and the survivors would never time out and re-elect.
+    let first_leader = leader(&nodes).await.unwrap().name.clone();
+    leader(&nodes)
+        .await
+        .unwrap()
+        .raft
+        .client_write(ReplicatedOp::Register {
+            key: key(1),
+            commitment: commitment(1),
+            control_pubkey: pubkey(1),
+        })
+        .await
+        .unwrap();
+
+    let dead_idx = nodes.iter().position(|n| n.name == first_leader).unwrap();
+    let dead = nodes.remove(dead_idx);
+    dead.raft.shutdown().await;
+    drop(dead);
+
+    // The two survivors re-elect within a window and keep committing. Submit to
+    // whichever survivor becomes leader, retrying: a freshly-elected leader
+    // must commit its initial blank entry before it serves writes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let committed = match leader(&nodes).await {
+            Some(n) => n
+                .raft
+                .client_write(ReplicatedOp::Register {
+                    key: key(2),
+                    commitment: commitment(2),
+                    control_pubkey: pubkey(2),
+                })
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if committed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "survivors never re-elected + committed after the leader was killed"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// #121 hydration path: a node restarted with EMPTY state rejoins a quiet
+/// cluster and catches its full view up from the survivors. The cluster runs
+/// with an aggressive snapshot policy that purges the log, so the empty node's
+/// catch-up MUST go through an InstallSnapshot transfer over the mesh, not log
+/// replay.
+///
+/// This is the dedicated, deterministic home for the empty-state-restart fault
+/// (kept out of the randomized NodeViewConsistent fuzzer, where stacking it on
+/// concurrent partition churn hits openraft 0.9's `loosen-follower-log-revert`
+/// debug-assert; see that harness's module docs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_empty_node_hydrates_from_peers() {
+    // Snapshot after only a few logs and keep none in the log, so the leader's
+    // log is purged and a node that lost everything can only catch up via a
+    // snapshot install.
+    let aggressive = synchronizer::raft::Config {
+        heartbeat_interval: 150,
+        election_timeout_min: 300,
+        election_timeout_max: 600,
+        snapshot_policy: synchronizer::raft::SnapshotPolicy::LogsSinceLast(4),
+        max_in_snapshot_log_to_keep: 0,
+        ..Default::default()
+    };
+
+    let host = MeshHostStub::new();
+    let mut nodes = Vec::new();
+    for name in NODE_NAMES {
+        nodes.push(spawn_node_with_config(name, &host, aggressive.clone()).await);
+    }
+    nodes[0].raft.initialize_cluster().await.unwrap();
+    assert!(await_leader(&nodes, Duration::from_secs(5)).await);
+
+    // Commit a batch of ops so the log grows past the snapshot threshold and
+    // the leader builds + purges to a snapshot.
+    for i in 0..12u64 {
+        let ld = leader(&nodes).await.unwrap();
+        let _ = ld
+            .raft
+            .client_write(ReplicatedOp::Register {
+                key: key(i),
+                commitment: commitment(i),
+                control_pubkey: pubkey(i),
+            })
+            .await;
+    }
+    // Let snapshots build + log purge settle.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Restart a non-leader with EMPTY state.
+    let leader_name = leader(&nodes).await.unwrap().name.clone();
+    let victim_idx = nodes.iter().position(|n| n.name != leader_name).unwrap();
+    let victim_name = nodes[victim_idx].name.clone();
+    let old = nodes.remove(victim_idx);
+    old.raft.shutdown().await;
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    nodes.insert(
+        victim_idx,
+        spawn_node_with_config(&victim_name, &host, aggressive.clone()).await,
+    );
+
+    // The fresh empty node must hydrate the FULL set of 12 keys from the
+    // survivors (via snapshot install, since the log was purged).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let view = nodes[victim_idx].raft.state_machine().head_view().await;
+        if view.len() == 12 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restarted empty node never hydrated (have {} of 12 keys)",
+            view.len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
