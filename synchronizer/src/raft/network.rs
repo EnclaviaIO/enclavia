@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -25,24 +24,76 @@ use openraft::raft::{
 use serde::{Deserialize, Serialize};
 
 use crate::mesh::Mesh;
-use crate::mesh::rpc::{MeshPayload, RequestHandler};
+use crate::mesh::rpc::{MeshPayload, PeerContext, RequestHandler};
 use crate::raft::forward::{ForwardedClientRequest, ForwardedClientResponse};
-use crate::raft::{NodeIdMap, Raft, RaftHandle, RaftNodeId, TypeConfig};
+use crate::raft::{MemberRecord, Raft, RaftHandle, RaftHandleError, RaftNodeId, TypeConfig};
 
 /// The outer envelope multiplexed over the mesh's RPC payload namespace.
 ///
 /// Slice 3 sent a bare Raft RPC ([`MeshRaftRpc`]) as the `Mesh::call` body.
-/// Slice 4 adds a second message class, a [`ForwardedClientRequest`] a
-/// non-leader relays to the leader, so the same inbound
-/// [`RaftRequestHandler`] dispatches both cleanly. The reply shape differs per
+/// Slice 4 added a [`ForwardedClientRequest`] class. The #209 membership slice
+/// adds a third: a [`Join`](MeshMessage::Join) a (re)started node sends to the
+/// leader to be admitted for its configured slot. The same inbound
+/// [`RaftRequestHandler`] dispatches all three. The reply shape differs per
 /// class: a Raft RPC is answered with a CBOR [`MeshRaftReply`]; a forwarded
-/// client request with a CBOR [`ForwardedClientResponse`].
+/// client request with a CBOR [`ForwardedClientResponse`]; a Join with a CBOR
+/// [`JoinReply`].
 #[derive(Serialize, Deserialize)]
 pub enum MeshMessage {
     /// A Raft consensus RPC (AppendEntries / Vote / InstallSnapshot).
     Raft(MeshRaftRpc),
     /// A customer request a non-leader forwarded to the leader.
     ForwardClient(ForwardedClientRequest),
+    /// A membership-join request from a (re)started node for its configured
+    /// slot. See [`JoinRequest`].
+    Join(JoinRequest),
+}
+
+/// A node's request to be admitted into the cluster for its configured slot
+/// (#209). Carries ONLY the slot name: there is deliberately NO pubkey field.
+///
+/// SECURITY CONTRACT (the whole point of #209): the leader takes the
+/// candidate's instance pubkey from the JOIN's mutually-attested mesh channel
+/// ([`PeerIdentity::mesh_pubkey`](crate::mesh::handshake::PeerIdentity),
+/// surfaced to the handler as [`PeerContext`]), NEVER from this payload. A
+/// payload pubkey would be host-forgeable, which is exactly the hole the
+/// clone-resistant scheme closes, so it is simply not carried. The handler
+/// IGNORES anything but the channel identity for its admission decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// The configured slot name the candidate wants to occupy. A routing
+    /// label, bounded by the cluster's configured names; it confers no
+    /// authority (the kernel refuses any name outside the configured set).
+    pub slot_name: String,
+}
+
+/// The leader's reply to a [`JoinRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinReply {
+    /// The candidate is now (or was already) the slot's committed voter.
+    Admitted,
+    /// The kernel deterministically refused the join (unknown slot / id
+    /// collision / corrupt membership). The joiner must NOT retry; the answer
+    /// will not change. Carries the kernel's error string for logging.
+    Refused(String),
+    /// This node is not the leader. Carries the leader's routing name as a
+    /// redirect hint when known (`None` = election in progress). The joiner
+    /// retries against the hint (or any peer) with backoff.
+    NotLeader(Option<String>),
+    /// A transient failure executing the membership change (quorum lost, the
+    /// leader stepped down mid-change, an internal Raft error). The joiner
+    /// retries with backoff.
+    Unavailable(String),
+    /// This node has itself never observed an initialized cluster (its own
+    /// committed membership is empty). The DEFINITIVE "no cluster exists here"
+    /// signal the #209 bootstrap needs: it distinguishes a genuinely
+    /// uninitialized peer (co-bootstrap) from a live cluster whose leader is
+    /// momentarily unknown (which returns [`NotLeader`](JoinReply::NotLeader)).
+    /// The smallest-name node initializes a fresh cluster ONLY when every peer
+    /// returns this, never on the mere ABSENCE of a reply, so a node restarted
+    /// with a fresh identity against a live cluster (whose peers never return
+    /// `NoCluster`) can never initialize a competitor.
+    NoCluster,
 }
 
 /// One Raft RPC envelope on the mesh wire. CBOR-encoded inside a
@@ -70,34 +121,32 @@ enum MeshRaftReply {
     Error(String),
 }
 
-/// Builds a [`MeshRaftNetwork`] per target peer. Holds the shared mesh and the
-/// name <-> id mapping so it can translate openraft's [`RaftNodeId`] target
-/// back to the logical peer name [`Mesh::call`] routes by.
+/// Builds a [`MeshRaftNetwork`] per target peer. Holds the shared mesh; the
+/// target's routing name comes from its [`MemberRecord`] node payload (which
+/// openraft hands to [`new_client`](RaftNetworkFactory::new_client)), not a
+/// static name<->id table (#209 killed that).
 pub struct MeshRaftNetworkFactory {
     mesh: Arc<Mesh>,
-    ids: NodeIdMap,
 }
 
 impl MeshRaftNetworkFactory {
-    /// Build the factory over a running mesh and the cluster's id mapping.
-    pub fn new(mesh: Arc<Mesh>, ids: NodeIdMap) -> Self {
-        Self { mesh, ids }
+    /// Build the factory over a running mesh.
+    pub fn new(mesh: Arc<Mesh>) -> Self {
+        Self { mesh }
     }
 }
 
 impl RaftNetworkFactory<TypeConfig> for MeshRaftNetworkFactory {
     type Network = MeshRaftNetwork;
 
-    async fn new_client(&mut self, target: RaftNodeId, _node: &BasicNode) -> Self::Network {
-        let target_name = self
-            .ids
-            .name_of(target)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+    async fn new_client(&mut self, target: RaftNodeId, node: &MemberRecord) -> Self::Network {
+        // The target's routing name comes from its committed membership record:
+        // `Mesh::call` routes by name, and the record is what the cluster
+        // committed for this instance id.
         MeshRaftNetwork {
             mesh: Arc::clone(&self.mesh),
             target,
-            target_name,
+            target_name: node.name.clone(),
         }
     }
 }
@@ -117,7 +166,7 @@ impl MeshRaftNetwork {
     async fn call(
         &self,
         rpc: MeshRaftRpc,
-    ) -> Result<MeshRaftReply, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>> {
+    ) -> Result<MeshRaftReply, RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId>>> {
         let mut buf = Vec::new();
         ciborium::into_writer(&MeshMessage::Raft(rpc), &mut buf)
             .map_err(|e| RPCError::Network(NetworkError::new(&CborErr(e.to_string()))))?;
@@ -148,7 +197,7 @@ impl RaftNetwork<TypeConfig> for MeshRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         AppendEntriesResponse<RaftNodeId>,
-        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+        RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId>>,
     > {
         match self.call(MeshRaftRpc::AppendEntries(rpc)).await? {
             MeshRaftReply::AppendEntries(r) => Ok(r),
@@ -160,7 +209,7 @@ impl RaftNetwork<TypeConfig> for MeshRaftNetwork {
         &mut self,
         rpc: VoteRequest<RaftNodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<RaftNodeId>, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>>
+    ) -> Result<VoteResponse<RaftNodeId>, RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId>>>
     {
         match self.call(MeshRaftRpc::Vote(rpc)).await? {
             MeshRaftReply::Vote(r) => Ok(r),
@@ -174,7 +223,7 @@ impl RaftNetwork<TypeConfig> for MeshRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<RaftNodeId>,
-        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, InstallSnapshotError>>,
+        RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId, InstallSnapshotError>>,
     > {
         // The shared `call` returns the generic RaftError; remap onto the
         // InstallSnapshot-specialized error type openraft wants here.
@@ -199,7 +248,7 @@ fn reply_mismatch(
     _target: RaftNodeId,
     rpc: &str,
     got: MeshRaftReply,
-) -> RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>> {
+) -> RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId>> {
     let kind = match got {
         MeshRaftReply::AppendEntries(_) => "AppendEntries",
         MeshRaftReply::Vote(_) => "Vote",
@@ -217,8 +266,8 @@ fn reply_mismatch(
 /// (the receiver never returns a `RemoteError` over this channel), so the
 /// other arms are unreachable in practice but mapped conservatively.
 fn remap_rpc_error(
-    e: RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
-) -> RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, InstallSnapshotError>> {
+    e: RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId>>,
+) -> RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId, InstallSnapshotError>> {
     match e {
         RPCError::Unreachable(u) => RPCError::Unreachable(u),
         RPCError::Network(n) => RPCError::Network(n),
@@ -343,11 +392,42 @@ impl RaftRequestHandler {
         .await;
         ForwardedClientResponse(resp)
     }
+
+    /// Handle a membership [`JoinRequest`] on this node (#209). The candidate's
+    /// instance pubkey is taken from `peer` (its mutually-attested mesh
+    /// channel), NEVER from the request payload, which is the whole security
+    /// contract. Runs [`RaftHandle::admit`], which runs the frozen kernel and,
+    /// on the leader, executes the membership change.
+    ///
+    /// The handler uses the serve-installed [`RaftHandle`] (the same one the
+    /// forward path uses). A join arriving before `set_serve` (bootstrap
+    /// window) is answered `Unavailable` so the joiner retries.
+    async fn serve_join(&self, peer: &PeerContext, req: JoinRequest) -> JoinReply {
+        let Some((handle, _debug_mode)) = self.serve.get() else {
+            return JoinReply::Unavailable("raft serve path not yet installed".to_string());
+        };
+        // Definitive co-bootstrap signal: if THIS node has never observed an
+        // initialized cluster, say so explicitly (NoCluster), so a probing
+        // smallest-name node can tell genuine first-provision from a live
+        // cluster that is merely between leaders. Checked before `admit` (which
+        // would otherwise return NotLeader on an uninitialized node, the exact
+        // ambiguity NoCluster resolves).
+        if !handle.cluster_is_initialized().await {
+            return JoinReply::NoCluster;
+        }
+        // SECURITY: candidate pubkey from the attested channel, not the payload.
+        match handle.admit(&req.slot_name, &peer.mesh_pubkey).await {
+            Ok(_admitted) => JoinReply::Admitted,
+            Err(RaftHandleError::JoinRefused(e)) => JoinReply::Refused(e.to_string()),
+            Err(RaftHandleError::NotLeader(hint)) => JoinReply::NotLeader(hint),
+            Err(e) => JoinReply::Unavailable(format!("{e}")),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl RequestHandler for RaftRequestHandler {
-    async fn handle(&self, _from: &str, body: MeshPayload) -> MeshPayload {
+    async fn handle(&self, peer: &PeerContext, body: MeshPayload) -> MeshPayload {
         let msg: MeshMessage = match ciborium::from_reader(body.as_slice()) {
             Ok(m) => m,
             Err(e) => {
@@ -365,6 +445,10 @@ impl RequestHandler for RaftRequestHandler {
             }
             MeshMessage::ForwardClient(fwd) => {
                 let reply = self.serve_forwarded(fwd).await;
+                encode_or_empty(&reply)
+            }
+            MeshMessage::Join(req) => {
+                let reply = self.serve_join(peer, req).await;
                 encode_or_empty(&reply)
             }
         }

@@ -60,7 +60,16 @@ struct Node {
     name: String,
     _mesh: Arc<Mesh>,
     raft: RaftHandle,
+    /// The background #209 discovery/join + eviction-watch task. Aborted on
+    /// drop so a killed node's discovery does not linger.
+    _bootstrap: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self._bootstrap.abort();
+    }
 }
 
 async fn spawn_node(name: &str, host: &MeshHostStub) -> Node {
@@ -86,6 +95,7 @@ async fn spawn_node_with_config(
     let acceptor = UdsMeshAcceptor::bind(&sock).unwrap();
     host.register(name, &sock);
     let identity = MeshIdentity::generate();
+    let self_pubkey = identity.pubkey();
     let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
     let config = MeshConfig::new(
         name.to_string(),
@@ -102,13 +112,33 @@ async fn spawn_node_with_config(
         handler.clone(),
         true,
     ));
-    let raft = RaftHandle::with_config(Arc::clone(&mesh), name, &peers, handler, raft_config)
-        .await
-        .unwrap();
+    let raft = RaftHandle::with_config(
+        Arc::clone(&mesh),
+        name,
+        self_pubkey,
+        &peers,
+        handler.clone(),
+        raft_config,
+    )
+    .await
+    .unwrap();
+    // Enable serving (so inbound joins are admitted) and drive #209 discovery:
+    // the smallest-name node initializes a fresh cluster from peers' attested
+    // pubkeys, the others join. Replaces the old single-node initialize_cluster.
+    raft.enable_serving(&handler, true);
+    let bootstrap = {
+        let raft = raft.clone();
+        let mesh = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            synchronizer::raft::discover_and_join(&raft, &mesh).await;
+            synchronizer::raft::watch_for_eviction(raft).await;
+        })
+    };
     Node {
         name: name.to_string(),
         _mesh: mesh,
         raft,
+        _bootstrap: bootstrap,
         _dir: dir,
     }
 }
@@ -145,7 +175,7 @@ async fn three_nodes_elect_and_replicate() {
     for name in NODE_NAMES {
         nodes.push(spawn_node(name, &host).await);
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node).
 
     // A leader is elected within a short window.
     assert!(
@@ -229,7 +259,7 @@ async fn leader_failure_reelects_and_keeps_committing() {
     for name in NODE_NAMES {
         nodes.push(spawn_node(name, &host).await);
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node).
     assert!(await_leader(&nodes, Duration::from_secs(5)).await);
 
     // Commit one op, then KILL the current leader. We drop it (rather than
@@ -316,7 +346,7 @@ async fn restarted_empty_node_hydrates_from_peers() {
     for name in NODE_NAMES {
         nodes.push(spawn_node_with_config(name, &host, aggressive.clone()).await);
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node).
     assert!(await_leader(&nodes, Duration::from_secs(5)).await);
 
     // Commit a batch of ops so the log grows past the snapshot threshold and

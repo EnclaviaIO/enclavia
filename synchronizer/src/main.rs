@@ -202,35 +202,45 @@ fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
     ))
 }
 
-/// Start the replicated cluster (#119 mesh + Raft, slice 4 wiring): build the
+/// Start the replicated cluster (#119 mesh + Raft + #209 membership): build the
 /// mesh with a deferred [`RaftRequestHandler`], stand up the [`RaftHandle`] over
-/// it, enable serving forwarded client requests, then attempt
-/// `initialize_cluster` on exactly the bootstrap node.
+/// it (whose id is the per-boot instance key, #209), enable serving forwarded
+/// client requests AND inbound membership joins, then drive the discovery/join
+/// state machine in the background.
 ///
 /// Returns the running mesh (held for the process lifetime), the handle, and a
 /// [`ReplicatedDispatch`](synchronizer::raft::ReplicatedDispatch) the listener
 /// uses for every customer connection. `None` when no peer set is configured.
 ///
-/// ## Exactly-once initialize
+/// ## Discovery, join, and exactly-once initialize (#209)
 ///
-/// Every node computes the identical sorted membership, so exactly one node is
-/// the bootstrap node (id 0). Only it calls `initialize_cluster`;
-/// [`RaftHandle::initialize_cluster`](synchronizer::raft::RaftHandle::initialize_cluster)
-/// maps openraft's `NotAllowed` (already-initialized) to `Ok(())`, so a
-/// restarted bootstrap node re-attempting on a live cluster is benign.
+/// There is no fixed bootstrap node any more. Each node runs
+/// [`discover_and_join`](synchronizer::raft::discover_and_join): it probes peers
+/// for a live cluster (a Join doubles as the probe) and is admitted for its
+/// configured slot; ONLY when no peer reports a cluster within a discovery
+/// window AND this node holds the lexicographically-smallest configured name
+/// does it initialize a FRESH cluster from the peers' channel-attested pubkeys.
+/// That probe-first window plus the "only initialize when no peer knows a
+/// cluster" rule is the safety property that stops a restarted smallest-name
+/// node from re-initializing a SECOND cluster over a live one (split brain).
+/// The candidate pubkey the leader admits always comes from the join's attested
+/// mesh channel, never a payload (the #209 SECURITY CONTRACT). Once a voter, the
+/// node watches for eviction by a same-slot replacement
+/// ([`watch_for_eviction`](synchronizer::raft::watch_for_eviction)) and shuts
+/// its Raft down if it is replaced.
 ///
 /// ## Hydrate-on-restart (#121) + cold-start precondition (#122)
 ///
-/// A node restarted with EMPTY in-memory state rejoins as a follower and
-/// hydrates the full view from the survivors over the mesh (log replay, or an
-/// InstallSnapshot transfer once the leader's log has purged past what the node
-/// is missing), exactly the path slice 3's
-/// `restarted_empty_node_hydrates_from_peers` test proves. openraft's
+/// A node restarted with EMPTY in-memory state and a FRESH instance key JOINs
+/// (evicting its dead old id for the slot) and hydrates the full view from the
+/// survivors over the mesh (log replay, or an InstallSnapshot transfer once the
+/// leader's log has purged past what the node is missing). openraft's
 /// `loosen-follower-log-revert` mode (enabled in `Cargo.toml`) is what lets an
 /// empty-log node rejoin without the leader panicking on its log reversion.
 /// Operational precondition: durability is purely N-replica in-memory, so NEVER
-/// lose all three nodes simultaneously (cold-start recovery is #122, out of
-/// scope for this slice).
+/// lose all three nodes simultaneously. TWO simultaneous losses leave the old
+/// config without quorum and the cluster halts (a fresh joiner is not admitted),
+/// the deliberate #209 availability trade and the #122 recovery boundary.
 #[cfg(feature = "raft")]
 async fn start_replicated_from_env() -> Option<(
     Arc<synchronizer::mesh::Mesh>,
@@ -245,8 +255,10 @@ async fn start_replicated_from_env() -> Option<(
     let env = read_mesh_env()?;
     let attestor = NsmAttestor::new(&env.identity);
     // The deduped peer set (== Raft membership minus self), captured before the
-    // config is moved into the mesh.
+    // config is moved into the mesh. The per-boot instance pubkey is captured
+    // too: it is this node's clone-resistant Raft id (#209).
     let self_name = env.self_name.clone();
+    let self_pubkey = env.identity.pubkey();
     let peers = env.config.peers.clone();
 
     info!(
@@ -258,8 +270,8 @@ async fn start_replicated_from_env() -> Option<(
     );
 
     // 1. Deferred Raft handler, installed as the mesh's inbound handler so peer
-    //    RPCs (and forwarded client requests) reach this node once the Raft is
-    //    wired in.
+    //    RPCs (forwarded client requests + membership joins) reach this node
+    //    once the Raft is wired in.
     let handler = RaftRequestHandler::deferred();
     let mesh = Arc::new(Mesh::start(
         env.config,
@@ -272,8 +284,16 @@ async fn start_replicated_from_env() -> Option<(
     ));
 
     // 2. Stand up the local Raft over the mesh, installing the live Raft into
-    //    the deferred handler.
-    let raft = match RaftHandle::new(Arc::clone(&mesh), &self_name, &peers, handler.clone()).await {
+    //    the deferred handler. The Raft id is instance_node_id(self_pubkey).
+    let raft = match RaftHandle::new(
+        Arc::clone(&mesh),
+        &self_name,
+        self_pubkey,
+        &peers,
+        handler.clone(),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to construct RaftHandle");
@@ -281,21 +301,28 @@ async fn start_replicated_from_env() -> Option<(
         }
     };
 
-    // 3. Enable serving forwarded client requests on this node (any node may
-    //    become the leader and receive a forward).
+    // 3. Enable serving forwarded client requests AND inbound membership joins
+    //    on this node (any node may become the leader and admit a joiner).
     raft.enable_serving(&handler, DEBUG_MODE);
 
-    // 4. Bootstrap: exactly one node initializes the static membership; the
-    //    others learn it through replication. Benign if already initialized.
-    if raft.is_bootstrap_node() {
-        match raft.initialize_cluster().await {
-            Ok(()) => info!("bootstrap node initialized the cluster membership"),
-            Err(e) => {
-                warn!(error = %e, "initialize_cluster failed (will rely on existing membership)")
-            }
-        }
-    } else {
-        info!("non-bootstrap node, awaiting membership replication from the bootstrap node");
+    // 4. Discovery + join (#209): probe peers for a live cluster and be
+    //    admitted for our slot; or, when this node holds the smallest
+    //    configured name and NO peer reports a cluster within the discovery
+    //    window, initialize a fresh one from the peers' channel-attested
+    //    pubkeys. A restart with a fresh key takes the join path, NEVER a
+    //    re-initialize, even on the bootstrap-name node (see
+    //    [`synchronizer::raft::join`]). Runs in the background so the listener
+    //    can come up immediately; the dispatcher returns `Unavailable` until
+    //    this node is a voter.
+    {
+        let raft_for_join = raft.clone();
+        let mesh_for_join = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            synchronizer::raft::discover_and_join(&raft_for_join, &mesh_for_join).await;
+            // Once a voter, watch for eviction by a same-slot replacement and
+            // stop serving if it happens.
+            synchronizer::raft::watch_for_eviction(raft_for_join).await;
+        });
     }
 
     let dispatch = ReplicatedDispatch::new(raft.clone(), Arc::clone(&mesh), DEBUG_MODE);

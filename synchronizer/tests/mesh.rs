@@ -29,7 +29,7 @@ use synchronizer::mesh::Mesh;
 use synchronizer::mesh::attestation::FakeAttestor;
 use synchronizer::mesh::config::MeshConfig;
 use synchronizer::mesh::identity::MeshIdentity;
-use synchronizer::mesh::rpc::{MeshPayload, RequestHandler};
+use synchronizer::mesh::rpc::{MeshPayload, PeerContext, RequestHandler};
 use synchronizer::mesh::transport::{
     EofAckDialer, FailingAckDialer, GarbageDialer, MeshHostStub, MisroutingDialer, UdsMeshAcceptor,
 };
@@ -48,9 +48,9 @@ struct TaggingHandler {
 
 #[async_trait::async_trait]
 impl RequestHandler for TaggingHandler {
-    async fn handle(&self, from: &str, body: MeshPayload) -> MeshPayload {
+    async fn handle(&self, peer: &PeerContext, body: MeshPayload) -> MeshPayload {
         let req = String::from_utf8_lossy(&body);
-        format!("{}:{}:{}", self.self_name, from, req).into_bytes()
+        format!("{}:{}:{}", self.self_name, peer.name, req).into_bytes()
     }
 }
 

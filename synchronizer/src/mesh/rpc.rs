@@ -8,6 +8,18 @@
 //! [`super::Mesh::call`], and its inbound side ([`serve`]) feeds the node's
 //! request handler.
 //!
+//! ## Channel-attributed handler identity ([`PeerContext`])
+//!
+//! [`serve`] passes the request handler a [`PeerContext`], not just the peer's
+//! name: it carries the peer's attested per-boot instance pubkey and PCR digest
+//! from the mutual-attestation handshake alongside its `Hello` routing name.
+//! This is what fulfils the #209 membership SECURITY CONTRACT: the join handler
+//! reads a candidate's instance pubkey from the ATTESTED CHANNEL here, never
+//! from a request payload field (which the host could forge), so a clone cannot
+//! claim another instance's voting identity. Earlier slices only handed the
+//! handler the routing name; the pubkey + digest were verified during the
+//! handshake and then discarded.
+//!
 //! ## Envelope + correlation
 //!
 //! Every RPC message is a length-prefixed CBOR [`Envelope`] carried inside a
@@ -85,28 +97,56 @@ pub enum RpcError {
     Encode(String),
 }
 
+/// The channel-attributed identity of the peer whose request is being served.
+///
+/// Built by the accept loop from the mutual-attestation handshake's
+/// [`PeerIdentity`](crate::mesh::handshake::PeerIdentity) plus the dialer's
+/// `Hello` name, and threaded to the [`RequestHandler`] on every inbound
+/// request. This is what fulfils the #209 membership SECURITY CONTRACT: the
+/// join handler reads the candidate's instance pubkey from
+/// [`mesh_pubkey`](PeerContext::mesh_pubkey) here (the attested channel),
+/// NEVER from a request payload, so a host cannot forge a peer's voting
+/// identity.
+#[derive(Clone, Debug)]
+pub struct PeerContext {
+    /// The source peer's logical name (from the dialer's `Hello`). A routing
+    /// label only; it carries no authority.
+    pub name: String,
+    /// The peer's 65-byte SEC1 P-256 per-boot mesh instance pubkey, proven
+    /// live on this channel by the handshake-hash signature. The
+    /// clone-resistant Raft id derives from it.
+    pub mesh_pubkey: [u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN],
+    /// SHA-256 of the peer's attested PCR0/1/2. In a same-image cluster this
+    /// equals the node's own digest (the allowlist check already passed).
+    pub pcr_digest: crate::PcrKey,
+}
+
 /// Inbound-request handler hook. The node implements this to serve requests
 /// that arrive on its accept side; the handler returns the response body.
 ///
 /// Object-safe so the mesh can hold a `dyn RequestHandler`. The Raft layer
-/// (slice 3) supplies one that decodes the `body` as a Raft message, drives
-/// the consensus state machine, and encodes the reply.
+/// supplies one that decodes the `body` as a Raft / forward / join message,
+/// drives the consensus state machine, and encodes the reply.
+///
+/// `peer` is the channel-attributed [`PeerContext`] (attested instance pubkey
+/// + PCR digest + routing name). The membership-join path reads the
+/// candidate's pubkey from it, never from the request payload (#209).
 #[async_trait::async_trait]
 pub trait RequestHandler: Send + Sync {
-    /// Handle one request from `from` (the source peer's logical name) and
+    /// Handle one request from `peer` (its channel-attributed identity) and
     /// return the response body.
-    async fn handle(&self, from: &str, body: MeshPayload) -> MeshPayload;
+    async fn handle(&self, peer: &PeerContext, body: MeshPayload) -> MeshPayload;
 }
 
 /// A no-op handler that echoes the request body back. Used as the default
-/// before slice 3 wires Raft in, and as the server side of the request/
+/// before the Raft handler is wired in, and as the server side of the request/
 /// response tests.
 #[derive(Clone, Copy, Default)]
 pub struct EchoHandler;
 
 #[async_trait::async_trait]
 impl RequestHandler for EchoHandler {
-    async fn handle(&self, _from: &str, body: MeshPayload) -> MeshPayload {
+    async fn handle(&self, _peer: &PeerContext, body: MeshPayload) -> MeshPayload {
         body
     }
 }
@@ -296,11 +336,14 @@ impl Drop for AbortOnDrop {
 /// dispatch to `handler`, and write back correlated responses, until the peer
 /// closes.
 ///
-/// `from` is the source peer's logical name (learned from the dialer's
-/// `Hello`), passed to the handler so it can attribute the request. Requests
-/// are handled one at a time per connection (the synchronizer's throughput is
-/// low and Raft is happy with in-order per-link delivery); concurrent load is
-/// spread across the per-peer connections, not pipelined within one.
+/// `peer` is the source peer's channel-attributed identity ([`PeerContext`]:
+/// its `Hello` name plus the attested instance pubkey + PCR digest from the
+/// mutual-attestation handshake), passed to the handler so it can attribute
+/// the request AND, for the #209 join path, read the candidate's pubkey from
+/// the attested channel rather than a forgeable payload. Requests are handled
+/// one at a time per connection (the synchronizer's throughput is low and Raft
+/// is happy with in-order per-link delivery); concurrent load is spread across
+/// the per-peer connections, not pipelined within one.
 ///
 /// ## Cancel-safety
 ///
@@ -313,7 +356,7 @@ impl Drop for AbortOnDrop {
 pub async fn serve<S, H>(
     mut stream: S,
     mut transport: enclavia_protocol::NoiseTransport,
-    from: &str,
+    peer: &PeerContext,
     handler: &H,
 ) -> Result<(), HandshakeError>
 where
@@ -327,7 +370,7 @@ where
                     .map_err(|e| HandshakeError::Cbor(format!("{e}")))?;
                 match env {
                     Envelope::Request { id, body } => {
-                        let resp_body = handler.handle(from, body).await;
+                        let resp_body = handler.handle(peer, body).await;
                         let mut buf = Vec::new();
                         ciborium::into_writer(
                             &Envelope::Response {
@@ -526,7 +569,12 @@ mod tests {
 
         // Server side: echo every request body back, one at a time.
         let server = tokio::spawn(async move {
-            let _ = serve(server_stream, server_transport, "peer", &EchoHandler).await;
+            let peer = PeerContext {
+                name: "peer".to_string(),
+                mesh_pubkey: [0u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN],
+                pcr_digest: crate::PcrKey([0u8; 32]),
+            };
+            let _ = serve(server_stream, server_transport, &peer, &EchoHandler).await;
         });
 
         let (channel, driver) = spawn_client(client_stream, client_transport);

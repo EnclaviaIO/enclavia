@@ -60,7 +60,9 @@ use crate::mesh::attestation::AttestationProvider;
 use crate::mesh::config::{MeshConfig, PeerName};
 use crate::mesh::handshake::{MeshFrame, Role, mutual_authenticate, read_frame, write_frame};
 use crate::mesh::identity::MeshIdentity;
-use crate::mesh::rpc::{ClientChannel, MeshPayload, RequestHandler, RpcError, serve, spawn_client};
+use crate::mesh::rpc::{
+    ClientChannel, MeshPayload, PeerContext, RequestHandler, RpcError, serve, spawn_client,
+};
 use crate::mesh::transport::{BoxedStream, MeshAcceptor, MeshDialer};
 
 /// Initial reconnect backoff after a dropped peer connection.
@@ -95,6 +97,14 @@ pub enum CallError {
 /// each (re)connect. `None` while the peer is down or mid-handshake.
 type PeerSlot = Arc<Mutex<Option<ClientChannel>>>;
 
+/// The instance pubkeys of peers this node has attested over INBOUND
+/// connections, keyed by the peer's `Hello` name. Populated by the accept loop
+/// after a successful mutual attestation; read by the #209 discovery bootstrap
+/// so the smallest-name node can build the initial membership from the peers'
+/// CHANNEL-attested pubkeys (never a payload).
+type ObservedPeers =
+    Arc<Mutex<HashMap<PeerName, [u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN]>>>;
+
 /// A running peer mesh.
 ///
 /// Construct with [`Mesh::start`]. Drop it (or call [`Mesh::shutdown`]) to tear
@@ -102,6 +112,9 @@ type PeerSlot = Arc<Mutex<Option<ClientChannel>>>;
 pub struct Mesh {
     /// Per-peer live client channel, kept current by the dial loops.
     peers: HashMap<PeerName, PeerSlot>,
+    /// Instance pubkeys observed over inbound (accept-side) attested channels,
+    /// keyed by the peer's `Hello` name. See [`ObservedPeers`].
+    observed: ObservedPeers,
     /// Spawned tasks (dial loops + accept loop). Aborted on shutdown/drop.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -144,6 +157,12 @@ impl Mesh {
         let mut peers = HashMap::new();
         let mut tasks = Vec::new();
 
+        // Instance pubkeys observed over ANY attested channel (inbound accept
+        // OR outbound dial). Created before the dial loops so they can record
+        // the peer pubkey they attested, which the #209 bootstrap needs to
+        // build a peer's MemberRecord after a successful Join round-trip.
+        let observed: ObservedPeers = Arc::new(Mutex::new(HashMap::new()));
+
         // One dial loop per peer (outbound, initiator + RPC client).
         for peer in &config.peers {
             let slot: PeerSlot = Arc::new(Mutex::new(None));
@@ -156,6 +175,7 @@ impl Mesh {
                 identity.clone(),
                 debug_mode,
                 slot,
+                Arc::clone(&observed),
             ));
             tasks.push(handle);
         }
@@ -168,10 +188,15 @@ impl Mesh {
             identity,
             handler,
             debug_mode,
+            Arc::clone(&observed),
         ));
         tasks.push(accept_handle);
 
-        Mesh { peers, tasks }
+        Mesh {
+            peers,
+            observed,
+            tasks,
+        }
     }
 
     /// Issue an id-correlated request to `peer` over its attested channel and
@@ -217,6 +242,17 @@ impl Mesh {
         }
     }
 
+    /// The instance pubkey this node has attested for `peer` over an INBOUND
+    /// channel, if it has seen one. Used by the #209 discovery bootstrap to
+    /// build the initial membership from the peers' channel-attested pubkeys.
+    /// `None` until the peer has dialed in and mutually attested at least once.
+    pub async fn observed_peer_pubkey(
+        &self,
+        peer: &str,
+    ) -> Option<[u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN]> {
+        self.observed.lock().await.get(peer).copied()
+    }
+
     /// Tear down all dial loops and the accept loop.
     pub fn shutdown(&self) {
         for t in &self.tasks {
@@ -243,6 +279,7 @@ async fn dial_loop<D, A>(
     identity: MeshIdentity,
     debug_mode: bool,
     slot: PeerSlot,
+    observed: ObservedPeers,
 ) where
     D: MeshDialer + ?Sized,
     A: AttestationProvider + ?Sized,
@@ -257,6 +294,7 @@ async fn dial_loop<D, A>(
             &identity,
             debug_mode,
             &slot,
+            &observed,
         )
         .await
         {
@@ -292,6 +330,7 @@ async fn dial_once<D, A>(
     identity: &MeshIdentity,
     debug_mode: bool,
     slot: &PeerSlot,
+    observed: &ObservedPeers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     D: MeshDialer + ?Sized,
@@ -308,6 +347,17 @@ where
     )
     .await?;
     info!(peer = %peer, digest = ?peer_id.pcr_digest, "outbound peer attested, channel up");
+
+    // Record the peer's attested instance pubkey under the name we dialed (the
+    // mutual Hello below confirms the responder IS that name). The #209
+    // bootstrap reads this to build a peer's MemberRecord after a successful
+    // Join, so it must be available on the OUTBOUND path too, not only the
+    // accept side. The pubkey comes from the attestation handshake, never a
+    // payload.
+    observed
+        .lock()
+        .await
+        .insert(peer.to_string(), peer_id.mesh_pubkey);
 
     // Mutual Hello: send ours first (so the acceptor can attribute our
     // stream), then read the responder's and confirm the relay spliced us to
@@ -358,6 +408,7 @@ where
 /// peer would never notice the connection should have dropped and would keep
 /// talking to the dead instance). Finished tasks are reaped opportunistically
 /// so the set does not grow without bound.
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop<R, A, H>(
     config: Arc<MeshConfig>,
     mut acceptor: R,
@@ -365,6 +416,7 @@ async fn accept_loop<R, A, H>(
     identity: MeshIdentity,
     handler: Arc<H>,
     debug_mode: bool,
+    observed: ObservedPeers,
 ) where
     R: MeshAcceptor,
     A: AttestationProvider + ?Sized + 'static,
@@ -387,6 +439,7 @@ async fn accept_loop<R, A, H>(
         let attestor = Arc::clone(&attestor);
         let handler = Arc::clone(&handler);
         let identity = identity.clone();
+        let observed = Arc::clone(&observed);
         conns.spawn(async move {
             if let Err(e) = handle_inbound(
                 &config,
@@ -395,6 +448,7 @@ async fn accept_loop<R, A, H>(
                 &identity,
                 handler.as_ref(),
                 debug_mode,
+                &observed,
             )
             .await
             {
@@ -406,6 +460,7 @@ async fn accept_loop<R, A, H>(
 
 /// Drive one accepted connection: attest as responder, read `Hello`, serve RPC
 /// requests until the peer closes.
+#[allow(clippy::too_many_arguments)]
 async fn handle_inbound<A, H>(
     config: &MeshConfig,
     mut stream: BoxedStream,
@@ -413,6 +468,7 @@ async fn handle_inbound<A, H>(
     identity: &MeshIdentity,
     handler: &H,
     debug_mode: bool,
+    observed: &ObservedPeers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     A: AttestationProvider + ?Sized,
@@ -454,7 +510,22 @@ where
     .await?;
     info!(peer = %from, digest = ?peer_id.pcr_digest, "inbound peer attested, serving RPC");
 
-    serve(stream, transport, &from, handler).await?;
+    // Channel-attributed identity for the handler: the dialer's `Hello` name
+    // plus the attested instance pubkey + PCR digest from the handshake. The
+    // #209 join handler reads the candidate's pubkey from HERE (the attested
+    // channel), never from a request payload.
+    let peer = PeerContext {
+        name: from.clone(),
+        mesh_pubkey: peer_id.mesh_pubkey,
+        pcr_digest: peer_id.pcr_digest,
+    };
+    // Record the channel-attested instance pubkey so the discovery bootstrap
+    // (#209) can build the initial membership from peers' attested pubkeys.
+    observed
+        .lock()
+        .await
+        .insert(from.clone(), peer_id.mesh_pubkey);
+    serve(stream, transport, &peer, handler).await?;
     debug!(peer = %from, "inbound peer closed");
     Ok(())
 }

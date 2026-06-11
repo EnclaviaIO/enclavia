@@ -148,12 +148,16 @@ struct Node {
     /// "kill the node" drop, so the old mesh's dial/accept loops would never
     /// stop and the dead node would keep talking to its peers.
     listener_task: tokio::task::JoinHandle<()>,
+    /// The background #209 discovery/join + eviction-watch task. Aborted on
+    /// drop alongside the listener so a killed node fully stops.
+    bootstrap_task: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
         self.listener_task.abort();
+        self.bootstrap_task.abort();
     }
 }
 
@@ -196,6 +200,7 @@ async fn spawn_node_full(
     host.register(name, &mesh_sock);
 
     let identity = MeshIdentity::generate();
+    let self_pubkey = identity.pubkey();
     let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
     let config = MeshConfig::new(
         name.to_string(),
@@ -217,6 +222,7 @@ async fn spawn_node_full(
     let mut raft = RaftHandle::with_config(
         Arc::clone(&mesh),
         name,
+        self_pubkey,
         &peers,
         handler.clone(),
         raft_config,
@@ -230,6 +236,18 @@ async fn spawn_node_full(
         raft = raft.with_replication_wait(wait);
     }
     raft.enable_serving(&handler, true);
+    // Drive #209 discovery/join in the background: the smallest-name node
+    // initializes the fresh cluster from peers' attested pubkeys, the others
+    // join. Replaces the old single-node initialize_cluster the cluster helpers
+    // used to call.
+    let bootstrap_task = {
+        let raft = raft.clone();
+        let mesh = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            synchronizer::raft::discover_and_join(&raft, &mesh).await;
+            synchronizer::raft::watch_for_eviction(raft).await;
+        })
+    };
 
     // Stand up the real customer listener on its own UDS backed by the
     // replicated dispatcher.
@@ -261,6 +279,7 @@ async fn spawn_node_full(
         raft,
         client_sock,
         listener_task,
+        bootstrap_task,
         _dir: dir,
     }
 }
@@ -353,7 +372,7 @@ async fn cluster(host: &MeshHostStub) -> Vec<Node> {
     for name in NODE_NAMES {
         nodes.push(spawn_node(name, host).await);
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node_full).
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
         "no leader elected at startup"
@@ -370,7 +389,7 @@ async fn cluster_with_config(
     for name in NODE_NAMES {
         nodes.push(spawn_node_with_config(name, host, raft_config.clone()).await);
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node_full).
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
         "no leader elected at startup"
@@ -400,7 +419,7 @@ async fn cluster_short_replication_wait(host: &MeshHostStub) -> Vec<Node> {
             .await,
         );
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node_full).
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
         "no leader elected at startup"
@@ -1136,6 +1155,560 @@ async fn no_false_ack_when_a_node_is_partitioned() {
         committed.0 >= 1,
         "version did not advance past the pre-outage value"
     );
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+// --- #209 clone-resistant membership tests --------------------------------
+
+/// The slot name a committed voter id holds, read from the leader's committed
+/// membership records, or `None` if the id is not a committed voter.
+async fn slot_holders(nodes: &[Node]) -> std::collections::BTreeMap<String, u64> {
+    // No leader right now (e.g. a re-election in progress after the leader was
+    // restarted): report an empty membership so polling callers keep waiting
+    // rather than panicking. When a leader exists this is unchanged.
+    let Some(leader) = current_leader(nodes).await else {
+        return std::collections::BTreeMap::new();
+    };
+    leader
+        .raft
+        .committed_voters()
+        .await
+        .into_values()
+        .map(|rec| {
+            (
+                rec.name.clone(),
+                synchronizer::raft::instance_node_id(&rec.pubkey),
+            )
+        })
+        .collect()
+}
+
+/// Wait until the leader's committed membership reports `slot` held by `id`.
+async fn await_slot_holder(nodes: &[Node], slot: &str, id: u64, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if slot_holders(nodes).await.get(slot) == Some(&id) {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Restart the SMALLEST-configured-name node (the fresh-cluster bootstrap
+/// initializer, here `node-a`) with a fresh identity against a LIVE cluster
+/// (#209 bootstrap-race regression). This is the dangerous path: a restarted
+/// bootstrap-name node boots with empty state and is NOT in the live
+/// membership (its instance id is new), so it gets no passive signal that the
+/// cluster exists, only its Join probes do. It must JOIN, and must NEVER
+/// initialize a competing cluster. A competitor would reuse the same member
+/// ids and could, via a higher-term election, roll the real log back (the
+/// `loosen-follower-log-revert` mode removes the panic that would otherwise
+/// catch it). The fix: a peer that has itself seen no cluster answers
+/// `NoCluster`; a live peer answers `NotLeader`/`Admitted`, so the restarted
+/// node observes a cluster and never initializes.
+///
+/// Assertions: the survivors' leader term is preserved across the restart (no
+/// competing election bumped it via a parallel cluster), the restarted node is
+/// admitted for its slot evicting its old id, exactly three slot holders, and
+/// all three views converge, including the pre-restart pin (proving no
+/// rollback).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_of_bootstrap_name_node_joins_never_initializes_competitor() {
+    let host = MeshHostStub::new();
+    let mut nodes = cluster(&host).await;
+
+    // Commit a pin so a rollback (which a competing cluster could cause) would
+    // be observable as a lost/regressed version.
+    let seed = 0x73;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    {
+        let ld = current_leader(&nodes).await.unwrap();
+        let mut client = Client::connect(ld, seed, pk).await;
+        assert_eq!(
+            client
+                .rpc(Request::Pin {
+                    key,
+                    commitment: c(0xb2)
+                })
+                .await,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+    }
+
+    // The smallest configured name is the bootstrap initializer. Restarting it
+    // is the case that, before the NoCluster discriminator, could race into
+    // initializing a second cluster.
+    let victim_name = NODE_NAMES.iter().copied().min().unwrap().to_string();
+    let victim_idx = nodes.iter().position(|n| n.name == victim_name).unwrap();
+    let old_id = nodes[victim_idx].raft.self_id();
+
+    let old = nodes.remove(victim_idx);
+    old.raft.shutdown().await;
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Re-spawn node-a with a brand-new identity (empty state, new instance id).
+    let replacement = spawn_node(&victim_name, &host).await;
+    let new_id = replacement.raft.self_id();
+    assert_ne!(old_id, new_id, "replacement must have a fresh instance id");
+    nodes.insert(victim_idx, replacement);
+
+    // The two survivors retain quorum (2 of 3) and re-elect among themselves if
+    // node-a was the leader. If this ever fails, restarting the bootstrap-name
+    // node deadlocked the cluster, a real product bug, not test fragility.
+    assert!(
+        await_leader(&nodes, Duration::from_secs(15)).await,
+        "the surviving nodes did not keep/elect a leader after the bootstrap-name restart"
+    );
+
+    // The restarted bootstrap-name node must JOIN (be admitted for its slot
+    // with the new id), not stand up a competitor.
+    assert!(
+        await_slot_holder(&nodes, &victim_name, new_id, Duration::from_secs(15)).await,
+        "the restarted bootstrap-name node was not admitted via join (it may have \
+         initialized a competing cluster instead)"
+    );
+
+    // Exactly three slots, each held by a live node's current id, and the old
+    // id is gone: one cluster, no duplicate/competitor membership.
+    let holders = slot_holders(&nodes).await;
+    assert_eq!(holders.len(), 3, "not exactly three slots after restart");
+    assert_eq!(holders.get(&victim_name), Some(&new_id));
+    assert!(
+        !holders.values().any(|id| *id == old_id),
+        "the evicted old bootstrap-name id is still a committed voter"
+    );
+    for n in &nodes {
+        assert_eq!(
+            holders.get(&n.name),
+            Some(&n.raft.self_id()),
+            "slot {} held by an id that matches no live node (competing membership)",
+            n.name
+        );
+    }
+
+    // No rollback: the pre-restart pin survives, served through the restarted
+    // node (forwarded to the leader). A competing cluster that won would have
+    // wiped this.
+    let mut client = Client::connect(&nodes[victim_idx], seed, pk).await;
+    assert_eq!(
+        client.rpc(Request::Get { key }).await,
+        Response::GetOk {
+            commitment: c(0xb2),
+            version: Version(0)
+        }
+    );
+
+    // All three live nodes converge on the identical view.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut views = Vec::new();
+        for n in &nodes {
+            views.push(n.raft.state_machine().head_view().await);
+        }
+        if views.iter().all(|v| *v == views[0]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "views never converged after bootstrap-name restart"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// Restart a node with the SAME slot name but a NEW per-boot identity (#209):
+/// it must be ADMITTED via join (evicting the old instance id for the slot),
+/// hydrate the committed view, and the cluster keeps serving clients. The
+/// three live nodes converge on the identical view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_with_new_identity_is_admitted_via_join() {
+    let host = MeshHostStub::new();
+    let mut nodes = cluster(&host).await;
+
+    // Pin a key so there is committed state the restarted node must hydrate.
+    let seed = 0x71;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    {
+        let ld = current_leader(&nodes).await.unwrap();
+        let mut client = Client::connect(ld, seed, pk).await;
+        assert_eq!(
+            client
+                .rpc(Request::Pin {
+                    key,
+                    commitment: c(0xa1)
+                })
+                .await,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+    }
+
+    // Restart a NON-leader with a fresh identity (spawn_node generates a new
+    // MeshIdentity, so the replacement has a brand-new instance id).
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let victim_idx = nodes.iter().position(|n| n.name != leader_name).unwrap();
+    let victim_name = nodes[victim_idx].name.clone();
+    let old_id = nodes[victim_idx].raft.self_id();
+    let old = nodes.remove(victim_idx);
+    old.raft.shutdown().await;
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let replacement = spawn_node(&victim_name, &host).await;
+    let new_id = replacement.raft.self_id();
+    assert_ne!(
+        old_id, new_id,
+        "the replacement must have a fresh instance id"
+    );
+    nodes.insert(victim_idx, replacement);
+
+    // The replacement joins for its slot, evicting the old id: the committed
+    // membership for the slot is now the NEW id, never the old one.
+    assert!(
+        await_slot_holder(&nodes, &victim_name, new_id, Duration::from_secs(15)).await,
+        "the restarted node was not admitted for its slot via join"
+    );
+    let holders = slot_holders(&nodes).await;
+    assert_eq!(holders.get(&victim_name), Some(&new_id));
+    assert!(
+        !holders.values().any(|id| *id == old_id),
+        "the evicted old instance id is still a committed voter"
+    );
+
+    // The replacement hydrates the committed view and the cluster serves a Get
+    // through it (forwarded to the leader).
+    let mut client = Client::connect(&nodes[victim_idx], seed, pk).await;
+    assert_eq!(
+        client.rpc(Request::Get { key }).await,
+        Response::GetOk {
+            commitment: c(0xa1),
+            version: Version(0)
+        }
+    );
+
+    // The three live nodes converge on the identical view.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut views = Vec::new();
+        for n in &nodes {
+            views.push(n.raft.state_machine().head_view().await);
+        }
+        if views.iter().all(|v| *v == views[0]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "views never converged after restart"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// Clone race (#209): while a node is alive, a SECOND instance with the same
+/// slot name and a fresh identity joins. The host points routing at the clone
+/// (modelled by re-registering the slot's mesh socket, then severing the
+/// original's connections so the cluster re-dials the clone). The clone is
+/// admitted, EVICTING the original's id: exactly one instance holds the slot at
+/// the end, and the original is no longer a committed voter (its participation
+/// ceases). Then flap back: a third fresh instance for the slot is admitted,
+/// again evicting the clone, still exactly one holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clone_race_evicts_original_exactly_one_holder() {
+    let host = MeshHostStub::new();
+    let mut nodes = cluster(&host).await;
+
+    // Pick a NON-leader slot to clone (so the leader stays put and admits).
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let slot = nodes
+        .iter()
+        .find(|n| n.name != leader_name)
+        .unwrap()
+        .name
+        .clone();
+    let original_idx = nodes.iter().position(|n| n.name == slot).unwrap();
+    let original_id = nodes[original_idx].raft.self_id();
+
+    // Exactly one holder of the slot before the clone: the original.
+    assert_eq!(slot_holders(&nodes).await.get(&slot), Some(&original_id));
+
+    // Bring up the clone: a fresh instance for the SAME slot. spawn_node
+    // re-registers the slot's mesh socket (the host now routes the slot to the
+    // clone) and generates a fresh identity. To make the cluster actually route
+    // to the clone (rather than keep its live splice to the original), block the
+    // slot briefly (severs the original's live connections AND the clone's,
+    // which has none yet), then unblock so the cluster re-dials the slot name
+    // and reaches the clone's freshly-registered socket.
+    host.block(slot.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let clone = spawn_node(&slot, &host).await;
+    let clone_id = clone.raft.self_id();
+    assert_ne!(original_id, clone_id);
+    host.unblock(&slot);
+
+    // The clone is admitted for the slot, evicting the original id. At the end
+    // exactly ONE instance holds the slot (the clone), and the original id is
+    // gone from the committed membership.
+    assert!(
+        await_slot_holder(&nodes, &slot, clone_id, Duration::from_secs(20)).await,
+        "the clone was not admitted (evicting the original) for its slot"
+    );
+    {
+        let holders = slot_holders(&nodes).await;
+        assert_eq!(
+            holders.get(&slot),
+            Some(&clone_id),
+            "slot not held by the clone"
+        );
+        assert!(
+            !holders.values().any(|id| *id == original_id),
+            "the evicted original id is still a committed voter (two holders)"
+        );
+        // Exactly one voter per name: no duplicate slot.
+        let names: Vec<&String> = holders.keys().collect();
+        let unique: std::collections::BTreeSet<&String> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "a slot has two committed voters");
+    }
+
+    // The original instance's participation ceased: it is not the leader and a
+    // direct write on it fails (it is no longer a voter that can commit). Its
+    // eviction watch shuts its Raft down on observing itself gone.
+    assert!(
+        !nodes[original_idx].raft.is_leader().await,
+        "the evicted original still believes it is the leader"
+    );
+
+    // The cluster (leader + other + clone) still serves clients with a
+    // consistent view.
+    let seed = 0x72;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    let ld = current_leader(&nodes).await.unwrap();
+    let mut client = Client::connect(ld, seed, pk).await;
+    assert_eq!(
+        client
+            .rpc(Request::Pin {
+                key,
+                commitment: c(0xb2)
+            })
+            .await,
+        Response::PinOk {
+            version: Version(0)
+        }
+    );
+
+    // Drop the now-orphaned original so it stops contending for the slot route,
+    // and replace the slot once more (flap back): a third fresh instance is
+    // admitted, evicting the clone. Still exactly one holder.
+    let original = nodes.remove(original_idx);
+    original.raft.shutdown().await;
+    drop(original);
+    host.block(slot.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let flapped = spawn_node(&slot, &host).await;
+    let flapped_id = flapped.raft.self_id();
+    assert_ne!(clone_id, flapped_id);
+    nodes.insert(original_idx, flapped);
+    host.unblock(&slot);
+
+    assert!(
+        await_slot_holder(&nodes, &slot, flapped_id, Duration::from_secs(20)).await,
+        "the flapped-back instance was not admitted (evicting the clone)"
+    );
+    {
+        let holders = slot_holders(&nodes).await;
+        assert_eq!(holders.get(&slot), Some(&flapped_id));
+        assert!(!holders.values().any(|id| *id == clone_id));
+        let names: Vec<&String> = holders.keys().collect();
+        let unique: std::collections::BTreeSet<&String> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "a slot has two committed voters after flap"
+        );
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+    // The clone node we replaced is still in scope; shut it down.
+    clone.raft.shutdown().await;
+}
+
+/// A joiner whose slot name is NOT in the configured set is refused by the
+/// kernel and NEVER becomes a committed voter (#209): the cluster never grows
+/// past its configured slots no matter how many attested same-image instances
+/// ask. We exercise the leader's join handler directly via the public `admit`
+/// API (the join path runs it with the channel-attested pubkey); the wire Join
+/// would return `Refused`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_slot_name_is_refused_and_never_a_voter() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    let leader = current_leader(&nodes).await.unwrap();
+    // A pubkey for an unconfigured slot.
+    let bogus_pk = keypair(0x99).1;
+    let err = leader
+        .raft
+        .admit("node-evil", &bogus_pk)
+        .await
+        .expect_err("an unconfigured slot must be refused");
+    assert!(
+        matches!(err, synchronizer::raft::RaftHandleError::JoinRefused(_)),
+        "expected JoinRefused for an unconfigured slot, got {err:?}"
+    );
+
+    // The cluster membership is unchanged: still exactly the three configured
+    // slots, and the bogus id is not a voter.
+    let bogus_id = synchronizer::raft::instance_node_id(&bogus_pk);
+    assert!(
+        !leader.raft.is_committed_voter(bogus_id).await,
+        "an unconfigured-slot joiner became a voter"
+    );
+    let holders = slot_holders(&nodes).await;
+    assert_eq!(
+        holders.len(),
+        3,
+        "the cluster grew past its configured slots"
+    );
+    assert!(holders.keys().all(|n| NODE_NAMES.contains(&n.as_str())));
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// Double-loss (#209, the #122 recovery boundary): kill TWO of three nodes.
+/// The old config has no quorum, so the cluster HALTS, no leader, and a new
+/// joiner with a fresh key is NOT admitted (the surviving node cannot commit a
+/// membership change without quorum). The joiner halts rather than misbehaves;
+/// it never becomes a voter. This is the deliberate availability trade documented
+/// in #209: clone resistance costs double-restart recovery, which is operator-
+/// gated (#122).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn double_loss_halts_and_refuses_a_fresh_joiner() {
+    let host = MeshHostStub::new();
+    let mut nodes = cluster(&host).await;
+
+    // Kill two nodes (keep the third). The survivor loses quorum: it can no
+    // longer COMMIT anything (no client writes, no membership changes), which is
+    // the halt the design intends. A lone survivor may still briefly *believe*
+    // it is leader (openraft only relinquishes the belief on a higher term it
+    // never sees, or an explicit linearizability check), but belief without
+    // quorum commits nothing, which is what the assertions below pin down.
+    for _ in 0..2 {
+        let victim = nodes.pop().unwrap();
+        victim.raft.shutdown().await;
+        drop(victim);
+    }
+    let survivor = &nodes[0];
+
+    // The survivor cannot serve client writes (no quorum to commit them): a
+    // client Pin through its listener fails with Unavailable rather than ACKing.
+    // This is the "halts" half.
+    {
+        let seed = 0x5a;
+        let (_, pk) = keypair(seed);
+        let key = key_from_seed(seed);
+        let mut client = Client::connect(survivor, seed, pk).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(8),
+            client.rpc(Request::Pin {
+                key,
+                commitment: c(0x5a),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                r,
+                Ok(Response::Err {
+                    error: RpcError::Unavailable
+                }) | Err(_)
+            ),
+            "a write succeeded without quorum (the cluster did not halt): {r:?}"
+        );
+    }
+
+    // A fresh-key joiner for a dead slot asks the survivor to admit it. Without
+    // quorum the survivor cannot commit the membership change, so the join is
+    // NOT admitted within a bounded window (it would hang on the blocking
+    // add_learner): it halts, never a voter. Bound it with a timeout so a hung
+    // membership change surfaces as the (correct) "not admitted" outcome.
+    let dead_slot = NODE_NAMES
+        .iter()
+        .find(|n| **n != survivor.name)
+        .unwrap()
+        .to_string();
+    let fresh_pk = keypair(0x55).1;
+    let fresh_id = synchronizer::raft::instance_node_id(&fresh_pk);
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(5),
+        survivor.raft.admit(&dead_slot, &fresh_pk),
+    )
+    .await;
+    // Either the admit returned an error (NotLeader / Raft), or it hung and
+    // timed out: in NO case did it report Ok(true) (a successful admission).
+    let was_admitted = matches!(admitted, Ok(Ok(true)));
+    assert!(
+        !was_admitted,
+        "without quorum a join must NOT be admitted; got {admitted:?}"
+    );
+    assert!(
+        !survivor.raft.is_committed_voter(fresh_id).await,
+        "a fresh joiner became a committed voter without quorum (must halt instead)"
+    );
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// Bootstrap (#209): a fresh 3-node cluster initializes EXACTLY ONCE via the
+/// discovery window. After bootstrap the committed membership has exactly the
+/// three configured slots, each held by the running instance's id, so no slot
+/// was filled twice and no extra initialize happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_cluster_initializes_exactly_once() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    // Exactly the three configured slots, each held by the corresponding live
+    // node's instance id. A double-initialize or duplicate fill would show up
+    // as a wrong count or a slot id that matches no live node.
+    let holders = slot_holders(&nodes).await;
+    assert_eq!(
+        holders.len(),
+        3,
+        "bootstrap did not yield exactly three slots"
+    );
+    for n in &nodes {
+        assert_eq!(
+            holders.get(&n.name),
+            Some(&n.raft.self_id()),
+            "slot {} not held by its live instance id (double-init or wrong fill)",
+            n.name
+        );
+    }
 
     for n in &nodes {
         n.raft.shutdown().await;
