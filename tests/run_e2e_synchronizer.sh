@@ -284,9 +284,21 @@ fi
 if [ -n "${TEST_RESTART:-}" ]; then
     echo ""
     echo "=== restart node-c and show re-join + Get ==="
-    # Kill node-c's QEMU only (leave its vhost/mesh-host/names alive).
+    # Kill node-c's QEMU only (leave its vhost/mesh-host/names alive),
+    # then WAIT for it to actually exit before relaunching: the new QEMU
+    # attaches to the same vhost-device-vsock socket, and on a loaded
+    # host the old process can outlive a fixed sleep, leaving the new
+    # one unable to attach (it dies instantly with an empty serial log).
     pkill -f "qemu-system-x86_64.*sync-node-c" 2>/dev/null || true
-    sleep 3
+    for _ in $(seq 1 100); do
+        pgrep -f "qemu-system-x86_64.*sync-node-c" >/dev/null 2>&1 || break
+        sleep 0.2
+    done
+    if pgrep -f "qemu-system-x86_64.*sync-node-c" >/dev/null 2>&1; then
+        echo "  old node-c QEMU still alive after 20s; escalating to SIGKILL"
+        pkill -9 -f "qemu-system-x86_64.*sync-node-c" 2>/dev/null || true
+        sleep 1
+    fi
     : > "${DIR[node-c]}/serial.log"
     qc=(
         -M "nitro-enclave,vsock=c,id=sync-node-c"
@@ -295,8 +307,15 @@ if [ -n "${TEST_RESTART:-}" ]; then
     )
     [ -e /dev/kvm ] && qc+=(--enable-kvm -cpu host) || qc+=(-cpu max)
     nice qemu-system-x86_64 "${qc[@]}" </dev/null >"${DIR[node-c]}/serial.log" 2>&1 &
-    PIDS+=("$!")
-    echo "  node-c relaunched (pid $!); waiting for re-join (up to 120s)..."
+    QEMU_C_PID="$!"
+    PIDS+=("$QEMU_C_PID")
+    echo "  node-c relaunched (pid $QEMU_C_PID); waiting for re-join (up to 120s)..."
+    sleep 2
+    if ! kill -0 "$QEMU_C_PID" 2>/dev/null; then
+        echo "BLOCKER: relaunched node-c QEMU died within 2s; serial tail:" >&2
+        tail -n 40 "${DIR[node-c]}/serial.log" >&2 || true
+        exit 4
+    fi
     rejoin_deadline=$(( $(date +%s) + 120 ))
     while [ "$(date +%s)" -lt "$rejoin_deadline" ]; do
         grep -qi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null && break
@@ -304,12 +323,14 @@ if [ -n "${TEST_RESTART:-}" ]; then
     done
     grep -Ei "join|hydrat|snapshot|voter|cluster" "${DIR[node-c]}/serial.log" | tail -20 || true
     if ! grep -qi "committed voter" "${DIR[node-c]}/serial.log" 2>/dev/null; then
-        echo "BLOCKER: node-c did not re-join (no committed-voter line); see ${DIR[node-c]}/serial.log" >&2
+        echo "BLOCKER: node-c did not re-join (no committed-voter line); serial tail:" >&2
+        tail -n 60 "${DIR[node-c]}/serial.log" >&2 || true
         exit 4
     fi
     echo "--- Get on node-c after restart ---"
     RESTART_OUT="$("$CLIENT" "${DIR[node-c]}/proxy.sock" get --port 5010 --seed "$SEED")" || {
-        echo "BLOCKER: node-c Get failed after restart; see ${DIR[node-c]}/serial.log" >&2
+        echo "BLOCKER: node-c Get failed after restart; serial tail:" >&2
+        tail -n 60 "${DIR[node-c]}/serial.log" >&2 || true
         exit 4
     }
     echo "$RESTART_OUT"
