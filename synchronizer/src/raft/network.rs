@@ -26,12 +26,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::mesh::Mesh;
 use crate::mesh::rpc::{MeshPayload, RequestHandler};
-use crate::raft::{NodeIdMap, Raft, RaftNodeId, TypeConfig};
+use crate::raft::forward::{ForwardedClientRequest, ForwardedClientResponse};
+use crate::raft::{NodeIdMap, Raft, RaftHandle, RaftNodeId, TypeConfig};
 
-/// One Raft RPC envelope on the mesh wire. CBOR-encoded into a
-/// [`MeshPayload`]; the mesh layer treats it as opaque bytes.
+/// The outer envelope multiplexed over the mesh's RPC payload namespace.
+///
+/// Slice 3 sent a bare Raft RPC ([`MeshRaftRpc`]) as the `Mesh::call` body.
+/// Slice 4 adds a second message class, a [`ForwardedClientRequest`] a
+/// non-leader relays to the leader, so the same inbound
+/// [`RaftRequestHandler`] dispatches both cleanly. The reply shape differs per
+/// class: a Raft RPC is answered with a CBOR [`MeshRaftReply`]; a forwarded
+/// client request with a CBOR [`ForwardedClientResponse`].
 #[derive(Serialize, Deserialize)]
-enum MeshRaftRpc {
+pub enum MeshMessage {
+    /// A Raft consensus RPC (AppendEntries / Vote / InstallSnapshot).
+    Raft(MeshRaftRpc),
+    /// A customer request a non-leader forwarded to the leader.
+    ForwardClient(ForwardedClientRequest),
+}
+
+/// One Raft RPC envelope on the mesh wire. CBOR-encoded inside a
+/// [`MeshMessage::Raft`]; the mesh layer treats it as opaque bytes.
+#[derive(Serialize, Deserialize)]
+pub enum MeshRaftRpc {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<RaftNodeId>),
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
@@ -102,7 +119,7 @@ impl MeshRaftNetwork {
         rpc: MeshRaftRpc,
     ) -> Result<MeshRaftReply, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>> {
         let mut buf = Vec::new();
-        ciborium::into_writer(&rpc, &mut buf)
+        ciborium::into_writer(&MeshMessage::Raft(rpc), &mut buf)
             .map_err(|e| RPCError::Network(NetworkError::new(&CborErr(e.to_string()))))?;
 
         let resp: MeshPayload = self.mesh.call(&self.target_name, buf).await.map_err(|e| {
@@ -213,8 +230,10 @@ fn remap_rpc_error(
     }
 }
 
-/// The mesh's inbound [`RequestHandler`]: decode a [`MeshRaftRpc`] and dispatch
-/// it into the local [`Raft`] instance, encoding the reply.
+/// The mesh's inbound [`RequestHandler`]: decode a [`MeshMessage`] and dispatch
+/// it, either a Raft consensus RPC into the local [`Raft`] instance, or a
+/// [`ForwardedClientRequest`] (relayed by a non-leader) into the replicated
+/// client-request handler. Encodes the matching reply.
 ///
 /// Install this as the mesh's handler (slice 4 wires it in `main.rs`; the
 /// NodeViewConsistent harness wires it directly). Holds the local `Raft`
@@ -226,9 +245,22 @@ fn remap_rpc_error(
 /// install it with [`set_raft`](Self::set_raft). RPCs that arrive before the
 /// `Raft` is installed are answered with a transient error (the peer retries),
 /// which is harmless during the brief bootstrap window.
+///
+/// The forwarded-client path additionally needs the full
+/// [`RaftHandle`](crate::raft::RaftHandle) (state machine + linearizable read)
+/// and the node's `debug_mode`; those are installed alongside the `Raft` by
+/// [`set_serve`](Self::set_serve). A forwarded request arriving before
+/// `set_serve` (or addressed to a node that is no longer the leader) is answered
+/// with [`RpcError::Unavailable`](crate::wire::RpcError::Unavailable) so the
+/// forwarding follower re-resolves the leader and retries.
 #[derive(Clone)]
 pub struct RaftRequestHandler {
     raft: Arc<tokio::sync::OnceCell<Raft>>,
+    /// The full handle + debug-mode flag for serving forwarded client requests.
+    /// Installed by [`set_serve`](Self::set_serve) after the `RaftHandle` is
+    /// constructed (it cannot exist when the handler is first built, the mesh
+    /// owns the handler and is constructed first).
+    serve: Arc<tokio::sync::OnceCell<(RaftHandle, bool)>>,
 }
 
 impl RaftRequestHandler {
@@ -238,6 +270,7 @@ impl RaftRequestHandler {
     pub fn deferred() -> Self {
         Self {
             raft: Arc::new(tokio::sync::OnceCell::new()),
+            serve: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -248,6 +281,7 @@ impl RaftRequestHandler {
         let _ = cell.set(raft);
         Self {
             raft: Arc::new(cell),
+            serve: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -257,13 +291,18 @@ impl RaftRequestHandler {
         self.raft.set(raft).is_ok()
     }
 
-    async fn dispatch(&self, body: MeshPayload) -> MeshRaftReply {
+    /// Install the [`RaftHandle`](crate::raft::RaftHandle) + `debug_mode` used to
+    /// serve forwarded client requests on the leader. Idempotent; returns
+    /// whether this call set it. Called by [`RaftHandle::enable_serving`]
+    /// once the handle exists, so the deferred handler can run the replicated
+    /// client-request path for forwards that land here.
+    pub fn set_serve(&self, handle: RaftHandle, debug_mode: bool) -> bool {
+        self.serve.set((handle, debug_mode)).is_ok()
+    }
+
+    async fn dispatch_raft(&self, rpc: MeshRaftRpc) -> MeshRaftReply {
         let Some(raft) = self.raft.get() else {
             return MeshRaftReply::Error("raft not yet installed (bootstrap window)".to_string());
-        };
-        let rpc: MeshRaftRpc = match ciborium::from_reader(body.as_slice()) {
-            Ok(r) => r,
-            Err(e) => return MeshRaftReply::Error(format!("decode raft rpc: {e}")),
         };
         match rpc {
             MeshRaftRpc::AppendEntries(req) => match raft.append_entries(req).await {
@@ -280,21 +319,67 @@ impl RaftRequestHandler {
             },
         }
     }
+
+    /// Run a forwarded client request on this (leader) node. The forwarding
+    /// follower already verified the session attestation and vouches for the
+    /// carried facts (see [`crate::raft::forward`]); the leader still runs the
+    /// full replicated handler, including the `Transition` chain-link check.
+    async fn serve_forwarded(&self, fwd: ForwardedClientRequest) -> ForwardedClientResponse {
+        use crate::wire::{Response, RpcError};
+        let Some((handle, debug_mode)) = self.serve.get() else {
+            // Serve path not yet installed (bootstrap window): tell the
+            // forwarder to retry.
+            return ForwardedClientResponse(Response::Err {
+                error: RpcError::Unavailable,
+            });
+        };
+        let resp = crate::raft::serve::handle_on_leader(
+            handle,
+            fwd.session_key,
+            fwd.control_pubkey,
+            fwd.request,
+            *debug_mode,
+        )
+        .await;
+        ForwardedClientResponse(resp)
+    }
 }
 
 #[async_trait::async_trait]
 impl RequestHandler for RaftRequestHandler {
     async fn handle(&self, _from: &str, body: MeshPayload) -> MeshPayload {
-        let reply = self.dispatch(body).await;
-        let mut buf = Vec::new();
-        // Encoding our own reply enum cannot realistically fail; if it
-        // somehow does, fall back to an empty body (the caller decodes it as a
-        // network error and retries).
-        if ciborium::into_writer(&reply, &mut buf).is_err() {
-            buf.clear();
+        let msg: MeshMessage = match ciborium::from_reader(body.as_slice()) {
+            Ok(m) => m,
+            Err(e) => {
+                // Undecodable body: answer with a Raft error envelope (the most
+                // common caller is the Raft network, which treats it as a
+                // network error and retries).
+                let reply = MeshRaftReply::Error(format!("decode mesh message: {e}"));
+                return encode_or_empty(&reply);
+            }
+        };
+        match msg {
+            MeshMessage::Raft(rpc) => {
+                let reply = self.dispatch_raft(rpc).await;
+                encode_or_empty(&reply)
+            }
+            MeshMessage::ForwardClient(fwd) => {
+                let reply = self.serve_forwarded(fwd).await;
+                encode_or_empty(&reply)
+            }
         }
-        buf
     }
+}
+
+/// CBOR-encode a reply, falling back to an empty body on the (unrealistic)
+/// encode failure. The caller decodes an empty body as a transport error and
+/// retries.
+fn encode_or_empty<T: Serialize>(reply: &T) -> MeshPayload {
+    let mut buf = Vec::new();
+    if ciborium::into_writer(reply, &mut buf).is_err() {
+        buf.clear();
+    }
+    buf
 }
 
 /// Minimal `std::error::Error` wrappers so mesh / CBOR failure strings can be

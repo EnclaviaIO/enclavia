@@ -67,7 +67,9 @@
 //! slice. A single node restarting with empty state is fine: it rejoins as a
 //! follower and hydrates from the survivors' snapshot before serving.
 
-mod network;
+pub mod forward;
+pub(crate) mod network;
+pub mod serve;
 mod store;
 
 use std::collections::BTreeMap;
@@ -81,6 +83,9 @@ use crate::mesh::Mesh;
 use crate::mesh::config::PeerName;
 use crate::{CONTROL_PUBKEY_LEN, Commitment, KeyState, PcrKey, ValidationError};
 
+#[cfg(feature = "node")]
+pub use forward::ReplicatedDispatch;
+pub use forward::{ForwardedClientRequest, ForwardedClientResponse, route_client_request};
 pub use network::{MeshRaftNetworkFactory, RaftRequestHandler};
 pub use store::{LogStore, StateMachineStore, control_pubkey_bytes};
 
@@ -355,10 +360,41 @@ impl RaftHandle {
         })
     }
 
-    /// Initialize the static 3-node cluster. Call on EXACTLY ONE node after
-    /// every node's `RaftRequestHandler` is wired into its mesh. The other
-    /// nodes learn the membership through the initial replication. Idempotent
-    /// failure (`NotAllowed` if already initialized) is mapped to `Ok(())`.
+    /// Enable serving FORWARDED client requests on this node.
+    ///
+    /// A non-leader relays a customer request to the leader over the mesh (see
+    /// [`forward`]); the leader's inbound [`RaftRequestHandler`] runs it through
+    /// the replicated client path, which needs this `RaftHandle` (the state
+    /// machine plus the linearizable read) and the node's `debug_mode` (for
+    /// `Transition` chain-link verification). Install them into the SAME
+    /// `handler` that was passed to [`new`](Self::new) /
+    /// [`with_config`](Self::with_config).
+    ///
+    /// Call exactly once, right after the handle is constructed, on EVERY node
+    /// (any node may end up the leader and receive a forward). Idempotent.
+    pub fn enable_serving(&self, handler: &RaftRequestHandler, debug_mode: bool) {
+        handler.set_serve(self.clone(), debug_mode);
+    }
+
+    /// Whether THIS node is the designated bootstrap node, the one that calls
+    /// [`initialize_cluster`](Self::initialize_cluster).
+    ///
+    /// Every node computes the identical [`NodeIdMap`] (sorted membership), so
+    /// the node with id 0 (lexicographically-smallest name) is the same on every
+    /// node and is the natural single initializer. This makes the
+    /// "exactly one node initializes" rule a pure function of the static config,
+    /// no coordination, no env flag. A non-bootstrap node simply waits for the
+    /// initial membership to replicate to it.
+    pub fn is_bootstrap_node(&self) -> bool {
+        self.self_id == 0
+    }
+
+    /// Initialize the static 3-node cluster. Call on EXACTLY ONE node (the
+    /// [`is_bootstrap_node`](Self::is_bootstrap_node) one) after every node's
+    /// `RaftRequestHandler` is wired into its mesh. The other nodes learn the
+    /// membership through the initial replication. Idempotent failure
+    /// (`NotAllowed` if already initialized) is mapped to `Ok(())`, so a
+    /// restarted bootstrap node that re-attempts it on a live cluster is benign.
     pub async fn initialize_cluster(&self) -> Result<(), RaftHandleError> {
         let members: BTreeMap<RaftNodeId, openraft::BasicNode> = self
             .ids

@@ -1,9 +1,10 @@
-//! Synchronizer single-node listener.
+//! Synchronizer node listener.
 //!
-//! Accepts CBOR-framed RPC connections, dispatches each to a shared
-//! [`Node`], and writes responses back. Transport is selected at compile
-//! time via the `debug` and `enclave` features (mutually exclusive in
-//! practice; the rest of the workspace follows the same pattern):
+//! Accepts CBOR-framed customer RPC connections, dispatches each through a
+//! [`SessionDispatch`](synchronizer::listener::SessionDispatch), and writes
+//! responses back. Transport is selected at compile time via the `debug` and
+//! `enclave` features (mutually exclusive in practice; the rest of the workspace
+//! follows the same pattern):
 //!
 //! - `debug` listens on a Unix domain socket (env: `LISTEN_PATH`). The
 //!   attestation verifier uses the `decode_attestation_document` debug
@@ -11,13 +12,25 @@
 //! - `enclave` listens on vsock (env: `VSOCK_PORT`, default
 //!   [`SYNCHRONIZER_CLIENT_PORT`] = 5010). The verifier requires a full
 //!   Nitro CA-chain-signed attestation document.
+//!
+//! ## Single-node vs replicated (#120 / #121, slice 4)
+//!
+//! Without the `raft` feature (or when the mesh env is not configured) the node
+//! is a single-node [`Node`](synchronizer::Node): it verifies + applies every
+//! request against one local state machine. With the `raft` feature AND a
+//! configured peer mesh, the node joins the 3-node replicated cluster: a
+//! [`ReplicatedDispatch`](synchronizer::raft::ReplicatedDispatch) routes each
+//! request to the cluster leader (forwarding over the mesh when this node is a
+//! follower) and serves reads linearizably. The exactly-one-node bootstrap and
+//! the hydrate-on-restart precondition are documented on
+//! [`start_replicated_from_env`].
 
 use std::sync::Arc;
 
 #[cfg(feature = "enclave")]
 use enclavia_protocol::mesh::SYNCHRONIZER_CLIENT_PORT;
 use synchronizer::Node;
-use synchronizer::listener::handle_connection;
+use synchronizer::listener::{SessionDispatch, handle_connection};
 use tracing::{error, info, warn};
 
 #[cfg(all(feature = "debug", feature = "enclave"))]
@@ -34,7 +47,8 @@ const DEFAULT_VSOCK_PORT: u32 = SYNCHRONIZER_CLIENT_PORT;
 
 /// Picked at compile time from the `debug`/`enclave` feature pair. Passed
 /// to [`handle_connection`] so the listener picks the matching
-/// attestation-validation path (skip-cert-chain vs full chain).
+/// attestation-validation path (skip-cert-chain vs full chain), and to the
+/// Node / replicated dispatcher for the `Transition` chain-link check.
 #[cfg(feature = "debug")]
 const DEBUG_MODE: bool = true;
 #[cfg(feature = "enclave")]
@@ -44,12 +58,11 @@ const DEBUG_MODE: bool = false;
 /// parent under real Nitro; the vhost-device-vsock bridge under QEMU debug),
 /// so the mesh transport is vsock in both binary variants, regardless of the
 /// `debug`/`enclave` split (which only governs the customer-facing listener).
+#[cfg(any(feature = "mesh", feature = "raft"))]
 const VSOCK_HOST_CID: u32 = 2;
 
-/// Start the mutually-attested peer mesh (#118) from the environment, if
-/// configured. Returns the running [`synchronizer::mesh::Mesh`] so `main`
-/// keeps it (and its dial / accept tasks) alive for the process lifetime;
-/// returns `None` when no peer set is configured (single-node deployments).
+/// The pieces read from the mesh environment, shared by the single-node
+/// (echo-handler) and replicated (raft-handler) wiring paths.
 ///
 /// Env (all required together to enable the mesh):
 /// * `MESH_SELF_NAME`  - this node's logical name (matches what `mesh-host`
@@ -60,22 +73,25 @@ const VSOCK_HOST_CID: u32 = 2;
 ///   allowlist admits a peer only if its attested PCR digest equals
 ///   `sha256(PCR0||PCR1||PCR2)` of these. Configured at launch because a
 ///   debug enclave cannot trust its own fake attestation as a reference.
-///
-/// The node generates a fresh per-boot P-256 mesh identity, reaches
-/// `mesh-host` over vsock ([`enclavia_protocol::mesh::MESH_VSOCK_PORT`]) and
-/// listens for relayed-in peer connections on
-/// [`enclavia_protocol::mesh::SYNCHRONIZER_BOOTSTRAP_PORT`]. Inbound requests
-/// are served by an echo handler until slice 3 (openraft) supplies the real
-/// one.
-fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
+#[cfg(any(feature = "mesh", feature = "raft"))]
+struct MeshEnv {
+    self_name: String,
+    config: synchronizer::mesh::config::MeshConfig,
+    identity: synchronizer::mesh::identity::MeshIdentity,
+    dialer: synchronizer::mesh::transport::VsockMeshDialer,
+    acceptor: synchronizer::mesh::transport::VsockMeshAcceptor,
+}
+
+/// Read the mesh environment, build the config + identity + transports. Returns
+/// `None` when no peer set is configured (single-node deployments) or a
+/// required value is missing / malformed.
+#[cfg(any(feature = "mesh", feature = "raft"))]
+fn read_mesh_env() -> Option<MeshEnv> {
     use enclavia_protocol::attestation::Pcrs;
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::PcrKey;
-    use synchronizer::mesh::Mesh;
-    use synchronizer::mesh::attestation::NsmAttestor;
     use synchronizer::mesh::config::MeshConfig;
     use synchronizer::mesh::identity::MeshIdentity;
-    use synchronizer::mesh::rpc::EchoHandler;
     use synchronizer::mesh::transport::{VsockMeshAcceptor, VsockMeshDialer};
 
     let self_name = std::env::var("MESH_SELF_NAME").ok()?;
@@ -107,9 +123,8 @@ fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
     };
     let self_digest = PcrKey(self_pcrs.digest());
 
-    let config = MeshConfig::new(self_name.clone(), peers.clone(), self_digest);
+    let config = MeshConfig::new(self_name.clone(), peers, self_digest);
     let identity = MeshIdentity::generate();
-    let attestor = NsmAttestor::new(&identity);
     let dialer = VsockMeshDialer {
         cid: VSOCK_HOST_CID,
         port: MESH_VSOCK_PORT,
@@ -122,22 +137,144 @@ fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
         }
     };
 
-    info!(
-        self_name = %self_name,
-        peers = ?config.peers,
-        bootstrap_port = SYNCHRONIZER_BOOTSTRAP_PORT,
-        mesh_port = MESH_VSOCK_PORT,
-        "starting mutually-attested peer mesh"
-    );
-    Some(Mesh::start(
+    Some(MeshEnv {
+        self_name,
         config,
+        identity,
         dialer,
         acceptor,
+    })
+}
+
+/// Start the mutually-attested peer mesh (#118) with the no-op echo handler,
+/// used in the non-`raft` build (the mesh stands up but nothing drives it).
+/// Returns the running [`Mesh`](synchronizer::mesh::Mesh) so `main` keeps it
+/// alive; `None` when no peer set is configured.
+#[cfg(all(feature = "mesh", not(feature = "raft")))]
+fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
+    use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
+    use synchronizer::mesh::Mesh;
+    use synchronizer::mesh::attestation::NsmAttestor;
+    use synchronizer::mesh::rpc::EchoHandler;
+
+    let env = read_mesh_env()?;
+    let attestor = NsmAttestor::new(&env.identity);
+    info!(
+        self_name = %env.self_name,
+        peers = ?env.config.peers,
+        bootstrap_port = SYNCHRONIZER_BOOTSTRAP_PORT,
+        mesh_port = MESH_VSOCK_PORT,
+        "starting mutually-attested peer mesh (single-node binary, echo handler)"
+    );
+    Some(Mesh::start(
+        env.config,
+        env.dialer,
+        env.acceptor,
         attestor,
-        identity,
+        env.identity,
         EchoHandler,
         DEBUG_MODE,
     ))
+}
+
+/// Start the replicated cluster (#119 mesh + Raft, slice 4 wiring): build the
+/// mesh with a deferred [`RaftRequestHandler`], stand up the [`RaftHandle`] over
+/// it, enable serving forwarded client requests, then attempt
+/// `initialize_cluster` on exactly the bootstrap node.
+///
+/// Returns the running mesh (held for the process lifetime), the handle, and a
+/// [`ReplicatedDispatch`](synchronizer::raft::ReplicatedDispatch) the listener
+/// uses for every customer connection. `None` when no peer set is configured.
+///
+/// ## Exactly-once initialize
+///
+/// Every node computes the identical sorted membership, so exactly one node is
+/// the bootstrap node (id 0). Only it calls `initialize_cluster`;
+/// [`RaftHandle::initialize_cluster`](synchronizer::raft::RaftHandle::initialize_cluster)
+/// maps openraft's `NotAllowed` (already-initialized) to `Ok(())`, so a
+/// restarted bootstrap node re-attempting on a live cluster is benign.
+///
+/// ## Hydrate-on-restart (#121) + cold-start precondition (#122)
+///
+/// A node restarted with EMPTY in-memory state rejoins as a follower and
+/// hydrates the full view from the survivors over the mesh (log replay, or an
+/// InstallSnapshot transfer once the leader's log has purged past what the node
+/// is missing), exactly the path slice 3's
+/// `restarted_empty_node_hydrates_from_peers` test proves. openraft's
+/// `loosen-follower-log-revert` mode (enabled in `Cargo.toml`) is what lets an
+/// empty-log node rejoin without the leader panicking on its log reversion.
+/// Operational precondition: durability is purely N-replica in-memory, so NEVER
+/// lose all three nodes simultaneously (cold-start recovery is #122, out of
+/// scope for this slice).
+#[cfg(feature = "raft")]
+async fn start_replicated_from_env() -> Option<(
+    Arc<synchronizer::mesh::Mesh>,
+    synchronizer::raft::RaftHandle,
+    synchronizer::raft::ReplicatedDispatch,
+)> {
+    use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
+    use synchronizer::mesh::Mesh;
+    use synchronizer::mesh::attestation::NsmAttestor;
+    use synchronizer::raft::{RaftHandle, RaftRequestHandler, ReplicatedDispatch};
+
+    let env = read_mesh_env()?;
+    let attestor = NsmAttestor::new(&env.identity);
+    // The deduped peer set (== Raft membership minus self), captured before the
+    // config is moved into the mesh.
+    let self_name = env.self_name.clone();
+    let peers = env.config.peers.clone();
+
+    info!(
+        self_name = %self_name,
+        peers = ?peers,
+        bootstrap_port = SYNCHRONIZER_BOOTSTRAP_PORT,
+        mesh_port = MESH_VSOCK_PORT,
+        "starting replicated cluster (mesh + raft)"
+    );
+
+    // 1. Deferred Raft handler, installed as the mesh's inbound handler so peer
+    //    RPCs (and forwarded client requests) reach this node once the Raft is
+    //    wired in.
+    let handler = RaftRequestHandler::deferred();
+    let mesh = Arc::new(Mesh::start(
+        env.config,
+        env.dialer,
+        env.acceptor,
+        attestor,
+        env.identity,
+        handler.clone(),
+        DEBUG_MODE,
+    ));
+
+    // 2. Stand up the local Raft over the mesh, installing the live Raft into
+    //    the deferred handler.
+    let raft = match RaftHandle::new(Arc::clone(&mesh), &self_name, &peers, handler.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "failed to construct RaftHandle");
+            return None;
+        }
+    };
+
+    // 3. Enable serving forwarded client requests on this node (any node may
+    //    become the leader and receive a forward).
+    raft.enable_serving(&handler, DEBUG_MODE);
+
+    // 4. Bootstrap: exactly one node initializes the static membership; the
+    //    others learn it through replication. Benign if already initialized.
+    if raft.is_bootstrap_node() {
+        match raft.initialize_cluster().await {
+            Ok(()) => info!("bootstrap node initialized the cluster membership"),
+            Err(e) => {
+                warn!(error = %e, "initialize_cluster failed (will rely on existing membership)")
+            }
+        }
+    } else {
+        info!("non-bootstrap node, awaiting membership replication from the bootstrap node");
+    }
+
+    let dispatch = ReplicatedDispatch::new(raft.clone(), Arc::clone(&mesh), DEBUG_MODE);
+    Some((mesh, raft, dispatch))
 }
 
 #[tokio::main]
@@ -149,16 +286,32 @@ async fn main() {
         .with_ansi(false)
         .init();
 
-    // The Node carries the same `debug_mode` the listener passes to
-    // `handle_connection`: it selects the skip-cert-chain vs full-Nitro-CA
-    // path used when verifying a `Transition`'s chain-link attestation.
-    let node = Arc::new(Node::with_debug_mode(DEBUG_MODE));
+    // Build the request dispatcher. With the `raft` feature AND a configured
+    // mesh, this is the replicated cluster; otherwise the single-node Node. The
+    // mesh / raft handle are held for the process lifetime (dropping them aborts
+    // the dial / accept / openraft tasks).
+    #[cfg(feature = "raft")]
+    let (dispatch, _mesh, _raft): (Arc<dyn SessionDispatch>, _, _) =
+        match start_replicated_from_env().await {
+            Some((mesh, raft, replicated)) => {
+                info!("serving customer RPC through the replicated cluster");
+                (Arc::new(replicated), Some(mesh), Some(raft))
+            }
+            None => {
+                info!("no mesh configured, serving customer RPC as a single node");
+                (
+                    Arc::new(Node::with_debug_mode(DEBUG_MODE)),
+                    None::<Arc<synchronizer::mesh::Mesh>>,
+                    None::<synchronizer::raft::RaftHandle>,
+                )
+            }
+        };
 
-    // Start the mutually-attested peer mesh (#118) if configured. Held in
-    // `_mesh` for the process lifetime: dropping it would abort the dial /
-    // accept tasks. Slice 2 only stands the mesh up (boot-time attestation,
-    // reconnect, the call/serve RPC surface); the Raft layer that drives it
-    // lands in slice 3, so nothing reads `_mesh` here yet.
+    // Non-raft build: single-node Node, plus (if `mesh` is on) the echo-handler
+    // mesh stood up but not driven.
+    #[cfg(not(feature = "raft"))]
+    let dispatch: Arc<dyn SessionDispatch> = Arc::new(Node::with_debug_mode(DEBUG_MODE));
+    #[cfg(all(feature = "mesh", not(feature = "raft")))]
     let _mesh = start_mesh_from_env();
 
     #[cfg(feature = "debug")]
@@ -182,9 +335,11 @@ async fn main() {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    let node = Arc::clone(&node);
+                    let dispatch = Arc::clone(&dispatch);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(&node, stream, DEBUG_MODE).await {
+                        if let Err(e) =
+                            handle_connection(dispatch.as_ref(), stream, DEBUG_MODE).await
+                        {
                             warn!(error = %e, "connection error");
                         }
                     });
@@ -202,7 +357,7 @@ async fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_VSOCK_PORT);
-        // VMADDR_CID_ANY — accept connections on any CID.
+        // VMADDR_CID_ANY: accept connections on any CID.
         let cid: u32 = u32::MAX;
         let mut listener = match tokio_vsock::VsockListener::bind(cid, port) {
             Ok(l) => l,
@@ -215,9 +370,11 @@ async fn main() {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    let node = Arc::clone(&node);
+                    let dispatch = Arc::clone(&dispatch);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(&node, stream, DEBUG_MODE).await {
+                        if let Err(e) =
+                            handle_connection(dispatch.as_ref(), stream, DEBUG_MODE).await
+                        {
                             warn!(error = %e, "connection error");
                         }
                     });
