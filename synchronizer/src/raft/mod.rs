@@ -92,6 +92,7 @@
 //! (which submit ops directly, not through the serve path).
 
 pub mod forward;
+pub mod membership;
 pub(crate) mod network;
 pub mod serve;
 mod store;
