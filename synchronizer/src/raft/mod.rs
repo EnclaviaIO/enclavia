@@ -303,6 +303,11 @@ impl RaftHandle {
     /// no-persistence + `loosen-follower-log-revert` combination on openraft's
     /// well-trodden code; a node that lost EVERYTHING still hydrates via the
     /// snapshot once the log eventually purges past what it is missing.
+    ///
+    /// Payload bounds: both `snapshot_max_chunk_size` and `max_payload_entries`
+    /// are pinned well under the mesh's single-Noise-message ceiling, because
+    /// every replication RPC rides exactly one such message. See the field
+    /// comments below for the full argument.
     pub fn default_config() -> openraft::Config {
         openraft::Config {
             heartbeat_interval: 150,
@@ -310,6 +315,29 @@ impl RaftHandle {
             election_timeout_max: 600,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(100),
             max_in_snapshot_log_to_keep: 1000,
+            // Bound every replication payload to the mesh's single-Noise-message
+            // ceiling. A mesh RPC is ONE Noise message
+            // (`mesh::handshake::write_message`), and
+            // `Noise_NN_25519_ChaChaPoly_BLAKE2s` caps a single message at 65535
+            // bytes. openraft fragments an `InstallSnapshot` into chunks of
+            // `snapshot_max_chunk_size` and ships each chunk as one such RPC, and
+            // batches up to `max_payload_entries` log entries per AppendEntries
+            // RPC, so both default ceilings (3 MiB chunk / 300 entries) blow past
+            // the frame the moment the snapshot CBOR or a log batch exceeds
+            // ~64 KiB, and hydration / replication wedges permanently.
+            //
+            // The usable budget is well under a literal 64 KiB because the
+            // payload is wrapped in THREE layers of `Vec<u8>` on its way to the
+            // wire (`InstallSnapshotRequest.data` -> `MeshRaftRpc` -> mesh
+            // `Envelope.body` -> `MeshFrame::Rpc.envelope`), and ciborium encodes
+            // a `Vec<u8>` as a CBOR array of integers (~1.6x per layer), so the
+            // chunk's raw bytes are inflated ~3x before encryption. A 16 KiB chunk
+            // therefore reaches the Noise layer at ~48 KiB, comfortably under the
+            // 65535-byte cap with room for the 16-byte ChaChaPoly AEAD tag; a
+            // 64-entry log batch (each `ReplicatedOp` entry is a couple hundred
+            // bytes) stays far smaller still.
+            snapshot_max_chunk_size: 16 * 1024,
+            max_payload_entries: 64,
             ..Default::default()
         }
     }
