@@ -107,8 +107,25 @@ jobs:
           CRATES_DIR: ${{ runner.temp }}/enclavia-crates
           BUILDER_DIR: ${{ runner.temp }}/builder
           TEST_RESTART: "1"
+          # Pin the scratch dir and keep it on exit so the artifact
+          # step below can grab the COMPLETE per-node serial / vhost /
+          # mesh-host logs on failure (the serial console corrupts
+          # lines under load, so grepped excerpts in the job log are
+          # not enough to debug with). RUNNER_TEMP is wiped between
+          # jobs, so KEEP leaks nothing.
+          WORK: ${{ runner.temp }}/sync-e2e
+          KEEP: "1"
         # `path:` (not a bare dir) on both develop calls and inside the
         # script: the clones are shallow, and a bare directory flakeref
         # on a git repo routes through the git fetcher, which refuses
         # shallow repos.
         run: nix develop "path:$RUNNER_TEMP/enclavia-crates" --command bash tests/run_e2e_synchronizer.sh
+
+      - name: Upload node logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-e2e-logs-${{ github.run_id }}
+          path: ${{ runner.temp }}/sync-e2e/*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
