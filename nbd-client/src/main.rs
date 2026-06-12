@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 mod nbd;
+mod rollback;
 
 use std::collections::HashMap;
 use std::os::fd::FromRawFd;
@@ -19,13 +20,18 @@ struct Config {
     /// LUKS2's default with cryptsetup ≥ 2.0 places data at 16 MiB.
     luks_data_offset: u64,
     vsock_port: u32,
+    /// Opt-in anti-rollback wiring (#16): when true (SYNCHRONIZER_ENABLED=1),
+    /// boot-time superblock verification against the synchronizer cluster is
+    /// mandatory before serving, and every primary-superblock write gates its
+    /// NBD reply on a durable Pin ack. When false, nothing about the legacy
+    /// data path changes.
+    synchronizer_enabled: bool,
 }
 
 impl Config {
     fn from_env() -> Self {
-        let device = PathBuf::from(
-            std::env::var("NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".into()),
-        );
+        let device =
+            PathBuf::from(std::env::var("NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".into()));
         let block_size: u32 = std::env::var("NBD_BLOCK_SIZE")
             .unwrap_or_else(|_| "4096".into())
             .parse()
@@ -45,6 +51,7 @@ impl Config {
             block_size,
             luks_data_offset,
             vsock_port,
+            synchronizer_enabled: rollback::synchronizer_enabled(),
         }
     }
 }
@@ -53,8 +60,7 @@ impl Config {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_ansi(false)
         .init();
@@ -71,12 +77,37 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Connect to the host storage daemon over vsock.
     // CID 2 = VMADDR_CID_HOST (the parent/host)
     let cid = 2u32;
-    info!(cid, port = config.vsock_port, "Connecting to storage host via vsock");
+    info!(
+        cid,
+        port = config.vsock_port,
+        "Connecting to storage host via vsock"
+    );
     let mut stream = tokio_vsock::VsockStream::connect(cid, config.vsock_port).await?;
 
     // 2. Perform NBD newstyle negotiation.
     let export_info = negotiate(&mut stream).await?;
-    info!(size = export_info.size, flags = export_info.flags, "NBD negotiation complete");
+    info!(
+        size = export_info.size,
+        flags = export_info.flags,
+        "NBD negotiation complete"
+    );
+
+    // 2b. Anti-rollback boot verification (#16, opt-in via
+    //     SYNCHRONIZER_ENABLED). MUST complete before the kernel gets the
+    //     device: connect + attest to the synchronizer, read the primary
+    //     btrfs superblock region directly off the host stream, and run
+    //     the decision table. Any failure aborts run() and the device is
+    //     never served (fail-stop; see rollback.rs for the policy).
+    let sync_session = if config.synchronizer_enabled {
+        info!("Synchronizer anti-rollback wiring enabled; verifying superblock before serving");
+        Some(
+            rollback::boot(&mut stream, config.luks_data_offset)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+        )
+    } else {
+        None
+    };
 
     // 3. Create a Unix socketpair. One half goes to the kernel via NBD_SET_SOCK;
     //    the other half is held in userspace so we can sit between the kernel
@@ -90,9 +121,17 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     info!(device = %config.device.display(), "Configuring NBD device");
 
     unsafe {
-        nbd_ioctl(nbd_fd, nbd::NBD_SET_BLKSIZE, config.block_size as libc::c_ulong)?;
+        nbd_ioctl(
+            nbd_fd,
+            nbd::NBD_SET_BLKSIZE,
+            config.block_size as libc::c_ulong,
+        )?;
         nbd_ioctl(nbd_fd, nbd::NBD_SET_SIZE, export_info.size as libc::c_ulong)?;
-        nbd_ioctl(nbd_fd, nbd::NBD_SET_FLAGS, export_info.flags as libc::c_ulong)?;
+        nbd_ioctl(
+            nbd_fd,
+            nbd::NBD_SET_FLAGS,
+            export_info.flags as libc::c_ulong,
+        )?;
         // Kernel takes a refcount on the file via fget(); our fd can be closed.
         nbd_ioctl(nbd_fd, nbd::NBD_SET_SOCK, kernel_side_fd as libc::c_ulong)?;
         libc::close(kernel_side_fd);
@@ -116,14 +155,44 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let inflight = Arc::new(Mutex::new(HashMap::<u64, u32>::new()));
     let data_offset = config.luks_data_offset;
 
+    // With the synchronizer wiring enabled, the reply path runs the gated
+    // pump plus a pin actor; without it, the legacy proxies run untouched.
+    let (sync_hooks, rep_task, pin_task) = match sync_session {
+        Some(session) => {
+            let gate = Arc::new(rollback::PinGate::new());
+            let (pin_tx, pin_rx) = tokio::sync::mpsc::channel::<rollback::PinJob>(64);
+            let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hooks = rollback::SyncHooks {
+                gate: gate.clone(),
+                pin_tx,
+            };
+            let inflight_rep = inflight.clone();
+            let rep_task = tokio::spawn(rollback::gated_reply_proxy(
+                host_read,
+                proxy_write,
+                inflight_rep,
+                gate.clone(),
+                nudge_rx,
+            ));
+            let pinner = rollback::into_pinner(session);
+            let pin_task = tokio::spawn(rollback::pin_actor(pinner, gate, pin_rx, nudge_tx));
+            (Some(hooks), rep_task, Some(pin_task))
+        }
+        None => {
+            let inflight_rep = inflight.clone();
+            let rep_task = tokio::spawn(reply_proxy(host_read, proxy_write, inflight_rep));
+            (None, rep_task, None)
+        }
+    };
+
     let inflight_req = inflight.clone();
-    let req_task = tokio::spawn(async move {
-        request_proxy(proxy_read, host_write, inflight_req, data_offset).await
-    });
-    let inflight_rep = inflight.clone();
-    let rep_task = tokio::spawn(async move {
-        reply_proxy(host_read, proxy_write, inflight_rep).await
-    });
+    let req_task = tokio::spawn(request_proxy(
+        proxy_read,
+        host_write,
+        inflight_req,
+        data_offset,
+        sync_hooks,
+    ));
 
     // 6. NBD_DO_IT blocks until the device is disconnected.
     let nbd_fd_copy = nbd_fd;
@@ -140,6 +209,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Wait for either NBD_DO_IT to return, a proxy task to fail, or SIGTERM/SIGINT.
+    let mut proxy_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     tokio::select! {
         result = do_it_handle => {
             match result {
@@ -147,9 +217,16 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => error!("NBD task panicked: {e}"),
             }
         }
-        result = async { tokio::try_join!(flatten(req_task), flatten(rep_task)) } => {
+        result = async {
+            match pin_task {
+                Some(pin) => tokio::try_join!(flatten(req_task), flatten(rep_task), flatten(pin))
+                    .map(|_| ()),
+                None => tokio::try_join!(flatten(req_task), flatten(rep_task)).map(|_| ()),
+            }
+        } => {
             if let Err(e) = result {
                 error!("Proxy task ended: {e}");
+                proxy_error = Some(e);
             }
             unsafe {
                 let _ = nbd_ioctl(nbd_fd, nbd::NBD_DISCONNECT, 0);
@@ -172,6 +249,16 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         libc::close(nbd_fd);
     }
 
+    // Fail-stop: with the synchronizer wiring enabled, a proxy / pin
+    // failure must surface as a non-zero exit so the supervisor never
+    // treats an unprotected teardown as a clean stop. Without the wiring,
+    // keep the historical log-and-exit-clean behavior.
+    if let Some(e) = proxy_error {
+        if config.synchronizer_enabled {
+            return Err(format!("fatal proxy/synchronizer failure: {e}").into());
+        }
+    }
+
     Ok(())
 }
 
@@ -188,6 +275,15 @@ async fn flatten<T>(
 /// Forward NBD requests from the kernel side to the host, parsing each header
 /// and logging writes that touch a btrfs superblock offset.
 ///
+/// When `sync_hooks` is set (synchronizer wiring enabled), a write that
+/// covers the primary superblock region is additionally hashed on the way
+/// through: its handle is gated BEFORE the request is forwarded (so the
+/// reply pump holds the eventual reply), the region's new ciphertext is
+/// extracted while streaming, and a PinJob is queued for the pin actor.
+/// A write that only PARTIALLY covers the region is fatal: its post-write
+/// content cannot be derived from the payload (legitimate btrfs
+/// superblock writes are whole-block, so this never fires in practice).
+///
 /// Wire format (kernel → server):
 ///   magic:   u32  (NBD_REQUEST_MAGIC)
 ///   flags:   u16
@@ -201,6 +297,7 @@ async fn request_proxy<R, W>(
     mut to_host: W,
     inflight: Arc<Mutex<HashMap<u64, u32>>>,
     data_offset: u64,
+    sync_hooks: Option<rollback::SyncHooks>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -227,6 +324,10 @@ where
 
         debug!(cmd_type, handle, offset, length, "request");
 
+        // Anti-rollback: classify the write against the primary superblock
+        // region and gate its handle BEFORE the request is forwarded, so
+        // the gate entry exists before the host can possibly reply.
+        let mut sb_capture: Option<usize> = None;
         match cmd_type {
             nbd::NBD_CMD_READ => {
                 inflight.lock().unwrap().insert(handle, length);
@@ -239,6 +340,23 @@ where
                         "superblock write detected"
                     );
                 }
+                if let Some(hooks) = &sync_hooks {
+                    match rollback::primary_sb_overlap(offset, length, data_offset) {
+                        rollback::SbOverlap::None => {}
+                        rollback::SbOverlap::Full { payload_offset } => {
+                            hooks.gate.begin(handle);
+                            sb_capture = Some(payload_offset);
+                        }
+                        rollback::SbOverlap::Partial => {
+                            return Err(format!(
+                                "write at offset {offset} (len {length}) partially covers \
+                                 the primary btrfs superblock; cannot compute its \
+                                 commitment (fail-stop)"
+                            )
+                            .into());
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -246,9 +364,40 @@ where
         to_host.write_all(&header).await?;
 
         if cmd_type == nbd::NBD_CMD_WRITE && length > 0 {
-            // Forward the write payload. Use a bounded buffer to avoid a huge alloc
-            // on a single oversized request.
-            forward_bytes(&mut from_kernel, &mut to_host, length as u64).await?;
+            match (sb_capture, &sync_hooks) {
+                (Some(payload_offset), Some(hooks)) => {
+                    // Forward the payload while extracting the superblock
+                    // region's new ciphertext, then queue the durable pin.
+                    // The NBD reply for `handle` stays parked in the reply
+                    // pump until the pin actor reports the cluster's ack.
+                    let region = rollback::forward_bytes_extract(
+                        &mut from_kernel,
+                        &mut to_host,
+                        length as u64,
+                        payload_offset,
+                        rollback::SB_REGION_LEN,
+                    )
+                    .await?;
+                    let commitment = rollback::commitment_of_region(&region);
+                    info!(
+                        handle,
+                        offset, "superblock write: reply gated on durable pin"
+                    );
+                    hooks
+                        .pin_tx
+                        .send(rollback::PinJob { handle, commitment })
+                        .await
+                        .map_err(|_| {
+                            "pin actor is gone; cannot guarantee rollback protection \
+                             (fail-stop)"
+                        })?;
+                }
+                _ => {
+                    // Forward the write payload. Use a bounded buffer to avoid
+                    // a huge alloc on a single oversized request.
+                    forward_bytes(&mut from_kernel, &mut to_host, length as u64).await?;
+                }
+            }
         }
 
         to_host.flush().await?;
@@ -369,20 +518,9 @@ fn classify_superblock_write(offset: u64, length: u32, data_offset: u64) -> Opti
 /// keep in userspace.
 fn make_socketpair() -> Result<(i32, i32), Box<dyn std::error::Error>> {
     let mut fds = [0i32; 2];
-    let ret = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
+    let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     if ret < 0 {
-        return Err(format!(
-            "socketpair failed: {}",
-            std::io::Error::last_os_error()
-        )
-        .into());
+        return Err(format!("socketpair failed: {}", std::io::Error::last_os_error()).into());
     }
     Ok((fds[0], fds[1]))
 }
@@ -408,12 +546,18 @@ where
 
     // Send client flags
     let client_flags: u32 = nbd::NBD_FLAG_C_FIXED_NEWSTYLE
-        | if no_zeroes { nbd::NBD_FLAG_C_NO_ZEROES } else { 0 };
+        | if no_zeroes {
+            nbd::NBD_FLAG_C_NO_ZEROES
+        } else {
+            0
+        };
     stream.write_all(&client_flags.to_be_bytes()).await?;
 
     // Send OPT_EXPORT_NAME with empty name (default export)
     stream.write_all(&nbd::IHAVEOPT.to_be_bytes()).await?;
-    stream.write_all(&nbd::NBD_OPT_EXPORT_NAME.to_be_bytes()).await?;
+    stream
+        .write_all(&nbd::NBD_OPT_EXPORT_NAME.to_be_bytes())
+        .await?;
     stream.write_all(&0u32.to_be_bytes()).await?; // data length = 0 (empty export name)
     stream.flush().await?;
 
@@ -447,7 +591,11 @@ fn open_nbd_device(path: &Path) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 /// Perform an NBD ioctl, returning an error on failure.
-unsafe fn nbd_ioctl(fd: i32, request: libc::c_ulong, arg: libc::c_ulong) -> Result<(), Box<dyn std::error::Error>> {
+unsafe fn nbd_ioctl(
+    fd: i32,
+    request: libc::c_ulong,
+    arg: libc::c_ulong,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ret = unsafe { libc::ioctl(fd, request, arg) };
     if ret < 0 {
         Err(format!(
@@ -490,10 +638,7 @@ mod tests {
 
     #[test]
     fn ignores_writes_inside_luks_header() {
-        assert_eq!(
-            classify_superblock_write(0x10000, 4096, 0x1000000),
-            None
-        );
+        assert_eq!(classify_superblock_write(0x10000, 4096, 0x1000000), None);
     }
 
     #[test]

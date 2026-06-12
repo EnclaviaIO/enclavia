@@ -47,6 +47,9 @@ pub use node::Node;
 #[cfg(feature = "node")]
 pub mod listener;
 
+#[cfg(feature = "client")]
+pub mod client;
+
 #[cfg(feature = "mesh")]
 pub mod mesh;
 

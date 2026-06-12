@@ -65,19 +65,22 @@ jobs:
       # membership suites are all feature-gated. This combo enables
       # every in-process suite (lib, mesh integration,
       # raft_client_routing, the NodeViewConsistent fuzz harness,
-      # raft_replication) on a dev machine, no QEMU needed. The full
-      # QEMU 3-node cluster e2e lives in e2e-synchronizer.yml.
+      # raft_replication, and the customer-client round-trip suite)
+      # on a dev machine, no QEMU needed. The full QEMU 3-node cluster
+      # e2e lives in e2e-synchronizer.yml.
       - name: cargo test (synchronizer full suite)
-        run: nix develop --command cargo test -p synchronizer --features raft,test-utils,debug
+        run: nix develop --command cargo test -p synchronizer --features raft,test-utils,debug,client
 
       # Clippy across the synchronizer's real build flavors. The
       # debug / enclave / qemu features pick the customer transport
       # and attestation-verification mode at compile time, so cfg
       # drift (an import or const that only one flavor uses) only
-      # surfaces when each combo is compiled on its own.
+      # surfaces when each combo is compiled on its own. The bare
+      # `client` combo proves the customer client (what nbd-client
+      # consumes) builds without the node / mesh / raft stack.
       - name: cargo clippy (synchronizer feature matrix)
         run: |
-          for features in qemu,raft enclave,raft debug,raft debug,mesh debug enclave; do
+          for features in qemu,raft enclave,raft debug,raft debug,mesh debug enclave client debug,client; do
             echo "::group::clippy --features $features"
             nix develop --command cargo clippy -p synchronizer --features "$features" --all-targets -- -D warnings
             echo "::endgroup::"

@@ -112,6 +112,56 @@ pub enum AttestationError {
 /// `AttestationDoc::user_data`. See EnclaviaIO/enclavia-crates#47.
 pub const CONTROL_PUBKEY_LEN: usize = 65;
 
+/// Domain-separation string the canonical non-upgradable control key is
+/// derived from. Public and fixed: it is the audit anchor that lets
+/// anyone reproduce [`NON_UPGRADABLE_CONTROL_KEY`] and confirm the
+/// construction.
+pub const NON_UPGRADABLE_CONTROL_KEY_DST: &[u8] =
+    b"enclavia/synchronizer/non-upgradable-control-key/v1";
+
+/// The canonical "provably un-signable" control key for enclaves that
+/// have no #47 upgrade chain.
+///
+/// ## What it is for
+///
+/// The synchronizer freezes a key's control pubkey at first pin and uses
+/// it for exactly one thing: verifying the ECDSA signature on a future
+/// `Transition` (the PCR re-key that an upgrade performs). An enclave
+/// with no upgrade chain has no control key, so the storage-pinning
+/// client registers with THIS value instead. Because no private key for
+/// it is known to anyone, no `Transition` signature can ever verify, so
+/// the pinned storage history is permanently bound to that one image,
+/// which is exactly the correct semantic for a non-upgradable enclave.
+/// It only disables `Transition`; `Pin`/`Get` are gated by the attested
+/// PCR key, not by this pubkey, so storage pinning works normally.
+///
+/// ## Why it is provably un-signable (nothing-up-my-sleeve)
+///
+/// The point's x-coordinate is a SHA-256 hash output over the public
+/// [`NON_UPGRADABLE_CONTROL_KEY_DST`] (try-and-increment to the first
+/// valid curve point). Recovering a private key would mean solving the
+/// discrete log for a point whose x nobody chose, so by construction no
+/// party knows (or could have arranged to know) the scalar. This is
+/// strictly safer than minting a throwaway real key and trusting that
+/// its private half was destroyed: here no usable private half ever
+/// existed.
+///
+/// Baked as a compile-time constant (uncompressed SEC1, `0x04 || X || Y`)
+/// so it costs nothing at runtime and is usable in const contexts. The
+/// bytes are the output of try-and-increment over
+/// [`NON_UPGRADABLE_CONTROL_KEY_DST`] (hash the DST with a 1-byte
+/// counter to a candidate x-coordinate, take the first that decompresses
+/// to a valid P-256 point). `derive_non_upgradable_control_key` in the
+/// tests re-runs that derivation and asserts it equals this constant, so
+/// the literal can never silently drift from its construction.
+pub const NON_UPGRADABLE_CONTROL_KEY: [u8; CONTROL_PUBKEY_LEN] = [
+    0x04, 0x22, 0x18, 0xad, 0x29, 0x17, 0x7d, 0x9a, 0x5c, 0xb3, 0x52, 0xc4, 0x78, 0x64, 0x06, 0xfa,
+    0x76, 0x57, 0xaa, 0xc1, 0x6c, 0xe4, 0xb2, 0xe8, 0x19, 0xcd, 0xbd, 0x7f, 0x6e, 0xbd, 0xfa, 0x5a,
+    0x8e, 0xb1, 0x1a, 0xf7, 0x68, 0x69, 0x3a, 0xd6, 0x5f, 0xc5, 0xb2, 0x21, 0x10, 0x3f, 0x10, 0x8a,
+    0xe9, 0x50, 0x87, 0xb3, 0x1d, 0x68, 0x54, 0xe8, 0x13, 0x51, 0x60, 0x6d, 0xc4, 0xe2, 0xd4, 0xf7,
+    0xda,
+];
+
 /// Verified enclave identity extracted from an NSM attestation document.
 ///
 /// Returned by [`verify_and_extract`] when the document validates and the
@@ -1067,5 +1117,74 @@ mod tests {
             matches!(err, AttestationError::PayloadBindingMismatch),
             "expected PayloadBindingMismatch, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod non_upgradable_control_key_tests {
+    use super::{CONTROL_PUBKEY_LEN, NON_UPGRADABLE_CONTROL_KEY, NON_UPGRADABLE_CONTROL_KEY_DST};
+    use sha2::{Digest, Sha256};
+
+    /// Re-run the try-and-increment derivation the baked constant came
+    /// from: hash the DST with a 1-byte counter to a candidate
+    /// x-coordinate and take the first that decompresses to a valid
+    /// P-256 point. Test-only; the production value is the
+    /// [`NON_UPGRADABLE_CONTROL_KEY`] constant, this just proves the
+    /// constant equals its construction so the literal cannot drift.
+    fn derive_non_upgradable_control_key() -> [u8; CONTROL_PUBKEY_LEN] {
+        use p256::EncodedPoint;
+        use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+
+        for counter in 0u16..=255 {
+            let mut hasher = Sha256::new();
+            hasher.update(NON_UPGRADABLE_CONTROL_KEY_DST);
+            hasher.update([counter as u8]);
+            let x = hasher.finalize();
+            let mut compressed = [0u8; 33];
+            compressed[0] = 0x02; // even-y compressed SEC1
+            compressed[1..].copy_from_slice(&x);
+            let Ok(encoded) = EncodedPoint::from_bytes(compressed) else {
+                continue;
+            };
+            let maybe_point = p256::AffinePoint::from_encoded_point(&encoded);
+            if maybe_point.is_some().into() {
+                let uncompressed = maybe_point.unwrap().to_encoded_point(false);
+                let mut out = [0u8; CONTROL_PUBKEY_LEN];
+                out.copy_from_slice(uncompressed.as_bytes());
+                return out;
+            }
+        }
+        panic!("no valid P-256 point found deriving the non-upgradable control key");
+    }
+
+    /// The baked constant must equal the live derivation. This is the
+    /// audit anchor: a change to the DST or the derivation that is not
+    /// mirrored into the constant trips here, forcing a deliberate
+    /// review (changing the value would orphan every already-pinned
+    /// non-upgradable enclave).
+    #[test]
+    fn constant_matches_derivation() {
+        assert_eq!(
+            NON_UPGRADABLE_CONTROL_KEY,
+            derive_non_upgradable_control_key(),
+            "baked non-upgradable control key drifted from its DST derivation"
+        );
+    }
+
+    #[test]
+    fn is_uncompressed_sec1_shape() {
+        assert_eq!(NON_UPGRADABLE_CONTROL_KEY.len(), CONTROL_PUBKEY_LEN);
+        assert_eq!(NON_UPGRADABLE_CONTROL_KEY[0], 0x04);
+    }
+
+    /// It must parse as a real P-256 verifying key, so `Register` and the
+    /// `verify_transition_link` decode step accept it (the un-signability
+    /// bites at the signature check, not at decode: a Transition cannot
+    /// be rejected merely because the key looks malformed, it must be a
+    /// well-formed key that simply no signature verifies against).
+    #[test]
+    fn parses_as_a_valid_verifying_key() {
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(NON_UPGRADABLE_CONTROL_KEY.as_slice())
+            .expect("canonical non-upgradable control key must be a valid P-256 point");
     }
 }

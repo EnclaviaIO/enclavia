@@ -37,44 +37,15 @@
 //! transition authorizations on behalf of the caller.
 
 use enclavia_protocol::{NoiseTransport, attestation, perform_handshake_as_responder};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::wire::{Request, Response, RpcError};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 
-/// Maximum size (bytes) of an inbound ENCRYPTED frame on the wire.
-///
-/// `Noise_NN_25519_ChaChaPoly_BLAKE2s` has a 65535-byte hard cap per
-/// message, so we use that as the outer bound. Anything larger is a
-/// protocol error, a malicious peer can't OOM the node by claiming a
-/// giant length. A typical Nitro attestation document is ~5 KiB, well
-/// within budget.
-pub const MAX_FRAME_SIZE: u32 = 65535;
-
-/// One frame over the Noise-encrypted stream. Tagged so we can extend
-/// with control frames (ping, etc.) without breaking the format.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "frame")]
-pub enum Frame {
-    /// First client→server frame on every connection. Carries the raw
-    /// CBOR/COSE_Sign1 bytes of a Nitro NSM attestation document. The
-    /// document's `nonce` field MUST equal `base64(handshake_hash)`
-    /// from the just-completed Noise handshake; the listener verifies
-    /// the doc, extracts PCR0/1/2, and binds the session to
-    /// `PcrKey = SHA-256(PCR0||PCR1||PCR2)`.
-    Authenticate {
-        /// Raw NSM attestation document bytes.
-        nsm_doc: Vec<u8>,
-    },
-
-    /// Subsequent frame: an RPC [`Request`] to dispatch through
-    /// [`Node::handle_request`].
-    Rpc {
-        /// RPC payload to dispatch against the session's bound key.
-        request: Request,
-    },
-}
+// Frame + MAX_FRAME_SIZE moved to `crate::wire` so the customer client
+// (`client` feature) can share them without pulling in the responder
+// stack; re-exported here for existing callers.
+pub use crate::wire::{Frame, MAX_FRAME_SIZE};
 
 /// Dispatch one attested-session request to whatever backs this node: the
 /// single-node [`Node`](crate::Node), or (under the `raft` feature) the

@@ -63,6 +63,51 @@ use crate::{Commitment, PcrKey, ValidationError, Version};
 // Re-exported so callers of `verify_transition_link` have one import site.
 pub use enclavia_protocol::chain::{ChainLink, ChainLinkKind, UpgradePayload};
 
+/// Maximum size (bytes) of an ENCRYPTED frame on the wire, in either
+/// direction.
+///
+/// `Noise_NN_25519_ChaChaPoly_BLAKE2s` has a 65535-byte hard cap per
+/// message, so we use that as the outer bound. Anything larger is a
+/// protocol error, a malicious peer can't OOM the node by claiming a
+/// giant length. A typical Nitro attestation document is ~5 KiB, well
+/// within budget.
+///
+/// Shared by the listener (responder side) and the customer client
+/// (`client` feature, initiator side); it lives here, next to the frame
+/// type, so the two stay in lockstep.
+pub const MAX_FRAME_SIZE: u32 = 65535;
+
+/// One frame over the Noise-encrypted session stream. Tagged so we can
+/// extend with control frames (ping, etc.) without breaking the format.
+///
+/// The session protocol: 4-byte big-endian length prefix, then that many
+/// bytes of Noise ciphertext whose plaintext is one CBOR-encoded `Frame`.
+/// The first client-to-server frame MUST be [`Frame::Authenticate`]; every
+/// subsequent frame is [`Frame::Rpc`], answered with one CBOR [`Response`].
+/// See `crate::listener` for the responder side and `crate::client` for
+/// the initiator side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "frame")]
+pub enum Frame {
+    /// First client→server frame on every connection. Carries the raw
+    /// CBOR/COSE_Sign1 bytes of a Nitro NSM attestation document. The
+    /// document's `nonce` field MUST equal `base64(handshake_hash)`
+    /// from the just-completed Noise handshake; the listener verifies
+    /// the doc, extracts PCR0/1/2, and binds the session to
+    /// `PcrKey = SHA-256(PCR0||PCR1||PCR2)`.
+    Authenticate {
+        /// Raw NSM attestation document bytes.
+        nsm_doc: Vec<u8>,
+    },
+
+    /// Subsequent frame: an RPC [`Request`] to dispatch against the
+    /// session's bound key.
+    Rpc {
+        /// RPC payload to dispatch against the session's bound key.
+        request: Request,
+    },
+}
+
 /// Compile-time check that the pure core's [`crate::CONTROL_PUBKEY_LEN`]
 /// equals the protocol layer's contract for the SEC1 P-256 control key.
 /// If enclavia-protocol ever changes the width, this fails the build here

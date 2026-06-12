@@ -22,9 +22,7 @@
 #     from fork pull_request runs; all first-party work happens on
 #     branches in this repo, where the secret is available.
 #
-# TODO(flip after EnclaviaIO/enclavia-crates#207 merges): mesh-host is
-# still on the `synchronizer-5-mesh-host` branch, so the crates clone
-# pins that ref. Switch CRATES_REF to `master` once #207 lands.
+# crates#207 (mesh-host) is merged, so the crates clone tracks master.
 
 name: e2e-synchronizer
 
@@ -64,7 +62,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CRATES_REF: synchronizer-5-mesh-host
+  CRATES_REF: master
 
 jobs:
   e2e:
