@@ -2234,7 +2234,14 @@ dependencies = [
 name = "nbd-client"
 version = "0.1.0"
 dependencies = [
+ "aws-nitro-enclaves-nsm-api",
+ "base64 0.22.1",
+ "enclavia-protocol",
  "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synchronizer",
  "tokio",
  "tokio-vsock",
  "tracing",

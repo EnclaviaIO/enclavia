@@ -12,12 +12,32 @@ repository.workspace = true
 description = "In-enclave NBD client over vsock: backs the encrypted filesystem on top of the host-side storage relay."
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
 
 tokio-vsock = { workspace = true }
+
+# --- #16 anti-rollback wiring (synchronizer pinning) ---
+# Customer-side synchronizer RPC client (Noise initiator + Pin/Get).
+# The `client` feature deliberately pulls in NO mesh / NSM driver /
+# openraft; see synchronizer/Cargo.toml.
+synchronizer = { path = "../synchronizer", features = ["client"] }
+# `extract_own_pcrs` (derive our own PcrKey from the doc we just minted)
+# and the synchronizer relay port constant. The async Noise plumbing
+# lives behind the synchronizer client, so default features stay off.
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+# SHA-256 of the primary btrfs superblock region: the pinned commitment.
+sha2.workspace = true
+# Drive /dev/nsm for the real attestation document (`nix` turns the
+# driver syscalls on; the workspace pin strips it by default).
+aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
+# Read the #47 control pubkey out of /etc/enclavia/config.json (the same
+# field enclavia-server reads).
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
 
 [[bin]]
 name = "enclavia-nbd-client"
