@@ -493,7 +493,7 @@ where
         .await
         {
             Ok(Ok(version)) => {
-                info!(version = version.0, "superblock pin durably acknowledged");
+                debug!(version = version.0, "superblock pin durably acknowledged");
                 Ok(())
             }
             Ok(Err(e)) => Err((pin_error_is_retryable(&e), format!("pin rpc failed: {e}"))),

@@ -379,7 +379,7 @@ where
                     )
                     .await?;
                     let commitment = rollback::commitment_of_region(&region);
-                    info!(
+                    debug!(
                         handle,
                         offset, "superblock write: reply gated on durable pin"
                     );
