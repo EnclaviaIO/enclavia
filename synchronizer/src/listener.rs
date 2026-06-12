@@ -16,13 +16,53 @@
 //!   pulls the 65-byte SEC1 P-256 control pubkey out of the doc's
 //!   `user_data` (`AttestedIdentity::control_pubkey`), and binds the
 //!   session to that key for life.
+//! - The SERVER then authenticates back (#208): it requests a fresh NSM
+//!   document from its own `/dev/nsm` with `nonce = handshake_hash`
+//!   (per session, so the binding is per session, like the mesh) and
+//!   sends it as the first server-to-client frame, also a
+//!   [`Frame::Authenticate`]. The client verifies the document and
+//!   checks its PCRs against the synchronizer measurements it trusts
+//!   (see [`crate::wire::ServerPcrPolicy`]). This step is MANDATORY:
+//!   `Noise_NN` is unauthenticated DH and the whole customer path is
+//!   host-relayed, so without it a malicious host could terminate the
+//!   customer's session itself and answer Get/Pin as a fake oracle,
+//!   serving an arbitrarily stale commitment, the exact rollback the
+//!   synchronizer exists to prevent.
 //! - Subsequent frames are [`Frame::Rpc`] with a [`Request`] payload;
 //!   the server replies with an encrypted CBOR [`Response`].
 //!
-//! The Noise handshake hash binds the attestation document to *this*
+//! The Noise handshake hash binds each attestation document to *this*
 //! specific session, a document captured from a previous handshake
 //! can't be replayed because it would carry the wrong hash in its
-//! nonce field. No explicit server-side challenge frame is needed.
+//! nonce field. No explicit challenge frames are needed in either
+//! direction.
+//!
+//! ## Write ordering (frame-coalescing hazard)
+//!
+//! The mesh handshake (`crate::mesh::handshake`) documents why the
+//! responder's first encrypted write must never be pipelined with the
+//! Noise handshake messages: `perform_handshake_as_*` reads raw (not
+//! length-prefixed) Noise messages, so an eager write could coalesce
+//! with the trailing handshake message on the initiator and corrupt the
+//! transport. The customer protocol is safe by construction: the
+//! server's first encrypted write (its `Authenticate`) happens only
+//! AFTER it has read and verified the client's `Authenticate` frame,
+//! which the client can only have sent after finishing the handshake
+//! reads. The client mirrors the strict ping-pong: write `Authenticate`,
+//! then read the server's, then RPC.
+//!
+//! ## Why no identity signature (unlike the mesh)
+//!
+//! The mesh's mutual attestation adds an identity-key signature over the
+//! handshake hash because mesh peers all run the SAME image: a malicious
+//! relay holding a node's channel-bound document (nodes send theirs
+//! first when dialing) could reflect it on the same channel and pass the
+//! peer's self-PCR allowlist. On the customer path the only document an
+//! attacker can hold for THIS session's hash is the customer's own
+//! `Authenticate`, and the client's [`crate::wire::ServerPcrPolicy`]
+//! rejects it (customer PCRs are not synchronizer PCRs). Every other
+//! document fails the nonce binding, so the PCR policy alone closes the
+//! reflection hole and no extra signature exchange is needed.
 //!
 //! Requests are dispatched through a [`SessionDispatch`]: the single-node
 //! [`Node`](crate::Node) (no Raft) verifies + applies them against one local
@@ -46,6 +86,77 @@ use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 // (`client` feature) can share them without pulling in the responder
 // stack; re-exported here for existing callers.
 pub use crate::wire::{Frame, MAX_FRAME_SIZE};
+
+/// Cap a single transport write at 32 KiB: AF_VSOCK (and the
+/// vhost-device-vsock UDS bridge in QEMU debug mode) is unreliable on
+/// single writes above that (see CLAUDE.md). Every outbound frame body
+/// is chunked at this boundary; an NSM document (~5 KiB) plus Noise
+/// overhead normally fits in one chunk, the cap keeps the listener safe
+/// even at the 65535-byte Noise maximum.
+const VSOCK_WRITE_CHUNK: usize = 32 * 1024;
+
+/// Produces this node's own NSM attestation document for one customer
+/// session (#208): `nonce = handshake_hash`, binding the document to
+/// that session.
+///
+/// One document is requested PER SESSION (not cached per boot): the
+/// nonce must bind the live session's handshake hash, exactly like the
+/// mesh's per-peer documents, so there is nothing reusable to cache.
+/// Object-safe so the binary can hold a `dyn SessionAttestor` across
+/// the production / dev / test implementations.
+#[async_trait::async_trait]
+pub trait SessionAttestor: Send + Sync {
+    /// Produce an NSM attestation document whose `nonce` equals
+    /// `handshake_hash`. `user_data` is unconstrained (the customer
+    /// client does not read it); the production implementation sends
+    /// none.
+    async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// Production [`SessionAttestor`]: drives the in-enclave `/dev/nsm`
+/// device, one blocking request per session, off the async runtime via
+/// `spawn_blocking`. Used by the `enclave` / `qemu` binaries (QEMU's
+/// nitro-enclave machine emulates the device identically; its documents
+/// are self-signed, which is exactly what the client's `debug_mode`
+/// verification accepts).
+pub struct NsmSessionAttestor;
+
+#[async_trait::async_trait]
+impl SessionAttestor for NsmSessionAttestor {
+    async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, String> {
+        let nonce = handshake_hash.to_vec();
+        tokio::task::spawn_blocking(move || {
+            crate::mesh::attestation::request_own_attestation(Some(nonce), None)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("nsm attestation task panicked: {e}"))?
+    }
+}
+
+/// Synthetic [`SessionAttestor`] for the dev UDS listener (`debug`
+/// feature) and in-process tests: there is no `/dev/nsm` on a dev
+/// machine, so the mandatory server-authentication step serves a
+/// `FakeAttestation` document with seed-derived PCRs instead. Only a
+/// client verifying in `debug_mode` with a matching expected-PCR
+/// policy accepts it; never compiled into the `enclave` / `qemu`
+/// binaries.
+#[cfg(any(test, feature = "test-utils", feature = "debug"))]
+pub struct FakeSessionAttestor {
+    /// Seed the document's PCR triple is derived from
+    /// (`pcr0 = [seed; 48]`, `pcr1 = [seed+1; 48]`, `pcr2 = [seed+2; 48]`,
+    /// matching `FakeAttestation::with_seed`).
+    pub seed: u8,
+}
+
+#[cfg(any(test, feature = "test-utils", feature = "debug"))]
+#[async_trait::async_trait]
+impl SessionAttestor for FakeSessionAttestor {
+    async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, String> {
+        use enclavia_protocol::attestation::test_utils::FakeAttestation;
+        Ok(FakeAttestation::with_seed(self.seed, handshake_hash.to_vec()).encode())
+    }
+}
 
 /// Dispatch one attested-session request to whatever backs this node: the
 /// single-node [`Node`](crate::Node), or (under the `raft` feature) the
@@ -109,6 +220,11 @@ pub enum ConnError {
     /// Noise handshake hash via its `nonce` field.
     #[error("attestation: {0}")]
     Attestation(String),
+    /// Producing this node's OWN attestation document for the mandatory
+    /// server-authentication step (#208) failed. The session cannot
+    /// proceed unauthenticated, so the connection is torn down.
+    #[error("local attestation: {0}")]
+    LocalAttestation(String),
     /// Caller violated the framing contract (e.g. RPC before Authenticate,
     /// or re-authentication on an already-bound session).
     #[error("protocol: {0}")]
@@ -124,6 +240,7 @@ pub enum ConnError {
 /// Drive one accepted connection to completion. Performs the Noise
 /// handshake first, then reads encrypted frames until EOF: the first
 /// frame must be `Authenticate` (verified against the handshake hash),
+/// answered with this node's OWN session-bound `Authenticate` (#208),
 /// each subsequent frame an RPC.
 ///
 /// `debug_mode` selects the debug (skip-cert-chain) vs production
@@ -132,14 +249,19 @@ pub enum ConnError {
 ///
 /// `dispatch` backs the request handling: the single-node
 /// [`Node`](crate::Node) or (under `raft`) the replicated cluster dispatcher.
-pub async fn handle_connection<S, D>(
+/// `attestor` produces this node's own per-session attestation document
+/// ([`NsmSessionAttestor`] in the enclave; [`FakeSessionAttestor`] in
+/// the dev UDS listener and tests).
+pub async fn handle_connection<S, D, A>(
     dispatch: &D,
+    attestor: &A,
     mut stream: S,
     debug_mode: bool,
 ) -> Result<(), ConnError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     D: SessionDispatch + ?Sized,
+    A: SessionAttestor + ?Sized,
 {
     // 0. Noise handshake. `handshake_hash` is the channel-binding token
     //    we feed to the attestation verifier as the expected nonce, so
@@ -174,6 +296,28 @@ where
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
         None => return Ok(()),
     };
+
+    // 1b. Server authentication (#208): answer with our OWN attestation
+    //     document, freshly requested for THIS session (`nonce =
+    //     handshake_hash`), as the first server-to-client frame. The
+    //     client verifies it and checks our PCRs against the
+    //     synchronizer measurements baked into its measured config;
+    //     without this step `Noise_NN` would leave the oracle's end of
+    //     the channel unauthenticated and a malicious host could answer
+    //     Get/Pin itself. Ordering note: this is the server's first
+    //     encrypted write and happens strictly after reading the
+    //     client's first frame, so it can never coalesce with the Noise
+    //     handshake messages (see the module docs).
+    let own_doc = attestor
+        .attest(&handshake_hash)
+        .await
+        .map_err(ConnError::LocalAttestation)?;
+    write_cbor_frame(
+        &mut stream,
+        &mut transport,
+        &Frame::Authenticate { nsm_doc: own_doc },
+    )
+    .await?;
 
     // 2. Subsequent frames: RPC dispatch. The dispatcher owns observing the
     //    attestation (single-node) / carrying the verified facts to the leader
@@ -243,8 +387,25 @@ async fn write_response<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
+    write_cbor_frame(stream, transport, resp).await
+}
+
+/// Encrypt one CBOR-serializable value through the Noise transport and
+/// write it as `[u32 BE length][ciphertext]`, with the body chunked at
+/// [`VSOCK_WRITE_CHUNK`] so a single vsock write never exceeds the
+/// per-write limit. Shared by the RPC [`Response`] path and the server's
+/// `Authenticate` frame (#208).
+async fn write_cbor_frame<S, T>(
+    stream: &mut S,
+    transport: &mut NoiseTransport,
+    value: &T,
+) -> Result<(), ConnError>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
     let mut plaintext = Vec::new();
-    ciborium::into_writer(resp, &mut plaintext)
+    ciborium::into_writer(value, &mut plaintext)
         .map_err(|e| ConnError::CborEncode(format!("{e}")))?;
     let mut ciphertext = vec![0u8; MAX_FRAME_SIZE as usize];
     let ct_len = transport
@@ -254,7 +415,9 @@ where
         .try_into()
         .map_err(|_| ConnError::FrameTooLarge(u32::MAX))?;
     stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&ciphertext[..ct_len]).await?;
+    for chunk in ciphertext[..ct_len].chunks(VSOCK_WRITE_CHUNK) {
+        stream.write_all(chunk).await?;
+    }
     stream.flush().await?;
     Ok(())
 }
@@ -415,6 +578,44 @@ mod tests {
         ciborium::from_reader(&plaintext[..pt_len]).unwrap()
     }
 
+    /// The PCR seed [`connect`]'s server attests its own sessions with.
+    const SERVER_SEED: u8 = 0xa5;
+
+    /// Read the server's `Authenticate` frame (#208), verify it against
+    /// this session's handshake hash and the [`SERVER_SEED`] PCR
+    /// expectation, and return the raw document bytes.
+    async fn read_and_verify_server_auth<S>(
+        stream: &mut S,
+        transport: &mut NoiseTransport,
+        hash: &[u8],
+    ) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await.unwrap();
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let mut ciphertext = vec![0u8; len];
+        stream.read_exact(&mut ciphertext).await.unwrap();
+        let mut plaintext = vec![0u8; MAX_FRAME_SIZE as usize];
+        let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
+        let frame: Frame = ciborium::from_reader(&plaintext[..pt_len]).unwrap();
+        match frame {
+            Frame::Authenticate { nsm_doc } => {
+                let expected = Pcrs {
+                    pcr0: vec![SERVER_SEED; 48],
+                    pcr1: vec![SERVER_SEED.wrapping_add(1); 48],
+                    pcr2: vec![SERVER_SEED.wrapping_add(2); 48],
+                };
+                let policy = crate::wire::ServerPcrPolicy::Expected(vec![expected]);
+                crate::wire::verify_server_attestation(&nsm_doc, hash, &policy, true)
+                    .expect("server attestation must verify and match the expected PCRs");
+                nsm_doc
+            }
+            other => panic!("expected the server's Authenticate frame, got {other:?}"),
+        }
+    }
+
     /// Spawn `handle_connection` against one half of a duplex pair (debug
     /// mode) and drive the initiator handshake on the other half.
     async fn connect() -> (
@@ -438,8 +639,10 @@ mod tests {
         tokio::task::JoinHandle<Result<(), ConnError>>,
     ) {
         let (mut client, server) = duplex(64 * 1024);
-        let server_task =
-            tokio::spawn(async move { handle_connection(node.as_ref(), server, true).await });
+        let server_task = tokio::spawn(async move {
+            let attestor = FakeSessionAttestor { seed: SERVER_SEED };
+            handle_connection(node.as_ref(), &attestor, server, true).await
+        });
         let (transport, hash) = perform_handshake_as_initiator(&mut client).await.unwrap();
         (client, transport, hash, server_task)
     }
@@ -451,6 +654,9 @@ mod tests {
         let (_, pk) = keypair(0x11);
         let (auth, key) = auth_frame(0x11, &hash, pk);
         write_frame(&mut client, &mut ct, &auth).await;
+        // Mutual auth (#208): the server answers a valid Authenticate
+        // with its own session-bound document before any RPC response.
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
         write_frame(
             &mut client,
             &mut ct,
@@ -519,6 +725,7 @@ mod tests {
         let (auth1, _) = auth_frame(0x33, &hash, pk1);
         let (auth2, _) = auth_frame(0x44, &hash, pk2);
         write_frame(&mut client, &mut ct, &auth1).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
         write_frame(&mut client, &mut ct, &auth2).await;
         let resp = read_response(&mut client, &mut ct).await;
         assert_eq!(
@@ -586,6 +793,104 @@ mod tests {
         );
     }
 
+    /// The server's own attestation (#208) is bound to THIS session: the
+    /// same document fails verification under any other handshake hash,
+    /// so a captured server doc cannot be replayed by a host fronting a
+    /// different session.
+    #[tokio::test]
+    async fn server_attestation_is_bound_to_this_session() {
+        let (mut client, mut ct, hash, server_task) = connect().await;
+
+        let (_, pk) = keypair(0x12);
+        let (auth, _) = auth_frame(0x12, &hash, pk);
+        write_frame(&mut client, &mut ct, &auth).await;
+        let server_doc = read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
+
+        // Replay check: the SAME bytes under a different session hash
+        // must be rejected by the nonce binding. The policy holds the
+        // server's real (SERVER_SEED) PCRs, so the rejection is the
+        // nonce binding alone, not a PCR mismatch.
+        let other_hash = vec![0x77u8; 32];
+        let policy = crate::wire::ServerPcrPolicy::Expected(vec![Pcrs {
+            pcr0: vec![SERVER_SEED; 48],
+            pcr1: vec![SERVER_SEED.wrapping_add(1); 48],
+            pcr2: vec![SERVER_SEED.wrapping_add(2); 48],
+        }]);
+        let err = crate::wire::verify_server_attestation(&server_doc, &other_hash, &policy, true)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::wire::ServerAuthError::Attestation(_)),
+            "{err:?}"
+        );
+
+        drop(client);
+        let _ = server_task.await.unwrap();
+    }
+
+    /// A failing local attestor is fatal for the connection (#208): the
+    /// session must never proceed with the server unauthenticated, so
+    /// the client sees the stream close instead of a missing/skipped
+    /// server Authenticate.
+    #[tokio::test]
+    async fn failing_local_attestor_tears_the_connection_down() {
+        struct FailingAttestor;
+        #[async_trait::async_trait]
+        impl SessionAttestor for FailingAttestor {
+            async fn attest(&self, _handshake_hash: &[u8]) -> Result<Vec<u8>, String> {
+                Err("nsm exploded".into())
+            }
+        }
+
+        let node = Arc::new(Node::with_debug_mode(true));
+        let (mut client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            handle_connection(node.as_ref(), &FailingAttestor, server, true).await
+        });
+        let (mut ct, hash) = perform_handshake_as_initiator(&mut client).await.unwrap();
+
+        let (_, pk) = keypair(0x13);
+        let (auth, _) = auth_frame(0x13, &hash, pk);
+        write_frame(&mut client, &mut ct, &auth).await;
+
+        // The connection is torn down with LocalAttestation; the client
+        // reads EOF where the server Authenticate would have been.
+        let result = server_task.await.unwrap();
+        assert!(
+            matches!(result, Err(ConnError::LocalAttestation(_))),
+            "{result:?}"
+        );
+        let mut buf = [0u8; 4];
+        let read = client.read_exact(&mut buf).await;
+        assert!(read.is_err(), "expected EOF, got a frame header");
+    }
+
+    /// An invalid client never receives the server's attestation: the
+    /// listener verifies the client FIRST and tears down on failure, so
+    /// an unauthenticated probe cannot farm session-bound oracle
+    /// documents.
+    #[tokio::test]
+    async fn invalid_client_gets_no_server_attestation() {
+        let (mut client, mut ct, _hash, server_task) = connect().await;
+
+        write_frame(
+            &mut client,
+            &mut ct,
+            &Frame::Authenticate {
+                nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
+            },
+        )
+        .await;
+
+        let result = server_task.await.unwrap();
+        assert!(
+            matches!(result, Err(ConnError::Attestation(_))),
+            "{result:?}"
+        );
+        let mut buf = [0u8; 4];
+        let read = client.read_exact(&mut buf).await;
+        assert!(read.is_err(), "expected EOF, got a frame header");
+    }
+
     /// After authentication the session is bound to the PCR-derived key,
     /// so RPC payloads must reference that same key.
     #[tokio::test]
@@ -595,6 +900,7 @@ mod tests {
         let (_, pk) = keypair(0x66);
         let (auth, _session_key) = auth_frame(0x66, &hash, pk);
         write_frame(&mut client, &mut ct, &auth).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
 
         let other_key = PcrKey([0u8; 32]);
         write_frame(
@@ -635,6 +941,7 @@ mod tests {
         let (_, pk_new) = keypair(0xee);
         let (auth, _new_key) = auth_frame(0xee, &hash, pk_new);
         write_frame(&mut client, &mut ct, &auth).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
 
         let link = upgrade_link(0x77, 0xee, &sk_old);
         write_frame(
@@ -674,6 +981,7 @@ mod tests {
         let (_, pk_new) = keypair(0xee);
         let (auth, _new_key) = auth_frame(0xee, &hash, pk_new);
         write_frame(&mut client, &mut ct, &auth).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
 
         let link = upgrade_link(0x77, 0xee, &sk_attacker);
         write_frame(
@@ -709,6 +1017,7 @@ mod tests {
         let (_, pk_new) = keypair(0xee);
         let (auth, _new_key) = auth_frame(0xee, &hash, pk_new);
         write_frame(&mut client, &mut ct, &auth).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
 
         let link = upgrade_link(0x77, 0xee, &sk_old);
         write_frame(

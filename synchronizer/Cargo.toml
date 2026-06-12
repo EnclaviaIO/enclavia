@@ -127,7 +127,13 @@ mesh = [
 ]
 # Build the listener binary. Pick one of `debug` (UDS) or `enclave`
 # (vsock) — same pattern as the other in-enclave crates.
-debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber"]
+#
+# `debug` additionally turns on enclavia-protocol's `test-utils`: the dev
+# UDS listener has no /dev/nsm, and the mandatory server-authentication
+# step (#208) needs SOME document to serve, so the dev binary answers
+# with a synthetic `FakeAttestation` (`listener::FakeSessionAttestor`).
+# The production `enclave` / `qemu` binaries never compile it.
+debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "enclavia-protocol/test-utils"]
 enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "dep:tokio-vsock"]
 # QEMU nitro-enclave variant. Identical transport to `enclave` (the
 # customer listener and the mesh both ride vsock, since an in-enclave

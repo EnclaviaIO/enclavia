@@ -30,6 +30,28 @@
 //! served. Serving without freshness assurance would silently reopen the
 //! rollback hole this module exists to close.
 //!
+//! ## Mutual authentication: verifying the oracle (#208)
+//!
+//! The session protocol authenticates BOTH ways. This enclave attests to
+//! the synchronizer (client `Authenticate`), and the synchronizer
+//! attests back: its first frame is its own NSM document bound to the
+//! same Noise handshake hash, which the client verifies and checks
+//! against the expected synchronizer PCRs before issuing any RPC.
+//! Without that check `Noise_NN` would leave the oracle's end of the
+//! host-relayed channel unauthenticated: the host could terminate the
+//! session itself and answer `Get`/`Pin` with arbitrarily stale state,
+//! which is exactly the rollback this module exists to prevent.
+//!
+//! **Trust-anchor contract.** The expected synchronizer PCRs and the
+//! `debug_attestation` flag are read from the enclave config
+//! (`/etc/enclavia/config.json`), which is baked into the EIF and
+//! therefore covered by THIS enclave's own measurements. They MUST NEVER
+//! come from host-controlled input (environment variables, vsock
+//! side-channels, kernel cmdline): a host that chooses the expected PCRs
+//! or flips `debug_attestation` can impersonate the oracle and the whole
+//! check is worthless. With [`ENV_SYNCHRONIZER_ENABLED`] set, a missing
+//! or empty `synchronizer.expected_pcrs` config is fail-stop.
+//!
 //! ## Opt-in gate
 //!
 //! The wiring activates only when [`ENV_SYNCHRONIZER_ENABLED`] is set to
@@ -43,7 +65,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use synchronizer::client::{Client, ClientError, Handshake};
+use synchronizer::client::{Client, ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::wire::RpcError;
 use synchronizer::{Commitment, PcrKey, Version};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -744,10 +766,46 @@ where
 // ---------------------------------------------------------------------------
 
 /// Subset of `/etc/enclavia/config.json` we need: the #47 control
-/// pubkey (the same field enclavia-server reads).
+/// pubkey (the same field enclavia-server reads) plus the synchronizer
+/// trust anchors (#208).
 #[derive(serde::Deserialize, Default)]
 struct RawConfig {
     control_public_key: Option<String>,
+    synchronizer: Option<RawSynchronizerSection>,
+}
+
+/// The `synchronizer` object inside the enclave config: the expected
+/// oracle measurements and the attestation-verification mode. Baked
+/// into the measured EIF, see the module docs' trust-anchor contract.
+#[derive(serde::Deserialize)]
+struct RawSynchronizerSection {
+    /// Hex PCR triples (`{"PCR0": "...", "PCR1": "...", "PCR2": "..."}`,
+    /// the same shape the chain endpoints use) the synchronizer cluster
+    /// is allowed to present. Normally one entry; MUST be non-empty.
+    expected_pcrs: Vec<enclavia_protocol::chain::PcrsHex>,
+    /// `true` selects the skip-cert-chain verification path for the
+    /// server's document (QEMU's self-signing NSM in dev clusters);
+    /// `false` (the default, and the production value) requires the
+    /// full AWS Nitro CA chain. Part of the trust decision, hence read
+    /// from the measured config and never from the environment.
+    #[serde(default)]
+    debug_attestation: bool,
+}
+
+/// The synchronizer trust anchors loaded from the MEASURED enclave
+/// config: everything the session setup needs that the host must not be
+/// able to influence.
+#[derive(Debug)]
+pub struct SynchronizerTrust {
+    /// 65-byte uncompressed SEC1 P-256 control pubkey (#47), sent as the
+    /// attestation document's `user_data`.
+    pub control_pubkey: [u8; 65],
+    /// Expected synchronizer PCR policy the server's attestation is
+    /// checked against (#208).
+    pub server_policy: ServerPcrPolicy,
+    /// Verification mode for the server's document (see
+    /// [`RawSynchronizerSection::debug_attestation`]).
+    pub debug_attestation: bool,
 }
 
 /// Load the 65-byte uncompressed SEC1 P-256 control pubkey from the
@@ -795,6 +853,48 @@ pub fn load_control_pubkey(path: &Path) -> Result<[u8; 65], FatalError> {
     Ok(out)
 }
 
+/// Load every synchronizer trust anchor from the enclave config: the
+/// control pubkey, the expected oracle PCRs, and the verification mode.
+///
+/// Fail-stop on a missing `synchronizer` section, an EMPTY
+/// `expected_pcrs` list, or any malformed PCR entry: with
+/// `SYNCHRONIZER_ENABLED=1` the oracle MUST be verifiable, and serving
+/// with an unauthenticated oracle would reopen the host-impersonation
+/// rollback hole (#208). The config file is baked into the measured EIF,
+/// so the host cannot supply or alter any of these values.
+pub fn load_synchronizer_trust(path: &Path) -> Result<SynchronizerTrust, FatalError> {
+    let control_pubkey = load_control_pubkey(path)?;
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read enclave config {}: {e}", path.display()))?;
+    let raw: RawConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("cannot parse enclave config {}: {e}", path.display()))?;
+    let section = raw.synchronizer.ok_or(
+        "enclave config has no `synchronizer` section; the synchronizer wiring requires the \
+         expected oracle PCRs (synchronizer.expected_pcrs) to authenticate the oracle (#208)",
+    )?;
+    if section.expected_pcrs.is_empty() {
+        return Err(
+            "enclave config `synchronizer.expected_pcrs` is empty; refusing to start with an \
+             unverifiable oracle (fail-stop)"
+                .into(),
+        );
+    }
+    let mut expected = Vec::with_capacity(section.expected_pcrs.len());
+    for (i, hex_triple) in section.expected_pcrs.iter().enumerate() {
+        let pcrs = hex_triple.to_pcrs().map_err(|e| {
+            format!("enclave config `synchronizer.expected_pcrs[{i}]` is malformed: {e}")
+        })?;
+        expected.push(pcrs);
+    }
+
+    Ok(SynchronizerTrust {
+        control_pubkey,
+        server_policy: ServerPcrPolicy::Expected(expected),
+        debug_attestation: section.debug_attestation,
+    })
+}
+
 /// Request one attestation document from this enclave's own `/dev/nsm`
 /// with `nonce = handshake_hash` (channel binding) and `user_data =
 /// control_pubkey` (#47). BLOCKING: call through `spawn_blocking`.
@@ -835,11 +935,15 @@ pub struct SyncSession {
 
 /// Dial the host-side relay (CID 2, vsock port
 /// `SYNCHRONIZER_CUSTOMER_RELAY_PORT`), run the Noise handshake, mint a
-/// real NSM document bound to it, and authenticate. Every step is under
-/// an explicit timeout; any failure is fatal (fail-stop, no retries).
+/// real NSM document bound to it, and MUTUALLY authenticate: this
+/// enclave attests to the oracle, and the oracle's answering attestation
+/// is verified against the expected-PCR policy from the measured config
+/// (#208). Every step is under an explicit timeout; any failure,
+/// including the oracle failing to prove its identity, is fatal
+/// (fail-stop, no retries).
 pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
     let config_path = std::env::var(ENV_CONFIG_PATH).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
-    let control_pubkey = load_control_pubkey(Path::new(&config_path))?;
+    let trust = load_synchronizer_trust(Path::new(&config_path))?;
 
     let port = enclavia_protocol::mesh::SYNCHRONIZER_CUSTOMER_RELAY_PORT;
     info!(port, "connecting to the synchronizer relay over vsock");
@@ -855,7 +959,7 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
     tokio::time::timeout(SYNC_RPC_TIMEOUT, async move {
         let hs = Handshake::start(stream).await?;
         let nonce = hs.handshake_hash().to_vec();
-        let user_data = control_pubkey.to_vec();
+        let user_data = trust.control_pubkey.to_vec();
         let doc = tokio::task::spawn_blocking(move || request_nsm_attestation(nonce, user_data))
             .await
             .map_err(|e| format!("NSM attestation task panicked: {e}"))??;
@@ -865,8 +969,14 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
         let pcrs = enclavia_protocol::attestation::extract_own_pcrs(&doc)
             .map_err(|e| format!("cannot extract own PCRs from NSM document: {e}"))?;
         let key = PcrKey(pcrs.digest());
-        let client = hs.authenticate(doc).await?;
-        info!("synchronizer session authenticated");
+        // Mutual auth: send our document, then verify the oracle's
+        // answering attestation (nonce-bound to this session) against
+        // the measured-config policy. A server that cannot prove it is
+        // the expected synchronizer is fail-stop.
+        let client = hs
+            .authenticate(doc, &trust.server_policy, trust.debug_attestation)
+            .await?;
+        info!("synchronizer session mutually authenticated (oracle PCRs verified)");
         Ok::<_, FatalError>(SyncSession { client, key })
     })
     .await
@@ -1507,6 +1617,196 @@ mod tests {
             .unwrap();
         assert_eq!(region, vec![0x5a; SB_REGION_LEN]);
         server.await.unwrap();
+    }
+
+    // --- load_synchronizer_trust (#208 trust anchors) -------------------
+
+    /// Write `contents` to a unique temp config file and return its path.
+    fn write_config(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nbd-sync-trust-{}-{}.json",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// A valid 65-byte SEC1 control pubkey, base64-encoded, for config
+    /// fixtures.
+    fn control_pubkey_b64() -> String {
+        use base64::Engine;
+        let mut pk = [0x11u8; 65];
+        pk[0] = 0x04;
+        base64::engine::general_purpose::STANDARD.encode(pk)
+    }
+
+    fn hex48(byte: u8) -> String {
+        hex_encode(&[byte; 48])
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Happy path: control pubkey + one expected PCR triple + explicit
+    /// debug flag all load; the policy admits exactly the listed triple.
+    #[test]
+    fn trust_loads_with_expected_pcrs() {
+        let config = format!(
+            r#"{{
+                "control_public_key": "{}",
+                "synchronizer": {{
+                    "expected_pcrs": [
+                        {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
+                    ],
+                    "debug_attestation": true
+                }}
+            }}"#,
+            control_pubkey_b64(),
+            hex48(0xa5),
+            hex48(0xa6),
+            hex48(0xa7),
+        );
+        let path = write_config("happy", &config);
+        let trust = load_synchronizer_trust(&path).expect("load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(trust.control_pubkey[0], 0x04);
+        assert!(trust.debug_attestation);
+        let listed = enclavia_protocol::attestation::Pcrs {
+            pcr0: vec![0xa5; 48],
+            pcr1: vec![0xa6; 48],
+            pcr2: vec![0xa7; 48],
+        };
+        let other = enclavia_protocol::attestation::Pcrs {
+            pcr0: vec![0x01; 48],
+            pcr1: vec![0x02; 48],
+            pcr2: vec![0x03; 48],
+        };
+        assert!(trust.server_policy.admits(&listed));
+        assert!(!trust.server_policy.admits(&other));
+    }
+
+    /// `debug_attestation` defaults to FALSE (production full-chain
+    /// verification) when omitted: forgetting the flag can only make
+    /// verification stricter, never weaker.
+    #[test]
+    fn trust_debug_attestation_defaults_to_false() {
+        let config = format!(
+            r#"{{
+                "control_public_key": "{}",
+                "synchronizer": {{
+                    "expected_pcrs": [
+                        {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
+                    ]
+                }}
+            }}"#,
+            control_pubkey_b64(),
+            hex48(0x10),
+            hex48(0x11),
+            hex48(0x12),
+        );
+        let path = write_config("default-debug", &config);
+        let trust = load_synchronizer_trust(&path).expect("load");
+        std::fs::remove_file(&path).ok();
+        assert!(!trust.debug_attestation);
+    }
+
+    /// The decision the wiring hinges on: SYNCHRONIZER_ENABLED=1 with NO
+    /// `synchronizer` section in the measured config is fail-stop, never
+    /// an unauthenticated-oracle fallback.
+    #[test]
+    fn trust_missing_synchronizer_section_is_fatal() {
+        let config = format!(r#"{{"control_public_key": "{}"}}"#, control_pubkey_b64());
+        let path = write_config("no-section", &config);
+        let err = load_synchronizer_trust(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            err.to_string().contains("expected_pcrs"),
+            "error must name the missing trust anchor: {err}"
+        );
+    }
+
+    /// An EMPTY expected_pcrs list is fail-stop: it would admit no oracle
+    /// (the policy is fail-safe), so refuse at load time with a clear
+    /// message instead of failing every connection cryptically.
+    #[test]
+    fn trust_empty_expected_pcrs_is_fatal() {
+        let config = format!(
+            r#"{{
+                "control_public_key": "{}",
+                "synchronizer": {{ "expected_pcrs": [] }}
+            }}"#,
+            control_pubkey_b64()
+        );
+        let path = write_config("empty-pcrs", &config);
+        let err = load_synchronizer_trust(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    /// A malformed PCR entry (bad hex) is fail-stop.
+    #[test]
+    fn trust_malformed_pcr_hex_is_fatal() {
+        let config = format!(
+            r#"{{
+                "control_public_key": "{}",
+                "synchronizer": {{
+                    "expected_pcrs": [
+                        {{"PCR0": "not-hex", "PCR1": "{}", "PCR2": "{}"}}
+                    ]
+                }}
+            }}"#,
+            control_pubkey_b64(),
+            hex48(0x21),
+            hex48(0x22),
+        );
+        let path = write_config("bad-hex", &config);
+        let err = load_synchronizer_trust(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("expected_pcrs[0]"), "{err}");
+    }
+
+    /// A missing control pubkey is NOT fatal through the trust loader: a
+    /// non-upgradable enclave registers under the canonical un-signable
+    /// control key (#41), so as long as the #208 oracle-authentication
+    /// anchor (`expected_pcrs`) is present, the trust loads. Only a
+    /// missing `synchronizer` section / empty `expected_pcrs` are fatal
+    /// (covered by the tests below).
+    #[test]
+    fn trust_missing_control_pubkey_uses_non_upgradable_key() {
+        let config = format!(
+            r#"{{
+                "synchronizer": {{
+                    "expected_pcrs": [
+                        {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
+                    ]
+                }}
+            }}"#,
+            hex48(0x31),
+            hex48(0x32),
+            hex48(0x33),
+        );
+        let path = write_config("no-control-key", &config);
+        let trust = load_synchronizer_trust(&path).expect("missing control key must not be fatal");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            trust.control_pubkey,
+            enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY,
+            "a non-upgradable enclave must load the un-signable control key"
+        );
+    }
+
+    /// A missing config file is fatal.
+    #[test]
+    fn trust_missing_config_file_is_fatal() {
+        let path = std::env::temp_dir().join("nbd-sync-trust-does-not-exist.json");
+        assert!(load_synchronizer_trust(&path).is_err());
     }
 
     /// An NBD error on the boot read is fatal (fail-stop).

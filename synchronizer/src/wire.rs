@@ -82,19 +82,36 @@ pub const MAX_FRAME_SIZE: u32 = 65535;
 ///
 /// The session protocol: 4-byte big-endian length prefix, then that many
 /// bytes of Noise ciphertext whose plaintext is one CBOR-encoded `Frame`.
-/// The first client-to-server frame MUST be [`Frame::Authenticate`]; every
-/// subsequent frame is [`Frame::Rpc`], answered with one CBOR [`Response`].
-/// See `crate::listener` for the responder side and `crate::client` for
-/// the initiator side.
+/// Authentication is MUTUAL and strictly ordered (#208): the first
+/// client-to-server frame MUST be [`Frame::Authenticate`] (the customer's
+/// document), and the first server-to-client frame is the server's own
+/// [`Frame::Authenticate`] (the oracle's document, sent only after the
+/// client's verified). Every subsequent client frame is [`Frame::Rpc`],
+/// answered with one CBOR [`Response`]. See `crate::listener` for the
+/// responder side and `crate::client` for the initiator side.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "frame")]
 pub enum Frame {
-    /// First client→server frame on every connection. Carries the raw
-    /// CBOR/COSE_Sign1 bytes of a Nitro NSM attestation document. The
-    /// document's `nonce` field MUST equal `base64(handshake_hash)`
-    /// from the just-completed Noise handshake; the listener verifies
-    /// the doc, extracts PCR0/1/2, and binds the session to
+    /// Mutual-authentication frame, sent by BOTH ends (#208). Carries the
+    /// raw CBOR/COSE_Sign1 bytes of a Nitro NSM attestation document
+    /// whose `nonce` field MUST equal `base64(handshake_hash)` from the
+    /// just-completed Noise handshake (channel binding: a document
+    /// captured from any other session carries the wrong nonce and is
+    /// rejected).
+    ///
+    /// Client→server (first client frame): the listener verifies the doc,
+    /// extracts PCR0/1/2, and binds the session to
     /// `PcrKey = SHA-256(PCR0||PCR1||PCR2)`.
+    ///
+    /// Server→client (first server frame, sent only after the client's
+    /// `Authenticate` verified): the client verifies the doc and checks
+    /// its PCRs against the synchronizer measurements it trusts (a
+    /// [`ServerPcrPolicy`] sourced from the customer enclave's MEASURED
+    /// image/config). This is what stops a malicious host from
+    /// terminating the customer's session itself and answering Get/Pin
+    /// as a fake oracle: `Noise_NN` is unauthenticated DH, so without
+    /// the server attesting back the customer would have no idea who is
+    /// on the other end.
     Authenticate {
         /// Raw NSM attestation document bytes.
         nsm_doc: Vec<u8>,
@@ -285,6 +302,109 @@ impl From<ValidationError> for RpcError {
             ValidationError::AlreadyRegistered => RpcError::OperationRejected,
             ValidationError::KeyRetired => RpcError::OperationRejected,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server-attestation verifier (#208; pure, called by the customer client)
+// ---------------------------------------------------------------------------
+
+// Re-exported so policy construction has one import site alongside the
+// verifier that consumes it.
+pub use enclavia_protocol::attestation::Pcrs;
+
+/// Which synchronizer measurements a customer accepts when the oracle
+/// attests back to it (#208).
+///
+/// # SECURITY CONTRACT: where the expected PCRs MUST come from
+///
+/// The whole point of the server attestation is to stop a malicious HOST
+/// from impersonating the oracle, so the expected PCRs MUST come from
+/// data the host cannot influence: the customer enclave's MEASURED
+/// image or config (e.g. `/etc/enclavia/config.json`, which is baked
+/// into the EIF and therefore part of the enclave's own PCRs). Sourcing
+/// them from a host-controlled channel (environment variables, a vsock
+/// side-channel, command-line arguments) makes the check WORTHLESS: the
+/// host would simply supply the PCRs of whatever it wants to
+/// impersonate the oracle with.
+///
+/// An empty [`ServerPcrPolicy::Expected`] list admits nothing
+/// (fail-stop), never everything.
+///
+/// There is deliberately NO "accept any PCRs" variant. The oracle's
+/// identity MUST always be checked against a known measurement set, so
+/// every caller (production and tests alike) supplies the PCRs it
+/// expects: production reads them from the customer enclave's MEASURED
+/// config (hardcoded by the builder, injected into the EIF), and the
+/// smoke client reads the freshly built EIF's `pcr.json`. Kept an enum
+/// (rather than a bare `Vec<Pcrs>`) so future policy kinds, e.g. a
+/// PCR0-only match, can be added without churning call sites.
+#[derive(Clone, Debug)]
+pub enum ServerPcrPolicy {
+    /// Accept only a server whose verified PCR0/1/2 equal one of these
+    /// triples exactly. The list normally has one entry (the deployed
+    /// synchronizer cluster runs a single image) and only changes when a
+    /// new cluster is stood up. An EMPTY list admits nothing.
+    Expected(Vec<Pcrs>),
+}
+
+impl ServerPcrPolicy {
+    /// Whether `pcrs` (a server's VERIFIED measurements) satisfy this
+    /// policy.
+    pub fn admits(&self, pcrs: &Pcrs) -> bool {
+        match self {
+            ServerPcrPolicy::Expected(expected) => expected.iter().any(|e| e == pcrs),
+        }
+    }
+}
+
+/// Why a server's `Authenticate` document was rejected by
+/// [`verify_server_attestation`].
+#[derive(Debug, thiserror::Error)]
+pub enum ServerAuthError {
+    /// The document failed validation: malformed COSE/CBOR, a failed
+    /// AWS Nitro CA-chain / COSE-signature check (production mode), or a
+    /// `nonce` that does not bind this session's handshake hash (a
+    /// replayed capture from another session).
+    #[error("server attestation document invalid: {0}")]
+    Attestation(String),
+    /// The document verified, but its PCRs are not admitted by the
+    /// caller's [`ServerPcrPolicy`]: whatever is on the other end of
+    /// this session, it is not the synchronizer the caller trusts.
+    #[error("server attestation PCRs are not the expected synchronizer measurements")]
+    PcrRejected,
+}
+
+/// Verify the server's `Authenticate` document for one customer session
+/// (#208): full document validation (AWS Nitro CA chain + COSE signature
+/// when `debug_mode = false`; structural-only for QEMU's self-signing
+/// NSM when `true`), nonce binding to THIS session's `handshake_hash`,
+/// then the PCR check against `policy`.
+///
+/// `debug_mode` MUST come from the same measured source as the policy
+/// (it is part of the trust decision: a host that could flip it to
+/// `true` could forge the document outright). Returns the server's
+/// verified PCRs on success so the caller can log/record them.
+pub fn verify_server_attestation(
+    nsm_doc: &[u8],
+    handshake_hash: &[u8],
+    policy: &ServerPcrPolicy,
+    debug_mode: bool,
+) -> Result<Pcrs, ServerAuthError> {
+    use enclavia_protocol::attestation::AttestationError;
+    let ServerPcrPolicy::Expected(expected) = policy;
+    // The PCR comparison happens INSIDE the protocol verifier (its
+    // `expected` parameter is mandatory), so no code path can verify a
+    // server document without committing to an identity.
+    match enclavia_protocol::attestation::verify_and_extract_pcrs(
+        nsm_doc,
+        handshake_hash,
+        expected,
+        debug_mode,
+    ) {
+        Ok(pcrs) => Ok(pcrs),
+        Err(AttestationError::PcrsNotExpected) => Err(ServerAuthError::PcrRejected),
+        Err(e) => Err(ServerAuthError::Attestation(e.to_string())),
     }
 }
 
@@ -744,6 +864,96 @@ mod tests {
             })
             .expect("type discriminator present");
         assert_eq!(ty, "Get");
+    }
+
+    // --- verify_server_attestation (#208) ------------------------------
+
+    use enclavia_protocol::attestation::test_utils::FakeAttestation;
+
+    fn pcrs_from_seed(seed: u8) -> Pcrs {
+        Pcrs {
+            pcr0: vec![seed; 48],
+            pcr1: vec![seed.wrapping_add(1); 48],
+            pcr2: vec![seed.wrapping_add(2); 48],
+        }
+    }
+
+    fn hh() -> Vec<u8> {
+        (0u8..32).collect()
+    }
+
+    /// Happy path: the server's document binds this session's hash and
+    /// its PCRs are in the expected set.
+    #[test]
+    fn server_attestation_expected_pcrs_admitted() {
+        let doc = FakeAttestation::with_seed(0x51, hh()).encode();
+        let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x51)]);
+        let pcrs = verify_server_attestation(&doc, &hh(), &policy, true).expect("verify");
+        assert_eq!(pcrs, pcrs_from_seed(0x51));
+    }
+
+    /// A multi-entry policy admits any listed triple.
+    #[test]
+    fn server_attestation_any_of_expected_set_admitted() {
+        let doc = FakeAttestation::with_seed(0x52, hh()).encode();
+        let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x99), pcrs_from_seed(0x52)]);
+        verify_server_attestation(&doc, &hh(), &policy, true).expect("verify");
+    }
+
+    /// The impersonation case: a valid, session-bound document whose
+    /// PCRs are NOT the expected synchronizer measurements is rejected.
+    /// This is exactly what a host reflecting the customer's own
+    /// document (or fronting a rogue image) produces.
+    #[test]
+    fn server_attestation_wrong_pcrs_rejected() {
+        let doc = FakeAttestation::with_seed(0x53, hh()).encode();
+        let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x54)]);
+        let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
+        assert!(matches!(err, ServerAuthError::PcrRejected), "{err:?}");
+    }
+
+    /// An EMPTY expected set admits nothing: fail-stop, never
+    /// fail-open.
+    #[test]
+    fn server_attestation_empty_expected_set_rejects_everything() {
+        let doc = FakeAttestation::with_seed(0x55, hh()).encode();
+        let policy = ServerPcrPolicy::Expected(Vec::new());
+        let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
+        assert!(matches!(err, ServerAuthError::PcrRejected), "{err:?}");
+    }
+
+    /// Nonce binding: a document captured from ANOTHER session (replay)
+    /// is rejected even when its PCRs are expected.
+    #[test]
+    fn server_attestation_replayed_doc_rejected() {
+        let doc = FakeAttestation::with_seed(0x56, vec![0xab; 32]).encode();
+        let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x56)]);
+        let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
+        assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
+    }
+
+    /// Garbage bytes are rejected as a malformed document (before any
+    /// PCR comparison, so the specific expected set is irrelevant).
+    #[test]
+    fn server_attestation_garbage_doc_rejected() {
+        let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x57)]);
+        let err =
+            verify_server_attestation(&[0xde, 0xad, 0xbe, 0xef], &hh(), &policy, true).unwrap_err();
+        assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
+    }
+
+    /// A correctly-bound, expected-PCR document verifies, and the SAME
+    /// document replayed under a different session hash is rejected by
+    /// the nonce binding even though its PCRs still match the policy.
+    #[test]
+    fn server_attestation_matching_policy_still_checks_nonce() {
+        let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x57)]);
+        let good = FakeAttestation::with_seed(0x57, hh()).encode();
+        verify_server_attestation(&good, &hh(), &policy, true).expect("verify");
+
+        let replayed = FakeAttestation::with_seed(0x57, vec![0xcd; 32]).encode();
+        let err = verify_server_attestation(&replayed, &hh(), &policy, true).unwrap_err();
+        assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
     }
 
     // --- verify_transition_link ---------------------------------------

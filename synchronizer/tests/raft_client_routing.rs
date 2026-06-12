@@ -49,7 +49,7 @@ use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use synchronizer::listener::{Frame, MAX_FRAME_SIZE, handle_connection};
+use synchronizer::listener::{FakeSessionAttestor, Frame, MAX_FRAME_SIZE, handle_connection};
 use synchronizer::mesh::Mesh;
 use synchronizer::mesh::attestation::FakeAttestor;
 use synchronizer::mesh::config::MeshConfig;
@@ -265,7 +265,10 @@ async fn spawn_node_full(
                 Ok((stream, _)) => {
                     let dispatch = Arc::clone(&dispatch);
                     tokio::spawn(async move {
-                        let _ = handle_connection(&*dispatch, stream, true).await;
+                        // The node attests its own sessions (#208) with the
+                        // shared image seed, like every cluster member.
+                        let attestor = FakeSessionAttestor { seed: IMAGE_SEED };
+                        let _ = handle_connection(&*dispatch, &attestor, stream, true).await;
                     });
                 }
                 Err(_) => return,
@@ -322,11 +325,33 @@ impl Client {
     async fn connect(node: &Node, seed: u8, pubkey: [u8; CONTROL_PUBKEY_LEN]) -> Client {
         let mut stream = UnixStream::connect(&node.client_sock).await.unwrap();
         let (mut transport, hash) = perform_handshake_as_initiator(&mut stream).await.unwrap();
-        let fake = FakeAttestation::with_seed_and_pubkey(seed, hash, pubkey);
+        let fake = FakeAttestation::with_seed_and_pubkey(seed, hash.clone(), pubkey);
         let auth = Frame::Authenticate {
             nsm_doc: fake.encode(),
         };
         write_frame(&mut stream, &mut transport, &auth).await;
+        // Mutual auth (#208): the node answers with its own session-bound
+        // attestation. Verify it against the cluster's shared image PCRs
+        // before issuing RPCs, exactly as a real customer would.
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await.unwrap();
+        let mut ciphertext = vec![0u8; u32::from_be_bytes(len_bytes) as usize];
+        stream.read_exact(&mut ciphertext).await.unwrap();
+        let mut plaintext = vec![0u8; MAX_FRAME_SIZE as usize];
+        let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
+        let frame: Frame = ciborium::from_reader(&plaintext[..pt_len]).unwrap();
+        let server_doc = match frame {
+            Frame::Authenticate { nsm_doc } => nsm_doc,
+            other => panic!("expected the node's Authenticate, got {other:?}"),
+        };
+        let expected = Pcrs {
+            pcr0: vec![IMAGE_SEED; 48],
+            pcr1: vec![IMAGE_SEED.wrapping_add(1); 48],
+            pcr2: vec![IMAGE_SEED.wrapping_add(2); 48],
+        };
+        let policy = synchronizer::wire::ServerPcrPolicy::Expected(vec![expected]);
+        synchronizer::wire::verify_server_attestation(&server_doc, &hash, &policy, true)
+            .expect("node's server attestation must verify");
         Client { stream, transport }
     }
 

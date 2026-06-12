@@ -103,6 +103,13 @@ pub enum AttestationError {
     /// document was produced for a different purpose (or tampered with).
     #[error("attestation document user_data is not a 32-byte control nonce")]
     InvalidControlNonce,
+    /// The document verified (structure, signature, nonce binding) but
+    /// its PCR0/1/2 equal NONE of the caller's expected triples.
+    /// Returned by [`verify_and_extract_pcrs`]: the presenting enclave
+    /// is genuine but is not the identity the caller trusts (#208
+    /// server authentication).
+    #[error("attestation document PCRs match none of the expected values")]
+    PcrsNotExpected,
 }
 
 /// Length of an ECDSA P-256 verifying key in uncompressed SEC1 form
@@ -309,6 +316,63 @@ pub fn verify_and_extract(
         pcrs,
         control_pubkey,
     })
+}
+
+/// Verify an attestation document's session binding AND that its PCRs
+/// equal one of the caller's `expected` triples, with no `user_data`
+/// requirement. Returns the verified PCRs (which of the expected set
+/// matched).
+///
+/// Server-authentication entry point (EnclaviaIO/enclavia-crates#208).
+/// The synchronizer's CUSTOMER client uses this to authenticate the
+/// ORACLE back to itself: the synchronizer sends its own NSM document
+/// bound to the live Noise session and the client validates it here
+/// against the synchronizer measurements it trusts.
+///
+/// Checks performed:
+///
+/// 1. Parse + structural validation of the COSE_Sign1 wrapper; in
+///    production mode (`debug_mode = false`) the AWS Nitro CA chain is
+///    validated and the COSE signature verified, exactly like
+///    [`verify_against`] / [`verify_and_extract`].
+/// 2. Nonce equals `base64(handshake_hash)`: the document is bound to
+///    *this* Noise session, so a document captured from any other
+///    session (including the mesh and other customers' sessions) is
+///    rejected.
+/// 3. The document's PCR0/1/2 equal one of `expected` EXACTLY. An empty
+///    `expected` admits nothing. The comparison is mandatory and lives
+///    here (not at the caller) so no public API exists that verifies a
+///    document without committing to an identity; a bare
+///    verify-and-return-PCRs form would be passable by ANY enclave,
+///    including a reflection of the caller's own document.
+///
+/// Differs from [`verify_against`] in accepting a SET of valid triples
+/// (a deployment may roll between two cluster images), and from
+/// [`verify_and_extract`] in not requiring (or reading) `user_data`:
+/// the server side of the customer protocol carries no control pubkey,
+/// so demanding one would force the server to stuff a meaningless value
+/// into the document.
+pub fn verify_and_extract_pcrs(
+    attestation_data: &[u8],
+    handshake_hash: &[u8],
+    expected: &[Pcrs],
+    debug_mode: bool,
+) -> Result<Pcrs, AttestationError> {
+    let doc = parse_and_validate(attestation_data, debug_mode)?;
+
+    check_nonce(&doc, handshake_hash)?;
+
+    let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
+
+    let pcrs = Pcrs {
+        pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
+        pcr1: decode_pcr(&hex_pcrs.pcr_1, 1)?,
+        pcr2: decode_pcr(&hex_pcrs.pcr_2, 2)?,
+    };
+    if !expected.iter().any(|e| e == &pcrs) {
+        return Err(AttestationError::PcrsNotExpected);
+    }
+    Ok(pcrs)
 }
 
 /// Extract PCR0/1/2 from an attestation document the caller JUST obtained from
@@ -963,6 +1027,108 @@ mod tests {
             matches!(err, AttestationError::InvalidControlPubkey),
             "expected InvalidControlPubkey, got {err:?}"
         );
+    }
+
+    /// The expected-PCR triple matching `FakeAttestation::with_seed(seed)`.
+    fn seed_pcrs(seed: u8) -> Pcrs {
+        Pcrs {
+            pcr0: vec![seed; 48],
+            pcr1: vec![seed.wrapping_add(1); 48],
+            pcr2: vec![seed.wrapping_add(2); 48],
+        }
+    }
+
+    #[test]
+    fn verify_and_extract_pcrs_returns_doc_pcrs_in_debug_mode() {
+        let fake = test_utils::FakeAttestation::with_seed(0x66, hh());
+        let pcrs = verify_and_extract_pcrs(&fake.encode(), &hh(), &[seed_pcrs(0x66)], true)
+            .expect("verify");
+        assert_eq!(pcrs.pcr0, fake.pcr0);
+        assert_eq!(pcrs.pcr1, fake.pcr1);
+        assert_eq!(pcrs.pcr2, fake.pcr2);
+    }
+
+    #[test]
+    fn verify_and_extract_pcrs_rejects_unexpected_pcrs() {
+        let fake = test_utils::FakeAttestation::with_seed(0x66, hh());
+        let err =
+            verify_and_extract_pcrs(&fake.encode(), &hh(), &[seed_pcrs(0x99)], true).unwrap_err();
+        assert!(
+            matches!(err, AttestationError::PcrsNotExpected),
+            "expected PcrsNotExpected, got {err:?}"
+        );
+        // An empty expected set admits nothing.
+        let err = verify_and_extract_pcrs(&fake.encode(), &hh(), &[], true).unwrap_err();
+        assert!(
+            matches!(err, AttestationError::PcrsNotExpected),
+            "expected PcrsNotExpected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_and_extract_pcrs_rejects_wrong_handshake_hash() {
+        let fake = test_utils::FakeAttestation::with_seed(0x67, hh());
+        let wrong: Vec<u8> = vec![0xab; 32];
+        let err =
+            verify_and_extract_pcrs(&fake.encode(), &wrong, &[seed_pcrs(0x67)], true).unwrap_err();
+        assert!(
+            matches!(err, AttestationError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_and_extract_pcrs_rejects_garbage_bytes() {
+        let err = verify_and_extract_pcrs(b"not a cose document", &hh(), &[seed_pcrs(0x66)], true)
+            .unwrap_err();
+        assert!(
+            matches!(err, AttestationError::Validation(_)),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_and_extract_pcrs_accepts_doc_without_user_data() {
+        // The server side of the customer protocol carries no control
+        // pubkey, so the doc may legitimately omit user_data (a real
+        // /dev/nsm request with user_data = None). Build one inline,
+        // since FakeAttestation always populates user_data.
+        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
+        use ciborium::value::Value as CborValue;
+        use std::collections::BTreeMap;
+
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert(0usize, vec![0x68u8; 48]);
+        pcrs.insert(1usize, vec![0x69u8; 48]);
+        pcrs.insert(2usize, vec![0x6au8; 48]);
+        pcrs.insert(8usize, vec![0u8; 48]);
+
+        let doc = AttestationDoc::new(
+            "test-module".to_string(),
+            Digest::SHA384,
+            0,
+            pcrs,
+            vec![0u8; 64],
+            vec![vec![0u8; 64]],
+            None, // no user_data: must still verify.
+            Some(hh()),
+            None,
+        );
+
+        let mut payload = Vec::new();
+        ciborium::into_writer(&doc, &mut payload).unwrap();
+        let cose = CborValue::Array(vec![
+            CborValue::Bytes(vec![0xa0]),
+            CborValue::Map(Vec::new()),
+            CborValue::Bytes(payload),
+            CborValue::Bytes(vec![0u8; 96]),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&cose, &mut bytes).unwrap();
+
+        let pcrs =
+            verify_and_extract_pcrs(&bytes, &hh(), &[seed_pcrs(0x68)], true).expect("verify");
+        assert_eq!(pcrs.pcr0, vec![0x68u8; 48]);
     }
 
     #[test]

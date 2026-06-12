@@ -112,13 +112,13 @@ EIF="$WORK/eif/image.eif"
 [ -f "$EIF" ] || { echo "FATAL: EIF not produced at $EIF" >&2; ls -la "$WORK/eif" >&2; exit 1; }
 echo "  EIF: $EIF"
 
-# Record the PCRs the build measured (same for all three nodes). The EIF
-# build prints a PCR JSON next to the image in newer nitro-util; if absent
-# we just note that all nodes share this single artifact.
-if [ -f "$WORK/eif/pcr.json" ]; then
-    echo "  PCRs (single image, shared by all nodes):"
-    cat "$WORK/eif/pcr.json"
-fi
+# The measured PCRs (same for all three nodes: one image). The smoke
+# client authenticates the oracle's server-attestation against these
+# (#208), so the file is REQUIRED, no accept-any path.
+PCRS_JSON="$WORK/eif/pcr.json"
+[ -f "$PCRS_JSON" ] || { echo "FATAL: pcr.json not produced at $PCRS_JSON (the client needs the expected server PCRs)" >&2; exit 1; }
+echo "  PCRs (single image, shared by all nodes):"
+cat "$PCRS_JSON"
 
 echo "  building mesh-host (debug)..."
 nice nix build "path:$CRATES_DIR#mesh-host-debug" --out-link "$WORK/mesh-host" --print-build-logs
@@ -268,10 +268,10 @@ SEED=0x42
 COMMIT=0xab
 
 echo "--- Pin on node-a ---"
-"$CLIENT" "${DIR[node-a]}/proxy.sock" pin "$COMMIT" --port 5010 --seed "$SEED"
+"$CLIENT" "${DIR[node-a]}/proxy.sock" pin "$COMMIT" --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED"
 
 echo "--- Get on node-b (forwarded to leader, linearizable) ---"
-GET_OUT="$("$CLIENT" "${DIR[node-b]}/proxy.sock" get --port 5010 --seed "$SEED")"
+GET_OUT="$("$CLIENT" "${DIR[node-b]}/proxy.sock" get --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED")"
 echo "$GET_OUT"
 
 if echo "$GET_OUT" | grep -q "get ok commitment_byte=$COMMIT"; then
@@ -380,7 +380,7 @@ if [ -n "${TEST_RESTART:-}" ]; then
         exit 4
     fi
     echo "--- Get on node-c after restart ---"
-    RESTART_OUT="$("$CLIENT" "${DIR[node-c]}/proxy.sock" get --port 5010 --seed "$SEED")" || {
+    RESTART_OUT="$("$CLIENT" "${DIR[node-c]}/proxy.sock" get --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED")" || {
         echo "BLOCKER: node-c Get failed after restart; serial tail:" >&2
         tail -n 60 "${DIR[node-c]}/serial.log" >&2 || true
         exit 4
