@@ -334,7 +334,7 @@ where
             }
             nbd::NBD_CMD_WRITE => {
                 if let Some(label) = classify_superblock_write(offset, length, data_offset) {
-                    info!(
+                    debug!(
                         target: "synchronizer",
                         offset, length, %label,
                         "superblock write detected"
