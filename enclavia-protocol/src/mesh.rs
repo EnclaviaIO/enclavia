@@ -77,6 +77,22 @@ pub const SYNCHRONIZER_BOOTSTRAP_PORT: u32 = 5008;
 /// pass; supersedes the single-node binary's interim default of 5004.
 pub const SYNCHRONIZER_CLIENT_PORT: u32 = 5010;
 
+/// vsock port a CUSTOMER enclave's `nbd-client` dials on its OWN host
+/// (CID 2) to reach the synchronizer cluster's customer RPC surface.
+///
+/// A customer enclave cannot dial the synchronizer enclaves directly (an
+/// in-enclave binary only reaches its own parent over vsock), so a
+/// host-side relay (follow-up in enclavia-crates, same conventions as
+/// `egress-host` / the future `mesh-host`) listens here and splices the
+/// byte stream to a cluster node's [`SYNCHRONIZER_CLIENT_PORT`] (5010).
+/// The relay never sees plaintext: the end-to-end Noise channel between
+/// the customer enclave and the synchronizer node is load-bearing.
+///
+/// 5010 is the cluster's OWN customer listener (guest-side, inside the
+/// synchronizer enclaves) and 5011 is the names side-channel
+/// (`synchronizer-names-init`), so this had to be a fresh assignment.
+pub const SYNCHRONIZER_CUSTOMER_RELAY_PORT: u32 = 5012;
+
 /// Maximum size (in bytes) of the opener CBOR frame. Plenty of room for
 /// the small `Open` struct we serialize today (a peer name), but tight
 /// enough to reject obvious junk before allocating. Mirrors
@@ -428,11 +444,15 @@ mod tests {
         assert_eq!(SYNCHRONIZER_BOOTSTRAP_PORT, 5008);
         assert_eq!(MESH_VSOCK_PORT, 5009);
         assert_eq!(SYNCHRONIZER_CLIENT_PORT, 5010);
-        // Sanity: no accidental collisions among the three.
+        // 5011 is the names side-channel (synchronizer-names-init); the
+        // customer relay had to skip it.
+        assert_eq!(SYNCHRONIZER_CUSTOMER_RELAY_PORT, 5012);
+        // Sanity: no accidental collisions among the assignments.
         let ports = [
             SYNCHRONIZER_BOOTSTRAP_PORT,
             MESH_VSOCK_PORT,
             SYNCHRONIZER_CLIENT_PORT,
+            SYNCHRONIZER_CUSTOMER_RELAY_PORT,
         ];
         for (i, p) in ports.iter().enumerate() {
             for q in &ports[i + 1..] {

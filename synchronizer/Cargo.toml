@@ -90,6 +90,15 @@ wire = [
 # helpers (async-transport) on top of `wire`. Implies `wire` and the
 # mesh layer (the peer mesh shares the Noise + attestation plumbing).
 node = ["wire", "mesh", "dep:tokio", "tokio/io-util", "enclavia-protocol/async-transport", "dep:snow"]
+# Customer-side RPC client (Noise initiator + Authenticate + Pin/Get),
+# consumed by `nbd-client` for the #16 anti-rollback wiring. Deliberately
+# light: `wire` plus the async Noise transport, with NO mesh / NSM-driver
+# / openraft pull-in (verified by nbd-client's dependency tree). The
+# caller supplies the raw attestation-document bytes, so the NSM driver
+# stays out of this feature; the transport is generic over
+# AsyncRead + AsyncWrite, so tokio-vsock stays out too (the consumer
+# owns the dial).
+client = ["wire", "dep:tokio", "tokio/io-util", "enclavia-protocol/async-transport"]
 # Mutually-attested peer mesh (#118). Boot-time peer attestation,
 # self-PCR allowlist, long-lived per-peer transport with reconnect +
 # backoff. Pulls in the async-trait-backed AttestationProvider /
