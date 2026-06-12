@@ -751,20 +751,39 @@ struct RawConfig {
 }
 
 /// Load the 65-byte uncompressed SEC1 P-256 control pubkey from the
-/// enclave config. The synchronizer protocol requires it in the
-/// attestation document's `user_data` (it is what authorizes a future
-/// PCR Transition for this key), so when the wiring is enabled a
-/// missing / malformed key is fatal.
+/// enclave config, the value the synchronizer freezes and later uses to
+/// verify a PCR `Transition` for this key.
+///
+/// Two valid outcomes:
+///
+/// - `control_public_key` present: an upgradable enclave (#47 chain).
+///   Decode it; a malformed value is fatal (a real key was intended, so
+///   a broken one is a misconfiguration, not a non-upgradable signal).
+/// - `control_public_key` absent: a non-upgradable enclave. Register
+///   with the canonical provably-un-signable
+///   [`NON_UPGRADABLE_CONTROL_KEY`] instead of failing. No private key
+///   for it exists, so no `Transition` can ever be authorized and the
+///   pinned storage history is permanently bound to this one image,
+///   which is the correct semantic for an enclave with no upgrade path.
+///   Storage pinning itself is unaffected (`Pin`/`Get` are gated by the
+///   attested PCR key, not by this pubkey). The choice is logged so the
+///   non-upgradable posture is observable; a chain-enabled enclave whose
+///   key went missing therefore fails SAFE (it can never transition,
+///   never an unauthorised one).
 pub fn load_control_pubkey(path: &Path) -> Result<[u8; 65], FatalError> {
     use base64::Engine;
     let bytes = std::fs::read(path)
         .map_err(|e| format!("cannot read enclave config {}: {e}", path.display()))?;
     let raw: RawConfig = serde_json::from_slice(&bytes)
         .map_err(|e| format!("cannot parse enclave config {}: {e}", path.display()))?;
-    let b64 = raw.control_public_key.ok_or(
-        "enclave config has no control_public_key; the synchronizer wiring requires one \
-         (non-upgradable enclaves cannot pin storage state)",
-    )?;
+    let Some(b64) = raw.control_public_key else {
+        warn!(
+            "enclave config has no control_public_key: treating this enclave as NON-UPGRADABLE \
+             and pinning storage under the canonical un-signable control key (no PCR Transition \
+             will ever be possible for it)"
+        );
+        return Ok(*enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY);
+    };
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| format!("control_public_key is not valid base64: {e}"))?;
@@ -1508,5 +1527,60 @@ mod tests {
                 .is_err()
         );
         server.await.unwrap();
+    }
+
+    // --- load_control_pubkey -----------------------------------------
+
+    /// Write `contents` to a unique temp config file; returns its path.
+    fn temp_config(tag: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("nbd-cpk-{tag}.json"));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn control_pubkey_absent_uses_non_upgradable_key() {
+        // No control_public_key field: a non-upgradable enclave. The
+        // loader must fall back to the canonical un-signable key, not
+        // fail-stop.
+        let path = temp_config("absent", r#"{"other_field": 1}"#);
+        let got = load_control_pubkey(&path).expect("absent key must not be fatal");
+        assert_eq!(
+            got,
+            *enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn control_pubkey_present_valid_is_used_verbatim() {
+        use base64::Engine;
+        // A real (test) uncompressed SEC1 key round-trips unchanged.
+        let mut key = [0u8; 65];
+        key[0] = 0x04;
+        key[1] = 0xAB;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        let path = temp_config("valid", &format!(r#"{{"control_public_key": "{b64}"}}"#));
+        let got = load_control_pubkey(&path).expect("valid key must load");
+        assert_eq!(got, key);
+        // And it must NOT be the un-signable fallback.
+        assert_ne!(
+            got,
+            *enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn control_pubkey_present_but_malformed_is_fatal() {
+        // A present-but-broken key is a misconfiguration of an
+        // upgradable enclave, not a non-upgradable signal: stay fatal.
+        let path = temp_config("malformed", r#"{"control_public_key": "not-base64!!!"}"#);
+        assert!(load_control_pubkey(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+
+        let path = temp_config("shortkey", r#"{"control_public_key": "BAAB"}"#);
+        assert!(load_control_pubkey(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }
