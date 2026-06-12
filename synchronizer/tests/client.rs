@@ -17,13 +17,17 @@
 
 use std::sync::Arc;
 
-use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs, test_utils::FakeAttestation};
+use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
+use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
+use enclavia_protocol::chain::PcrsHex;
 use enclavia_protocol::perform_handshake_as_responder;
-use p256::ecdsa::SigningKey;
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use synchronizer::client::{ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::listener::{FakeSessionAttestor, handle_connection};
 use synchronizer::node::Node;
-use synchronizer::wire::{Frame, MAX_FRAME_SIZE, RpcError};
+use synchronizer::wire::{
+    ChainLink, ChainLinkKind, Frame, MAX_FRAME_SIZE, Request, RpcError, UpgradePayload,
+};
 use synchronizer::{Commitment, PcrKey, Version};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -34,9 +38,12 @@ fn c(b: u8) -> Commitment {
     Commitment([b; 32])
 }
 
-/// Deterministic 65-byte uncompressed SEC1 P-256 pubkey for the NSM
-/// doc's `user_data` (the #47 control pubkey slot).
-fn pubkey(seed: u8) -> [u8; CONTROL_PUBKEY_LEN] {
+/// Deterministic P-256 keypair; the 65-byte uncompressed SEC1 pubkey is
+/// what goes in the NSM doc's `user_data` (the #47 control pubkey slot),
+/// the signing key signs transition-link payloads.
+fn keypair(seed: u8) -> (SigningKey, [u8; CONTROL_PUBKEY_LEN]) {
+    // A reliably-valid, nonzero P-256 scalar: a small big-endian integer
+    // (0x01, seed, 0, ...) is always below the curve order.
     let mut scalar = [0u8; 32];
     scalar[0] = 0x01;
     scalar[1] = seed;
@@ -48,7 +55,13 @@ fn pubkey(seed: u8) -> [u8; CONTROL_PUBKEY_LEN] {
         .to_vec();
     let mut pk = [0u8; CONTROL_PUBKEY_LEN];
     pk.copy_from_slice(&pk_vec);
-    pk
+    (sk, pk)
+}
+
+/// Deterministic 65-byte uncompressed SEC1 P-256 pubkey for the NSM
+/// doc's `user_data` (the #47 control pubkey slot).
+fn pubkey(seed: u8) -> [u8; CONTROL_PUBKEY_LEN] {
+    keypair(seed).1
 }
 
 /// The PcrKey a seed's FakeAttestation binds the session to, matching
@@ -191,6 +204,98 @@ async fn second_session_reads_first_sessions_pin() {
     let (commitment, version) = client2.get(key2).await.expect("get");
     assert_eq!(commitment, c(0xcd));
     assert_eq!(version, Version(0));
+}
+
+/// The PcrsHex triple `FakeAttestation::with_seed(seed)` measures, in
+/// the hex form transition-link payloads carry.
+fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
+    PcrsHex {
+        pcr0: hex::encode(vec![seed; 48]),
+        pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
+        pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
+    }
+}
+
+/// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by the
+/// OLD enclave's control key and attested for the OLD measurements
+/// (mirrors the in-crate listener test fixture).
+fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+    let payload = UpgradePayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        from_pcrs: pcrs_hex_from_seed(from_seed),
+        to_pcrs: pcrs_hex_from_seed(to_seed),
+        image_digest: "sha256:to".into(),
+        valid_from: chrono::Utc::now(),
+        issued_at: chrono::Utc::now(),
+        nonce: vec![0x5a; 32],
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+    let sig: Signature = signing.sign(&payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Upgrade,
+        payload: payload_bytes,
+        attestation,
+        signature: Some(sig.to_bytes().to_vec()),
+    }
+}
+
+/// Seed an OLD enclave's key into the node (attest + Pin), modelling its
+/// earlier, now-stopped session, so its control pubkey is frozen.
+async fn register_old(node: &Node, seed: u8, control_pubkey: [u8; CONTROL_PUBKEY_LEN]) -> PcrKey {
+    let key_old = key_from_seed(seed);
+    node.observe_attestation(key_old, control_pubkey).await;
+    node.handle_request(
+        key_old,
+        Request::Pin {
+            key: key_old,
+            commitment: c(0xee),
+        },
+    )
+    .await;
+    key_old
+}
+
+/// `Client::transition` round trip (#46 client half): the NEW enclave's
+/// authenticated session submits the old-key-signed upgrade link, the
+/// oracle retires the old key and the migrated pin reads back under the
+/// new key with commitment + version carried forward.
+#[tokio::test]
+async fn transition_migrates_pin_to_new_key() {
+    let node = Arc::new(Node::with_debug_mode(true));
+    let (sk_old, pk_old) = keypair(0x50);
+    register_old(&node, 0x50, pk_old).await;
+
+    let (mut client, new_key, _task) = connect_as(Arc::clone(&node), 0x60).await;
+    let link = upgrade_link(0x50, 0x60, &sk_old);
+    let version = client.transition(link).await.expect("transition");
+    assert_eq!(version, Version(0), "carried-over version");
+
+    let (commitment, version) = client.get(new_key).await.expect("get after transition");
+    assert_eq!(commitment, c(0xee));
+    assert_eq!(version, Version(0));
+}
+
+/// A link the oracle cannot verify (signed by a key other than the one
+/// frozen for old_key) surfaces as the structured TransitionRejected,
+/// which the nbd-client boot verifier folds into its fail-stop message.
+#[tokio::test]
+async fn rejected_transition_surfaces_as_rpc_error() {
+    let node = Arc::new(Node::with_debug_mode(true));
+    let (_sk_real, pk_real) = keypair(0x51);
+    let (sk_attacker, _) = keypair(0x52);
+    register_old(&node, 0x51, pk_real).await;
+
+    let (mut client, _new_key, _task) = connect_as(Arc::clone(&node), 0x61).await;
+    let link = upgrade_link(0x51, 0x61, &sk_attacker);
+    let err = client.transition(link).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc(RpcError::TransitionRejected)),
+        "{err:?}"
+    );
 }
 
 /// An attestation document the server rejects (garbage bytes) tears the

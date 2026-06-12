@@ -38,6 +38,9 @@ aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
+# Decode the CBOR ChainLink frame chain-host serves on the upgrade-link
+# fetch path (#46).
+ciborium.workspace = true
 
 [[bin]]
 name = "enclavia-nbd-client"

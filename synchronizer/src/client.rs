@@ -67,7 +67,7 @@
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::wire::{Frame, MAX_FRAME_SIZE, Request, Response, RpcError};
+use crate::wire::{ChainLink, Frame, MAX_FRAME_SIZE, Request, Response, RpcError};
 use crate::{Commitment, PcrKey, Version};
 
 // Re-exported so callers (nbd-client) construct the policy and match its
@@ -271,9 +271,29 @@ where
         }
     }
 
+    /// Submit a #47 upgrade [`ChainLink`] authorizing a PCR transition:
+    /// the oracle retires the link's old key and carries its pinned
+    /// commitment + version over to this session's (new) key. Submitted
+    /// by the NEW enclave on its authenticated session; the link is
+    /// verified END TO END by the server ([`crate::wire`]'s
+    /// `verify_transition_link`: control signature against the pubkey
+    /// frozen for the derived old key, attestation/payload binding,
+    /// `new_key == session key`), so the channel the caller fetched the
+    /// link over needs no trust of its own. A failed verification
+    /// surfaces as [`RpcError::TransitionRejected`]. Returns the
+    /// carried-over version on success.
+    pub async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
+        match self.rpc(Request::Transition { link }).await? {
+            Response::TransitionOk { version } => Ok(version),
+            Response::Err { error } => Err(ClientError::Rpc(error)),
+            _ => Err(ClientError::UnexpectedResponse("expected TransitionOk")),
+        }
+    }
+
     /// Issue one raw [`Request`] and read its [`Response`]. The typed
-    /// helpers ([`Client::pin`], [`Client::get`]) are usually what you
-    /// want; this exists for `Transition` and future RPCs.
+    /// helpers ([`Client::pin`], [`Client::get`],
+    /// [`Client::transition`]) are usually what you want; this exists
+    /// for future RPCs.
     pub async fn rpc(&mut self, request: Request) -> Result<Response, ClientError> {
         write_frame(
             &mut self.stream,
