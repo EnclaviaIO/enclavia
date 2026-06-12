@@ -434,18 +434,58 @@ pub trait Pinner {
     async fn pin(&mut self, commitment: [u8; 32]) -> Result<(), String>;
 }
 
+/// How many times a failed pin may trigger a session re-establishment
+/// before the fail-stop policy takes over. Each attempt is a FULL new
+/// session (fresh dial through the relay, which fails over to a healthy
+/// cluster node, then a fresh Noise handshake and MUTUAL attestation),
+/// so reconnection never weakens authentication. Bounded so a truly
+/// unreachable oracle still fail-stops promptly.
+pub const SYNC_RECONNECT_ATTEMPTS: u32 = 3;
+
+/// Pause before each reconnect attempt: long enough for relay failover
+/// to route around a restarting cluster node, short enough that a gated
+/// superblock write does not stall the guest noticeably.
+pub const SYNC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Whether a pin failure is plausibly a dropped connection (a cluster
+/// node restart severs the relay splice) rather than a protocol-level
+/// answer. Only these trigger reconnection; a structured `Rpc` refusal,
+/// a malformed frame, or a protocol mismatch stay immediately fatal,
+/// because retrying them against another node would repeat the same
+/// answer (or mask a real bug).
+pub fn pin_error_is_retryable(e: &ClientError) -> bool {
+    matches!(e, ClientError::Io(_) | ClientError::ConnectionClosed)
+}
+
+/// Re-establishes a full session after a dropped connection. Returns
+/// the new client AND the key its attestation bound, which MUST equal
+/// the old key (same enclave, same `/dev/nsm`, same PCRs): a mismatch
+/// would mean our own attested identity changed mid-run, which is
+/// fatal. Boxed so [`SyncPinner`] stays a nameable type.
+pub type Reconnector<S> = Box<
+    dyn FnMut() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(Client<S>, PcrKey), String>> + Send>,
+        > + Send,
+>;
+
 /// Production [`Pinner`]: the authenticated synchronizer session, with
-/// [`SYNC_RPC_TIMEOUT`] applied per RPC.
+/// [`SYNC_RPC_TIMEOUT`] applied per RPC and bounded session
+/// re-establishment on dropped connections. The retried operation is
+/// always the SAME pin: re-pinning a commitment whose first attempt may
+/// or may not have committed is safe (the value is identical, so at
+/// worst the version bumps twice).
 pub struct SyncPinner<S> {
     client: Client<S>,
     key: PcrKey,
+    reconnect: Option<Reconnector<S>>,
 }
 
-impl<S> Pinner for SyncPinner<S>
+impl<S> SyncPinner<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    async fn pin(&mut self, commitment: [u8; 32]) -> Result<(), String> {
+    /// One pin attempt on the current session. `Err((retryable, msg))`.
+    async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (bool, String)> {
         match tokio::time::timeout(
             SYNC_RPC_TIMEOUT,
             self.client.pin(self.key, Commitment(commitment)),
@@ -456,11 +496,69 @@ where
                 info!(version = version.0, "superblock pin durably acknowledged");
                 Ok(())
             }
-            Ok(Err(e)) => Err(format!("pin rpc failed: {e}")),
-            Err(_) => Err(format!(
-                "pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"
+            Ok(Err(e)) => Err((pin_error_is_retryable(&e), format!("pin rpc failed: {e}"))),
+            // A timeout is indistinguishable from a dead node: retryable.
+            Err(_) => Err((
+                true,
+                format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
             )),
         }
+    }
+}
+
+impl<S> Pinner for SyncPinner<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    async fn pin(&mut self, commitment: [u8; 32]) -> Result<(), String> {
+        let mut last_err = match self.pin_once(commitment).await {
+            Ok(()) => return Ok(()),
+            Err((retryable, msg)) => {
+                if !retryable || self.reconnect.is_none() {
+                    return Err(msg);
+                }
+                msg
+            }
+        };
+        for attempt in 1..=SYNC_RECONNECT_ATTEMPTS {
+            warn!(
+                attempt,
+                last_err, "pin failed on a dropped session; re-establishing"
+            );
+            tokio::time::sleep(SYNC_RECONNECT_BACKOFF).await;
+            let reconnect = self.reconnect.as_mut().expect("checked above");
+            match reconnect().await {
+                Ok((client, key)) => {
+                    if key != self.key {
+                        return Err(format!(
+                            "reconnected session attested a DIFFERENT key ({key:?} != {:?}); \
+                             our own identity cannot change mid-run, refusing",
+                            self.key
+                        ));
+                    }
+                    self.client = client;
+                }
+                Err(e) => {
+                    last_err = format!("session re-establishment failed: {e}");
+                    continue;
+                }
+            }
+            match self.pin_once(commitment).await {
+                Ok(()) => {
+                    info!(attempt, "pin succeeded after session re-establishment");
+                    return Ok(());
+                }
+                Err((retryable, msg)) => {
+                    if !retryable {
+                        return Err(msg);
+                    }
+                    last_err = msg;
+                }
+            }
+        }
+        Err(format!(
+            "pin failed after {SYNC_RECONNECT_ATTEMPTS} session re-establishments: {last_err}"
+        ))
     }
 }
 
@@ -999,11 +1097,26 @@ where
     Ok(session)
 }
 
-/// Turn a [`SyncSession`] into the production [`Pinner`] for the actor.
+/// Turn a [`SyncSession`] into the production [`Pinner`] for the actor,
+/// with session re-establishment wired to a full
+/// [`connect_and_authenticate`]: a fresh dial (the relay fails over to a
+/// healthy cluster node), a fresh Noise handshake, and fresh MUTUAL
+/// attestation. Boot verification is deliberately NOT re-run on
+/// reconnect: the device has been live and gated the whole time, so the
+/// pinned state cannot have moved under us; the key-continuity check in
+/// [`SyncPinner`] guards the only thing that could change.
 pub fn into_pinner(session: SyncSession) -> SyncPinner<tokio_vsock::VsockStream> {
     SyncPinner {
         client: session.client,
         key: session.key,
+        reconnect: Some(Box::new(|| {
+            Box::pin(async {
+                let session = connect_and_authenticate()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok((session.client, session.key))
+            })
+        })),
     }
 }
 
@@ -1882,5 +1995,30 @@ mod tests {
         let path = temp_config("shortkey", r#"{"control_public_key": "BAAB"}"#);
         assert!(load_control_pubkey(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    /// Dropped-connection signatures trigger reconnection; protocol
+    /// answers stay immediately fatal.
+    #[test]
+    fn retryable_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(pin_error_is_retryable(&ClientError::Io(Error::new(
+            ErrorKind::BrokenPipe,
+            "pipe"
+        ))));
+        assert!(pin_error_is_retryable(&ClientError::ConnectionClosed));
+        assert!(!pin_error_is_retryable(&ClientError::Rpc(
+            synchronizer::wire::RpcError::Unauthorized
+        )));
+        assert!(!pin_error_is_retryable(&ClientError::Cbor("x".into())));
+        assert!(!pin_error_is_retryable(&ClientError::UnexpectedResponse(
+            "x"
+        )));
+        assert!(!pin_error_is_retryable(&ClientError::Crypto("x".into())));
     }
 }
