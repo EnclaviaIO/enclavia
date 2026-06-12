@@ -49,6 +49,16 @@ pub struct ReproduceResult {
     /// supply one; the local build is handed the empty document so
     /// PCRs match the backend's empty-doc bake.
     pub recorded_egress_allowlist: serde_json::Value,
+    /// Synchronizer trust anchors the backend recorded for THIS version
+    /// (the exact `expected_pcrs` list it passed to the builder via
+    /// `--synchronizer-pcrs`). `None` means the version was built before
+    /// the anti-rollback wiring existed, or without it; the local build
+    /// then omits the flag so the PCRs match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_synchronizer_pcrs: Option<serde_json::Value>,
+    /// Whether the backend passed `--synchronizer-enabled` for this
+    /// version (the in-enclave anti-rollback wiring was baked ON).
+    pub recorded_synchronizer_enabled: bool,
 }
 
 impl ReproduceResult {
@@ -88,6 +98,11 @@ pub struct PcrMismatch {
 /// does not change across upgrades, so it is always read from the
 /// enclave row in [`run_builder`]. This struct carries only the bits
 /// that differ between versions.
+///
+/// The synchronizer anchors are version-specific on purpose: the
+/// cluster's expected PCRs rotate over time, so each build records the
+/// exact list it was given and reproduce must replay that list, not
+/// whatever the cluster looks like today.
 #[derive(Debug)]
 struct ReproduceInputs {
     image_digest: String,
@@ -95,6 +110,12 @@ struct ReproduceInputs {
     docker_image: String,
     builder_rev: Option<String>,
     crates_rev: Option<String>,
+    /// Recorded `expected_pcrs` list (JSON array of {PCR0,PCR1,PCR2}
+    /// objects, verbatim from the backend). `None` = flag not passed at
+    /// the original build.
+    synchronizer_pcrs: Option<serde_json::Value>,
+    /// Recorded `--synchronizer-enabled` state of the original build.
+    synchronizer_enabled: bool,
 }
 
 impl ReproduceInputs {
@@ -123,6 +144,14 @@ impl ReproduceInputs {
             docker_image,
             builder_rev: opt_str(enclave, "builder_rev"),
             crates_rev: opt_str(enclave, "crates_rev"),
+            synchronizer_pcrs: enclave
+                .get("synchronizer_pcrs")
+                .filter(|v| !v.is_null())
+                .cloned(),
+            synchronizer_enabled: enclave
+                .get("synchronizer_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     }
 
@@ -165,12 +194,24 @@ impl ReproduceInputs {
             )));
         }
 
+        // The staged row's anchors are typed (Vec<PcrsHex>); re-serialise
+        // to the same JSON-array shape the enclave-row path reads, so
+        // run_builder has a single representation to forward.
+        let synchronizer_pcrs = match upgrade.synchronizer_pcrs.as_ref() {
+            Some(list) => Some(serde_json::to_value(list).map_err(|e| {
+                CliError::Other(format!("serialising recorded synchronizer PCRs: {e}"))
+            })?),
+            None => None,
+        };
+
         Ok(Self {
             image_digest,
             expected,
             docker_image: upgrade.docker_image.clone(),
             builder_rev: upgrade.builder_rev.clone(),
             crates_rev: upgrade.crates_rev.clone(),
+            synchronizer_pcrs,
+            synchronizer_enabled: upgrade.synchronizer_enabled,
         })
     }
 }
@@ -237,6 +278,8 @@ async fn run_reproduce(
         &recorded_egress_allowlist,
         inputs.builder_rev.as_deref(),
         inputs.crates_rev.as_deref(),
+        inputs.synchronizer_pcrs.as_ref(),
+        inputs.synchronizer_enabled,
     )
     .await?;
 
@@ -251,6 +294,8 @@ async fn run_reproduce(
         recorded_builder_rev: inputs.builder_rev,
         recorded_crates_rev: inputs.crates_rev,
         recorded_egress_allowlist,
+        recorded_synchronizer_pcrs: inputs.synchronizer_pcrs,
+        recorded_synchronizer_enabled: inputs.synchronizer_enabled,
     })
 }
 
@@ -307,6 +352,8 @@ async fn run_builder(
     egress_allowlist: &serde_json::Value,
     recorded_builder_rev: Option<&str>,
     recorded_crates_rev: Option<&str>,
+    recorded_synchronizer_pcrs: Option<&serde_json::Value>,
+    recorded_synchronizer_enabled: bool,
 ) -> Result<PcrTriple, CliError> {
     let builder_path = std::env::var("BUILDER_PATH").unwrap_or_else(|_| "builder".to_string());
     let output_dir = std::env::temp_dir().join(format!("enclavia-reproduce-{enclave_id}"));
@@ -338,6 +385,16 @@ async fn run_builder(
         .arg(enclave_id)
         .arg("--egress-allowlist")
         .arg(&egress_path);
+
+    // Replay the synchronizer trust anchors exactly as the backend
+    // recorded them for this version. The anchors land in the measured
+    // `enclavia-config.json`, so a missing or different list moves PCR0
+    // and PCR2. Passed as inline JSON (the builder detects the leading
+    // `[`); old images therefore stay reproducible even after the live
+    // cluster has rotated to new PCRs.
+    for arg in synchronizer_args(recorded_synchronizer_pcrs, recorded_synchronizer_enabled)? {
+        cmd.arg(arg);
+    }
 
     // Match the backend's `--image-digest` invocation so the rebuilt
     // `enclavia-config.json` is byte-identical to the original.
@@ -526,6 +583,40 @@ async fn fetch_flake_source(label: &str, url: &str, rev: &str) -> Result<PathBuf
     Ok(PathBuf::from(parsed.path))
 }
 
+/// Build the `--synchronizer-pcrs` / `--synchronizer-enabled` argv tail
+/// from the recorded provenance.
+///
+/// `(None, false)` is the pre-feature / feature-off shape: no flags, the
+/// rebuild mirrors a build without the synchronizer section. Anchors
+/// without the enabled flag replay a "baked but dormant" build. Enabled
+/// without anchors is impossible to rebuild (the builder rejects the
+/// combination), so we fail loudly instead of producing a guaranteed
+/// PCR mismatch.
+fn synchronizer_args(
+    pcrs: Option<&serde_json::Value>,
+    enabled: bool,
+) -> Result<Vec<String>, CliError> {
+    match (pcrs, enabled) {
+        (None, false) => Ok(vec![]),
+        (None, true) => Err(CliError::Other(
+            "this version records synchronizer_enabled without synchronizer_pcrs; the builder \
+             rejects that combination, so the original build cannot be replayed (backend \
+             stamping bug?)"
+                .into(),
+        )),
+        (Some(list), _) => {
+            let json = serde_json::to_string(list).map_err(|e| {
+                CliError::Other(format!("serialising recorded synchronizer PCRs: {e}"))
+            })?;
+            let mut args = vec!["--synchronizer-pcrs".to_string(), json];
+            if enabled {
+                args.push("--synchronizer-enabled".to_string());
+            }
+            Ok(args)
+        }
+    }
+}
+
 /// Replace a `<host>/<owner>/<repo>:<tag>` reference with its digest-pinned
 /// form `<host>/<owner>/<repo>@sha256:<digest>`. Mirrors the backend's
 /// `pin_image_to_digest` so the CLI pulls exactly the bytes the original
@@ -699,6 +790,8 @@ mod tests {
             recorded_builder_rev: None,
             recorded_crates_rev: None,
             recorded_egress_allowlist: serde_json::Value::Null,
+            recorded_synchronizer_pcrs: None,
+            recorded_synchronizer_enabled: false,
         };
         assert!(r.is_reproducible());
 
@@ -764,6 +857,8 @@ mod tests {
             error_message: None,
             builder_rev: builder_rev.map(|s| s.to_string()),
             crates_rev: crates_rev.map(|s| s.to_string()),
+            synchronizer_pcrs: None,
+            synchronizer_enabled: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -830,5 +925,104 @@ mod tests {
             None,
         );
         assert!(ReproduceInputs::from_staged_upgrade(&up).is_err());
+    }
+
+    // -- synchronizer provenance ----------------------------------------------
+
+    fn anchors_json() -> serde_json::Value {
+        serde_json::json!([{
+            "PCR0": "a".repeat(96),
+            "PCR1": "b".repeat(96),
+            "PCR2": "c".repeat(96),
+        }])
+    }
+
+    #[test]
+    fn from_enclave_row_reads_synchronizer_provenance() {
+        let mut enclave = serde_json::json!({
+            "image_digest": "sha256:abc",
+            "docker_image": "registry.local/alice/foo:v1",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+            "synchronizer_enabled": true,
+        });
+        enclave["synchronizer_pcrs"] = anchors_json();
+        let inputs = ReproduceInputs::from_enclave_row(&enclave, "eid").unwrap();
+        assert_eq!(inputs.synchronizer_pcrs, Some(anchors_json()));
+        assert!(inputs.synchronizer_enabled);
+    }
+
+    #[test]
+    fn from_enclave_row_defaults_synchronizer_provenance_to_off() {
+        // Pre-feature backend: neither key on the row. JSON null is
+        // treated the same as absent.
+        let enclave = serde_json::json!({
+            "image_digest": "sha256:abc",
+            "docker_image": "registry.local/alice/foo:v1",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+            "synchronizer_pcrs": null,
+        });
+        let inputs = ReproduceInputs::from_enclave_row(&enclave, "eid").unwrap();
+        assert!(inputs.synchronizer_pcrs.is_none());
+        assert!(!inputs.synchronizer_enabled);
+    }
+
+    #[test]
+    fn from_staged_upgrade_carries_synchronizer_provenance() {
+        use enclavia_protocol::staging::StagedUpgradeStatus;
+        let mut up = staged(
+            StagedUpgradeStatus::Promoted,
+            Some("sha256:def"),
+            Some(pcrs_hex("aa", "bb", "cc")),
+            Some("bbb"),
+            Some("ccc"),
+        );
+        up.synchronizer_pcrs = Some(vec![enclavia_protocol::chain::PcrsHex {
+            pcr0: "a".repeat(96),
+            pcr1: "b".repeat(96),
+            pcr2: "c".repeat(96),
+        }]);
+        up.synchronizer_enabled = true;
+        let inputs = ReproduceInputs::from_staged_upgrade(&up).unwrap();
+        // The typed anchors re-serialise to the same JSON-array shape the
+        // enclave-row path produces (PCR0/PCR1/PCR2 keys).
+        assert_eq!(inputs.synchronizer_pcrs, Some(anchors_json()));
+        assert!(inputs.synchronizer_enabled);
+    }
+
+    // -- synchronizer_args ----------------------------------------------------
+
+    #[test]
+    fn synchronizer_args_empty_when_feature_off() {
+        assert!(synchronizer_args(None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn synchronizer_args_passes_inline_json_and_enabled_flag() {
+        let anchors = anchors_json();
+        let args = synchronizer_args(Some(&anchors), true).unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "--synchronizer-pcrs");
+        // Inline JSON: the builder detects the leading `[` and parses it
+        // without touching the filesystem.
+        let parsed: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        assert_eq!(parsed, anchors);
+        assert_eq!(args[2], "--synchronizer-enabled");
+    }
+
+    #[test]
+    fn synchronizer_args_anchors_without_enabled_omits_flag() {
+        let anchors = anchors_json();
+        let args = synchronizer_args(Some(&anchors), false).unwrap();
+        assert_eq!(args.len(), 2);
+        assert!(!args.contains(&"--synchronizer-enabled".to_string()));
+    }
+
+    #[test]
+    fn synchronizer_args_enabled_without_anchors_errors() {
+        let err = synchronizer_args(None, true).unwrap_err();
+        assert!(
+            err.to_string().contains("synchronizer_enabled"),
+            "got: {err}"
+        );
     }
 }
