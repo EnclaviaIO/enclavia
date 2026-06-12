@@ -2236,6 +2236,7 @@ version = "0.1.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
+ "ciborium",
  "enclavia-protocol",
  "libc",
  "serde",

@@ -14,6 +14,12 @@
 //!   cluster's pinned commitment. Any mismatch is rollback evidence and
 //!   the client REFUSES to serve (fail-stop). A blank (all-zero) region
 //!   with no pinned key is a fresh device: register it and proceed.
+//!   A WRITTEN region with no pinned key under our PCR key is either a
+//!   rollback or the first boot after a staged upgrade (#46): the pin
+//!   then lives under the OLD image's key, and the disambiguator is the
+//!   #47 upgrade `ChainLink`, fetched best-effort from `chain-host` and
+//!   submitted as a `Transition` RPC the ORACLE verifies end to end.
+//!   Without a link (or on rejection) the verdict stays fail-stop.
 //! * **Runtime:** every NBD write that covers the region is hashed on
 //!   the way through, a `Pin` RPC is issued, and the corresponding NBD
 //!   reply to the kernel is HELD until the cluster's durable `PinOk`
@@ -64,6 +70,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
 use sha2::{Digest, Sha256};
 use synchronizer::client::{Client, ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::wire::RpcError;
@@ -107,6 +114,21 @@ pub const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// but finite: expiry is treated exactly like the oracle being
 /// unreachable, i.e. fail-stop.
 pub const SYNC_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Vsock port of the host-side `chain-host` daemon (same constant as
+/// `enclavia-chain-init`; the #46 fetch verb shares the submit socket).
+pub const CHAIN_HOST_PORT: u32 = 5005;
+
+/// Overall ceiling for the chain-host upgrade-link fetch (dial + frame
+/// round trip). Deliberately short AND non-fatal: the fetch only runs
+/// on the written-superblock-but-no-pin boot path, and any failure
+/// collapses to "no link", which fail-stops exactly as before #46.
+pub const CHAIN_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on the chain-host fetch response frame. An upgrade link is a few
+/// KiB (CBOR payload + ~5 KiB NSM document + 64-byte signature); 256 KiB
+/// bounds a misbehaving host with generous slack.
+pub const CHAIN_FETCH_MAX_FRAME: u32 = 256 * 1024;
 
 /// Environment variable that opts an enclave into the anti-rollback
 /// wiring (`1` / `true`). Absent or any other value: nbd-client runs
@@ -207,6 +229,13 @@ pub enum BootDecision {
     /// Fresh device, unregistered key: register (first Pin) the blank
     /// region's commitment, then serve.
     RegisterThenServe,
+    /// Written superblock, no pin under our key: either a rollback or
+    /// the first boot after a staged upgrade (#46). Attempt a PCR
+    /// `Transition` with a chain-host-fetched #47 upgrade link; without
+    /// one, or on oracle rejection, fail-stop with the carried reason.
+    /// NEVER falls back to Register: registering over a written region
+    /// is exactly the history-erasure hole this module closes.
+    TransitionOrFailStop(String),
     /// Rollback evidence or inconsistency: refuse to serve. The carried
     /// string is the operator-facing reason.
     FailStop(String),
@@ -220,7 +249,7 @@ pub enum BootDecision {
 /// | any           | Found, hash matches    | Serve |
 /// | any           | Found, hash mismatches | FailStop (rollback or corruption) |
 /// | blank         | NotFound               | RegisterThenServe (fresh device) |
-/// | non-blank     | NotFound               | FailStop (data exists but no pin: rollback evidence) |
+/// | non-blank     | NotFound               | TransitionOrFailStop (staged upgrade, #46, or rollback evidence) |
 ///
 /// Note the blank + Found case falls out of the hash compare: a pinned
 /// commitment over a blank region (registered at first boot, no write
@@ -244,7 +273,7 @@ pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
             if region_is_blank(region) {
                 BootDecision::RegisterThenServe
             } else {
-                BootDecision::FailStop(
+                BootDecision::TransitionOrFailStop(
                     "device carries a written superblock region but the synchronizer has no \
                      pinned state for this enclave (rollback evidence: history was erased); \
                      refusing to serve"
@@ -760,6 +789,96 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Upgrade-link fetch (chain-host, #46)
+// ---------------------------------------------------------------------------
+
+/// Run chain-host's fetch verb on an established stream: write one
+/// zero-length frame (`u32 BE 0`, exactly 4 zero bytes, where the
+/// submit path puts a link), read back `[u32 BE len | CBOR ChainLink]`
+/// carrying the enclave's LATEST upgrade link, or a zero length when
+/// none exists.
+///
+/// Returns `None` for BOTH "no link" and every failure (truncated or
+/// oversized frame, non-CBOR body): the fetch channel is host-relayed
+/// and carries NO trust by design (the link is a bearer credential the
+/// synchronizer verifies end to end), so a broken answer is
+/// indistinguishable from a withheld one and must degrade to the same
+/// fail-stop-as-before-#46 outcome, never a panic and never a weaker
+/// verdict.
+pub async fn fetch_link_over<S>(stream: &mut S) -> Option<ChainLink>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let result: Result<Option<ChainLink>, FatalError> = async {
+        stream.write_all(&0u32.to_be_bytes()).await?;
+        stream.flush().await?;
+
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await?;
+        let len = u32::from_be_bytes(len_bytes);
+        if len == 0 {
+            return Ok(None);
+        }
+        if len > CHAIN_FETCH_MAX_FRAME {
+            return Err(
+                format!("response frame claims {len} bytes (cap {CHAIN_FETCH_MAX_FRAME})").into(),
+            );
+        }
+        let mut buf = vec![0u8; len as usize];
+        stream.read_exact(&mut buf).await?;
+        let link: ChainLink = ciborium::from_reader(buf.as_slice())
+            .map_err(|e| format!("response frame is not a CBOR ChainLink: {e}"))?;
+        Ok(Some(link))
+    }
+    .await;
+
+    match result {
+        Ok(Some(link)) => {
+            info!(
+                sequence = ?link.sequence,
+                "fetched latest upgrade link from chain-host"
+            );
+            Some(link)
+        }
+        Ok(None) => {
+            debug!("chain-host has no upgrade link for this enclave");
+            None
+        }
+        Err(e) => {
+            warn!("chain-host upgrade-link fetch failed ({e}); treating as no link available");
+            None
+        }
+    }
+}
+
+/// Dial chain-host (CID 2, port [`CHAIN_HOST_PORT`]) and fetch this
+/// enclave's latest upgrade link. Best-effort by design: every failure
+/// (connect refused, timeout, malformed frame) is logged at warn and
+/// collapses to `None`, which the verify path treats exactly like "no
+/// upgrade ever happened" (fail-stop on a written-but-unpinned device).
+pub async fn fetch_latest_upgrade_link() -> Option<ChainLink> {
+    let fetch = async {
+        match tokio_vsock::VsockStream::connect(2, CHAIN_HOST_PORT).await {
+            Ok(mut stream) => fetch_link_over(&mut stream).await,
+            Err(e) => {
+                warn!("chain-host connect failed ({e}); treating as no upgrade link available");
+                None
+            }
+        }
+    };
+    match tokio::time::timeout(CHAIN_FETCH_TIMEOUT, fetch).await {
+        Ok(link) => link,
+        Err(_) => {
+            warn!(
+                "chain-host upgrade-link fetch timed out after {CHAIN_FETCH_TIMEOUT:?}; \
+                 treating as no upgrade link available"
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Boot-time verification
 // ---------------------------------------------------------------------------
 
@@ -803,18 +922,52 @@ where
     Ok(region)
 }
 
-/// Run the boot decision table against a live session: `Get`, compare,
-/// and on a fresh device register the blank region. Any verdict other
-/// than serve / register propagates as a fatal error.
-pub async fn verify_or_register<S>(
-    client: &mut Client<S>,
-    key: PcrKey,
-    region: &[u8],
-) -> Result<(), FatalError>
+/// The RPCs boot verification issues on the authenticated session.
+/// Abstracted from the network client (mirroring [`Pinner`]) so the
+/// verify / transition flow is testable without a Noise stack.
+#[allow(async_fn_in_trait)]
+pub trait BootOracle {
+    /// `Client::get`.
+    async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError>;
+    /// `Client::pin`.
+    async fn pin(&mut self, key: PcrKey, commitment: Commitment) -> Result<Version, ClientError>;
+    /// `Client::transition`.
+    async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError>;
+}
+
+impl<S> BootOracle for Client<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let result = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get(key))
+    async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError> {
+        Client::get(self, key).await
+    }
+    async fn pin(&mut self, key: PcrKey, commitment: Commitment) -> Result<Version, ClientError> {
+        Client::pin(self, key, commitment).await
+    }
+    async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
+        Client::transition(self, link).await
+    }
+}
+
+/// Run the boot decision table against a live session: `Get`, compare,
+/// and on a fresh device register the blank region. On the
+/// written-but-unpinned verdict, attempt the #46 staged-upgrade
+/// `Transition` (see [`transition_and_reverify`]); `upgrade_link` is the
+/// LAZY chain-host fetch, awaited only on that branch. Any verdict other
+/// than serve / register / successful transition propagates as a fatal
+/// error.
+pub async fn verify_or_register<O, F>(
+    oracle: &mut O,
+    key: PcrKey,
+    region: &[u8],
+    upgrade_link: F,
+) -> Result<(), FatalError>
+where
+    O: BootOracle,
+    F: std::future::Future<Output = Option<ChainLink>>,
+{
+    let result = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.get(key))
         .await
         .map_err(|_| {
             format!(
@@ -832,7 +985,7 @@ where
         BootDecision::RegisterThenServe => {
             info!("boot verify: fresh device, registering with the synchronizer");
             let commitment = Commitment(commitment_of_region(region));
-            let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.pin(key, commitment))
+            let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, commitment))
                 .await
                 .map_err(|_| {
                     format!(
@@ -855,7 +1008,105 @@ where
             }
             Ok(())
         }
+        BootDecision::TransitionOrFailStop(reason) => {
+            transition_and_reverify(oracle, key, region, upgrade_link, &reason).await
+        }
         BootDecision::FailStop(reason) => Err(format!("boot verify: {reason}").into()),
+    }
+}
+
+/// The #46 staged-upgrade branch of boot verification: the device
+/// carries a written superblock but the oracle has no pin under our
+/// (new) key, which is either a genuine rollback or the first boot
+/// after a staged upgrade whose pin still lives under the OLD image's
+/// PCR key. Disambiguate with the #47 upgrade link: if chain-host
+/// serves one, submit `Transition { link }` on the already-established,
+/// MUTUALLY-authenticated session (the only place this is ever called
+/// from) and re-run the NORMAL verify against the migrated pin, whose
+/// carried-forward commitment must match the disk. Anything short of
+/// that full success (no link, non-upgrade link, oracle rejection,
+/// post-transition mismatch) fail-stops exactly as before #46, with
+/// the extra context appended to `fail_reason`.
+///
+/// SECURITY: the link is a bearer credential the ORACLE verifies end to
+/// end (control signature against the pubkey frozen for the old key,
+/// attestation/payload binding, new key == session key), so the
+/// host-relayed fetch channel adds no trust: a forged or substituted
+/// link can at worst be rejected. This path NEVER registers; Register
+/// over a written region is the rollback hole this module closes.
+async fn transition_and_reverify<O, F>(
+    oracle: &mut O,
+    key: PcrKey,
+    region: &[u8],
+    upgrade_link: F,
+    fail_reason: &str,
+) -> Result<(), FatalError>
+where
+    O: BootOracle,
+    F: std::future::Future<Output = Option<ChainLink>>,
+{
+    let Some(link) = upgrade_link.await else {
+        return Err(format!(
+            "boot verify: {fail_reason} (no upgrade link available from chain-host, so this \
+             is not a recoverable staged upgrade)"
+        )
+        .into());
+    };
+    if link.kind != ChainLinkKind::Upgrade {
+        warn!(kind = ?link.kind, "chain-host returned a non-upgrade link; treating as no link");
+        return Err(format!(
+            "boot verify: {fail_reason} (chain-host returned a {:?} link where only an \
+             Upgrade link can authorize a transition)",
+            link.kind
+        )
+        .into());
+    }
+
+    info!("submitting PCR transition: adopting the pre-upgrade pinned state under this image");
+    let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.transition(link))
+        .await
+        .map_err(|_| {
+            format!(
+                "boot verify: Transition timed out after {SYNC_RPC_TIMEOUT:?} \
+                 (synchronizer unreachable)"
+            )
+        })?
+        .map_err(|e| {
+            format!(
+                "boot verify: {fail_reason} (the synchronizer rejected the PCR transition: {e})"
+            )
+        })?;
+    info!(
+        version = version.0,
+        "transition accepted; pinned state migrated to this image"
+    );
+
+    // Re-issue the Get and run the NORMAL verify path against the
+    // migrated pin: same decision table, but transition and register are
+    // no longer survivable answers (TransitionOk just told us the pin
+    // exists under our key, so a second NotFound is oracle inconsistency,
+    // and looping or registering would weaken the verdict).
+    let result = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.get(key))
+        .await
+        .map_err(|_| {
+            format!(
+                "boot verify: post-transition Get timed out after {SYNC_RPC_TIMEOUT:?} \
+                 (synchronizer unreachable)"
+            )
+        })?;
+    let outcome =
+        get_outcome(result).map_err(|e| format!("boot verify: post-transition Get failed: {e}"))?;
+    match boot_decision(region, &outcome) {
+        BootDecision::Serve => {
+            info!("boot verify: superblock matches the migrated pinned commitment; serving");
+            Ok(())
+        }
+        BootDecision::FailStop(reason) => Err(format!("boot verify: {reason}").into()),
+        BootDecision::RegisterThenServe | BootDecision::TransitionOrFailStop(_) => Err(
+            "boot verify: the synchronizer reported no pin under our key immediately after \
+             accepting the transition (inconsistent oracle state); refusing to serve"
+                .into(),
+        ),
     }
 }
 
@@ -1093,7 +1344,17 @@ where
 {
     let mut session = connect_and_authenticate().await?;
     let region = nbd_read_region(host, data_offset + SB_PRIMARY_FS_OFFSET).await?;
-    verify_or_register(&mut session.client, session.key, &region).await?;
+    // The chain-host fetch future is lazy: it dials only if the verify
+    // path reaches the transition branch (#46). The Transition itself
+    // runs on `session.client`, i.e. strictly after the oracle's PCRs
+    // were verified by `connect_and_authenticate`.
+    verify_or_register(
+        &mut session.client,
+        session.key,
+        &region,
+        fetch_latest_upgrade_link(),
+    )
+    .await?;
     Ok(session)
 }
 
@@ -1277,12 +1538,14 @@ mod tests {
     }
 
     #[test]
-    fn decision_present_not_found_fail_stops() {
+    fn decision_present_not_found_transitions_or_fail_stops() {
         // The rollback-evidence case: device has data, oracle has no pin.
+        // Since #46 this is the transition branch; WITHOUT a verified
+        // upgrade link it still fail-stops (see the transition tests).
         let region = region_with_data();
         assert!(matches!(
             boot_decision(&region, &GetOutcome::NotFound),
-            BootDecision::FailStop(_)
+            BootDecision::TransitionOrFailStop(_)
         ));
     }
 
@@ -1353,6 +1616,310 @@ mod tests {
         ] {
             assert!(get_outcome(Err(err)).is_err());
         }
+    }
+
+    // --- #46 transition path (verify_or_register) -----------------------
+
+    /// Scripted [`BootOracle`]: pops pre-programmed RPC results in order
+    /// and records every Transition link. `expect` panics double as the
+    /// "this RPC must never be issued on this path" assertions (e.g. no
+    /// Pin/Register on a written region).
+    struct ScriptedOracle {
+        gets: std::collections::VecDeque<Result<(Commitment, Version), ClientError>>,
+        pins: std::collections::VecDeque<Result<Version, ClientError>>,
+        transitions: std::collections::VecDeque<Result<Version, ClientError>>,
+        seen_transitions: Vec<ChainLink>,
+    }
+
+    impl ScriptedOracle {
+        fn new(
+            gets: Vec<Result<(Commitment, Version), ClientError>>,
+            pins: Vec<Result<Version, ClientError>>,
+            transitions: Vec<Result<Version, ClientError>>,
+        ) -> Self {
+            Self {
+                gets: gets.into_iter().collect(),
+                pins: pins.into_iter().collect(),
+                transitions: transitions.into_iter().collect(),
+                seen_transitions: Vec::new(),
+            }
+        }
+    }
+
+    impl BootOracle for ScriptedOracle {
+        async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
+            self.gets.pop_front().expect("unexpected Get")
+        }
+        async fn pin(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<Version, ClientError> {
+            self.pins.pop_front().expect("unexpected Pin")
+        }
+        async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
+            self.seen_transitions.push(link);
+            self.transitions.pop_front().expect("unexpected Transition")
+        }
+    }
+
+    fn test_key() -> PcrKey {
+        PcrKey([0x42; 32])
+    }
+
+    fn not_found() -> Result<(Commitment, Version), ClientError> {
+        Err(ClientError::Rpc(RpcError::NotFound))
+    }
+
+    /// A structurally plausible #47 upgrade link. The contents are
+    /// opaque to the client (the ORACLE verifies them), so dummy bytes
+    /// are exactly as good as a real signed link here.
+    fn test_upgrade_link(sequence: u64) -> ChainLink {
+        ChainLink {
+            id: None,
+            sequence: Some(sequence),
+            kind: ChainLinkKind::Upgrade,
+            payload: vec![0x01, 0x02, 0x03],
+            attestation: vec![0x04, 0x05],
+            signature: Some(vec![0xab; 64]),
+        }
+    }
+
+    /// The staged-upgrade happy path: written region, Get says NotFound,
+    /// chain-host serves an upgrade link, the oracle accepts the
+    /// Transition, and the re-issued Get returns the migrated pin whose
+    /// commitment matches the disk. The device is served.
+    #[tokio::test]
+    async fn transition_success_serves() {
+        let region = region_with_data();
+        let migrated = Commitment(commitment_of_region(&region));
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found(), Ok((migrated, Version(7)))],
+            vec![],
+            vec![Ok(Version(7))],
+        );
+
+        verify_or_register(&mut oracle, test_key(), &region, async {
+            Some(test_upgrade_link(3))
+        })
+        .await
+        .expect("transitioned device must be served");
+
+        assert_eq!(oracle.seen_transitions.len(), 1);
+        assert_eq!(oracle.seen_transitions[0].sequence, Some(3));
+    }
+
+    /// No upgrade link available: the written-but-unpinned device
+    /// fail-stops exactly as before #46. No Transition, no Register.
+    #[tokio::test]
+    async fn transition_without_link_still_fail_stops() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+
+        let err = verify_or_register(&mut oracle, test_key(), &region, async { None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rollback evidence"), "{err}");
+        assert!(err.to_string().contains("no upgrade link"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+    }
+
+    /// The oracle rejecting the Transition is fail-stop, with the
+    /// rejection reason in the fatal message.
+    #[tokio::test]
+    async fn transition_rejected_fail_stops() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found()],
+            vec![],
+            vec![Err(ClientError::Rpc(RpcError::TransitionRejected))],
+        );
+
+        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+            Some(test_upgrade_link(3))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("rollback evidence"), "{err}");
+        assert!(err.to_string().contains("transition rejected"), "{err}");
+    }
+
+    /// A migrated pin whose commitment does NOT match the disk hits the
+    /// existing mismatch fail-stop: the transition migrates state, it
+    /// never weakens the compare.
+    #[tokio::test]
+    async fn transition_then_commitment_mismatch_fail_stops() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found(), Ok((Commitment([0x11; 32]), Version(7)))],
+            vec![],
+            vec![Ok(Version(7))],
+        );
+
+        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+            Some(test_upgrade_link(3))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    /// NotFound again right after TransitionOk is oracle inconsistency:
+    /// fail-stop, never a second transition and never a Register (the
+    /// scripted deques would panic on either).
+    #[tokio::test]
+    async fn transition_then_not_found_fail_stops() {
+        let region = region_with_data();
+        let mut oracle =
+            ScriptedOracle::new(vec![not_found(), not_found()], vec![], vec![Ok(Version(7))]);
+
+        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+            Some(test_upgrade_link(3))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("inconsistent oracle state"),
+            "{err}"
+        );
+        assert_eq!(oracle.seen_transitions.len(), 1);
+    }
+
+    /// A link of the wrong kind (chain-host misbehaving) is treated as
+    /// no link: fail-stop without ever submitting a Transition.
+    #[tokio::test]
+    async fn transition_with_non_upgrade_link_fail_stops() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+
+        let mut link = test_upgrade_link(3);
+        link.kind = ChainLinkKind::Boot;
+        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(link) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rollback evidence"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+    }
+
+    /// Untouched branches: a matching pin still serves, a fresh device
+    /// still registers, and neither ever awaits the (lazy) link fetch:
+    /// the fetch future panics if polled.
+    #[tokio::test]
+    async fn non_transition_branches_never_fetch_the_link() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(
+            vec![Ok((Commitment(commitment_of_region(&region)), Version(1)))],
+            vec![],
+            vec![],
+        );
+        verify_or_register(&mut oracle, test_key(), &region, async {
+            panic!("matching pin must not fetch the upgrade link")
+        })
+        .await
+        .expect("matching pin must serve");
+
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
+        verify_or_register(&mut oracle, test_key(), &blank, async {
+            panic!("fresh device must not fetch the upgrade link")
+        })
+        .await
+        .expect("fresh device must register and serve");
+    }
+
+    // --- #46 chain-host fetch framing -----------------------------------
+
+    /// Round trip: the request is one zero-length frame, the response is
+    /// a length-prefixed CBOR ChainLink, decoded intact.
+    #[tokio::test]
+    async fn fetch_round_trip_returns_link() {
+        let (mut host, mut guest) = duplex(64 * 1024);
+        let link = test_upgrade_link(5);
+        let expected = link.clone();
+        let server = tokio::spawn(async move {
+            let mut req = [0xffu8; 4];
+            host.read_exact(&mut req).await.unwrap();
+            assert_eq!(req, [0u8; 4], "fetch verb must be a zero-length frame");
+            let mut body = Vec::new();
+            ciborium::into_writer(&link, &mut body).unwrap();
+            host.write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            host.write_all(&body).await.unwrap();
+            host.flush().await.unwrap();
+        });
+
+        let got = fetch_link_over(&mut guest).await.expect("link expected");
+        assert_eq!(got, expected);
+        server.await.unwrap();
+    }
+
+    /// A zero-length response frame means "no upgrade link exists".
+    #[tokio::test]
+    async fn fetch_zero_length_response_is_no_link() {
+        let (mut host, mut guest) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut req = [0u8; 4];
+            host.read_exact(&mut req).await.unwrap();
+            host.write_all(&0u32.to_be_bytes()).await.unwrap();
+            host.flush().await.unwrap();
+        });
+
+        assert_eq!(fetch_link_over(&mut guest).await, None);
+        server.await.unwrap();
+    }
+
+    /// A response body that is not a CBOR ChainLink degrades to no-link
+    /// (the fetch channel is untrusted; broken == withheld).
+    #[tokio::test]
+    async fn fetch_malformed_response_is_no_link() {
+        let (mut host, mut guest) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut req = [0u8; 4];
+            host.read_exact(&mut req).await.unwrap();
+            host.write_all(&3u32.to_be_bytes()).await.unwrap();
+            host.write_all(&[0xde, 0xad, 0xbe]).await.unwrap();
+            host.flush().await.unwrap();
+        });
+
+        assert_eq!(fetch_link_over(&mut guest).await, None);
+        server.await.unwrap();
+    }
+
+    /// A claimed frame length above the 256 KiB cap is rejected without
+    /// reading the body: no-link.
+    #[tokio::test]
+    async fn fetch_oversized_frame_is_no_link() {
+        let (mut host, mut guest) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut req = [0u8; 4];
+            host.read_exact(&mut req).await.unwrap();
+            host.write_all(&(CHAIN_FETCH_MAX_FRAME + 1).to_be_bytes())
+                .await
+                .unwrap();
+            host.flush().await.unwrap();
+        });
+
+        assert_eq!(fetch_link_over(&mut guest).await, None);
+        server.await.unwrap();
+    }
+
+    /// The daemon closing mid-frame (truncated length or body) is
+    /// no-link, never a panic.
+    #[tokio::test]
+    async fn fetch_truncated_stream_is_no_link() {
+        let (mut host, mut guest) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut req = [0u8; 4];
+            host.read_exact(&mut req).await.unwrap();
+            host.write_all(&64u32.to_be_bytes()).await.unwrap();
+            host.write_all(&[0x01; 10]).await.unwrap();
+            host.flush().await.unwrap();
+            // Drop: only 10 of the claimed 64 body bytes ever arrive.
+        });
+
+        assert_eq!(fetch_link_over(&mut guest).await, None);
+        server.await.unwrap();
     }
 
     // --- forward_bytes_extract ------------------------------------------
