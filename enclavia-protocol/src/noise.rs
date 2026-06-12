@@ -28,11 +28,19 @@ impl NoiseHandshake {
         Ok(Self { state })
     }
 
-    pub fn write_message(&mut self, payload: &[u8], message: &mut [u8]) -> Result<usize, snow::Error> {
+    pub fn write_message(
+        &mut self,
+        payload: &[u8],
+        message: &mut [u8],
+    ) -> Result<usize, snow::Error> {
         self.state.write_message(payload, message)
     }
 
-    pub fn read_message(&mut self, message: &[u8], payload: &mut [u8]) -> Result<usize, snow::Error> {
+    pub fn read_message(
+        &mut self,
+        message: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, snow::Error> {
         self.state.read_message(message, payload)
     }
 
@@ -51,11 +59,19 @@ pub struct NoiseTransport {
 }
 
 impl NoiseTransport {
-    pub fn write_message(&mut self, payload: &[u8], message: &mut [u8]) -> Result<usize, snow::Error> {
+    pub fn write_message(
+        &mut self,
+        payload: &[u8],
+        message: &mut [u8],
+    ) -> Result<usize, snow::Error> {
         self.state.write_message(payload, message)
     }
 
-    pub fn read_message(&mut self, message: &[u8], payload: &mut [u8]) -> Result<usize, snow::Error> {
+    pub fn read_message(
+        &mut self,
+        message: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, snow::Error> {
         self.state.read_message(message, payload)
     }
 }
@@ -161,17 +177,23 @@ where
     }
 
     #[instrument(skip(self, message))]
-    pub async fn send<T: Serialize>(&mut self, message: &T) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn send<T: Serialize>(
+        &mut self,
+        message: &T,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut cbor_bytes = Vec::new();
         into_writer(message, &mut cbor_bytes)?;
         trace!(cbor_len = cbor_bytes.len(), "Serialized CBOR message");
 
-        let encrypted_len = self.transport.write_message(&cbor_bytes, &mut self.write_buffer)?;
+        let encrypted_len = self
+            .transport
+            .write_message(&cbor_bytes, &mut self.write_buffer)?;
         trace!(encrypted_len = encrypted_len, "Encrypted message");
 
         let length_bytes = (encrypted_len as u32).to_be_bytes();
         tokio::io::AsyncWriteExt::write_all(&mut self.stream, &length_bytes).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &self.write_buffer[..encrypted_len]).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &self.write_buffer[..encrypted_len])
+            .await?;
         tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
 
         trace!("CBOR message sent successfully");
@@ -179,21 +201,34 @@ where
     }
 
     #[instrument(skip(self))]
-    pub async fn receive<T: for<'de> Deserialize<'de>>(&mut self) -> Result<T, Box<dyn std::error::Error>> {
+    pub async fn receive<T: for<'de> Deserialize<'de>>(
+        &mut self,
+    ) -> Result<T, Box<dyn std::error::Error>> {
         let mut length_bytes = [0u8; 4];
         tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut length_bytes).await?;
         let encrypted_len = u32::from_be_bytes(length_bytes) as usize;
 
         if encrypted_len > self.read_buffer.len() {
-            return Err(format!("Message too large: {} bytes (max: {})", encrypted_len, self.read_buffer.len()).into());
+            return Err(format!(
+                "Message too large: {} bytes (max: {})",
+                encrypted_len,
+                self.read_buffer.len()
+            )
+            .into());
         }
 
         trace!(encrypted_len = encrypted_len, "Reading encrypted message");
 
-        tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut self.read_buffer[..encrypted_len]).await?;
+        tokio::io::AsyncReadExt::read_exact(
+            &mut self.stream,
+            &mut self.read_buffer[..encrypted_len],
+        )
+        .await?;
 
         let mut payload = vec![0u8; 65535];
-        let payload_len = self.transport.read_message(&self.read_buffer[..encrypted_len], &mut payload)?;
+        let payload_len = self
+            .transport
+            .read_message(&self.read_buffer[..encrypted_len], &mut payload)?;
         trace!(payload_len = payload_len, "Decrypted message");
 
         let mut cursor = Cursor::new(&payload[..payload_len]);

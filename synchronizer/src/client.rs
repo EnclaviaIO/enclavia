@@ -7,10 +7,31 @@
 //! 2. First frame: [`Frame::Authenticate`] carrying a Nitro NSM
 //!    attestation document whose `nonce` binds the just-completed Noise
 //!    handshake hash and whose `user_data` carries the enclave's 65-byte
-//!    SEC1 P-256 control pubkey (#47). The listener never replies to a
-//!    successful `Authenticate`; a bad document tears the connection down.
-//! 3. Subsequent frames: [`Frame::Rpc`] requests, each answered with one
+//!    SEC1 P-256 control pubkey (#47). A bad document tears the
+//!    connection down.
+//! 3. The SERVER authenticates back (#208): its first frame is its own
+//!    [`Frame::Authenticate`], a document bound to the SAME handshake
+//!    hash. [`Handshake::authenticate`] verifies it (full AWS Nitro CA
+//!    chain when `debug_mode = false`) and checks its PCRs against the
+//!    caller-supplied [`ServerPcrPolicy`] BEFORE returning an RPC-ready
+//!    [`Client`]. This step is mandatory: `Noise_NN` is unauthenticated
+//!    DH over a host-relayed transport, so without it ANY host could
+//!    terminate the session and answer Get/Pin as a fake oracle, which
+//!    is precisely the rollback the synchronizer exists to prevent.
+//! 4. Subsequent frames: [`Frame::Rpc`] requests, each answered with one
 //!    CBOR [`Response`].
+//!
+//! ## SECURITY: where the expected server PCRs MUST come from
+//!
+//! The [`ServerPcrPolicy`] is the trust anchor of the whole oracle
+//! relationship. It MUST be sourced from the customer enclave's MEASURED
+//! image or config (e.g. `/etc/enclavia/config.json`, baked into the
+//! EIF and therefore covered by the enclave's own PCRs), NEVER from a
+//! host-controlled channel (environment variables, command-line
+//! arguments, any vsock side-channel). A host that can choose the
+//! expected PCRs, or flip `debug_mode` to `true`, can impersonate the
+//! oracle and the verification is worthless. See
+//! [`crate::wire::ServerPcrPolicy`] for the full contract.
 //!
 //! The attestation document is produced by the CALLER (typically via
 //! `/dev/nsm` from inside the customer enclave, or a `FakeAttestation`
@@ -48,6 +69,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::wire::{Frame, MAX_FRAME_SIZE, Request, Response, RpcError};
 use crate::{Commitment, PcrKey, Version};
+
+// Re-exported so callers (nbd-client) construct the policy and match its
+// rejection error from the module they already import the client from.
+pub use crate::wire::{Pcrs, ServerAuthError, ServerPcrPolicy, verify_server_attestation};
 
 /// Maximum bytes per single `write_all` on the underlying transport.
 ///
@@ -88,6 +113,23 @@ pub enum ClientError {
     /// request that was sent (protocol bug on one side).
     #[error("unexpected response variant: {0}")]
     UnexpectedResponse(&'static str),
+    /// The server's mandatory `Authenticate` frame (#208) failed
+    /// verification: the document was malformed, failed the CA-chain /
+    /// COSE checks (production mode), or did not bind this session's
+    /// handshake hash (a replayed capture). Whoever is on the other end,
+    /// it has not proven it is an enclave on THIS channel; fail-stop.
+    #[error("server attestation invalid: {0}")]
+    ServerAttestation(String),
+    /// The server's attestation verified but its PCRs are not admitted
+    /// by the caller's [`ServerPcrPolicy`]: the other end is a real,
+    /// channel-bound enclave, but NOT the synchronizer the caller
+    /// trusts (oracle impersonation). Fail-stop.
+    #[error("server attestation PCRs are not the expected synchronizer measurements")]
+    ServerPcrRejected,
+    /// The server's first frame was not its `Authenticate` (#208): the
+    /// far end does not speak the mutual-authentication protocol.
+    #[error("server's first frame was not its Authenticate")]
+    ServerAuthMissing,
 }
 
 /// A completed Noise handshake, waiting for the caller to produce the
@@ -125,20 +167,55 @@ where
         &self.handshake_hash
     }
 
-    /// Send [`Frame::Authenticate`] with the caller-produced NSM
-    /// document and return the RPC-ready [`Client`].
+    /// Run the mutual authentication (#208): send [`Frame::Authenticate`]
+    /// with the caller-produced NSM document, then read and verify the
+    /// SERVER's `Authenticate` against this session's handshake hash and
+    /// the caller's `server_policy`. Returns the RPC-ready [`Client`]
+    /// only once the oracle has proven both that it is a genuine enclave
+    /// terminating THIS channel (nonce binding; full AWS Nitro CA chain
+    /// when `debug_mode = false`) and that it runs the expected
+    /// synchronizer image (PCR policy).
     ///
-    /// The listener sends no reply to a successful `Authenticate` (the
-    /// next read would be the first RPC response), so success here only
-    /// means the frame was written; an invalid document surfaces as
-    /// [`ClientError::ConnectionClosed`] on the first RPC.
-    pub async fn authenticate(mut self, nsm_doc: Vec<u8>) -> Result<Client<S>, ClientError> {
+    /// # SECURITY: `server_policy` and `debug_mode` are trust anchors
+    ///
+    /// Both MUST come from the customer enclave's MEASURED image/config
+    /// (e.g. `/etc/enclavia/config.json`, baked into the EIF), NEVER
+    /// from host-controlled input: a host that picks the expected PCRs,
+    /// or sets `debug_mode = true`, can impersonate the oracle outright.
+    /// See the module docs and [`ServerPcrPolicy`].
+    ///
+    /// An invalid CLIENT document still surfaces as
+    /// [`ClientError::ConnectionClosed`] (the listener tears the
+    /// connection down before attesting back).
+    pub async fn authenticate(
+        mut self,
+        nsm_doc: Vec<u8>,
+        server_policy: &ServerPcrPolicy,
+        debug_mode: bool,
+    ) -> Result<Client<S>, ClientError> {
         write_frame(
             &mut self.stream,
             &mut self.transport,
             &Frame::Authenticate { nsm_doc },
         )
         .await?;
+
+        // Strict ping-pong (mirrors the listener): the server's first
+        // frame after a valid client Authenticate is its own
+        // Authenticate, bound to the same handshake hash.
+        let plaintext = read_plaintext_frame(&mut self.stream, &mut self.transport).await?;
+        let frame: Frame = ciborium::from_reader(plaintext.as_slice())
+            .map_err(|e| ClientError::Cbor(e.to_string()))?;
+        let server_doc = match frame {
+            Frame::Authenticate { nsm_doc } => nsm_doc,
+            _ => return Err(ClientError::ServerAuthMissing),
+        };
+        verify_server_attestation(&server_doc, &self.handshake_hash, server_policy, debug_mode)
+            .map_err(|e| match e {
+                ServerAuthError::Attestation(msg) => ClientError::ServerAttestation(msg),
+                ServerAuthError::PcrRejected => ClientError::ServerPcrRejected,
+            })?;
+
         Ok(Client {
             stream: self.stream,
             transport: self.transport,
@@ -244,10 +321,13 @@ where
     Ok(())
 }
 
-async fn read_response<R>(
+/// Read one length-prefixed encrypted frame and return its decrypted
+/// plaintext bytes. Shared by the server-`Authenticate` read (decoded as
+/// a [`Frame`]) and the RPC path (decoded as a [`Response`]).
+async fn read_plaintext_frame<R>(
     stream: &mut R,
     transport: &mut NoiseTransport,
-) -> Result<Response, ClientError>
+) -> Result<Vec<u8>, ClientError>
 where
     R: AsyncRead + Unpin,
 {
@@ -270,5 +350,17 @@ where
     let pt_len = transport
         .read_message(&ciphertext, &mut plaintext)
         .map_err(|e| ClientError::Crypto(e.to_string()))?;
-    ciborium::from_reader(&plaintext[..pt_len]).map_err(|e| ClientError::Cbor(e.to_string()))
+    plaintext.truncate(pt_len);
+    Ok(plaintext)
+}
+
+async fn read_response<R>(
+    stream: &mut R,
+    transport: &mut NoiseTransport,
+) -> Result<Response, ClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    let plaintext = read_plaintext_frame(stream, transport).await?;
+    ciborium::from_reader(plaintext.as_slice()).map_err(|e| ClientError::Cbor(e.to_string()))
 }

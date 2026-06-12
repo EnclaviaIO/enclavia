@@ -671,9 +671,7 @@ fn promotion_target(
     let revoked: Vec<Uuid> = prior
         .iter()
         .filter(|l| l.kind == ChainLinkKind::Revocation)
-        .filter_map(|l| {
-            ciborium::from_reader::<RevocationPayload, _>(l.payload.as_slice()).ok()
-        })
+        .filter_map(|l| ciborium::from_reader::<RevocationPayload, _>(l.payload.as_slice()).ok())
         .map(|p| p.revokes)
         .collect();
     prior
@@ -1269,9 +1267,20 @@ mod tests {
             recorded(rogue, now - Duration::minutes(5)),
         ];
         let row_pcrs = pcrs_hex_from_seed(0x31);
-        let walk = validate_chain(&links, &row_pcrs, "sha256:v2", Some(&[4u8; 65]), true, now, true);
+        let walk = validate_chain(
+            &links,
+            &row_pcrs,
+            "sha256:v2",
+            Some(&[4u8; 65]),
+            true,
+            now,
+            true,
+        );
 
-        assert!(matches!(walk.outcomes[0], Ok(Outcome::Append { sequence: 0 })));
+        assert!(matches!(
+            walk.outcomes[0],
+            Ok(Outcome::Append { sequence: 0 })
+        ));
         assert!(walk.outcomes[1].is_err(), "{:?}", walk.outcomes[1]);
         // Tip stays at genesis, which the row no longer matches.
         assert!(!walk.tip_matches_row);
@@ -1290,14 +1299,8 @@ mod tests {
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
         // Confirmed for the future, then revoked before activation.
-        let mut upgrade = transition_upgrade_link(
-            id,
-            "sha256:v2",
-            0x22,
-            0x32,
-            &sk,
-            now + Duration::days(7),
-        );
+        let mut upgrade =
+            transition_upgrade_link(id, "sha256:v2", 0x22, 0x32, &sk, now + Duration::days(7));
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x22, &sk);
@@ -1338,14 +1341,8 @@ mod tests {
         genesis.id = Some(Uuid::new_v4());
         genesis.sequence = Some(0);
         // valid_from is an hour in the PAST relative to the walk...
-        let mut upgrade = transition_upgrade_link(
-            id,
-            "sha256:v2",
-            0x23,
-            0x33,
-            &sk,
-            now - Duration::hours(1),
-        );
+        let mut upgrade =
+            transition_upgrade_link(id, "sha256:v2", 0x23, 0x33, &sk, now - Duration::hours(1));
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         // ...but the revocation was recorded 30 minutes BEFORE that.
@@ -1377,8 +1374,15 @@ mod tests {
                 recorded_at: None,
             })
             .collect();
-        let walk_now =
-            validate_chain(&unstamped, &row_pcrs, "sha256:v1", Some(&pk), true, now, true);
+        let walk_now = validate_chain(
+            &unstamped,
+            &row_pcrs,
+            "sha256:v1",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
         assert!(matches!(
             walk_now.outcomes[2],
             Err(ChainValidationError::RevokePastActivation)

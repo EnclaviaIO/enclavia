@@ -43,7 +43,7 @@ use enclavia_protocol::mesh::SYNCHRONIZER_CLIENT_PORT;
 // fatal, not a fallback), so the import only exists for non-raft builds.
 #[cfg(not(feature = "raft"))]
 use synchronizer::Node;
-use synchronizer::listener::{SessionDispatch, handle_connection};
+use synchronizer::listener::{SessionAttestor, SessionDispatch, handle_connection};
 use tracing::{error, info, warn};
 
 // `qemu` is an alias for `enclave` transport with skip-cert-chain
@@ -412,6 +412,24 @@ async fn main() {
     #[cfg(all(feature = "mesh", not(feature = "raft")))]
     let _mesh = start_mesh_from_env();
 
+    // The per-session server attestor (#208): every customer connection
+    // is answered with this node's OWN NSM document bound to the
+    // session's handshake hash, so the customer can verify it is talking
+    // to the oracle and not a host impersonating it. The `enclave` /
+    // `qemu` binaries drive the real /dev/nsm; the dev UDS listener has
+    // no NSM device, so it serves a synthetic FakeAttestation document
+    // (debug-mode clients only).
+    #[cfg(feature = "enclave")]
+    let attestor: Arc<dyn SessionAttestor> = Arc::new(synchronizer::listener::NsmSessionAttestor);
+    #[cfg(feature = "debug")]
+    let attestor: Arc<dyn SessionAttestor> = {
+        warn!(
+            "dev UDS listener: serving SYNTHETIC server attestation documents \
+             (no /dev/nsm); only debug-mode clients will accept them"
+        );
+        Arc::new(synchronizer::listener::FakeSessionAttestor { seed: 0xa5 })
+    };
+
     #[cfg(feature = "debug")]
     {
         let path = std::env::var("LISTEN_PATH").unwrap_or_else(|_| {
@@ -434,9 +452,15 @@ async fn main() {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let dispatch = Arc::clone(&dispatch);
+                    let attestor = Arc::clone(&attestor);
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_connection(dispatch.as_ref(), stream, DEBUG_MODE).await
+                        if let Err(e) = handle_connection(
+                            dispatch.as_ref(),
+                            attestor.as_ref(),
+                            stream,
+                            DEBUG_MODE,
+                        )
+                        .await
                         {
                             warn!(error = %e, "connection error");
                         }
@@ -469,9 +493,15 @@ async fn main() {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let dispatch = Arc::clone(&dispatch);
+                    let attestor = Arc::clone(&attestor);
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_connection(dispatch.as_ref(), stream, DEBUG_MODE).await
+                        if let Err(e) = handle_connection(
+                            dispatch.as_ref(),
+                            attestor.as_ref(),
+                            stream,
+                            DEBUG_MODE,
+                        )
+                        .await
                         {
                             warn!(error = %e, "connection error");
                         }

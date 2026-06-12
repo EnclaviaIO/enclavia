@@ -16,7 +16,16 @@
 //!      pubkey. The node runs in skip-cert-chain (debug) mode, so the
 //!      synthetic COSE_Sign1 is accepted; the session binds to
 //!      `PcrKey = SHA-256(PCR0||PCR1||PCR2)` derived from the seed.
-//!   4. Send one `Frame::Rpc { request }` (Pin or Get) and print the
+//!   4. Read the node's own `Frame::Authenticate` (#208): the QEMU
+//!      node answers with a REAL `/dev/nsm` document (self-signed by
+//!      QEMU's nitro-enclave machine) bound to this session's handshake
+//!      hash. Verify it in debug mode (QEMU self-signs, so the CA chain
+//!      is skipped) against the EXPECTED PCRs read from the freshly
+//!      built EIF's `pcr.json` (`--server-pcrs <path>`): the node's
+//!      measured PCRs must match, exactly as a real customer pins them
+//!      from its measured config. There is no accept-any escape; see
+//!      `synchronizer::wire::ServerPcrPolicy`.
+//!   5. Send one `Frame::Rpc { request }` (Pin or Get) and print the
 //!      decoded `Response`.
 //!
 //! The PCR seed is fixed (`--seed`, default 0x42) so a Pin on one node
@@ -24,11 +33,12 @@
 //! cross-node forwarding + linearizable read.
 //!
 //! Usage:
-//!   mesh_client <proxy-uds> pin <commitment-hex-byte> [--port P] [--seed S]
-//!   mesh_client <proxy-uds> get [--port P] [--seed S]
+//!   mesh_client <proxy-uds> pin <commitment-hex-byte> --server-pcrs <pcr.json> [--port P] [--seed S]
+//!   mesh_client <proxy-uds> get --server-pcrs <pcr.json> [--port P] [--seed S]
 
 use std::time::Duration;
 
+use enclavia_protocol::attestation::Pcrs;
 use enclavia_protocol::attestation::test_utils::FakeAttestation;
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use p256::ecdsa::SigningKey;
@@ -47,17 +57,19 @@ struct Args {
     commitment_byte: u8,
     port: u32,
     seed: u8,
+    /// Path to the built EIF's `pcr.json`, the expected server PCRs.
+    server_pcrs: String,
 }
 
 fn parse_args() -> Args {
+    let usage = "usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] --server-pcrs <pcr.json> [--port P] [--seed S]";
     let mut a = std::env::args().skip(1);
-    let proxy = a
-        .next()
-        .expect("usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] [--port P] [--seed S]");
+    let proxy = a.next().expect(usage);
     let cmd = a.next().expect("missing command (pin|get)");
     let mut commitment_byte = 0xc0u8;
     let mut port = 5010u32;
     let mut seed = 0x42u8;
+    let mut server_pcrs: Option<String> = None;
     let rest: Vec<String> = a.collect();
     let mut i = 0;
     // Positional commitment byte for `pin`.
@@ -77,6 +89,11 @@ fn parse_args() -> Args {
                 seed = parse_hex_byte(v);
                 i += 2;
             }
+            "--server-pcrs" => {
+                let v = rest.get(i + 1).expect("--server-pcrs requires a path");
+                server_pcrs = Some(v.clone());
+                i += 2;
+            }
             other => panic!("unexpected arg {other}"),
         }
     }
@@ -86,6 +103,35 @@ fn parse_args() -> Args {
         commitment_byte,
         port,
         seed,
+        server_pcrs: server_pcrs
+            .expect("--server-pcrs <pcr.json> is required (the expected oracle PCRs)"),
+    }
+}
+
+/// Parse the expected server PCRs from a nitro-util `pcr.json` (flat
+/// object with hex `PCR0`/`PCR1`/`PCR2` strings). No accept-any path:
+/// the smoke client authenticates the oracle against these exactly as a
+/// real customer would against its measured config.
+fn load_expected_pcrs(path: &str) -> Pcrs {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read server pcrs {path}: {e}"));
+    let extract = |name: &str| -> Vec<u8> {
+        let key = format!("\"{name}\"");
+        let start = text
+            .find(&key)
+            .unwrap_or_else(|| panic!("{name} not found in {path}"));
+        let after = &text[start + key.len()..];
+        let colon = after.find(':').expect("malformed pcr.json (no colon)");
+        let rest = &after[colon + 1..];
+        let open = rest.find('"').expect("malformed pcr.json (no open quote)");
+        let tail = &rest[open + 1..];
+        let close = tail.find('"').expect("malformed pcr.json (no close quote)");
+        hex::decode(&tail[..close]).unwrap_or_else(|e| panic!("{name} is not hex: {e}"))
+    };
+    Pcrs {
+        pcr0: extract("PCR0"),
+        pcr1: extract("PCR1"),
+        pcr2: extract("PCR2"),
     }
 }
 
@@ -147,28 +193,72 @@ where
     stream.flush().await.expect("flush");
 }
 
-async fn read_response<S>(stream: &mut S, t: &mut NoiseTransport) -> Response
+async fn read_plaintext<S>(stream: &mut S, t: &mut NoiseTransport) -> Vec<u8>
 where
     S: AsyncReadExt + Unpin,
 {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await.expect("read len");
     let len = u32::from_be_bytes(len_bytes) as usize;
-    assert!(len <= MAX_FRAME_SIZE, "response frame too large: {len}");
+    assert!(len <= MAX_FRAME_SIZE, "inbound frame too large: {len}");
     let mut ct = vec![0u8; len];
     stream.read_exact(&mut ct).await.expect("read ct");
     let mut pt = vec![0u8; MAX_FRAME_SIZE];
     let n = t.read_message(&ct, &mut pt).expect("noise decrypt");
-    ciborium::from_reader(&pt[..n]).expect("cbor decode response")
+    pt.truncate(n);
+    pt
+}
+
+async fn read_response<S>(stream: &mut S, t: &mut NoiseTransport) -> Response
+where
+    S: AsyncReadExt + Unpin,
+{
+    let pt = read_plaintext(stream, t).await;
+    ciborium::from_reader(pt.as_slice()).expect("cbor decode response")
+}
+
+/// Read and verify the node's own `Authenticate` (#208). Debug-mode
+/// verification (QEMU's NSM self-signs, so the CA chain is skipped) +
+/// nonce binding + the server's measured PCRs must equal `expected`
+/// (the freshly built EIF's pcr.json), exactly as a real customer pins
+/// them from its measured config.
+async fn read_and_verify_server_auth<S>(
+    stream: &mut S,
+    t: &mut NoiseTransport,
+    handshake_hash: &[u8],
+    expected: &Pcrs,
+) where
+    S: AsyncReadExt + Unpin,
+{
+    use synchronizer::wire::{ServerPcrPolicy, verify_server_attestation};
+
+    let pt = read_plaintext(stream, t).await;
+    let frame: Frame = ciborium::from_reader(pt.as_slice()).expect("cbor decode server frame");
+    let nsm_doc = match frame {
+        Frame::Authenticate { nsm_doc } => nsm_doc,
+        other => panic!("expected the node's Authenticate frame, got {other:?}"),
+    };
+    let pcrs = verify_server_attestation(
+        &nsm_doc,
+        handshake_hash,
+        &ServerPcrPolicy::Expected(vec![expected.clone()]),
+        /* debug_mode */ true,
+    )
+    .expect("server attestation must verify (doc + session nonce binding + expected PCRs)");
+    eprintln!(
+        "[client] server attested back; verified PCR digest = {}",
+        hex(&pcrs.digest())
+    );
 }
 
 #[tokio::main]
 async fn main() {
     let args = parse_args();
     eprintln!(
-        "[client] proxy={} cmd={} port={} seed=0x{:02x}",
-        args.proxy, args.cmd, args.port, args.seed
+        "[client] proxy={} cmd={} port={} seed=0x{:02x} server-pcrs={}",
+        args.proxy, args.cmd, args.port, args.seed, args.server_pcrs
     );
+    let expected_server_pcrs = load_expected_pcrs(&args.server_pcrs);
 
     let mut stream = proxy_connect(&args.proxy, args.port).await;
 
@@ -202,6 +292,15 @@ async fn main() {
         "[client] authenticated; session key = {}",
         hex(&session_key.0)
     );
+
+    // Mutual auth (#208): the node attests back before serving RPCs.
+    read_and_verify_server_auth(
+        &mut stream,
+        &mut transport,
+        &handshake_hash,
+        &expected_server_pcrs,
+    )
+    .await;
 
     let request = match args.cmd.as_str() {
         "pin" => Request::Pin {
