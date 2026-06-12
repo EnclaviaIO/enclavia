@@ -782,7 +782,7 @@ pub fn load_control_pubkey(path: &Path) -> Result<[u8; 65], FatalError> {
              and pinning storage under the canonical un-signable control key (no PCR Transition \
              will ever be possible for it)"
         );
-        return Ok(*enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY);
+        return Ok(enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY);
     };
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
@@ -1547,7 +1547,7 @@ mod tests {
         let got = load_control_pubkey(&path).expect("absent key must not be fatal");
         assert_eq!(
             got,
-            *enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY
+            enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1566,7 +1566,7 @@ mod tests {
         // And it must NOT be the un-signable fallback.
         assert_ne!(
             got,
-            *enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY
+            enclavia_protocol::attestation::NON_UPGRADABLE_CONTROL_KEY
         );
         let _ = std::fs::remove_file(&path);
     }
