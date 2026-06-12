@@ -482,7 +482,7 @@ async fn restarted_empty_node_hydrates_from_oversized_snapshot() {
     for name in NODE_NAMES {
         nodes.push(spawn_node_with_config(name, &host, cfg.clone()).await);
     }
-    nodes[0].raft.initialize_cluster().await.unwrap();
+    // Cluster bootstraps itself via #209 discovery (driven in spawn_node).
     assert!(await_leader(&nodes, Duration::from_secs(5)).await);
 
     // Commit all the Registers so the committed state (and thus its snapshot)
