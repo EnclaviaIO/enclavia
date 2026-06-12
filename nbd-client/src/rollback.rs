@@ -70,7 +70,7 @@ use synchronizer::wire::RpcError;
 use synchronizer::{Commitment, PcrKey, Version};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::nbd;
 
@@ -493,7 +493,7 @@ where
         .await
         {
             Ok(Ok(version)) => {
-                info!(version = version.0, "superblock pin durably acknowledged");
+                debug!(version = version.0, "superblock pin durably acknowledged");
                 Ok(())
             }
             Ok(Err(e)) => Err((pin_error_is_retryable(&e), format!("pin rpc failed: {e}"))),
@@ -713,7 +713,7 @@ where
                     )
                     .into());
                 }
-                info!(handle, "holding superblock write reply until durable PinOk");
+                debug!(handle, "holding superblock write reply until durable PinOk");
                 stashed.insert(handle, header[..16].try_into().unwrap());
             }
             GateCheck::Fail(reason) => {
@@ -740,7 +740,7 @@ where
             GateCheck::Hold => {}
             GateCheck::Pass => {
                 let hdr = stashed.remove(&handle).expect("stashed handle present");
-                info!(handle, "releasing superblock write reply (PinOk)");
+                debug!(handle, "releasing superblock write reply (PinOk)");
                 to_kernel.write_all(&hdr).await?;
                 to_kernel.flush().await?;
             }
