@@ -110,6 +110,22 @@ pub struct StagedUpgradeJson {
     /// `builder_rev`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crates_rev: Option<String>,
+    /// Synchronizer trust anchors baked into this upgrade's EIF (the
+    /// exact `expected_pcrs` list the backend passed to the builder via
+    /// `--synchronizer-pcrs`). Recorded alongside `pcrs` when the build
+    /// completes so `enclavia reproduce --upgrade <id>` can inject the
+    /// EXACT anchor set the original build used; old images stay
+    /// reproducible after a cluster rotation. `None` on rows staged
+    /// before this field existed or built without the synchronizer
+    /// wiring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronizer_pcrs: Option<Vec<PcrsHex>>,
+    /// Whether `--synchronizer-enabled` was passed to the builder for
+    /// this EIF (`synchronizer.enabled = true` in the measured config:
+    /// the in-enclave anti-rollback wiring is on). `false` on rows
+    /// staged before this field existed or built without the wiring.
+    #[serde(default)]
+    pub synchronizer_enabled: bool,
     /// Wall-clock time this upgrade record was created.
     pub created_at: DateTime<Utc>,
 }
@@ -137,6 +153,12 @@ mod tests {
             error_message: None,
             builder_rev: Some("08cc66bf46b79981253011725b9e792d6353a586".into()),
             crates_rev: Some("842b3394f1699b1fc7ae376ec7741fa9e4029621".into()),
+            synchronizer_pcrs: Some(vec![PcrsHex {
+                pcr0: "dd".repeat(48),
+                pcr1: "ee".repeat(48),
+                pcr2: "ff".repeat(48),
+            }]),
+            synchronizer_enabled: true,
             created_at: Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         }
     }
@@ -219,6 +241,8 @@ mod tests {
             error_message: None,
             builder_rev: None,
             crates_rev: None,
+            synchronizer_pcrs: None,
+            synchronizer_enabled: false,
             created_at: Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         };
         let v = serde_json::to_value(&building).unwrap();
@@ -229,6 +253,13 @@ mod tests {
         // Revs are skipped when None too.
         assert!(v.get("builder_rev").is_none());
         assert!(v.get("crates_rev").is_none());
+        // Synchronizer anchors are skipped when None; the enabled flag is
+        // always present (it is a plain bool).
+        assert!(v.get("synchronizer_pcrs").is_none());
+        assert_eq!(
+            v.get("synchronizer_enabled"),
+            Some(&serde_json::json!(false))
+        );
     }
 
     /// The revs serialise when present and round-trip back.
@@ -272,5 +303,34 @@ mod tests {
         assert!(back.builder_rev.is_none());
         assert!(back.crates_rev.is_none());
         assert_eq!(back.image_digest.as_deref(), Some("sha256:abcdef"));
+        // Synchronizer fields default too (rows from a pre-anti-rollback
+        // backend carry neither key).
+        assert!(back.synchronizer_pcrs.is_none());
+        assert!(!back.synchronizer_enabled);
+    }
+
+    /// Synchronizer provenance round-trips when present: the anchors list
+    /// keeps the PCR0/PCR1/PCR2 key shape and the enabled flag survives.
+    #[test]
+    fn synchronizer_provenance_round_trips_when_present() {
+        let v = serde_json::to_value(sample()).unwrap();
+        let anchors = v
+            .get("synchronizer_pcrs")
+            .and_then(|x| x.as_array())
+            .expect("synchronizer_pcrs present as a list");
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(
+            anchors[0].get("PCR0").and_then(|x| x.as_str()),
+            Some("dd".repeat(48).as_str())
+        );
+        assert_eq!(
+            v.get("synchronizer_enabled"),
+            Some(&serde_json::json!(true))
+        );
+
+        let back: StagedUpgradeJson = serde_json::from_value(v).unwrap();
+        let pcrs = back.synchronizer_pcrs.expect("anchors survive round-trip");
+        assert_eq!(pcrs[0].pcr1, "ee".repeat(48));
+        assert!(back.synchronizer_enabled);
     }
 }
