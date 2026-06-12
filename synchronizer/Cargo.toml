@@ -120,6 +120,17 @@ mesh = [
 # (vsock) — same pattern as the other in-enclave crates.
 debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber"]
 enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "dep:tokio-vsock"]
+# QEMU nitro-enclave variant. Identical transport to `enclave` (the
+# customer listener and the mesh both ride vsock, since an in-enclave
+# binary can only reach the host over vsock under QEMU's
+# vhost-device-vsock bridge), but the attestation verifier runs the
+# skip-cert-chain path. QEMU's nitro-enclave machine type measures the
+# EIF into real PCR0/1/2 yet self-signs the NSM document rather than
+# chaining to the AWS Nitro CA, which is exactly what the per-enclave
+# debug_mode flag accepts (skip the cert-chain check only). Neither
+# `debug` (UDS dev listener) nor `enclave` (full-chain verify) fits a
+# QEMU cluster on its own; this feature is the third combination.
+qemu = ["enclave"]
 # Dev-machine multi-node mesh test support: UDS/in-memory transport +
 # FakeAttestor. Tests only, never compiled into the production binary.
 # Adds `tokio/net` for the UDS listener/stream and turns on
@@ -167,4 +178,14 @@ rand = { workspace = true }
 [[bin]]
 name = "enclavia-synchronizer"
 path = "src/main.rs"
+required-features = ["node"]
+
+# Customer-RPC smoke client for the QEMU 3-node harness
+# (tests/run_e2e_synchronizer.sh). Speaks wire::Request/Response over a
+# vhost-device-vsock proxy UDS; builds the synthetic attestation doc from
+# enclavia-protocol's `test-utils` (a dev-dependency, active for
+# examples), so it needs `node` for the listener Frame + Noise helpers.
+[[example]]
+name = "mesh_client"
+path = "examples/mesh_client.rs"
 required-features = ["node"]

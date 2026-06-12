@@ -9,9 +9,25 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+
+    # Nitro EIF assembler (kernel + init + ramdisk -> image.eif). Same
+    # input the builder uses; do NOT follow our nixpkgs (nitro-util's Go
+    # builds break on newer nixpkgs). Only consumed by the dedicated
+    # `synchronizer-eif` output below.
+    nitro-util.url = "github:monzo/aws-nitro-util";
+
+    # Source-only input carrying the builder's patched init (CID-2
+    # heartbeat for QEMU's vhost-device-vsock) and kernel/init blobs we
+    # reuse for the synchronizer EIF. `flake = false` so we just get its
+    # source tree; override during local development with
+    # `--override-input builder-src path:../builder`.
+    builder-src = {
+      url = "github:EnclaviaIO/builder";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -111,6 +127,48 @@
           }
         );
 
+        # In-enclave synchronizer node binary, built in the `qemu`
+        # variant: vsock customer listener + vsock mesh transport (same
+        # as `enclave`) but skip-cert-chain attestation, which is what
+        # QEMU's self-signing NSM emits. `raft` turns on the replicated
+        # cluster path (mesh + openraft). One identical binary runs on
+        # all three nodes; identity is injected at runtime (see
+        # synchronizer-names-init), never baked in, so PCRs stay equal.
+        synchronizer = craneLib.buildPackage (
+          individualCrateArgs
+          // {
+            pname = "enclavia-synchronizer";
+            cargoExtraArgs = "-p synchronizer --features qemu,raft";
+          }
+        );
+
+        # In-enclave runtime identity fetcher (vsock 5011 -> host names
+        # responder). Keeps MESH_SELF_NAME / MESH_PEERS out of the
+        # measured image and cmdline so the three nodes share one PCR set.
+        synchronizerNamesInit = craneLib.buildPackage (
+          individualCrateArgs
+          // {
+            pname = "synchronizer-names-init";
+            cargoExtraArgs = "-p synchronizer-names-init";
+          }
+        );
+
+        # --- Dedicated synchronizer EIF ---------------------------------
+        #
+        # NOT the builder's OCI pipeline: the synchronizer is the entire
+        # in-enclave payload, so we assemble a minimal EIF directly with
+        # monzo's nitroLib.buildEif, reusing the builder's prebuilt
+        # kernel/init blobs and its patched (CID-2 heartbeat) init for
+        # QEMU debug. See nix/synchronizer-eif.nix for the rationale.
+        nitroLib = nitro-util.lib.${system};
+
+        synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix {
+          inherit pkgs nitroLib;
+          synchronizerPkg = synchronizer;
+          namesInitPkg = synchronizerNamesInit;
+          builderSrc = builder-src;
+        };
+
       in
       {
         devShells.default = pkgs.mkShell {
@@ -132,6 +190,12 @@
           # Beta-tester install entry point. Must stay named `enclavia`
           # so `nix profile install ...#enclavia` matches the binary.
           enclavia = enclaviaCli;
+
+          # Synchronizer node binary (qemu variant) + its runtime
+          # identity fetcher, plus the dedicated EIF that wraps them.
+          synchronizer = synchronizer;
+          synchronizer-names-init = synchronizerNamesInit;
+          synchronizer-eif = synchronizerEif;
         };
 
         # `nix run` shorthand and `nix profile install` default.
