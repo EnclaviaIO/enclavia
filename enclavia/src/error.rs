@@ -11,6 +11,15 @@ pub enum Error {
     #[error("Attestation verification failed: {0}")]
     Attestation(String),
 
+    /// `trust_upgrades` was enabled, the live PCRs did not match the
+    /// pinned ones, and verifying the running enclave as a descendant of
+    /// the pinned version through its public upgrade chain failed.
+    /// Carries the underlying reason: a chain-fetch error, a chain
+    /// validation failure, the pin not appearing in the chain's lineage,
+    /// or the live enclave not matching the verified chain tip.
+    #[error("trust_upgrades verification failed: {0}")]
+    TrustUpgrades(String),
+
     #[error("Attestation nonce mismatch")]
     AttestationNonceMismatch,
 

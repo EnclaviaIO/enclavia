@@ -8,7 +8,10 @@ description = "Encrypted HTTP client SDK for the Enclavia enclave runtime: Noise
 
 [features]
 default = []
-json = ["serde_json"]
+# `serde_json` is an unconditional dependency now (the trust_upgrades
+# chain fetch parses the enclave row with it), so this feature only
+# gates the user-facing request/response JSON body helpers.
+json = []
 
 [dependencies]
 # enclavia-protocol owns the shared attestation verifier. The SDK uses
@@ -31,8 +34,14 @@ thiserror.workspace = true
 httparse.workspace = true
 url.workspace = true
 tracing.workspace = true
-
-serde_json = { version = "1", optional = true }
+serde_json = "1"
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+# `trust_upgrades` fetches the enclave's public upgrade chain over HTTPS.
+# rustls (not native-tls) to match the WebSocket transport's TLS stack
+# and avoid pulling OpenSSL into the SDK.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 # Integration tests spin up an in-process Noise responder; that needs the

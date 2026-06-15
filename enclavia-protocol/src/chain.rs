@@ -34,6 +34,7 @@
 //! upgrade / revocation as defence-in-depth: a forged link injected by
 //! a tampered host-side daemon would carry no valid signature.
 
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
@@ -182,6 +183,62 @@ pub struct RevocationPayload {
     pub issued_at: DateTime<Utc>,
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+}
+
+/// Failure decoding a [`ChainLinkJson`] wire link into a [`ChainLink`].
+#[derive(Debug, thiserror::Error)]
+pub enum ChainLinkDecodeError {
+    /// One of the base64 byte fields did not decode.
+    #[error("chain link `{field}` is not valid base64: {source}")]
+    Base64 {
+        field: &'static str,
+        #[source]
+        source: base64::DecodeError,
+    },
+}
+
+impl ChainLinkJson {
+    /// Decode the base64 wire fields into the raw-bytes [`ChainLink`] the
+    /// validator consumes. `id` carries through; `sequence` narrows
+    /// `i64 -> u64` (a negative value is treated as absent, leaving the
+    /// walker to order by position).
+    ///
+    /// This is the single decode path for every consumer of the public
+    /// `GET /enclaves/{id}/upgrade-chain` endpoint (the SDK's
+    /// trust-upgrades walk and the CLI's `upgrade chain`), so the
+    /// base64 handling is defined once in the audited crate rather than
+    /// re-implemented per caller.
+    pub fn into_chain_link(&self) -> Result<ChainLink, ChainLinkDecodeError> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let decode = |field: &'static str, s: &str| {
+            b64.decode(s.as_bytes())
+                .map_err(|source| ChainLinkDecodeError::Base64 { field, source })
+        };
+        let payload = decode("payload", &self.payload)?;
+        let attestation = decode("attestation", &self.attestation)?;
+        let signature = match self.signature.as_deref() {
+            Some(s) => Some(decode("signature", s)?),
+            None => None,
+        };
+        Ok(ChainLink {
+            id: self.id,
+            sequence: self.sequence.and_then(|s| u64::try_from(s).ok()),
+            kind: self.kind,
+            payload,
+            attestation,
+            signature,
+        })
+    }
+
+    /// Decode into a [`RecordedLink`], carrying `created_at` as the
+    /// ingest reference instant for time-dependent rules (revocation
+    /// `valid_from`).
+    pub fn into_recorded_link(&self) -> Result<RecordedLink, ChainLinkDecodeError> {
+        Ok(RecordedLink {
+            link: self.into_chain_link()?,
+            recorded_at: self.created_at,
+        })
+    }
 }
 
 /// PCRs in hex-string form. Chosen over raw bytes for the wire/CBOR
@@ -681,6 +738,156 @@ fn promotion_target(
         .filter(|l| l.id.is_none_or(|id| !revoked.contains(&id)))
         .filter_map(|l| ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()).ok())
         .find(|p| p.to_pcrs == *boot_pcrs && p.image_digest == boot_image_digest)
+}
+
+// ---------------------------------------------------------------------------
+// Pinned-PCR upgrade-descent check (SDK `trust_upgrades`)
+// ---------------------------------------------------------------------------
+
+/// Why a live enclave's PCRs could not be shown to descend from the
+/// caller's pinned PCRs.
+#[derive(Debug, thiserror::Error)]
+pub enum PcrDescentError {
+    /// The chain produced no usable genesis, so no in-force state could
+    /// be established and nothing descends from anything.
+    #[error("chain has no valid genesis boot")]
+    NoGenesis,
+    /// A chain link failed validation (attestation, signature, or
+    /// cross-link consistency). The whole chain is rejected: a single
+    /// unverifiable link means the history is not a trustworthy account
+    /// of how the enclave reached its current measurements.
+    #[error("chain link at position {position} failed validation: {source}")]
+    LinkInvalid {
+        position: usize,
+        #[source]
+        source: ChainValidationError,
+    },
+    /// Every link validated, but the pinned PCRs never appear as an
+    /// in-force boot state on this chain. The chain may be a perfectly
+    /// valid history of a DIFFERENT enclave; it does not start from (or
+    /// pass through) the version the caller pinned, so the live
+    /// measurements cannot be said to descend from the pinned ones.
+    #[error("pinned PCRs are not an in-force state anywhere on this chain")]
+    PinnedNotInLineage,
+    /// A boot link the walker accepted carries a payload that no longer
+    /// CBOR-decodes, or PCR hex that no longer parses. Indicates the
+    /// link bytes were mutated between validation and this read; treated
+    /// as fatal.
+    #[error("validated boot link at position {0} has an unreadable payload")]
+    BootPayloadUnreadable(usize),
+}
+
+/// Verify that an enclave currently measuring some live PCRs descends,
+/// through this enclave's signed upgrade chain, from the PCRs the caller
+/// pinned, and return the chain's final (tip) measurements.
+///
+/// This backs the SDK's `trust_upgrades` mode. When a client pinned a
+/// version's PCRs and the enclave has since upgraded, the live
+/// attestation no longer matches the pin; this function decides whether
+/// to extend trust to the new image by proving the new image is a
+/// descendant of the pinned one.
+///
+/// The caller passes the pinned PCRs plus the enclave's public chain
+/// (from `GET /enclaves/{id}/upgrade-chain`) and the validator context
+/// (`row_*`, `control_public_key`, `upgradable`) from
+/// `GET /enclaves/{id}`. On success it returns the chain's TIP PCRs; the
+/// caller MUST then verify the LIVE attestation against exactly those
+/// PCRs (e.g. [`crate::attestation::verify_against`]) to bind the
+/// verified descendant version to the running Noise session. This
+/// function does not see the live attestation and so cannot make that
+/// binding itself.
+///
+/// ## Trust model
+///
+/// Soundness rests entirely on the per-link AWS Nitro attestations,
+/// which `validate_chain` verifies (in production mode); the
+/// control-key signatures and the `row_*` / `control_public_key` /
+/// `upgradable` context are corroborating, never load-bearing. A
+/// dishonest source of any of those can only make a genuine chain FAIL
+/// here (a denial), never make a forged transition pass: forging an
+/// upgrade link would require a real Nitro document from an enclave
+/// measuring the `from` PCRs that voluntarily authorized the `to` PCRs,
+/// which is exactly the trust delegation `trust_upgrades` opts into.
+///
+/// Two independent gates make the result meaningful:
+///
+/// 1. EVERY link validates. One bad link rejects the whole chain.
+/// 2. The pinned PCRs appear as an in-force boot state on the chain.
+///    Without this a valid chain belonging to some OTHER enclave would
+///    pass; with it, the pinned version is provably part of THIS
+///    enclave's measured history. Per-enclave PCRs are unique (the
+///    enclave UUID is measured into them), so a single matching
+///    in-force state on a fully-validated linear chain places the tip
+///    downstream of the pin.
+///
+/// `debug_mode` must be the SDK's own mode: in production mode a chain
+/// of debug (non-CA-signed) links fails attestation and is rejected, so
+/// a production client never extends trust through unverifiable history.
+// One arg over the lint's threshold: this mirrors `validate_chain`'s
+// context (which sits exactly at the limit) plus the pinned anchor.
+// Bundling them into a struct would just move the same fields around.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_pcr_descent(
+    pinned: &Pcrs,
+    links: &[RecordedLink],
+    control_public_key: Option<&[u8]>,
+    row_pcrs: &PcrsHex,
+    row_image_digest: &str,
+    upgradable: bool,
+    now: DateTime<Utc>,
+    debug_mode: bool,
+) -> Result<Pcrs, PcrDescentError> {
+    let ChainWalk {
+        outcomes,
+        final_pcrs,
+        ..
+    } = validate_chain(
+        links,
+        row_pcrs,
+        row_image_digest,
+        control_public_key,
+        upgradable,
+        now,
+        debug_mode,
+    );
+
+    // Gate 1: every link must validate. Reject on the first failure so a
+    // tampered or unexplained transition can never be papered over by a
+    // later good link.
+    for (position, outcome) in outcomes.into_iter().enumerate() {
+        outcome.map_err(|source| PcrDescentError::LinkInvalid { position, source })?;
+    }
+
+    let tip = final_pcrs
+        .ok_or(PcrDescentError::NoGenesis)?
+        .to_pcrs()
+        .map_err(|_| PcrDescentError::BootPayloadUnreadable(0))?;
+
+    // Gate 2: the pinned PCRs must be one of the chain's in-force boot
+    // states. Every boot link here was accepted by the walk above (we
+    // returned on any failure), so its PCRs are a measured state the
+    // enclave genuinely ran; the genesis and each promotion boot are the
+    // points where the in-force version changed.
+    let mut pinned_in_lineage = false;
+    for (position, recorded) in links.iter().enumerate() {
+        if recorded.link.kind != ChainLinkKind::Boot {
+            continue;
+        }
+        let payload: BootPayload = ciborium::from_reader(recorded.link.payload.as_slice())
+            .map_err(|_| PcrDescentError::BootPayloadUnreadable(position))?;
+        let state = payload
+            .pcrs
+            .to_pcrs()
+            .map_err(|_| PcrDescentError::BootPayloadUnreadable(position))?;
+        if &state == pinned {
+            pinned_in_lineage = true;
+        }
+    }
+    if !pinned_in_lineage {
+        return Err(PcrDescentError::PinnedNotInLineage);
+    }
+
+    Ok(tip)
 }
 
 #[cfg(test)]
@@ -1386,6 +1593,202 @@ mod tests {
         assert!(matches!(
             walk_now.outcomes[2],
             Err(ChainValidationError::RevokePastActivation)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_pcr_descent (SDK trust_upgrades)
+    // -----------------------------------------------------------------------
+
+    /// boot(v1) -> upgrade(v1->v2) -> boot(v2) walked AFTER promotion.
+    /// Returns the links plus the v1/v2 seeds and the control pubkey.
+    fn two_version_chain(now: DateTime<Utc>) -> (Vec<RecordedLink>, Vec<u8>, u8, u8) {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (v1, v2) = (0x20u8, 0x30u8);
+
+        let mut genesis = boot_link(id, "sha256:v1", v1);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade =
+            transition_upgrade_link(id, "sha256:v2", v1, v2, &sk, now - Duration::minutes(10));
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut promo = boot_link(id, "sha256:v2", v2);
+        promo.id = Some(Uuid::new_v4());
+        promo.sequence = Some(2);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(2)),
+            recorded(upgrade, now - Duration::minutes(11)),
+            recorded(promo, now - Duration::minutes(9)),
+        ];
+        (links, pk, v1, v2)
+    }
+
+    #[test]
+    fn descent_pinned_genesis_returns_tip() {
+        let now = chrono::Utc::now();
+        let (links, pk, v1, v2) = two_version_chain(now);
+        let row_pcrs = pcrs_hex_from_seed(v2);
+        let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
+
+        let tip = verify_pcr_descent(
+            &pinned,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
+        )
+        .unwrap();
+        // The tip is the v2 measurements the running enclave should show.
+        assert_eq!(tip, pcrs_hex_from_seed(v2).to_pcrs().unwrap());
+    }
+
+    #[test]
+    fn descent_pinned_current_tip_returns_tip() {
+        // Pinning the CURRENT (post-upgrade) version is also "in lineage":
+        // the tip itself is an in-force boot state.
+        let now = chrono::Utc::now();
+        let (links, pk, _v1, v2) = two_version_chain(now);
+        let row_pcrs = pcrs_hex_from_seed(v2);
+        let pinned = pcrs_hex_from_seed(v2).to_pcrs().unwrap();
+
+        let tip = verify_pcr_descent(
+            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+        )
+        .unwrap();
+        assert_eq!(tip, pinned);
+    }
+
+    #[test]
+    fn descent_rejects_pin_not_in_chain() {
+        // A fully-valid chain, but the pinned PCRs belong to neither the
+        // genesis nor any promotion: this could be a real chain for a
+        // different enclave. Must not extend trust.
+        let now = chrono::Utc::now();
+        let (links, pk, _v1, v2) = two_version_chain(now);
+        let row_pcrs = pcrs_hex_from_seed(v2);
+        let stranger = pcrs_hex_from_seed(0x77).to_pcrs().unwrap();
+
+        let err = verify_pcr_descent(
+            &stranger, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PcrDescentError::PinnedNotInLineage));
+    }
+
+    #[test]
+    fn descent_rejects_tampered_link() {
+        // Flip a byte in the upgrade payload: its attestation binding
+        // (user_data == sha256(payload)) breaks, so the link fails and
+        // the whole chain is rejected even though the pin matches genesis.
+        let now = chrono::Utc::now();
+        let (mut links, pk, v1, v2) = two_version_chain(now);
+        links[1].link.payload[0] ^= 0xff;
+        let row_pcrs = pcrs_hex_from_seed(v2);
+        let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
+
+        let err = verify_pcr_descent(
+            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            PcrDescentError::LinkInvalid { position: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn descent_rejects_unsigned_promotion() {
+        // boot(v1) then a promotion boot(v2) with NO upgrade link
+        // explaining the transition: the v2 boot fails the attestation
+        // PCR check against the in-force v1 state. An attacker cannot
+        // jump the measured version without a signed, attested upgrade.
+        let now = chrono::Utc::now();
+        let (_sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (v1, v2) = (0x20u8, 0x30u8);
+
+        let mut genesis = boot_link(id, "sha256:v1", v1);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut rogue = boot_link(id, "sha256:v2", v2);
+        rogue.id = Some(Uuid::new_v4());
+        rogue.sequence = Some(1);
+        let links = vec![
+            recorded(genesis, now - Duration::hours(1)),
+            recorded(rogue, now - Duration::minutes(1)),
+        ];
+        let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
+
+        let err = verify_pcr_descent(
+            &pinned,
+            &links,
+            Some(&pk),
+            &pcrs_hex_from_seed(v1),
+            "sha256:v1",
+            true,
+            now,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            PcrDescentError::LinkInvalid { position: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn descent_empty_chain_has_no_genesis() {
+        let now = chrono::Utc::now();
+        let pinned = pcrs_hex_from_seed(0x20).to_pcrs().unwrap();
+        let err = verify_pcr_descent(
+            &pinned,
+            &[],
+            None,
+            &pcrs_hex_from_seed(0x20),
+            "sha256:v1",
+            true,
+            now,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PcrDescentError::NoGenesis));
+    }
+
+    #[test]
+    fn chain_link_json_round_trips_through_decode() {
+        // into_chain_link is the SDK/CLI decode path: base64 wire fields
+        // back to raw bytes, id/sequence carried, negative sequence
+        // dropped.
+        let id = Uuid::new_v4();
+        let raw = boot_link(id, "sha256:v1", 0x20);
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let wire = ChainLinkJson {
+            id: Some(Uuid::new_v4()),
+            kind: ChainLinkKind::Boot,
+            sequence: Some(3),
+            payload: b64.encode(&raw.payload),
+            attestation: b64.encode(&raw.attestation),
+            signature: None,
+            created_at: None,
+        };
+        let decoded = wire.into_chain_link().unwrap();
+        assert_eq!(decoded.payload, raw.payload);
+        assert_eq!(decoded.attestation, raw.attestation);
+        assert_eq!(decoded.sequence, Some(3));
+
+        let bad = ChainLinkJson {
+            payload: "not base64!!!".into(),
+            ..wire
+        };
+        assert!(matches!(
+            bad.into_chain_link(),
+            Err(ChainLinkDecodeError::Base64 { field: "payload", .. })
         ));
     }
 }

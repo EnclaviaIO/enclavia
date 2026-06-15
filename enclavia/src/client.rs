@@ -8,6 +8,8 @@ use url::Url;
 
 use crate::error::Error;
 use enclavia_protocol::attestation::{self, Pcrs};
+use enclavia_protocol::chain::{ChainLinkJson, PcrsHex, RecordedLink};
+use uuid::Uuid;
 use crate::http::{self, Method};
 use crate::noise;
 use crate::request::RequestBuilder;
@@ -260,12 +262,24 @@ impl Client {
     }
 }
 
+/// Inputs the SDK needs to follow an enclave's upgrade chain when the
+/// live PCRs no longer match the pinned ones. See
+/// [`ClientBuilder::trust_upgrades`].
+#[derive(Clone)]
+struct TrustUpgrades {
+    /// Backend API base, e.g. `https://api.beta.enclavia.io`.
+    backend_url: String,
+    /// The enclave whose chain to walk.
+    enclave_id: Uuid,
+}
+
 /// Builder for configuring and establishing a [`Client`] connection.
 pub struct ClientBuilder {
     url: String,
     pcrs: Option<Pcrs>,
     debug_mode: bool,
     extra_headers: Vec<(String, String)>,
+    trust_upgrades: Option<TrustUpgrades>,
 }
 
 impl ClientBuilder {
@@ -275,6 +289,7 @@ impl ClientBuilder {
             pcrs: None,
             debug_mode: false,
             extra_headers: Vec::new(),
+            trust_upgrades: None,
         }
     }
 
@@ -290,6 +305,46 @@ impl ClientBuilder {
     /// a real COSE_Sign1 attestation document. Only the nonce match is verified.
     pub fn debug_mode(mut self, debug: bool) -> Self {
         self.debug_mode = debug;
+        self
+    }
+
+    /// Follow enclave upgrades instead of pinning a single immutable
+    /// version.
+    ///
+    /// By default the client trusts ONLY the exact PCRs passed to
+    /// [`ClientBuilder::pcrs`]: once the enclave is rebuilt or upgraded
+    /// to a new measured image, attestation no longer matches the pin
+    /// and the connection is refused. That is the right default for a
+    /// caller that wants to bind to one audited build.
+    ///
+    /// With `trust_upgrades` set, when the live attestation's PCRs differ
+    /// from the pinned ones the client fetches the enclave's public
+    /// upgrade chain from `backend_url` (`GET /enclaves/{id}` plus
+    /// `GET /enclaves/{id}/upgrade-chain`) and verifies that the running
+    /// version DESCENDS from the pinned version through a chain of
+    /// hardware-attested, control-key-signed upgrade links. Only if that
+    /// holds, and the live attestation matches the chain's verified tip,
+    /// is the connection allowed.
+    ///
+    /// The pinned PCRs remain the trust root. Soundness rests on each
+    /// link's AWS Nitro attestation, so a dishonest backend can at most
+    /// cause the connection to be refused, never make the client trust
+    /// an image that does not genuinely descend from the pinned one.
+    /// Enabling this without also calling [`ClientBuilder::pcrs`] is a
+    /// configuration error and fails the build.
+    ///
+    /// `backend_url` is the API base (e.g.
+    /// `https://api.beta.enclavia.io`); `enclave_id` is the enclave the
+    /// `wss://` endpoint routes to.
+    pub fn trust_upgrades(
+        mut self,
+        backend_url: impl Into<String>,
+        enclave_id: Uuid,
+    ) -> Self {
+        self.trust_upgrades = Some(TrustUpgrades {
+            backend_url: backend_url.into(),
+            enclave_id,
+        });
         self
     }
 
@@ -373,14 +428,36 @@ impl ClientBuilder {
             _ => return Err(Error::UnexpectedMessage),
         };
 
-        attestation::verify_against(
+        match attestation::verify_against(
             &attestation_data,
             &handshake_hash,
             &pcrs,
             self.debug_mode,
-        )
-        .map_err(|e| Error::Attestation(e.to_string()))?;
-        info!("Attestation verified");
+        ) {
+            Ok(()) => info!("Attestation verified (pinned PCRs match)"),
+            Err(pinned_err) => match &self.trust_upgrades {
+                // Pinned PCRs did not match, but the caller opted into
+                // following upgrades: try to verify the running enclave
+                // as a descendant of the pinned version.
+                Some(tu) => {
+                    if pcrs.pcr0.is_empty() && pcrs.pcr1.is_empty() && pcrs.pcr2.is_empty() {
+                        return Err(Error::TrustUpgrades(
+                            "trust_upgrades requires pinned PCRs (call .pcrs(..))".into(),
+                        ));
+                    }
+                    verify_via_upgrade_chain(
+                        &attestation_data,
+                        &handshake_hash,
+                        &pcrs,
+                        self.debug_mode,
+                        tu,
+                    )
+                    .await?;
+                    info!("Attestation verified (descends from pinned PCRs via upgrade chain)");
+                }
+                None => return Err(Error::Attestation(pinned_err.to_string())),
+            },
+        }
 
         // 4. Spawn background transport task
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -389,5 +466,218 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(ClientInner { cmd_tx, host }),
         })
+    }
+}
+
+/// Verify a running enclave whose live PCRs differ from the pinned ones
+/// by walking its public upgrade chain (the SDK side of
+/// [`ClientBuilder::trust_upgrades`]).
+///
+/// Steps, in order, with the trust each one carries:
+///
+/// 1. Fetch the enclave row + chain from the backend over HTTPS. These
+///    bytes are UNTRUSTED: the row's `control_public_key` / image digest
+///    / PCRs and the chain links are corroborated below, never taken on
+///    faith.
+/// 2. [`enclavia_protocol::chain::verify_pcr_descent`] validates every
+///    link's Nitro attestation (load-bearing) and proves the pinned PCRs
+///    appear as an in-force state on the chain, returning the chain's
+///    verified TIP measurements.
+/// 3. Re-verify the LIVE attestation against exactly that tip. This is
+///    the step that binds the verified descendant version to THIS Noise
+///    session: without it the chain could belong to a different live
+///    enclave. It reuses the same pinned-identity verifier
+///    ([`attestation::verify_against`]) used for the original pin, so
+///    the session-nonce and (in production) the Nitro CA chain are
+///    checked on the live document too.
+async fn verify_via_upgrade_chain(
+    attestation_data: &[u8],
+    handshake_hash: &[u8],
+    pinned: &Pcrs,
+    debug_mode: bool,
+    tu: &TrustUpgrades,
+) -> Result<(), Error> {
+    let base = tu.backend_url.trim_end_matches('/');
+    let http = reqwest::Client::new();
+
+    let fetch_err = |what: &str, e: reqwest::Error| {
+        Error::TrustUpgrades(format!("fetching {what}: {e}"))
+    };
+
+    let row: serde_json::Value = http
+        .get(format!("{base}/enclaves/{}", tu.enclave_id))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| fetch_err("enclave row", e))?
+        .json()
+        .await
+        .map_err(|e| fetch_err("enclave row", e))?;
+
+    let wire: Vec<ChainLinkJson> = http
+        .get(format!("{base}/enclaves/{}/upgrade-chain", tu.enclave_id))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| fetch_err("upgrade chain", e))?
+        .json()
+        .await
+        .map_err(|e| fetch_err("upgrade chain", e))?;
+
+    let row = parse_enclave_row(&row)?;
+
+    let mut links: Vec<RecordedLink> = Vec::with_capacity(wire.len());
+    for w in &wire {
+        links.push(
+            w.into_recorded_link()
+                .map_err(|e| Error::TrustUpgrades(format!("decoding chain link: {e}")))?,
+        );
+    }
+
+    // Walk the chain rooted at the pinned PCRs; on success this is the
+    // measured version the live enclave must be running.
+    let tip = enclavia_protocol::chain::verify_pcr_descent(
+        pinned,
+        &links,
+        row.control_public_key.as_deref(),
+        &row.pcrs,
+        &row.image_digest,
+        row.upgradable,
+        chrono::Utc::now(),
+        debug_mode,
+    )
+    .map_err(|e| Error::TrustUpgrades(e.to_string()))?;
+
+    // Bind the verified descendant version to this live session.
+    attestation::verify_against(attestation_data, handshake_hash, &tip, debug_mode).map_err(|e| {
+        Error::TrustUpgrades(format!(
+            "running enclave does not match the verified chain tip: {e}"
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// The `validate_chain` context extracted from a `GET /enclaves/{id}`
+/// row. These values are corroborating, not load-bearing (a wrong value
+/// can only cause a false reject), so the extraction is deliberately
+/// tolerant of the row's exact JSON shape.
+struct EnclaveRow {
+    pcrs: PcrsHex,
+    image_digest: String,
+    control_public_key: Option<Vec<u8>>,
+    upgradable: bool,
+}
+
+fn parse_enclave_row(row: &serde_json::Value) -> Result<EnclaveRow, Error> {
+    let bad = |m: &str| Error::TrustUpgrades(format!("enclave row {m}"));
+
+    let upgradable = row
+        .get("upgradable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let image_digest = row
+        .get("image_digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad("missing `image_digest`"))?
+        .to_string();
+
+    // The backend persists the builder's pcr.json verbatim (nitro-cli
+    // `PCR0` casing); tolerate lowercase too in case the row is ever
+    // normalized.
+    let pcrs_obj = row.get("pcrs").ok_or_else(|| bad("missing `pcrs`"))?;
+    let pcr = |upper: &str, lower: &str| -> Result<String, Error> {
+        pcrs_obj
+            .get(upper)
+            .or_else(|| pcrs_obj.get(lower))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| bad(&format!("pcrs missing `{upper}`")))
+    };
+    let pcrs = PcrsHex {
+        pcr0: pcr("PCR0", "pcr0")?,
+        pcr1: pcr("PCR1", "pcr1")?,
+        pcr2: pcr("PCR2", "pcr2")?,
+    };
+
+    // `control_public_key` is a BYTEA: the authenticated row serializes
+    // it as a JSON array of byte values; tolerate a base64 string and
+    // null (non-upgradable enclave) too.
+    let control_public_key = match row.get("control_public_key") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(arr)) => {
+            let mut bytes = Vec::with_capacity(arr.len());
+            for v in arr {
+                let n = v
+                    .as_u64()
+                    .filter(|n| *n <= 255)
+                    .ok_or_else(|| bad("control_public_key array element is not a byte"))?;
+                bytes.push(n as u8);
+            }
+            Some(bytes)
+        }
+        Some(serde_json::Value::String(s)) => {
+            use base64::Engine as _;
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(s.as_bytes())
+                    .map_err(|e| bad(&format!("control_public_key base64: {e}")))?,
+            )
+        }
+        Some(_) => return Err(bad("control_public_key has an unexpected JSON shape")),
+    };
+
+    Ok(EnclaveRow {
+        pcrs,
+        image_digest,
+        control_public_key,
+        upgradable,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_row_array_control_key_and_pcr_casing() {
+        let row = json!({
+            "upgradable": true,
+            "image_digest": "sha256:abc",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+            "control_public_key": [4, 255, 0, 7],
+        });
+        let parsed = parse_enclave_row(&row).unwrap();
+        assert!(parsed.upgradable);
+        assert_eq!(parsed.image_digest, "sha256:abc");
+        assert_eq!(parsed.pcrs.pcr0, "00");
+        assert_eq!(parsed.control_public_key, Some(vec![4u8, 255, 0, 7]));
+    }
+
+    #[test]
+    fn parse_row_null_control_key_is_non_upgradable() {
+        let row = json!({
+            "upgradable": false,
+            "image_digest": "sha256:abc",
+            "pcrs": { "pcr0": "00", "pcr1": "11", "pcr2": "22" },
+            "control_public_key": null,
+        });
+        let parsed = parse_enclave_row(&row).unwrap();
+        assert_eq!(parsed.control_public_key, None);
+        assert_eq!(parsed.pcrs.pcr1, "11");
+    }
+
+    #[test]
+    fn parse_row_missing_image_digest_errors() {
+        let row = json!({
+            "upgradable": true,
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+        });
+        assert!(matches!(
+            parse_enclave_row(&row),
+            Err(Error::TrustUpgrades(_))
+        ));
     }
 }
