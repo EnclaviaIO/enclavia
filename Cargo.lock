@@ -1080,7 +1080,6 @@ dependencies = [
 name = "enclavia"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "bytes 1.11.1",
  "chrono",
  "ciborium",

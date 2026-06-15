@@ -195,13 +195,17 @@ pub enum ChainLinkDecodeError {
         #[source]
         source: base64::DecodeError,
     },
+    /// `sequence` was negative. The backend never persists a negative
+    /// value; surface it instead of silently coercing, so a misbehaving
+    /// source is visible rather than papered over.
+    #[error("chain link has a negative sequence {0}")]
+    NegativeSequence(i64),
 }
 
 impl ChainLinkJson {
     /// Decode the base64 wire fields into the raw-bytes [`ChainLink`] the
     /// validator consumes. `id` carries through; `sequence` narrows
-    /// `i64 -> u64` (a negative value is treated as absent, leaving the
-    /// walker to order by position).
+    /// `i64 -> u64` and errors on a negative value rather than coercing.
     ///
     /// This is the single decode path for every consumer of the public
     /// `GET /enclaves/{id}/upgrade-chain` endpoint (the SDK's
@@ -220,9 +224,15 @@ impl ChainLinkJson {
             Some(s) => Some(decode("signature", s)?),
             None => None,
         };
+        let sequence = match self.sequence {
+            Some(s) => {
+                Some(u64::try_from(s).map_err(|_| ChainLinkDecodeError::NegativeSequence(s))?)
+            }
+            None => None,
+        };
         Ok(ChainLink {
             id: self.id,
-            sequence: self.sequence.and_then(|s| u64::try_from(s).ok()),
+            sequence,
             kind: self.kind,
             payload,
             attestation,
@@ -248,11 +258,15 @@ impl ChainLinkJson {
 /// what the attestation document carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PcrsHex {
-    #[serde(rename = "PCR0")]
+    // `alias` accepts the lowercase form too: the backend persists the
+    // builder's pcr.json verbatim (nitro-cli `PCR0` casing), but a
+    // future normalization on the row should not break a consumer
+    // deserializing it. Serialization is unchanged (always `PCR0`).
+    #[serde(rename = "PCR0", alias = "pcr0")]
     pub pcr0: String,
-    #[serde(rename = "PCR1")]
+    #[serde(rename = "PCR1", alias = "pcr1")]
     pub pcr1: String,
-    #[serde(rename = "PCR2")]
+    #[serde(rename = "PCR2", alias = "pcr2")]
     pub pcr2: String,
 }
 
@@ -266,6 +280,55 @@ impl PcrsHex {
         let pcr2 =
             hex::decode(&self.pcr2).map_err(|_| ChainValidationError::CorruptStoredPcrHex(2))?;
         Ok(Pcrs { pcr0, pcr1, pcr2 })
+    }
+}
+
+/// The `validate_chain` context fields carried on the public
+/// `GET /enclaves/{id}` response. Deserialized by every consumer that
+/// re-walks a chain (the SDK's `trust_upgrades`, the CLI's `upgrade
+/// chain`) so the tolerant parsing lives once here instead of being
+/// re-implemented per caller.
+///
+/// Tolerances, matching what the backend actually emits:
+/// - `pcrs`: nitro-cli `PCR0` casing or lowercase (see [`PcrsHex`]).
+/// - `control_public_key`: the BYTEA column serializes as a JSON array
+///   of byte values; a base64 string and `null` (a non-upgradable
+///   enclave) are also accepted.
+/// - `upgradable`: defaults to `false` when absent.
+///
+/// These values are corroborating, not load-bearing, in the
+/// `trust_upgrades` trust model (a wrong value can only make a genuine
+/// chain fail to verify); see [`verify_pcr_descent`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnclaveChainRow {
+    pub pcrs: PcrsHex,
+    pub image_digest: String,
+    #[serde(default, deserialize_with = "deserialize_control_key")]
+    pub control_public_key: Option<Vec<u8>>,
+    #[serde(default)]
+    pub upgradable: bool,
+}
+
+/// Accept the `control_public_key` BYTEA in any of the shapes the row
+/// can carry: a JSON array of byte values, a base64 string, or
+/// null/absent (non-upgradable enclave).
+fn deserialize_control_key<'de, D>(de: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bytes(Vec<u8>),
+        Base64(String),
+    }
+    match Option::<Raw>::deserialize(de)? {
+        None => Ok(None),
+        Some(Raw::Bytes(bytes)) => Ok(Some(bytes)),
+        Some(Raw::Base64(s)) => base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -1784,11 +1847,70 @@ mod tests {
 
         let bad = ChainLinkJson {
             payload: "not base64!!!".into(),
-            ..wire
+            ..wire.clone()
         };
         assert!(matches!(
             bad.into_chain_link(),
             Err(ChainLinkDecodeError::Base64 { field: "payload", .. })
         ));
+
+        let neg = ChainLinkJson {
+            sequence: Some(-1),
+            ..wire
+        };
+        assert!(matches!(
+            neg.into_chain_link(),
+            Err(ChainLinkDecodeError::NegativeSequence(-1))
+        ));
+    }
+
+    #[test]
+    fn enclave_row_parses_array_control_key_and_pcr_casing() {
+        let row = serde_json::json!({
+            "upgradable": true,
+            "image_digest": "sha256:abc",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+            "control_public_key": [4, 255, 0, 7],
+        });
+        let parsed: EnclaveChainRow = serde_json::from_value(row).unwrap();
+        assert!(parsed.upgradable);
+        assert_eq!(parsed.image_digest, "sha256:abc");
+        assert_eq!(parsed.pcrs.pcr0, "00");
+        assert_eq!(parsed.control_public_key, Some(vec![4u8, 255, 0, 7]));
+    }
+
+    #[test]
+    fn enclave_row_accepts_base64_control_key_and_lowercase_pcrs() {
+        let key = vec![4u8, 1, 2, 3];
+        let row = serde_json::json!({
+            "upgradable": true,
+            "image_digest": "sha256:abc",
+            "pcrs": { "pcr0": "aa", "pcr1": "bb", "pcr2": "cc" },
+            "control_public_key": base64::engine::general_purpose::STANDARD.encode(&key),
+        });
+        let parsed: EnclaveChainRow = serde_json::from_value(row).unwrap();
+        assert_eq!(parsed.pcrs.pcr1, "bb");
+        assert_eq!(parsed.control_public_key, Some(key));
+    }
+
+    #[test]
+    fn enclave_row_null_control_key_is_non_upgradable_and_upgradable_defaults_false() {
+        let row = serde_json::json!({
+            "image_digest": "sha256:abc",
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+            "control_public_key": null,
+        });
+        let parsed: EnclaveChainRow = serde_json::from_value(row).unwrap();
+        assert_eq!(parsed.control_public_key, None);
+        assert!(!parsed.upgradable);
+    }
+
+    #[test]
+    fn enclave_row_missing_image_digest_errors() {
+        let row = serde_json::json!({
+            "upgradable": true,
+            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
+        });
+        assert!(serde_json::from_value::<EnclaveChainRow>(row).is_err());
     }
 }

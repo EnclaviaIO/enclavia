@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::error::Error;
 use enclavia_protocol::attestation::{self, Pcrs};
-use enclavia_protocol::chain::{ChainLinkJson, PcrsHex, RecordedLink};
+use enclavia_protocol::chain::{ChainLinkJson, EnclaveChainRow, RecordedLink};
 use uuid::Uuid;
 use crate::http::{self, Method};
 use crate::noise;
@@ -504,7 +504,12 @@ async fn verify_via_upgrade_chain(
         Error::TrustUpgrades(format!("fetching {what}: {e}"))
     };
 
-    let row: serde_json::Value = http
+    // The enclave row + chain are UNTRUSTED bytes: the row's
+    // control_public_key / digest / PCRs and the chain links are all
+    // corroborated below, never taken on faith (a wrong value can only
+    // make a genuine chain fail to verify). The typed row deserialize
+    // and the link decode are the shared protocol-crate parsers.
+    let row: EnclaveChainRow = http
         .get(format!("{base}/enclaves/{}", tu.enclave_id))
         .send()
         .await
@@ -523,8 +528,6 @@ async fn verify_via_upgrade_chain(
         .json()
         .await
         .map_err(|e| fetch_err("upgrade chain", e))?;
-
-    let row = parse_enclave_row(&row)?;
 
     let mut links: Vec<RecordedLink> = Vec::with_capacity(wire.len());
     for w in &wire {
@@ -556,128 +559,4 @@ async fn verify_via_upgrade_chain(
     })?;
 
     Ok(())
-}
-
-/// The `validate_chain` context extracted from a `GET /enclaves/{id}`
-/// row. These values are corroborating, not load-bearing (a wrong value
-/// can only cause a false reject), so the extraction is deliberately
-/// tolerant of the row's exact JSON shape.
-struct EnclaveRow {
-    pcrs: PcrsHex,
-    image_digest: String,
-    control_public_key: Option<Vec<u8>>,
-    upgradable: bool,
-}
-
-fn parse_enclave_row(row: &serde_json::Value) -> Result<EnclaveRow, Error> {
-    let bad = |m: &str| Error::TrustUpgrades(format!("enclave row {m}"));
-
-    let upgradable = row
-        .get("upgradable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let image_digest = row
-        .get("image_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| bad("missing `image_digest`"))?
-        .to_string();
-
-    // The backend persists the builder's pcr.json verbatim (nitro-cli
-    // `PCR0` casing); tolerate lowercase too in case the row is ever
-    // normalized.
-    let pcrs_obj = row.get("pcrs").ok_or_else(|| bad("missing `pcrs`"))?;
-    let pcr = |upper: &str, lower: &str| -> Result<String, Error> {
-        pcrs_obj
-            .get(upper)
-            .or_else(|| pcrs_obj.get(lower))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| bad(&format!("pcrs missing `{upper}`")))
-    };
-    let pcrs = PcrsHex {
-        pcr0: pcr("PCR0", "pcr0")?,
-        pcr1: pcr("PCR1", "pcr1")?,
-        pcr2: pcr("PCR2", "pcr2")?,
-    };
-
-    // `control_public_key` is a BYTEA: the authenticated row serializes
-    // it as a JSON array of byte values; tolerate a base64 string and
-    // null (non-upgradable enclave) too.
-    let control_public_key = match row.get("control_public_key") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Array(arr)) => {
-            let mut bytes = Vec::with_capacity(arr.len());
-            for v in arr {
-                let n = v
-                    .as_u64()
-                    .filter(|n| *n <= 255)
-                    .ok_or_else(|| bad("control_public_key array element is not a byte"))?;
-                bytes.push(n as u8);
-            }
-            Some(bytes)
-        }
-        Some(serde_json::Value::String(s)) => {
-            use base64::Engine as _;
-            Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(s.as_bytes())
-                    .map_err(|e| bad(&format!("control_public_key base64: {e}")))?,
-            )
-        }
-        Some(_) => return Err(bad("control_public_key has an unexpected JSON shape")),
-    };
-
-    Ok(EnclaveRow {
-        pcrs,
-        image_digest,
-        control_public_key,
-        upgradable,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn parse_row_array_control_key_and_pcr_casing() {
-        let row = json!({
-            "upgradable": true,
-            "image_digest": "sha256:abc",
-            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
-            "control_public_key": [4, 255, 0, 7],
-        });
-        let parsed = parse_enclave_row(&row).unwrap();
-        assert!(parsed.upgradable);
-        assert_eq!(parsed.image_digest, "sha256:abc");
-        assert_eq!(parsed.pcrs.pcr0, "00");
-        assert_eq!(parsed.control_public_key, Some(vec![4u8, 255, 0, 7]));
-    }
-
-    #[test]
-    fn parse_row_null_control_key_is_non_upgradable() {
-        let row = json!({
-            "upgradable": false,
-            "image_digest": "sha256:abc",
-            "pcrs": { "pcr0": "00", "pcr1": "11", "pcr2": "22" },
-            "control_public_key": null,
-        });
-        let parsed = parse_enclave_row(&row).unwrap();
-        assert_eq!(parsed.control_public_key, None);
-        assert_eq!(parsed.pcrs.pcr1, "11");
-    }
-
-    #[test]
-    fn parse_row_missing_image_digest_errors() {
-        let row = json!({
-            "upgradable": true,
-            "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
-        });
-        assert!(matches!(
-            parse_enclave_row(&row),
-            Err(Error::TrustUpgrades(_))
-        ));
-    }
 }
