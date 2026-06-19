@@ -8,6 +8,8 @@ use url::Url;
 
 use crate::error::Error;
 use enclavia_protocol::attestation::{self, Pcrs};
+use enclavia_protocol::chain::{ChainLinkJson, EnclaveChainRow, RecordedLink};
+use uuid::Uuid;
 use crate::http::{self, Method};
 use crate::noise;
 use crate::request::RequestBuilder;
@@ -260,12 +262,24 @@ impl Client {
     }
 }
 
+/// Inputs the SDK needs to follow an enclave's upgrade chain when the
+/// live PCRs no longer match the pinned ones. See
+/// [`ClientBuilder::trust_upgrades`].
+#[derive(Clone)]
+struct TrustUpgrades {
+    /// Backend API base, e.g. `https://api.beta.enclavia.io`.
+    backend_url: String,
+    /// The enclave whose chain to walk.
+    enclave_id: Uuid,
+}
+
 /// Builder for configuring and establishing a [`Client`] connection.
 pub struct ClientBuilder {
     url: String,
     pcrs: Option<Pcrs>,
     debug_mode: bool,
     extra_headers: Vec<(String, String)>,
+    trust_upgrades: Option<TrustUpgrades>,
 }
 
 impl ClientBuilder {
@@ -275,6 +289,7 @@ impl ClientBuilder {
             pcrs: None,
             debug_mode: false,
             extra_headers: Vec::new(),
+            trust_upgrades: None,
         }
     }
 
@@ -290,6 +305,46 @@ impl ClientBuilder {
     /// a real COSE_Sign1 attestation document. Only the nonce match is verified.
     pub fn debug_mode(mut self, debug: bool) -> Self {
         self.debug_mode = debug;
+        self
+    }
+
+    /// Follow enclave upgrades instead of pinning a single immutable
+    /// version.
+    ///
+    /// By default the client trusts ONLY the exact PCRs passed to
+    /// [`ClientBuilder::pcrs`]: once the enclave is rebuilt or upgraded
+    /// to a new measured image, attestation no longer matches the pin
+    /// and the connection is refused. That is the right default for a
+    /// caller that wants to bind to one audited build.
+    ///
+    /// With `trust_upgrades` set, when the live attestation's PCRs differ
+    /// from the pinned ones the client fetches the enclave's public
+    /// upgrade chain from `backend_url` (`GET /enclaves/{id}` plus
+    /// `GET /enclaves/{id}/upgrade-chain`) and verifies that the running
+    /// version DESCENDS from the pinned version through a chain of
+    /// hardware-attested, control-key-signed upgrade links. Only if that
+    /// holds, and the live attestation matches the chain's verified tip,
+    /// is the connection allowed.
+    ///
+    /// The pinned PCRs remain the trust root. Soundness rests on each
+    /// link's AWS Nitro attestation, so a dishonest backend can at most
+    /// cause the connection to be refused, never make the client trust
+    /// an image that does not genuinely descend from the pinned one.
+    /// Enabling this without also calling [`ClientBuilder::pcrs`] is a
+    /// configuration error and fails the build.
+    ///
+    /// `backend_url` is the API base (e.g.
+    /// `https://api.beta.enclavia.io`); `enclave_id` is the enclave the
+    /// `wss://` endpoint routes to.
+    pub fn trust_upgrades(
+        mut self,
+        backend_url: impl Into<String>,
+        enclave_id: Uuid,
+    ) -> Self {
+        self.trust_upgrades = Some(TrustUpgrades {
+            backend_url: backend_url.into(),
+            enclave_id,
+        });
         self
     }
 
@@ -373,14 +428,36 @@ impl ClientBuilder {
             _ => return Err(Error::UnexpectedMessage),
         };
 
-        attestation::verify_against(
+        match attestation::verify_against(
             &attestation_data,
             &handshake_hash,
             &pcrs,
             self.debug_mode,
-        )
-        .map_err(|e| Error::Attestation(e.to_string()))?;
-        info!("Attestation verified");
+        ) {
+            Ok(()) => info!("Attestation verified (pinned PCRs match)"),
+            Err(pinned_err) => match &self.trust_upgrades {
+                // Pinned PCRs did not match, but the caller opted into
+                // following upgrades: try to verify the running enclave
+                // as a descendant of the pinned version.
+                Some(tu) => {
+                    if pcrs.pcr0.is_empty() && pcrs.pcr1.is_empty() && pcrs.pcr2.is_empty() {
+                        return Err(Error::TrustUpgrades(
+                            "trust_upgrades requires pinned PCRs (call .pcrs(..))".into(),
+                        ));
+                    }
+                    verify_via_upgrade_chain(
+                        &attestation_data,
+                        &handshake_hash,
+                        &pcrs,
+                        self.debug_mode,
+                        tu,
+                    )
+                    .await?;
+                    info!("Attestation verified (descends from pinned PCRs via upgrade chain)");
+                }
+                None => return Err(Error::Attestation(pinned_err.to_string())),
+            },
+        }
 
         // 4. Spawn background transport task
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -390,4 +467,96 @@ impl ClientBuilder {
             inner: Arc::new(ClientInner { cmd_tx, host }),
         })
     }
+}
+
+/// Verify a running enclave whose live PCRs differ from the pinned ones
+/// by walking its public upgrade chain (the SDK side of
+/// [`ClientBuilder::trust_upgrades`]).
+///
+/// Steps, in order, with the trust each one carries:
+///
+/// 1. Fetch the enclave row + chain from the backend over HTTPS. These
+///    bytes are UNTRUSTED: the row's `control_public_key` / image digest
+///    / PCRs and the chain links are corroborated below, never taken on
+///    faith.
+/// 2. [`enclavia_protocol::chain::verify_pcr_descent`] validates every
+///    link's Nitro attestation (load-bearing) and proves the pinned PCRs
+///    appear as an in-force state on the chain, returning the chain's
+///    verified TIP measurements.
+/// 3. Re-verify the LIVE attestation against exactly that tip. This is
+///    the step that binds the verified descendant version to THIS Noise
+///    session: without it the chain could belong to a different live
+///    enclave. It reuses the same pinned-identity verifier
+///    ([`attestation::verify_against`]) used for the original pin, so
+///    the session-nonce and (in production) the Nitro CA chain are
+///    checked on the live document too.
+async fn verify_via_upgrade_chain(
+    attestation_data: &[u8],
+    handshake_hash: &[u8],
+    pinned: &Pcrs,
+    debug_mode: bool,
+    tu: &TrustUpgrades,
+) -> Result<(), Error> {
+    let base = tu.backend_url.trim_end_matches('/');
+    let http = reqwest::Client::new();
+
+    let fetch_err = |what: &str, e: reqwest::Error| {
+        Error::TrustUpgrades(format!("fetching {what}: {e}"))
+    };
+
+    // The enclave row + chain are UNTRUSTED bytes: the row's
+    // control_public_key / digest / PCRs and the chain links are all
+    // corroborated below, never taken on faith (a wrong value can only
+    // make a genuine chain fail to verify). The typed row deserialize
+    // and the link decode are the shared protocol-crate parsers.
+    let row: EnclaveChainRow = http
+        .get(format!("{base}/enclaves/{}", tu.enclave_id))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| fetch_err("enclave row", e))?
+        .json()
+        .await
+        .map_err(|e| fetch_err("enclave row", e))?;
+
+    let wire: Vec<ChainLinkJson> = http
+        .get(format!("{base}/enclaves/{}/upgrade-chain", tu.enclave_id))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| fetch_err("upgrade chain", e))?
+        .json()
+        .await
+        .map_err(|e| fetch_err("upgrade chain", e))?;
+
+    let mut links: Vec<RecordedLink> = Vec::with_capacity(wire.len());
+    for w in &wire {
+        links.push(
+            w.into_recorded_link()
+                .map_err(|e| Error::TrustUpgrades(format!("decoding chain link: {e}")))?,
+        );
+    }
+
+    // Walk the chain rooted at the pinned PCRs; on success this is the
+    // measured version the live enclave must be running.
+    let tip = enclavia_protocol::chain::verify_pcr_descent(
+        pinned,
+        &links,
+        row.control_public_key.as_deref(),
+        &row.pcrs,
+        &row.image_digest,
+        row.upgradable,
+        chrono::Utc::now(),
+        debug_mode,
+    )
+    .map_err(|e| Error::TrustUpgrades(e.to_string()))?;
+
+    // Bind the verified descendant version to this live session.
+    attestation::verify_against(attestation_data, handshake_hash, &tip, debug_mode).map_err(|e| {
+        Error::TrustUpgrades(format!(
+            "running enclave does not match the verified chain tip: {e}"
+        ))
+    })?;
+
+    Ok(())
 }

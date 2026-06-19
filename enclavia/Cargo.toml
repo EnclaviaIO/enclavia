@@ -31,6 +31,12 @@ thiserror.workspace = true
 httparse.workspace = true
 url.workspace = true
 tracing.workspace = true
+uuid = { workspace = true }
+chrono = { workspace = true }
+# `trust_upgrades` fetches the enclave's public upgrade chain over HTTPS.
+# rustls (not native-tls) to match the WebSocket transport's TLS stack
+# and avoid pulling OpenSSL into the SDK.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 serde_json = { version = "1", optional = true }
 

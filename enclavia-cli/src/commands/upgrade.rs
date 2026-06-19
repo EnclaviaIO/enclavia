@@ -19,14 +19,14 @@
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
-    BootPayload, ChainLink, ChainLinkKind, PcrsHex, RecordedLink, RevocationPayload,
+    BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
     UpgradePayload, validate_chain,
 };
 pub use enclavia_protocol::staging::{StagedUpgradeJson, StagedUpgradeStatus};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::api::{ApiClient, ChainLinkJson};
+use crate::api::ApiClient;
 use crate::error::CliError;
 
 /// One chain link plus its decoded payload and local validation verdict.
@@ -110,45 +110,35 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
     let enclave = client.get_enclave(id).await?;
     let wire_links = client.get_enclave_chain(id).await?;
 
-    let upgradable = enclave
-        .get("upgradable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `mode` is CLI-specific (it picks the debug attestation path); the
+    // rest of the validator context is the shared, tolerant
+    // `EnclaveChainRow` parse used by every chain consumer.
     let debug_mode = debug_mode_from_enclave_row(&enclave);
-    let image_digest = enclave
-        .get("image_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            CliError::Other("enclave row missing `image_digest`".to_string())
-        })?
-        .to_string();
-    // The enclave row stores the builder's pcr.json verbatim, so the keys
-    // arrive in nitro-cli casing (`PCR0`); the extractor tolerates both
-    // casings rather than coupling to that detail.
-    let pcrs = pcrs_from_enclave_row(&enclave)?;
-
-    let control_public_key_bytes = control_key_bytes_from_enclave_row(&enclave)?;
-    let control_public_key_b64 = control_public_key_bytes
+    let row: EnclaveChainRow = serde_json::from_value(enclave)
+        .map_err(|e| CliError::Other(format!("enclave row: {e}")))?;
+    let control_public_key_b64 = row
+        .control_public_key
         .as_deref()
         .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
 
     let now = Utc::now();
     let mut links: Vec<RecordedLink> = Vec::with_capacity(wire_links.len());
     for wire in &wire_links {
-        links.push(RecordedLink {
-            link: wire_to_chain_link(wire)?,
-            // Ingest timestamp: time-dependent rules (revocations must
-            // precede their target's valid_from) are judged against the
-            // clock at ingest, not the walk's.
-            recorded_at: wire.created_at,
-        });
+        // into_recorded_link carries `created_at` as the ingest
+        // reference instant: time-dependent rules (revocations must
+        // precede their target's valid_from) are judged against the
+        // clock at ingest, not the walk's.
+        links.push(
+            wire.into_recorded_link()
+                .map_err(|e| CliError::Other(format!("decoding chain link: {e}")))?,
+        );
     }
     let walk = validate_chain(
         &links,
-        &pcrs,
-        &image_digest,
-        control_public_key_bytes.as_deref(),
-        upgradable,
+        &row.pcrs,
+        &row.image_digest,
+        row.control_public_key.as_deref(),
+        row.upgradable,
         now,
         debug_mode,
     );
@@ -182,9 +172,9 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
 
     Ok(ChainSummary {
         enclave_id: id.to_string(),
-        upgradable,
-        image_digest,
-        pcrs,
+        upgradable: row.upgradable,
+        image_digest: row.image_digest,
+        pcrs: row.pcrs,
         control_public_key: control_public_key_b64,
         debug_mode,
         tip_matches_row: walk.tip_matches_row,
@@ -200,97 +190,6 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
 /// against the AWS Nitro CA chain.
 fn debug_mode_from_enclave_row(enclave: &serde_json::Value) -> bool {
     enclave.get("mode").and_then(|v| v.as_str()) == Some("debug")
-}
-
-fn pcrs_from_enclave_row(enclave: &serde_json::Value) -> Result<PcrsHex, CliError> {
-    let pcrs_obj = enclave.get("pcrs").ok_or_else(|| {
-        CliError::Other("enclave row missing `pcrs`".to_string())
-    })?;
-    // The backend persists the builder's pcr.json verbatim, which uses the
-    // nitro-cli `PCR0`/`PCR1`/`PCR2` casing. Accept lowercase as well so a
-    // future normalization on the row can't break the walker.
-    let field = |upper: &str, lower: &str| -> Result<String, CliError> {
-        pcrs_obj
-            .get(upper)
-            .or_else(|| pcrs_obj.get(lower))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| CliError::Other(format!("enclave.pcrs missing `{upper}`")))
-    };
-    Ok(PcrsHex {
-        pcr0: field("PCR0", "pcr0")?,
-        pcr1: field("PCR1", "pcr1")?,
-        pcr2: field("PCR2", "pcr2")?,
-    })
-}
-
-/// Extract the control public key bytes from the enclave row.
-///
-/// The column is a BYTEA, so the authenticated row serializes it as a JSON
-/// array of numbers; tolerate a base64 string too in case the row shape is
-/// ever normalized. `None`/`null` means the enclave is non-upgradable.
-fn control_key_bytes_from_enclave_row(
-    enclave: &serde_json::Value,
-) -> Result<Option<Vec<u8>>, CliError> {
-    match enclave.get("control_public_key") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => base64::engine::general_purpose::STANDARD
-            .decode(s.as_bytes())
-            .map(Some)
-            .map_err(|e| CliError::Other(format!("control_public_key base64 decode: {e}"))),
-        Some(serde_json::Value::Array(arr)) => {
-            let mut bytes = Vec::with_capacity(arr.len());
-            for v in arr {
-                let n = v.as_u64().filter(|n| *n <= 255).ok_or_else(|| {
-                    CliError::Other(
-                        "control_public_key array element is not a byte".to_string(),
-                    )
-                })?;
-                bytes.push(n as u8);
-            }
-            Ok(Some(bytes))
-        }
-        Some(other) => Err(CliError::Other(format!(
-            "control_public_key has unexpected JSON shape: {other}"
-        ))),
-    }
-}
-
-fn wire_to_chain_link(w: &ChainLinkJson) -> Result<ChainLink, CliError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let payload = b64
-        .decode(w.payload.as_bytes())
-        .map_err(|e| CliError::Other(format!("payload base64: {e}")))?;
-    let attestation = b64
-        .decode(w.attestation.as_bytes())
-        .map_err(|e| CliError::Other(format!("attestation base64: {e}")))?;
-    let signature = match w.signature.as_deref() {
-        Some(s) => Some(
-            b64.decode(s.as_bytes())
-                .map_err(|e| CliError::Other(format!("signature base64: {e}")))?,
-        ),
-        None => None,
-    };
-    Ok(ChainLink {
-        id: w.id,
-        // ChainLinkJson stores `sequence` as `i64` matching the
-        // backend's serde shape; the validator-facing struct uses
-        // `u64`. The backend never persists a negative value, but
-        // surface a hard error instead of silently `as u64`-ing if a
-        // misbehaving backend ever returns one.
-        sequence: w
-            .sequence
-            .map(|s| {
-                u64::try_from(s).map_err(|_| {
-                    CliError::Other(format!("negative sequence {s} from backend"))
-                })
-            })
-            .transpose()?,
-        kind: w.kind,
-        payload,
-        attestation,
-        signature,
-    })
 }
 
 fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> {
@@ -374,78 +273,6 @@ mod tests {
     }
 
     #[test]
-    fn wire_to_chain_link_round_trips_boot() {
-        let payload = boot_payload_fixture();
-        let payload_bytes = cbor(&payload);
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let wire = ChainLinkJson {
-            id: Some(Uuid::nil()),
-            kind: ChainLinkKind::Boot,
-            sequence: Some(0),
-            payload: b64.encode(&payload_bytes),
-            attestation: b64.encode(b"fake-att"),
-            signature: None,
-            created_at: None,
-        };
-
-        let link = wire_to_chain_link(&wire).unwrap();
-        assert_eq!(link.id, Some(Uuid::nil()));
-        assert_eq!(link.sequence, Some(0));
-        assert_eq!(link.kind, ChainLinkKind::Boot);
-        assert_eq!(link.payload, payload_bytes);
-        assert_eq!(link.attestation, b"fake-att");
-        assert!(link.signature.is_none());
-    }
-
-    #[test]
-    fn wire_to_chain_link_decodes_signature_when_present() {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let sig = vec![0xaa; 64];
-        let wire = ChainLinkJson {
-            id: None,
-            kind: ChainLinkKind::Upgrade,
-            sequence: Some(1),
-            payload: b64.encode([0xa0]),
-            attestation: b64.encode([0]),
-            signature: Some(b64.encode(&sig)),
-            created_at: None,
-        };
-        let link = wire_to_chain_link(&wire).unwrap();
-        assert_eq!(link.signature.as_deref(), Some(sig.as_slice()));
-    }
-
-    #[test]
-    fn wire_to_chain_link_rejects_negative_sequence() {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let wire = ChainLinkJson {
-            id: None,
-            kind: ChainLinkKind::Boot,
-            sequence: Some(-1),
-            payload: b64.encode([0xa0]),
-            attestation: b64.encode([0]),
-            signature: None,
-            created_at: None,
-        };
-        let err = wire_to_chain_link(&wire).unwrap_err().to_string();
-        assert!(err.contains("negative sequence"), "{err}");
-    }
-
-    #[test]
-    fn wire_to_chain_link_rejects_invalid_base64() {
-        let wire = ChainLinkJson {
-            id: None,
-            kind: ChainLinkKind::Boot,
-            sequence: Some(0),
-            payload: "not!base64!!".to_string(),
-            attestation: "AAAA".to_string(),
-            signature: None,
-            created_at: None,
-        };
-        let err = wire_to_chain_link(&wire).unwrap_err().to_string();
-        assert!(err.contains("payload base64"), "{err}");
-    }
-
-    #[test]
     fn decode_payload_round_trips_boot() {
         let payload = boot_payload_fixture();
         let bytes = cbor(&payload);
@@ -512,95 +339,10 @@ mod tests {
         assert!(decoded.is_none());
     }
 
-    #[test]
-    fn pcrs_from_enclave_row_extracts_three() {
-        let enclave = serde_json::json!({
-            "pcrs": {
-                "pcr0": "aa".repeat(48),
-                "pcr1": "bb".repeat(48),
-                "pcr2": "cc".repeat(48),
-            }
-        });
-        let pcrs = pcrs_from_enclave_row(&enclave).unwrap();
-        assert_eq!(pcrs.pcr0, "aa".repeat(48));
-        assert_eq!(pcrs.pcr1, "bb".repeat(48));
-        assert_eq!(pcrs.pcr2, "cc".repeat(48));
-    }
-
-    /// The shape the backend actually serves: the row stores the builder's
-    /// pcr.json verbatim, so keys arrive in nitro-cli casing.
-    #[test]
-    fn pcrs_from_enclave_row_accepts_nitro_cli_casing() {
-        let enclave = serde_json::json!({
-            "pcrs": {
-                "PCR0": "aa".repeat(48),
-                "PCR1": "bb".repeat(48),
-                "PCR2": "cc".repeat(48),
-            }
-        });
-        let pcrs = pcrs_from_enclave_row(&enclave).unwrap();
-        assert_eq!(pcrs.pcr0, "aa".repeat(48));
-        assert_eq!(pcrs.pcr1, "bb".repeat(48));
-        assert_eq!(pcrs.pcr2, "cc".repeat(48));
-    }
-
-    #[test]
-    fn pcrs_from_enclave_row_errors_on_missing_field() {
-        let enclave = serde_json::json!({
-            "pcrs": {
-                "pcr0": "aa",
-                "pcr1": "bb",
-            }
-        });
-        let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
-        assert!(err.contains("PCR2"), "{err}");
-    }
-
-    #[test]
-    fn pcrs_from_enclave_row_errors_when_pcrs_absent() {
-        let enclave = serde_json::json!({});
-        let err = pcrs_from_enclave_row(&enclave).unwrap_err().to_string();
-        assert!(err.contains("pcrs"), "{err}");
-    }
-
-    /// `control_public_key` is a BYTEA on the row, so the authenticated
-    /// endpoint serializes it as a JSON array of numbers.
-    #[test]
-    fn control_key_from_enclave_row_accepts_byte_array() {
-        let enclave = serde_json::json!({ "control_public_key": [4, 100, 255, 0] });
-        let bytes = control_key_bytes_from_enclave_row(&enclave).unwrap();
-        assert_eq!(bytes, Some(vec![4u8, 100, 255, 0]));
-    }
-
-    #[test]
-    fn control_key_from_enclave_row_accepts_base64_string() {
-        let enclave = serde_json::json!({ "control_public_key": "BGT/AA==" });
-        let bytes = control_key_bytes_from_enclave_row(&enclave).unwrap();
-        assert_eq!(bytes, Some(vec![4u8, 100, 255, 0]));
-    }
-
-    #[test]
-    fn control_key_from_enclave_row_none_when_null_or_absent() {
-        let null_row = serde_json::json!({ "control_public_key": null });
-        assert_eq!(control_key_bytes_from_enclave_row(&null_row).unwrap(), None);
-        let absent_row = serde_json::json!({});
-        assert_eq!(
-            control_key_bytes_from_enclave_row(&absent_row).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn control_key_from_enclave_row_rejects_out_of_range() {
-        let enclave = serde_json::json!({ "control_public_key": [4, 256] });
-        let err = control_key_bytes_from_enclave_row(&enclave)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a byte"), "{err}");
-    }
-
     /// The chain walker mirrors the backend's ingest-time `debug_mode`
-    /// flag, read off the enclave row's `mode` field.
+    /// flag, read off the enclave row's `mode` field. (The rest of the
+    /// row context is parsed by the shared `EnclaveChainRow`, tested in
+    /// `enclavia-protocol`.)
     #[test]
     fn debug_mode_from_enclave_row_matches_mode_field() {
         let debug_row = serde_json::json!({ "mode": "debug" });
