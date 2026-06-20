@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod chain;
 #[cfg(feature = "async-transport")]
 pub mod egress;
+pub mod kms_recipient;
 #[cfg(feature = "async-transport")]
 pub mod mesh;
 mod noise;

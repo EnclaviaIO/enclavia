@@ -56,6 +56,17 @@ libc = "0.2"
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 rand = "0.8"
+# KMS phase 2 (#198): the in-enclave Decrypt asks KMS to return the
+# plaintext as a CMS `CiphertextForRecipient` envelope (RSA-OAEP-wrapped
+# AES-256-CBC), encrypted to the enclave's attested ephemeral key, so the
+# parent proxying the call never sees the passphrase. `cms` parses/builds
+# the RFC 5652 EnvelopedData; aes/cbc do the content layer.
+cms = "0.2"
+aes = "0.8"
+cbc = { version = "0.1", features = ["std", "block-padding"] }
+der = "0.7"
+spki = "0.7"
+x509-cert = "0.2"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 # ECDSA over NIST P-256. The upgrade control channel (#47) carries
 # its 65-byte uncompressed SEC1 verifying key in the attestation
