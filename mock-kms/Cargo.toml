@@ -21,6 +21,13 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 uuid = { workspace = true }
+# KMS phase 2 (#198): the `Recipient` Decrypt mode. We read the ephemeral
+# pubkey out of the request's attestation document (decode only — the mock
+# does not verify the signature) and wrap the plaintext with
+# `kms_recipient::encode`, so the QEMU e2e drives the same in-enclave path
+# as real KMS.
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+attestation-doc-validation = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

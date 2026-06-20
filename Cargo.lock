@@ -1180,9 +1180,11 @@ dependencies = [
 name = "enclavia-crypto"
 version = "0.1.0"
 dependencies = [
+ "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "bytes 1.11.1",
  "clap",
+ "enclavia-protocol",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2254,8 +2256,10 @@ dependencies = [
 name = "mock-kms"
 version = "0.1.0"
 dependencies = [
+ "attestation-doc-validation",
  "base64 0.22.1",
  "bytes 1.11.1",
+ "enclavia-protocol",
  "http-body-util",
  "hyper",
  "hyper-util",
