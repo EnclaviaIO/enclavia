@@ -28,6 +28,16 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 
+# In-enclave TLS + SigV4 to real AWS KMS (production path). The host's vsock
+# peer is a raw TCP relay; the enclave validates the KMS cert chain
+# (webpki-roots, compiled in = PCR-measured) and SigV4-signs requests with
+# hmac/sha2. See `sigv4.rs` and `kms_call` / `tls_connect` in main.rs.
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+hmac.workspace = true
+hex.workspace = true
+chrono.workspace = true
+
 clap.workspace = true
 
 tokio-vsock = { workspace = true }

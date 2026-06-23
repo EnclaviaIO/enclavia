@@ -2,7 +2,15 @@
 //!
 //! Talks to:
 //! - storage-host meta port (key blob GET/PUT) — vsock 5002
-//! - KMS proxy (HTTP) — vsock 5003
+//! - KMS over vsock 5003. Two transports, picked from the environment:
+//!   * **mock** (default, dev/QEMU): plaintext HTTP straight to `mock-kms`.
+//!   * **AWS** (set `KMS_AWS_REGION`): the vsock peer is a raw TCP relay
+//!     (`vsock-proxy`) to `kms.<region>.amazonaws.com:443`; the enclave
+//!     terminates TLS itself (validating the Amazon cert chain compiled
+//!     into this binary, so it is PCR-measured) and SigV4-signs each call
+//!     with credentials from the environment. The host therefore sees only
+//!     TLS ciphertext and cannot forge KMS responses — which is what makes
+//!     the boot-time key-policy / Origin checks load-bearing.
 //!
 //! Subcommands:
 //! - `init`: bootstrap or recover the LUKS passphrase, write 32 raw bytes
@@ -12,6 +20,7 @@
 //!   backend during an enclave version upgrade.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -26,8 +35,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 
+mod sigv4;
+
 const BLOB_VERSION: u32 = 1;
 const PASSPHRASE_BYTES: usize = 32;
+const KMS_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
 /// Path where `prepare-upgrade` writes rollback state so `revoke-upgrade`
 /// can undo the LUKS change. Lives in tmpfs so it is automatically cleaned up
@@ -932,9 +944,95 @@ async fn kms_schedule_deletion(key_id: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Any tokio duplex stream, boxed so the plaintext (`VsockStream`) and TLS
+/// (`TlsStream<VsockStream>`) transports share one `kms_call` body.
+trait TokioIoStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TokioIoStream for T {}
+
+/// How the enclave reaches KMS, decided once from the environment.
+enum KmsTransport {
+    /// Dev/QEMU: plaintext HTTP straight to `mock-kms` over vsock.
+    Mock,
+    /// Production: TLS + SigV4 to real AWS KMS. The vsock peer is a raw TCP
+    /// relay (`vsock-proxy`) to `kms.<region>.amazonaws.com:443`; the enclave
+    /// terminates TLS itself, so the host cannot read or forge the exchange.
+    Aws {
+        region: String,
+        host: String,
+        creds: sigv4::Credentials,
+    },
+}
+
+/// Select the KMS transport from the environment. `KMS_AWS_REGION` set (and
+/// non-empty) selects real AWS KMS (TLS + SigV4), and then the standard
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional
+/// `AWS_SESSION_TOKEN`) credentials are required; otherwise the dev/QEMU
+/// plaintext-to-mock path is used.
+fn kms_transport() -> Result<KmsTransport, Box<dyn std::error::Error>> {
+    match std::env::var("KMS_AWS_REGION") {
+        Ok(region) if !region.trim().is_empty() => {
+            let region = region.trim().to_string();
+            let host = format!("kms.{region}.amazonaws.com");
+            let creds = sigv4::Credentials {
+                access_key_id: std::env::var("AWS_ACCESS_KEY_ID")
+                    .map_err(|_| "AWS_ACCESS_KEY_ID required when KMS_AWS_REGION is set")?,
+                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .map_err(|_| "AWS_SECRET_ACCESS_KEY required when KMS_AWS_REGION is set")?,
+                session_token: std::env::var("AWS_SESSION_TOKEN").ok().filter(|s| !s.is_empty()),
+            };
+            Ok(KmsTransport::Aws { region, host, creds })
+        }
+        _ => Ok(KmsTransport::Mock),
+    }
+}
+
+fn kms_vsock_port() -> Result<u32, Box<dyn std::error::Error>> {
+    Ok(std::env::var("KMS_VSOCK_PORT")
+        .unwrap_or_else(|_| "5003".into())
+        .parse()?)
+}
+
+/// Current UTC time as the SigV4 `(amz_date, date_stamp)` pair.
+fn amz_timestamps() -> (String, String) {
+    let now = chrono::Utc::now();
+    (
+        now.format("%Y%m%dT%H%M%SZ").to_string(),
+        now.format("%Y%m%d").to_string(),
+    )
+}
+
 async fn kms_call(target: &str, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let stream = kms_connect().await?;
-    let io = TokioIo::new(stream);
+    let transport = kms_transport()?;
+    let stream = tokio_vsock::VsockStream::connect(2, kms_vsock_port()?).await?;
+
+    // TLS-wrap (AWS) or pass through (mock), and compute the signing headers.
+    let (io, host_header, signed): (Box<dyn TokioIoStream>, String, Option<sigv4::SignedHeaders>) =
+        match &transport {
+            KmsTransport::Mock => (Box::new(stream), "kms.local".to_string(), None),
+            KmsTransport::Aws {
+                region,
+                host,
+                creds,
+            } => {
+                let tls = tls_connect(stream, host).await?;
+                let (amz_date, date_stamp) = amz_timestamps();
+                let headers = [
+                    sigv4::Header {
+                        name: "content-type",
+                        value: KMS_CONTENT_TYPE,
+                    },
+                    sigv4::Header {
+                        name: "x-amz-target",
+                        value: target,
+                    },
+                ];
+                let s =
+                    sigv4::sign_post(creds, region, "kms", host, &amz_date, &date_stamp, &headers, &body);
+                (Box::new(tls), host.clone(), Some(s))
+            }
+        };
+
+    let io = TokioIo::new(io);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -942,29 +1040,54 @@ async fn kms_call(target: &str, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::e
         }
     });
 
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", "kms.local")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", target)
-        .body(Full::new(Bytes::from(body)))?;
+        .header("host", host_header)
+        .header("content-type", KMS_CONTENT_TYPE)
+        .header("x-amz-target", target);
+    if let Some(s) = signed {
+        builder = builder
+            .header("x-amz-date", s.amz_date)
+            .header("authorization", s.authorization);
+        if let Some(tok) = s.security_token {
+            builder = builder.header("x-amz-security-token", tok);
+        }
+    }
+    let req = builder.body(Full::new(Bytes::from(body)))?;
 
     let resp = sender.send_request(req).await?;
     let status = resp.status();
-    let body = resp.into_body().collect().await?.to_bytes().to_vec();
+    let resp_body = resp.into_body().collect().await?.to_bytes().to_vec();
     if !status.is_success() {
-        let msg = String::from_utf8_lossy(&body);
+        let msg = String::from_utf8_lossy(&resp_body);
         return Err(format!("KMS {target} returned {status}: {msg}").into());
     }
-    Ok(body)
+    Ok(resp_body)
 }
 
-async fn kms_connect() -> Result<tokio_vsock::VsockStream, Box<dyn std::error::Error>> {
-    let port: u32 = std::env::var("KMS_VSOCK_PORT")
-        .unwrap_or_else(|_| "5003".into())
-        .parse()?;
-    Ok(tokio_vsock::VsockStream::connect(2, port).await?)
+/// TLS-wrap a raw stream to AWS KMS, validating the server certificate
+/// against the Amazon (Mozilla `webpki-roots`) trust anchors compiled into
+/// this binary (hence PCR-measured). Pinned to the `ring` provider so the
+/// EIF builds without a C toolchain.
+async fn tls_connect(
+    stream: tokio_vsock::VsockStream,
+    host: &str,
+) -> Result<tokio_rustls::client::TlsStream<tokio_vsock::VsockStream>, Box<dyn std::error::Error>> {
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())?;
+    Ok(connector.connect(server_name, stream).await?)
 }
 
 #[cfg(test)]
