@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 
-mod sigv4;
+use enclavia_crypto::{kms_tls_config, sigv4};
 
 const BLOB_VERSION: u32 = 1;
 const PASSPHRASE_BYTES: usize = 32;
@@ -1075,17 +1075,8 @@ async fn tls_connect(
     host: &str,
 ) -> Result<tokio_rustls::client::TlsStream<tokio_vsock::VsockStream>, Box<dyn std::error::Error>> {
     use tokio_rustls::TlsConnector;
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        tokio_rustls::rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = TlsConnector::from(Arc::new(kms_tls_config()));
     let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())?;
     Ok(connector.connect(server_name, stream).await?)
 }

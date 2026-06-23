@@ -51,6 +51,10 @@ aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 # skip the async-transport (tokio/tracing) modules we don't use.
 enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
 
+[lib]
+name = "enclavia_crypto"
+path = "src/lib.rs"
+
 [[bin]]
 name = "enclavia-crypto"
 path = "src/main.rs"
