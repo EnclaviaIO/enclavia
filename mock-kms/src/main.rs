@@ -466,7 +466,16 @@ struct GetKeyPolicyResp {
 /// nonexistent key's policy is a NotFound, matching AWS.
 async fn handle_get_key_policy(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
     let req: GetKeyPolicyReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
-    let stored = load_key(&state.key_dir, &req.key_id).await?;
+    // Auto-create like GetPublicKey: the in-enclave boot check calls
+    // GetKeyPolicy / DescribeKey BEFORE GetPublicKey, so on first boot the
+    // key does not exist yet against an unseeded mock. (Real KMS keys are
+    // always pre-minted by the backend, so this only affects the dev
+    // auto-create path; without it, first boot fails with NotFound.)
+    let stored = if state.auto_create_keys {
+        load_or_create_key(&state.key_dir, &req.key_id).await?
+    } else {
+        load_key(&state.key_dir, &req.key_id).await?
+    };
     let policy = stored
         .policy
         .unwrap_or_else(|| r#"{"Version":"2012-10-17","Statement":[]}"#.to_string());
@@ -509,7 +518,13 @@ struct DescribeKeyMetadata {
 /// generated in-process, never imported).
 async fn handle_describe_key(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
     let req: DescribeKeyReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
-    let stored = load_key(&state.key_dir, &req.key_id).await?;
+    // Auto-create like GetPublicKey (see handle_get_key_policy): the boot
+    // check calls DescribeKey first, before the key exists on first boot.
+    let stored = if state.auto_create_keys {
+        load_or_create_key(&state.key_dir, &req.key_id).await?
+    } else {
+        load_key(&state.key_dir, &req.key_id).await?
+    };
     let resp = DescribeKeyResp {
         key_metadata: DescribeKeyMetadata {
             arn: format!("arn:aws:kms:us-east-1:000000000000:key/{}", stored.key_id),
