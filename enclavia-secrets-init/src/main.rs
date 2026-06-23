@@ -44,13 +44,20 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 
-/// Vsock CID of the host: `VMADDR_CID_HOST = 2` per the Linux vsock
-/// contract (`<linux/vm_sockets.h>`). Works on both real Nitro (CID 2
-/// is the parent EC2 instance) and QEMU debug mode
-/// (`vhost-device-vsock` translates host-side connections to its UDS
-/// at `<proxy>_5004`). One binary, one transport, no debug/enclave
-/// feature split, per the in-enclave crate convention in CLAUDE.md.
-const VSOCK_HOST_CID: u32 = 2;
+/// Vsock CID of the host this enclave talks to.
+///
+/// On real AWS Nitro the parent EC2 instance is always
+/// `VMADDR_CID_PARENT` == 3; under QEMU + vhost-device-vsock the host
+/// bridge answers on `VMADDR_CID_HOST` == 2 (`<proxy>_5004`), where the
+/// EIF init exports `VSOCK_HOST_CID=2`. Default 3 keeps production
+/// correct with a single binary, no debug/enclave split (see the
+/// in-enclave crate convention in CLAUDE.md).
+fn host_cid() -> u32 {
+    std::env::var("VSOCK_HOST_CID")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(3)
+}
 
 /// Port the host-side `enclavia-secrets-host` daemon listens on (#169).
 const SECRETS_HOST_PORT: u32 = 5004;
@@ -147,9 +154,10 @@ fn parse_argv() -> Result<PathBuf, String> {
 /// as a missing daemon.
 async fn fetch_secrets()
 -> Result<BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let cid = host_cid();
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(VSOCK_HOST_CID, SECRETS_HOST_PORT),
+        tokio_vsock::VsockStream::connect(cid, SECRETS_HOST_PORT),
     )
     .await
     {
@@ -157,7 +165,7 @@ async fn fetch_secrets()
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(_) => {
             return Err(format!(
-                "vsock {VSOCK_HOST_CID}:{SECRETS_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
+                "vsock {cid}:{SECRETS_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
             )
             .into());
         }
