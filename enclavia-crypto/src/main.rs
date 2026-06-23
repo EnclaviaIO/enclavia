@@ -758,6 +758,26 @@ struct GetKeyPolicyResp {
     policy: String,
 }
 
+#[derive(Debug, Serialize)]
+struct DescribeKeyReq<'a> {
+    #[serde(rename = "KeyId")]
+    key_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeKeyResp {
+    #[serde(rename = "KeyMetadata")]
+    key_metadata: KeyMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyMetadata {
+    // "AWS_KMS" for KMS-generated keys, "EXTERNAL" for imported (BYOK)
+    // material, "AWS_CLOUDHSM" / "EXTERNAL_KEY_STORE" for custom stores.
+    #[serde(rename = "Origin")]
+    origin: String,
+}
+
 async fn kms_get_public_key(key_id: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let body = serde_json::to_vec(&GetPublicKeyReq { key_id })?;
     let resp = kms_call("TrentService.GetPublicKey", body).await?;
@@ -776,12 +796,41 @@ async fn kms_get_key_policy(key_id: &str) -> Result<String, Box<dyn std::error::
     Ok(parsed.policy)
 }
 
-/// Verify the KMS key's policy is safe before we trust the key (see the
-/// call site in `init`). Fetches the policy with `kms:GetKeyPolicy`, reads
-/// this enclave's own PCR0/1/2 from a fresh NSM attestation, and runs both
-/// through `enclavia_protocol::kms_policy::verify_decrypt_policy`. Any
-/// failure is fatal — the caller refuses to boot.
+/// Fetch the key's `Origin` via `kms:DescribeKey`.
+async fn kms_key_origin(key_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(&DescribeKeyReq { key_id })?;
+    let resp = kms_call("TrentService.DescribeKey", body).await?;
+    let parsed: DescribeKeyResp = serde_json::from_slice(&resp)?;
+    Ok(parsed.key_metadata.origin)
+}
+
+/// Verify the KMS key is safe to trust before we seal under it / rely on
+/// it (see the call site in `init`). Two checks, both fatal (refuse to
+/// boot on failure):
+///
+/// 1. **Origin must be `AWS_KMS`** (`kms:DescribeKey`). A key with imported
+///    material (`EXTERNAL`) or a custom key store means someone holds the
+///    private key out-of-band and could decrypt our sealed passphrase
+///    offline, regardless of how tight the policy looks. So even a hostile
+///    host that swaps the bootstrap blob's `key_id` to a key it created
+///    cannot point us at a BYOK key.
+/// 2. **Policy gates Decrypt to our own PCR0/1/2** (`kms:GetKeyPolicy` +
+///    `enclavia_protocol::kms_policy::verify_decrypt_policy`), and grants no
+///    principal a way to loosen that gate.
+///
+/// Both checks are only as trustworthy as the channel to KMS: see the
+/// authenticated-transport note on `kms_call`.
 async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let origin = kms_key_origin(key_id).await?;
+    if origin != "AWS_KMS" {
+        return Err(format!(
+            "KMS key {key_id} has Origin={origin}, refusing to boot: only KMS-generated \
+             (non-exportable) keys are trusted; imported/external material could be held \
+             out-of-band and decrypt our sealed passphrase."
+        )
+        .into());
+    }
+
     let policy = kms_get_key_policy(key_id).await?;
     let own = own_pcrs()?;
     enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, &own).map_err(|e| {
@@ -791,7 +840,7 @@ async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error
              grant no principal a way to loosen it."
         )
     })?;
-    info!(key_id, "KMS key policy verified against own attestation");
+    info!(key_id, "KMS key origin and policy verified against own attestation");
     Ok(())
 }
 

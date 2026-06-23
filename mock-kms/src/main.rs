@@ -1,9 +1,10 @@
 //! Lightweight mock of AWS KMS for local testing.
 //!
-//! Implements five operations matching the real KMS JSON-RPC API:
+//! Implements six operations matching the real KMS JSON-RPC API:
 //! - `TrentService.CreateKey`
 //! - `TrentService.GetPublicKey`
 //! - `TrentService.GetKeyPolicy`
+//! - `TrentService.DescribeKey`
 //! - `TrentService.Decrypt`
 //! - `TrentService.ScheduleKeyDeletion`
 //!
@@ -226,6 +227,7 @@ async fn handle(
         "TrentService.CreateKey" => handle_create_key(&state, &body).await,
         "TrentService.GetPublicKey" => handle_get_public_key(&state, &body).await,
         "TrentService.GetKeyPolicy" => handle_get_key_policy(&state, &body).await,
+        "TrentService.DescribeKey" => handle_describe_key(&state, &body).await,
         "TrentService.Decrypt" => handle_decrypt(&state, &body).await,
         "TrentService.ScheduleKeyDeletion" => handle_schedule_deletion(&state, &body).await,
         other => Err(KmsError::UnsupportedOperation(other.to_string())),
@@ -469,6 +471,56 @@ async fn handle_get_key_policy(state: &AppState, body: &[u8]) -> Result<serde_js
         .policy
         .unwrap_or_else(|| r#"{"Version":"2012-10-17","Statement":[]}"#.to_string());
     Ok(serde_json::to_value(GetKeyPolicyResp { policy }).unwrap())
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeKeyReq {
+    #[serde(rename = "KeyId")]
+    key_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeKeyResp {
+    #[serde(rename = "KeyMetadata")]
+    key_metadata: DescribeKeyMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeKeyMetadata {
+    #[serde(rename = "KeyId")]
+    key_id: String,
+    #[serde(rename = "Arn")]
+    arn: String,
+    // Mock keys are always KMS-generated (RSA keypair minted in-process,
+    // never imported), so Origin is AWS_KMS — which is exactly what the
+    // in-enclave boot check requires to rule out BYOK/imported material.
+    #[serde(rename = "Origin")]
+    origin: &'static str,
+    #[serde(rename = "KeySpec")]
+    key_spec: &'static str,
+    #[serde(rename = "KeyUsage")]
+    key_usage: &'static str,
+    #[serde(rename = "Enabled")]
+    enabled: bool,
+}
+
+/// `DescribeKey`: report key metadata. The only field the in-enclave check
+/// reads is `Origin`, which is always `AWS_KMS` for mock keys (they are
+/// generated in-process, never imported).
+async fn handle_describe_key(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
+    let req: DescribeKeyReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
+    let stored = load_key(&state.key_dir, &req.key_id).await?;
+    let resp = DescribeKeyResp {
+        key_metadata: DescribeKeyMetadata {
+            arn: format!("arn:aws:kms:us-east-1:000000000000:key/{}", stored.key_id),
+            key_id: stored.key_id,
+            origin: "AWS_KMS",
+            key_spec: "RSA_2048",
+            key_usage: "ENCRYPT_DECRYPT",
+            enabled: stored.deletion_date.is_none(),
+        },
+    };
+    Ok(serde_json::to_value(resp).unwrap())
 }
 
 #[derive(Debug, Deserialize)]
@@ -871,6 +923,18 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "GetKeyPolicy body: {resp}");
         assert_eq!(resp["Policy"].as_str().unwrap(), policy);
+
+        // DescribeKey must report Origin=AWS_KMS so the in-enclave check
+        // accepts the key as KMS-generated (not imported/BYOK).
+        let (status, resp) = rpc(
+            &socket,
+            "TrentService.DescribeKey",
+            serde_json::json!({ "KeyId": key_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "DescribeKey body: {resp}");
+        assert_eq!(resp["KeyMetadata"]["Origin"], "AWS_KMS");
+        assert_eq!(resp["KeyMetadata"]["KeyId"], key_id);
 
         // GetPublicKey on the freshly-created key must succeed *without*
         // auto-create (we disabled it in spawn_mock_kms).
