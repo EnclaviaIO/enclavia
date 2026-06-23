@@ -259,6 +259,14 @@ async fn init() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("unsupported blob version: {}", blob.version).into());
         }
 
+        // Before we either seal the passphrase under this key (first boot)
+        // or rely on it to recover the passphrase (every later boot), prove
+        // the key's policy gates Decrypt to OUR attestation and grants no
+        // one a way to loosen that gate. A buggy or hostile backend must
+        // not be able to mint a key whose plaintext the account can read.
+        // Fail-closed: a bad (or unreadable) policy refuses the boot.
+        verify_key_policy(&blob.kms_key_id).await?;
+
         match blob.ciphertext.clone() {
             None => {
                 info!(key_id = %blob.kms_key_id, "first boot — generating passphrase");
@@ -733,11 +741,66 @@ struct ScheduleDeletionReq<'a> {
     pending_window_in_days: u32,
 }
 
+#[derive(Debug, Serialize)]
+struct GetKeyPolicyReq<'a> {
+    #[serde(rename = "KeyId")]
+    key_id: &'a str,
+    // KMS keys created by us have the single default policy. Naming it
+    // explicitly keeps the request unambiguous across KMS versions.
+    #[serde(rename = "PolicyName")]
+    policy_name: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetKeyPolicyResp {
+    // The policy is returned as a stringified JSON document.
+    #[serde(rename = "Policy")]
+    policy: String,
+}
+
 async fn kms_get_public_key(key_id: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let body = serde_json::to_vec(&GetPublicKeyReq { key_id })?;
     let resp = kms_call("TrentService.GetPublicKey", body).await?;
     let parsed: GetPublicKeyResp = serde_json::from_slice(&resp)?;
     Ok(B64.decode(parsed.public_key.as_bytes())?)
+}
+
+/// Fetch the stringified key policy via `kms:GetKeyPolicy`.
+async fn kms_get_key_policy(key_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(&GetKeyPolicyReq {
+        key_id,
+        policy_name: "default",
+    })?;
+    let resp = kms_call("TrentService.GetKeyPolicy", body).await?;
+    let parsed: GetKeyPolicyResp = serde_json::from_slice(&resp)?;
+    Ok(parsed.policy)
+}
+
+/// Verify the KMS key's policy is safe before we trust the key (see the
+/// call site in `init`). Fetches the policy with `kms:GetKeyPolicy`, reads
+/// this enclave's own PCR0/1/2 from a fresh NSM attestation, and runs both
+/// through `enclavia_protocol::kms_policy::verify_decrypt_policy`. Any
+/// failure is fatal — the caller refuses to boot.
+async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = kms_get_key_policy(key_id).await?;
+    let own = own_pcrs()?;
+    enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, &own).map_err(|e| {
+        format!(
+            "KMS key {key_id} policy rejected, refusing to boot: {e}. \
+             The key's Decrypt must be gated to this enclave's PCR0/1/2 and \
+             grant no principal a way to loosen it."
+        )
+    })?;
+    info!(key_id, "KMS key policy verified against own attestation");
+    Ok(())
+}
+
+/// This enclave's own PCR0/1/2, read from a fresh NSM attestation document
+/// (no recipient public key needed — we only want the measurements). Works
+/// identically under QEMU (emulated NSM) and real Nitro.
+fn own_pcrs() -> Result<enclavia_protocol::attestation::Pcrs, Box<dyn std::error::Error>> {
+    let attestation = nsm_attestation(&[])?;
+    Ok(enclavia_protocol::attestation::extract_own_pcrs(&attestation)?)
 }
 
 /// Recover a plaintext via KMS using the attestation-bound recipient flow
@@ -793,7 +856,13 @@ fn nsm_attestation(public_key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Err
     let request = Request::Attestation {
         user_data: None,
         nonce: None,
-        public_key: Some(From::from(public_key.to_vec())),
+        // Empty slice -> no recipient key (we only want the PCRs); a
+        // non-empty key is embedded for the KMS Recipient flow.
+        public_key: if public_key.is_empty() {
+            None
+        } else {
+            Some(From::from(public_key.to_vec()))
+        },
     };
     let result = match nsm_process_request(fd, request) {
         Response::Attestation { document } => Ok(document),

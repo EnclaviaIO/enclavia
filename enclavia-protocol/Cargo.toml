@@ -17,6 +17,10 @@ test-utils = []
 [dependencies]
 snow = { workspace = true }
 serde.workspace = true
+# Used by kms_policy.rs to parse the stringified KMS key policy the enclave
+# verifies at boot (#198 follow-up). A regular dependency (not dev-only)
+# because the verification runs in production.
+serde_json.workspace = true
 ciborium.workspace = true
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
@@ -53,5 +57,3 @@ der = { workspace = true }
 spki = { workspace = true }
 x509-cert = { workspace = true }
 
-[dev-dependencies]
-serde_json.workspace = true
