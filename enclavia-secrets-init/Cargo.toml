@@ -9,7 +9,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "In-enclave init helper: fetches per-enclave secrets from the host (vsock 5004) and merges them into the workload's OCI config.json env."
+description = "In-enclave init helper: pulls a host-side CBOR payload over vsock and lands it in one of two sinks. --mode workload-secrets (vsock 5004) merges per-enclave secrets into the workload's OCI config.json env (#169); --mode aws-creds (vsock 5013) writes AWS_* creds to a tmpfs env file init.sh sources before enclavia-crypto init (#199/#198)."
 
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "fs"] }
