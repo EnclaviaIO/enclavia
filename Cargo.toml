@@ -9,6 +9,7 @@ members = [
     "enclavia-protocol",
     "enclavia-secrets-init",
     "enclavia-server",
+    "enclavia-vsock",
     "mock-kms",
     "nbd-client",
     "synchronizer",

@@ -53,21 +53,6 @@ enum ChannelKind {
     Control,
 }
 
-/// Vsock CID of the host this enclave talks to.
-///
-/// On real AWS Nitro the parent EC2 instance is always
-/// `VMADDR_CID_PARENT` == 3; under QEMU + vhost-device-vsock the bridge
-/// answers on `VMADDR_CID_HOST` == 2, where the EIF init exports
-/// `VSOCK_HOST_CID=2`. Default 3 keeps production correct with a single
-/// binary (no debug/enclave split; see the in-enclave transport
-/// convention in CLAUDE.md).
-fn host_cid() -> u32 {
-    std::env::var("VSOCK_HOST_CID")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(3)
-}
-
 /// Port the host-side `chain-host` daemon listens on (#47).
 const CHAIN_HOST_PORT: u32 = 5005;
 
@@ -121,7 +106,7 @@ fn fresh_nonce() -> [u8; 32] {
 /// ~32 KiB). The shared `submit_chain_link` helper in enclavia-protocol
 /// handles chunking automatically.
 async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
-    let cid = host_cid();
+    let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         Duration::from_secs(30),
         VsockStream::connect(cid, CHAIN_HOST_PORT),

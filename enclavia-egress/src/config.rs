@@ -27,11 +27,6 @@ pub struct Config {
     pub tun_prefix_len: u8,
     /// MTU advertised to smoltcp and the kernel.
     pub mtu: usize,
-    /// Vsock CID of the host that runs `egress-host`. On real AWS Nitro
-    /// the parent is `VMADDR_CID_PARENT` == 3; under QEMU the
-    /// vhost-device-vsock bridge answers on `VMADDR_CID_HOST` == 2 and
-    /// the EIF init exports `EGRESS_VSOCK_CID=2` there. Default 3.
-    pub vsock_cid: u32,
     /// Vsock port `egress-host` listens on.
     pub vsock_port: u32,
     /// Path to the JSON allowlist file. Missing or empty == deny-all.
@@ -53,10 +48,6 @@ impl Config {
             .unwrap_or_else(|_| "1500".into())
             .parse()
             .expect("invalid EGRESS_MTU");
-        let vsock_cid: u32 = std::env::var("EGRESS_VSOCK_CID")
-            .unwrap_or_else(|_| "3".into())
-            .parse()
-            .expect("invalid EGRESS_VSOCK_CID");
         let vsock_port: u32 = std::env::var("EGRESS_VSOCK_PORT")
             .unwrap_or_else(|_| "5006".into())
             .parse()
@@ -71,7 +62,6 @@ impl Config {
             tun_local_ip,
             tun_prefix_len,
             mtu,
-            vsock_cid,
             vsock_port,
             allowlist_path,
         }

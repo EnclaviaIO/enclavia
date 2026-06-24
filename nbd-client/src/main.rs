@@ -74,11 +74,10 @@ async fn main() {
 }
 
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Connect to the host storage daemon over vsock.
-    // Parent CID is 3 on real Nitro (VMADDR_CID_PARENT); QEMU's
-    // vhost-device-vsock bridge answers on CID 2 and the EIF init exports
-    // VSOCK_HOST_CID=2 there. See rollback::host_cid.
-    let cid = rollback::host_cid();
+    // 1. Connect to the host storage daemon over vsock. The host CID is
+    // probed at runtime (CID 3 on real Nitro, CID 2 under QEMU) so one EIF
+    // boots in both. See enclavia_vsock::host_cid.
+    let cid = enclavia_vsock::host_cid().await;
     info!(
         cid,
         port = config.vsock_port,

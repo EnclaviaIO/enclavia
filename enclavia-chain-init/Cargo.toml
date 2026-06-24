@@ -13,6 +13,7 @@ description = "In-enclave boot helper: produces the genesis `ChainLink` for the 
 
 [dependencies]
 enclavia-protocol = { path = "../enclavia-protocol" }
+enclavia-vsock = { path = "../enclavia-vsock" }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "fs"] }
 tokio-vsock = { workspace = true }
 ciborium = { workspace = true }

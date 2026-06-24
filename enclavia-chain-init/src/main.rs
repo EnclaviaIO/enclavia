@@ -49,21 +49,6 @@ use tracing::{error, info, warn};
 mod attestation;
 mod config;
 
-/// Vsock CID of the host this enclave talks to.
-///
-/// On real AWS Nitro the parent EC2 instance is always
-/// `VMADDR_CID_PARENT` == 3; under QEMU + vhost-device-vsock the host
-/// bridge answers on `VMADDR_CID_HOST` == 2 (routing the connection to
-/// the `<proxy>_5005` UDS), where the EIF init exports
-/// `VSOCK_HOST_CID=2`. Default 3 keeps production correct with a single
-/// binary, no debug/enclave split (see the in-enclave crate convention
-/// in CLAUDE.md).
-fn host_cid() -> u32 {
-    std::env::var("VSOCK_HOST_CID")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(3)
-}
 
 /// Port the host-side `chain-host` daemon listens on (#47, phase 3b).
 const CHAIN_HOST_PORT: u32 = 5005;
@@ -173,7 +158,7 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
 /// means the launcher mis-wired the daemon; a write error means the parent
 /// dropped us mid-stream.
 async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cid = host_cid();
+    let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_vsock::VsockStream::connect(cid, CHAIN_HOST_PORT),

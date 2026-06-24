@@ -12,7 +12,7 @@ repository.workspace = true
 description = "In-enclave key management: KMS-backed LUKS unsealing for the persistent storage volume."
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "fs", "process", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "fs", "process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -50,6 +50,7 @@ aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 # `kms_recipient::decode` opens that envelope. default-features = false to
 # skip the async-transport (tokio/tracing) modules we don't use.
 enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+enclavia-vsock = { path = "../enclavia-vsock" }
 
 [lib]
 name = "enclavia_crypto"

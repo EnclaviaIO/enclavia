@@ -992,49 +992,7 @@ fn kms_vsock_port() -> Result<u32, Box<dyn std::error::Error>> {
         .parse()?)
 }
 
-/// Real AWS Nitro parent (`VMADDR_CID_PARENT`).
-const NITRO_PARENT_CID: u32 = 3;
-/// QEMU / `vhost-device-vsock` host (`VMADDR_CID_HOST`).
-const QEMU_HOST_CID: u32 = 2;
-/// Port the probe dials on the parent CID. The in-enclave init sends its
-/// heartbeat here, so a listener exists on the real host in BOTH
-/// environments (a `vhost-device-vsock` bridge to `heartbeat.py` under
-/// QEMU, the parent's heartbeat handler under Nitro).
-const HOST_CID_PROBE_PORT: u32 = 9000;
-
-/// Vsock CID of the host this enclave talks to, detected once by probing
-/// so a single EIF boots on both QEMU and real Nitro (no rootfs baking).
-///
-/// On real AWS Nitro the parent is `VMADDR_CID_PARENT` == 3; under QEMU +
-/// vhost-device-vsock only `VMADDR_CID_HOST` == 2 is routable. We try to
-/// reach CID 3 on the heartbeat port: if it answers we are on Nitro, else
-/// QEMU.
-///
-/// This is NOT a security decision: a wrong guess only fails closed (we
-/// cannot reach the host either way), and a hostile host can deny service
-/// regardless, so the probe only has to be correct in the honest case. The
-/// result is cached for the life of the process.
-async fn host_cid() -> u32 {
-    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    if let Some(c) = CACHE.get() {
-        return *c;
-    }
-    let cid = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio_vsock::VsockStream::connect(NITRO_PARENT_CID, HOST_CID_PROBE_PORT),
-    )
-    .await
-    {
-        Ok(Ok(_stream)) => NITRO_PARENT_CID, // CID 3 reachable -> real Nitro
-        _ => QEMU_HOST_CID,                  // error or timeout -> QEMU
-    };
-    info!(
-        selected_cid = cid,
-        probe_port = HOST_CID_PROBE_PORT,
-        "host vsock CID detected by probe (CID 3 reachable => Nitro, else QEMU)"
-    );
-    *CACHE.get_or_init(|| cid)
-}
+use enclavia_vsock::host_cid;
 
 /// Current UTC time as the SigV4 `(amz_date, date_stamp)` pair.
 fn amz_timestamps() -> (String, String) {
