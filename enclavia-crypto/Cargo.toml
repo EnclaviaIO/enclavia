@@ -12,7 +12,7 @@ repository.workspace = true
 description = "In-enclave key management: KMS-backed LUKS unsealing for the persistent storage volume."
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "fs", "process"] }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "fs", "process", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
