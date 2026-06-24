@@ -48,8 +48,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let dev = tun::create_as_async(&tun_config)?;
     let (tun_reader, tun_writer) = tokio::io::split(dev);
 
-    // Probe the host CID at runtime (CID 3 on real Nitro, CID 2 under QEMU)
-    // so one EIF boots in both. See enclavia_vsock::host_cid.
+    // Resolve the host CID at runtime (CID 3 on real Nitro, CID 2 under QEMU)
+    // so one EIF boots in both -- read from the value the init recorded at
+    // boot. See enclavia_vsock::host_cid.
     let cid = enclavia_vsock::host_cid().await;
     info!(vsock_cid = cid, "resolved egress host vsock CID");
     let transport = Arc::new(VsockTransport {
