@@ -169,6 +169,17 @@
           builderSrc = builder-src;
         };
 
+        # Real-Nitro variant: stock CID-3 init instead of the CID-2 patched
+        # init, so the enclave boots on AWS Graviton/Nitro (the QEMU one
+        # fails run-enclave E36). Same payload + PCRs caveat otherwise.
+        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix {
+          inherit pkgs nitroLib;
+          synchronizerPkg = synchronizer;
+          namesInitPkg = synchronizerNamesInit;
+          builderSrc = builder-src;
+          debugInit = false;
+        };
+
       in
       {
         devShells.default = pkgs.mkShell {
@@ -196,6 +207,7 @@
           synchronizer = synchronizer;
           synchronizer-names-init = synchronizerNamesInit;
           synchronizer-eif = synchronizerEif;
+          synchronizer-eif-nitro = synchronizerEifNitro;
         };
 
         # `nix run` shorthand and `nix profile install` default.

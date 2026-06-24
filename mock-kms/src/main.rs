@@ -439,6 +439,18 @@ struct DecryptReq {
     ciphertext_blob: String,
     #[serde(rename = "EncryptionAlgorithm", default)]
     _encryption_algorithm: Option<String>,
+    // KMS phase 2 (#198): when present, return CiphertextForRecipient
+    // wrapped to the attested ephemeral key instead of Plaintext.
+    #[serde(rename = "Recipient", default)]
+    recipient: Option<RecipientInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecipientInfo {
+    #[serde(rename = "AttestationDocument")]
+    attestation_document: String,
+    #[serde(rename = "KeyEncryptionAlgorithm", default)]
+    _key_encryption_algorithm: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +485,34 @@ async fn handle_decrypt(state: &AppState, body: &[u8]) -> Result<serde_json::Val
     let plaintext = private
         .decrypt(padding, &ciphertext)
         .map_err(|e| KmsError::DecryptFailed(e.to_string()))?;
+
+    // KMS phase 2 (#198): with a Recipient, wrap the plaintext as a CMS
+    // CiphertextForRecipient to the attested ephemeral key instead of
+    // returning it in the clear. The mock DECODES the attestation doc to
+    // read its `public_key` (no signature verification — it is a mock, and
+    // the real trust comes from the key policy's RecipientAttestation
+    // conditions which we deliberately don't enforce here).
+    if let Some(recipient) = req.recipient {
+        let doc_bytes = B64
+            .decode(recipient.attestation_document.as_bytes())
+            .map_err(|e| KmsError::Internal(format!("recipient attestation b64: {e}")))?;
+        let (_, doc) = attestation_doc_validation::attestation_doc::decode_attestation_document(
+            &doc_bytes,
+        )
+        .map_err(|e| KmsError::Internal(format!("decode attestation doc: {e:?}")))?;
+        let pub_der = doc
+            .public_key
+            .ok_or_else(|| KmsError::Internal("attestation doc has no public_key".into()))?;
+        use rsa::pkcs8::DecodePublicKey;
+        let recipient_key = rsa::RsaPublicKey::from_public_key_der(&pub_der)
+            .map_err(|e| KmsError::Internal(format!("recipient public key: {e}")))?;
+        let envelope = enclavia_protocol::kms_recipient::encode(&recipient_key, &plaintext)
+            .map_err(|e| KmsError::Internal(format!("build CiphertextForRecipient: {e}")))?;
+        return Ok(serde_json::json!({
+            "KeyId": stored.key_id,
+            "CiphertextForRecipient": B64.encode(&envelope),
+        }));
+    }
 
     let resp = DecryptResp {
         key_id: stored.key_id,

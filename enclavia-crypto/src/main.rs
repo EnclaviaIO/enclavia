@@ -700,12 +700,29 @@ struct DecryptReq<'a> {
     ciphertext_blob: String,
     #[serde(rename = "EncryptionAlgorithm")]
     encryption_algorithm: &'static str,
+    // KMS phase 2 (#198): ask KMS to return the plaintext encrypted to the
+    // ephemeral key we attest, instead of in the clear.
+    #[serde(rename = "Recipient")]
+    recipient: Recipient,
+}
+
+/// The `Recipient` parameter of a Nitro `kms:Decrypt` call: our attestation
+/// document (base64) carrying the ephemeral public key, and the algorithm
+/// KMS must use to wrap the content key to it.
+#[derive(Debug, Serialize)]
+struct Recipient {
+    #[serde(rename = "AttestationDocument")]
+    attestation_document: String,
+    #[serde(rename = "KeyEncryptionAlgorithm")]
+    key_encryption_algorithm: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
 struct DecryptResp {
-    #[serde(rename = "Plaintext")]
-    plaintext: String,
+    // With a Recipient, KMS returns the plaintext as a CMS envelope here
+    // (base64) instead of `Plaintext`.
+    #[serde(rename = "CiphertextForRecipient")]
+    ciphertext_for_recipient: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -723,19 +740,68 @@ async fn kms_get_public_key(key_id: &str) -> Result<Vec<u8>, Box<dyn std::error:
     Ok(B64.decode(parsed.public_key.as_bytes())?)
 }
 
+/// Recover a plaintext via KMS using the attestation-bound recipient flow
+/// (#198). We generate an ephemeral RSA key, embed its public half in an
+/// NSM attestation document, and ask KMS to return the decrypted plaintext
+/// as a `CiphertextForRecipient` CMS envelope encrypted to that key — so
+/// the parent that proxies the KMS call sees only ciphertext. The key
+/// policy's `kms:RecipientAttestation:PCRn` conditions gate the call on
+/// this document's PCRs.
 async fn kms_decrypt(
     key_id: &str,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use rsa::pkcs8::EncodePublicKey;
+
+    // Ephemeral keypair: lives only for this call, never leaves the enclave.
+    let ephemeral = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)?;
+    let public_der = rsa::RsaPublicKey::from(&ephemeral)
+        .to_public_key_der()?
+        .into_vec();
+
+    // Attest the ephemeral public key. KMS reads `public_key` from the doc
+    // and wraps the content key to it.
+    let attestation = nsm_attestation(&public_der)?;
+
     let req = DecryptReq {
         key_id,
         ciphertext_blob: B64.encode(ciphertext),
         encryption_algorithm: "RSAES_OAEP_SHA_256",
+        recipient: Recipient {
+            attestation_document: B64.encode(&attestation),
+            key_encryption_algorithm: "RSAES_OAEP_SHA_256",
+        },
     };
     let body = serde_json::to_vec(&req)?;
     let resp = kms_call("TrentService.Decrypt", body).await?;
     let parsed: DecryptResp = serde_json::from_slice(&resp)?;
-    Ok(B64.decode(parsed.plaintext.as_bytes())?)
+    let envelope = B64.decode(parsed.ciphertext_for_recipient.as_bytes())?;
+    Ok(enclavia_protocol::kms_recipient::decode(&ephemeral, &envelope)?)
+}
+
+/// Request an NSM attestation document carrying `public_key` (our ephemeral
+/// RSA public key, DER SPKI). Mirrors `enclavia-server::attestation`. Works
+/// identically under QEMU (emulated NSM, self-signed doc) and real Nitro.
+fn nsm_attestation(public_key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use aws_nitro_enclaves_nsm_api::api::{Request, Response};
+    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+
+    let fd = nsm_init();
+    if fd == -1 {
+        return Err("nsm_init failed (is /dev/nsm present?)".into());
+    }
+    let request = Request::Attestation {
+        user_data: None,
+        nonce: None,
+        public_key: Some(From::from(public_key.to_vec())),
+    };
+    let result = match nsm_process_request(fd, request) {
+        Response::Attestation { document } => Ok(document),
+        Response::Error(e) => Err(format!("NSM attestation error: {e:?}").into()),
+        _ => Err("unexpected NSM response".into()),
+    };
+    nsm_exit(fd);
+    result
 }
 
 async fn kms_schedule_deletion(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {

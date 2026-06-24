@@ -23,6 +23,11 @@
   synchronizerPkg,
   namesInitPkg,
   builderSrc,
+  # QEMU debug (default) uses the CID-2 patched init; real Nitro must use
+  # the stock CID-3 init (nitro-util's blob init), or the enclave never
+  # submits the boot `ready` signal and run-enclave fails E36. Set false
+  # for the AWS/real-Nitro EIF.
+  debugInit ? true,
 }:
 
 let
@@ -39,6 +44,10 @@ let
     env.CGO_ENABLED = 0;
     ldflags = [ "-s" "-w" ];
   };
+
+  # CID-2 patched (QEMU) vs the stock CID-3 init (real Nitro), the same
+  # selection the builder's enclave.nix makes via its debugMode flag.
+  initBinary = if debugInit then "${patchedInit}/bin/init" else blobs.init;
 
   initScript = pkgs.writeShellScript "synchronizer-enclave-init"
     (builtins.readFile ./synchronizer-init.sh);
@@ -74,5 +83,5 @@ nitroLib.buildEif {
   nsmKo = blobs.nsmKo;
   copyToRoot = rootfs;
   entrypoint = "/bin/enclave-init";
-  init = "${patchedInit}/bin/init";
+  init = initBinary;
 }

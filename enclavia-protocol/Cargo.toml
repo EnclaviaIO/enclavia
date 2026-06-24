@@ -41,6 +41,17 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 p256 = { workspace = true }
 serde_bytes = "0.11"
+# KMS phase 2 (#198) CiphertextForRecipient codec (kms_recipient.rs): the
+# RSA-OAEP-wrapped AES-256-CBC CMS envelope KMS returns to an attested
+# enclave, plus its mock-kms producer side.
+rsa = { workspace = true }
+rand = { workspace = true }
+cms = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+der = { workspace = true }
+spki = { workspace = true }
+x509-cert = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true
