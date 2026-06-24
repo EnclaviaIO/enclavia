@@ -1,17 +1,21 @@
 //! Lightweight mock of AWS KMS for local testing.
 //!
-//! Implements four operations matching the real KMS JSON-RPC API:
+//! Implements six operations matching the real KMS JSON-RPC API:
 //! - `TrentService.CreateKey`
 //! - `TrentService.GetPublicKey`
+//! - `TrentService.GetKeyPolicy`
+//! - `TrentService.DescribeKey`
 //! - `TrentService.Decrypt`
 //! - `TrentService.ScheduleKeyDeletion`
 //!
 //! Keys are RSA-2048 (OAEP-SHA256) and are persisted as JSON files in
 //! `KEY_DIR`. CreateKey accepts a stringified policy and, if it carries any
 //! `kms:RecipientAttestation:PCR{n}` conditions, the PCR values are stored
-//! alongside the key as a `<key_id>.pcrs.json` sidecar. Decrypt does not
-//! enforce the policy — this is a *mock* and exists to exercise the
-//! lifecycle, not to gate access.
+//! alongside the key as a `<key_id>.pcrs.json` sidecar. The full policy
+//! string is stored too and echoed verbatim by GetKeyPolicy, so the
+//! in-enclave boot-time policy check can validate exactly what was minted.
+//! Decrypt does not enforce the policy — this is a *mock* and exists to
+//! exercise the lifecycle, not to gate access.
 //!
 //! Listens on a Unix domain socket only — never used in production.
 
@@ -45,6 +49,12 @@ struct StoredKey {
     private_key_pem: String,
     /// If set, the key is scheduled for deletion (future-dated, but we treat as immediately disabled).
     deletion_date: Option<String>,
+    /// The stringified key policy supplied at `CreateKey`, echoed verbatim
+    /// by `GetKeyPolicy`. `None` for auto-created keys (which carry no
+    /// policy); `GetKeyPolicy` then returns an empty-statement document.
+    /// `#[serde(default)]` keeps older on-disk key files loadable.
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 /// Sidecar file written next to a key whose creation policy bound it to
@@ -216,6 +226,8 @@ async fn handle(
     let result = match target.as_str() {
         "TrentService.CreateKey" => handle_create_key(&state, &body).await,
         "TrentService.GetPublicKey" => handle_get_public_key(&state, &body).await,
+        "TrentService.GetKeyPolicy" => handle_get_key_policy(&state, &body).await,
+        "TrentService.DescribeKey" => handle_describe_key(&state, &body).await,
         "TrentService.Decrypt" => handle_decrypt(&state, &body).await,
         "TrentService.ScheduleKeyDeletion" => handle_schedule_deletion(&state, &body).await,
         other => Err(KmsError::UnsupportedOperation(other.to_string())),
@@ -300,6 +312,9 @@ async fn handle_create_key(state: &AppState, body: &[u8]) -> Result<serde_json::
         key_id: key_id.clone(),
         private_key_pem: pem,
         deletion_date: None,
+        // Echoed verbatim by GetKeyPolicy so the in-enclave boot-time policy
+        // check sees exactly what the backend minted.
+        policy: req.policy.clone(),
     };
     save_key(&state.key_dir, &stored).await?;
     save_pcrs(&state.key_dir, &key_id, &pcrs).await?;
@@ -427,6 +442,98 @@ async fn handle_get_public_key(state: &AppState, body: &[u8]) -> Result<serde_js
         key_usage: "ENCRYPT_DECRYPT",
         key_spec: "RSA_2048",
         encryption_algorithms: vec!["RSAES_OAEP_SHA_256"],
+    };
+    Ok(serde_json::to_value(resp).unwrap())
+}
+
+#[derive(Debug, Deserialize)]
+struct GetKeyPolicyReq {
+    #[serde(rename = "KeyId")]
+    key_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GetKeyPolicyResp {
+    #[serde(rename = "Policy")]
+    policy: String,
+}
+
+/// `GetKeyPolicy`: echo back the stringified policy supplied at CreateKey so
+/// the in-enclave boot-time policy check sees exactly what was minted. Keys
+/// created without a policy (auto-created) return an empty-statement
+/// document, which the enclave's check treats as vacuously safe (it grants
+/// nobody decrypt). The mock does not auto-create here: asking for a
+/// nonexistent key's policy is a NotFound, matching AWS.
+async fn handle_get_key_policy(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
+    let req: GetKeyPolicyReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
+    // Auto-create like GetPublicKey: the in-enclave boot check calls
+    // GetKeyPolicy / DescribeKey BEFORE GetPublicKey, so on first boot the
+    // key does not exist yet against an unseeded mock. (Real KMS keys are
+    // always pre-minted by the backend, so this only affects the dev
+    // auto-create path; without it, first boot fails with NotFound.)
+    let stored = if state.auto_create_keys {
+        load_or_create_key(&state.key_dir, &req.key_id).await?
+    } else {
+        load_key(&state.key_dir, &req.key_id).await?
+    };
+    let policy = stored
+        .policy
+        .unwrap_or_else(|| r#"{"Version":"2012-10-17","Statement":[]}"#.to_string());
+    Ok(serde_json::to_value(GetKeyPolicyResp { policy }).unwrap())
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeKeyReq {
+    #[serde(rename = "KeyId")]
+    key_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeKeyResp {
+    #[serde(rename = "KeyMetadata")]
+    key_metadata: DescribeKeyMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeKeyMetadata {
+    #[serde(rename = "KeyId")]
+    key_id: String,
+    #[serde(rename = "Arn")]
+    arn: String,
+    // Mock keys are always KMS-generated (RSA keypair minted in-process,
+    // never imported), so Origin is AWS_KMS — which is exactly what the
+    // in-enclave boot check requires to rule out BYOK/imported material.
+    #[serde(rename = "Origin")]
+    origin: &'static str,
+    #[serde(rename = "KeySpec")]
+    key_spec: &'static str,
+    #[serde(rename = "KeyUsage")]
+    key_usage: &'static str,
+    #[serde(rename = "Enabled")]
+    enabled: bool,
+}
+
+/// `DescribeKey`: report key metadata. The only field the in-enclave check
+/// reads is `Origin`, which is always `AWS_KMS` for mock keys (they are
+/// generated in-process, never imported).
+async fn handle_describe_key(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
+    let req: DescribeKeyReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
+    // Auto-create like GetPublicKey (see handle_get_key_policy): the boot
+    // check calls DescribeKey first, before the key exists on first boot.
+    let stored = if state.auto_create_keys {
+        load_or_create_key(&state.key_dir, &req.key_id).await?
+    } else {
+        load_key(&state.key_dir, &req.key_id).await?
+    };
+    let resp = DescribeKeyResp {
+        key_metadata: DescribeKeyMetadata {
+            arn: format!("arn:aws:kms:us-east-1:000000000000:key/{}", stored.key_id),
+            key_id: stored.key_id,
+            origin: "AWS_KMS",
+            key_spec: "RSA_2048",
+            key_usage: "ENCRYPT_DECRYPT",
+            enabled: stored.deletion_date.is_none(),
+        },
     };
     Ok(serde_json::to_value(resp).unwrap())
 }
@@ -615,6 +722,9 @@ async fn load_or_create_key(key_dir: &Path, key_id: &str) -> Result<StoredKey, K
                 key_id: key_id.to_string(),
                 private_key_pem: pem,
                 deletion_date: None,
+                // Auto-created keys carry no policy; GetKeyPolicy returns an
+                // empty-statement document for them.
+                policy: None,
             };
             save_key(key_dir, &stored).await?;
             Ok(stored)
@@ -817,6 +927,29 @@ mod tests {
         assert_eq!(saved.pcrs.get("0"), Some(&"aaaa".to_string()));
         assert_eq!(saved.pcrs.get("1"), Some(&"bbbb".to_string()));
         assert_eq!(saved.pcrs.get("2"), Some(&"cccc".to_string()));
+
+        // GetKeyPolicy must echo the exact policy we minted, byte-for-byte,
+        // so the in-enclave boot check validates what was actually stored.
+        let (status, resp) = rpc(
+            &socket,
+            "TrentService.GetKeyPolicy",
+            serde_json::json!({ "KeyId": key_id, "PolicyName": "default" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "GetKeyPolicy body: {resp}");
+        assert_eq!(resp["Policy"].as_str().unwrap(), policy);
+
+        // DescribeKey must report Origin=AWS_KMS so the in-enclave check
+        // accepts the key as KMS-generated (not imported/BYOK).
+        let (status, resp) = rpc(
+            &socket,
+            "TrentService.DescribeKey",
+            serde_json::json!({ "KeyId": key_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "DescribeKey body: {resp}");
+        assert_eq!(resp["KeyMetadata"]["Origin"], "AWS_KMS");
+        assert_eq!(resp["KeyMetadata"]["KeyId"], key_id);
 
         // GetPublicKey on the freshly-created key must succeed *without*
         // auto-create (we disabled it in spawn_mock_kms).

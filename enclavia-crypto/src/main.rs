@@ -2,7 +2,15 @@
 //!
 //! Talks to:
 //! - storage-host meta port (key blob GET/PUT) — vsock 5002
-//! - KMS proxy (HTTP) — vsock 5003
+//! - KMS over vsock 5003. Two transports, picked from the environment:
+//!   * **mock** (default, dev/QEMU): plaintext HTTP straight to `mock-kms`.
+//!   * **AWS** (set `KMS_AWS_REGION`): the vsock peer is a raw TCP relay
+//!     (`vsock-proxy`) to `kms.<region>.amazonaws.com:443`; the enclave
+//!     terminates TLS itself (validating the Amazon cert chain compiled
+//!     into this binary, so it is PCR-measured) and SigV4-signs each call
+//!     with credentials from the environment. The host therefore sees only
+//!     TLS ciphertext and cannot forge KMS responses — which is what makes
+//!     the boot-time key-policy / Origin checks load-bearing.
 //!
 //! Subcommands:
 //! - `init`: bootstrap or recover the LUKS passphrase, write 32 raw bytes
@@ -12,6 +20,7 @@
 //!   backend during an enclave version upgrade.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -26,8 +35,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 
+use enclavia_crypto::{kms_tls_config, sigv4};
+
 const BLOB_VERSION: u32 = 1;
 const PASSPHRASE_BYTES: usize = 32;
+const KMS_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
 /// Path where `prepare-upgrade` writes rollback state so `revoke-upgrade`
 /// can undo the LUKS change. Lives in tmpfs so it is automatically cleaned up
@@ -258,6 +270,14 @@ async fn init() -> Result<(), Box<dyn std::error::Error>> {
         if blob.version != BLOB_VERSION {
             return Err(format!("unsupported blob version: {}", blob.version).into());
         }
+
+        // Before we either seal the passphrase under this key (first boot)
+        // or rely on it to recover the passphrase (every later boot), prove
+        // the key's policy gates Decrypt to OUR attestation and grants no
+        // one a way to loosen that gate. A buggy or hostile backend must
+        // not be able to mint a key whose plaintext the account can read.
+        // Fail-closed: a bad (or unreadable) policy refuses the boot.
+        verify_key_policy(&blob.kms_key_id).await?;
 
         match blob.ciphertext.clone() {
             None => {
@@ -733,11 +753,115 @@ struct ScheduleDeletionReq<'a> {
     pending_window_in_days: u32,
 }
 
+#[derive(Debug, Serialize)]
+struct GetKeyPolicyReq<'a> {
+    #[serde(rename = "KeyId")]
+    key_id: &'a str,
+    // KMS keys created by us have the single default policy. Naming it
+    // explicitly keeps the request unambiguous across KMS versions.
+    #[serde(rename = "PolicyName")]
+    policy_name: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetKeyPolicyResp {
+    // The policy is returned as a stringified JSON document.
+    #[serde(rename = "Policy")]
+    policy: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeKeyReq<'a> {
+    #[serde(rename = "KeyId")]
+    key_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeKeyResp {
+    #[serde(rename = "KeyMetadata")]
+    key_metadata: KeyMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyMetadata {
+    // "AWS_KMS" for KMS-generated keys, "EXTERNAL" for imported (BYOK)
+    // material, "AWS_CLOUDHSM" / "EXTERNAL_KEY_STORE" for custom stores.
+    #[serde(rename = "Origin")]
+    origin: String,
+}
+
 async fn kms_get_public_key(key_id: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let body = serde_json::to_vec(&GetPublicKeyReq { key_id })?;
     let resp = kms_call("TrentService.GetPublicKey", body).await?;
     let parsed: GetPublicKeyResp = serde_json::from_slice(&resp)?;
     Ok(B64.decode(parsed.public_key.as_bytes())?)
+}
+
+/// Fetch the stringified key policy via `kms:GetKeyPolicy`.
+async fn kms_get_key_policy(key_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(&GetKeyPolicyReq {
+        key_id,
+        policy_name: "default",
+    })?;
+    let resp = kms_call("TrentService.GetKeyPolicy", body).await?;
+    let parsed: GetKeyPolicyResp = serde_json::from_slice(&resp)?;
+    Ok(parsed.policy)
+}
+
+/// Fetch the key's `Origin` via `kms:DescribeKey`.
+async fn kms_key_origin(key_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(&DescribeKeyReq { key_id })?;
+    let resp = kms_call("TrentService.DescribeKey", body).await?;
+    let parsed: DescribeKeyResp = serde_json::from_slice(&resp)?;
+    Ok(parsed.key_metadata.origin)
+}
+
+/// Verify the KMS key is safe to trust before we seal under it / rely on
+/// it (see the call site in `init`). Two checks, both fatal (refuse to
+/// boot on failure):
+///
+/// 1. **Origin must be `AWS_KMS`** (`kms:DescribeKey`). A key with imported
+///    material (`EXTERNAL`) or a custom key store means someone holds the
+///    private key out-of-band and could decrypt our sealed passphrase
+///    offline, regardless of how tight the policy looks. So even a hostile
+///    host that swaps the bootstrap blob's `key_id` to a key it created
+///    cannot point us at a BYOK key.
+/// 2. **Policy gates Decrypt to our own PCR0/1/2** (`kms:GetKeyPolicy` +
+///    `enclavia_protocol::kms_policy::verify_decrypt_policy`), and grants no
+///    principal a way to loosen that gate.
+///
+/// Both checks are only as trustworthy as the channel to KMS: see the
+/// authenticated-transport note on `kms_call`.
+async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let origin = kms_key_origin(key_id).await?;
+    if origin != "AWS_KMS" {
+        return Err(format!(
+            "KMS key {key_id} has Origin={origin}, refusing to boot: only KMS-generated \
+             (non-exportable) keys are trusted; imported/external material could be held \
+             out-of-band and decrypt our sealed passphrase."
+        )
+        .into());
+    }
+
+    let policy = kms_get_key_policy(key_id).await?;
+    let own = own_pcrs()?;
+    enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, &own).map_err(|e| {
+        format!(
+            "KMS key {key_id} policy rejected, refusing to boot: {e}. \
+             The key's Decrypt must be gated to this enclave's PCR0/1/2 and \
+             grant no principal a way to loosen it."
+        )
+    })?;
+    info!(key_id, "KMS key origin and policy verified against own attestation");
+    Ok(())
+}
+
+/// This enclave's own PCR0/1/2, read from a fresh NSM attestation document
+/// (no recipient public key needed — we only want the measurements). Works
+/// identically under QEMU (emulated NSM) and real Nitro.
+fn own_pcrs() -> Result<enclavia_protocol::attestation::Pcrs, Box<dyn std::error::Error>> {
+    let attestation = nsm_attestation(&[])?;
+    Ok(enclavia_protocol::attestation::extract_own_pcrs(&attestation)?)
 }
 
 /// Recover a plaintext via KMS using the attestation-bound recipient flow
@@ -793,7 +917,13 @@ fn nsm_attestation(public_key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Err
     let request = Request::Attestation {
         user_data: None,
         nonce: None,
-        public_key: Some(From::from(public_key.to_vec())),
+        // Empty slice -> no recipient key (we only want the PCRs); a
+        // non-empty key is embedded for the KMS Recipient flow.
+        public_key: if public_key.is_empty() {
+            None
+        } else {
+            Some(From::from(public_key.to_vec()))
+        },
     };
     let result = match nsm_process_request(fd, request) {
         Response::Attestation { document } => Ok(document),
@@ -814,9 +944,95 @@ async fn kms_schedule_deletion(key_id: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Any tokio duplex stream, boxed so the plaintext (`VsockStream`) and TLS
+/// (`TlsStream<VsockStream>`) transports share one `kms_call` body.
+trait TokioIoStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TokioIoStream for T {}
+
+/// How the enclave reaches KMS, decided once from the environment.
+enum KmsTransport {
+    /// Dev/QEMU: plaintext HTTP straight to `mock-kms` over vsock.
+    Mock,
+    /// Production: TLS + SigV4 to real AWS KMS. The vsock peer is a raw TCP
+    /// relay (`vsock-proxy`) to `kms.<region>.amazonaws.com:443`; the enclave
+    /// terminates TLS itself, so the host cannot read or forge the exchange.
+    Aws {
+        region: String,
+        host: String,
+        creds: sigv4::Credentials,
+    },
+}
+
+/// Select the KMS transport from the environment. `KMS_AWS_REGION` set (and
+/// non-empty) selects real AWS KMS (TLS + SigV4), and then the standard
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional
+/// `AWS_SESSION_TOKEN`) credentials are required; otherwise the dev/QEMU
+/// plaintext-to-mock path is used.
+fn kms_transport() -> Result<KmsTransport, Box<dyn std::error::Error>> {
+    match std::env::var("KMS_AWS_REGION") {
+        Ok(region) if !region.trim().is_empty() => {
+            let region = region.trim().to_string();
+            let host = format!("kms.{region}.amazonaws.com");
+            let creds = sigv4::Credentials {
+                access_key_id: std::env::var("AWS_ACCESS_KEY_ID")
+                    .map_err(|_| "AWS_ACCESS_KEY_ID required when KMS_AWS_REGION is set")?,
+                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .map_err(|_| "AWS_SECRET_ACCESS_KEY required when KMS_AWS_REGION is set")?,
+                session_token: std::env::var("AWS_SESSION_TOKEN").ok().filter(|s| !s.is_empty()),
+            };
+            Ok(KmsTransport::Aws { region, host, creds })
+        }
+        _ => Ok(KmsTransport::Mock),
+    }
+}
+
+fn kms_vsock_port() -> Result<u32, Box<dyn std::error::Error>> {
+    Ok(std::env::var("KMS_VSOCK_PORT")
+        .unwrap_or_else(|_| "5003".into())
+        .parse()?)
+}
+
+/// Current UTC time as the SigV4 `(amz_date, date_stamp)` pair.
+fn amz_timestamps() -> (String, String) {
+    let now = chrono::Utc::now();
+    (
+        now.format("%Y%m%dT%H%M%SZ").to_string(),
+        now.format("%Y%m%d").to_string(),
+    )
+}
+
 async fn kms_call(target: &str, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let stream = kms_connect().await?;
-    let io = TokioIo::new(stream);
+    let transport = kms_transport()?;
+    let stream = tokio_vsock::VsockStream::connect(2, kms_vsock_port()?).await?;
+
+    // TLS-wrap (AWS) or pass through (mock), and compute the signing headers.
+    let (io, host_header, signed): (Box<dyn TokioIoStream>, String, Option<sigv4::SignedHeaders>) =
+        match &transport {
+            KmsTransport::Mock => (Box::new(stream), "kms.local".to_string(), None),
+            KmsTransport::Aws {
+                region,
+                host,
+                creds,
+            } => {
+                let tls = tls_connect(stream, host).await?;
+                let (amz_date, date_stamp) = amz_timestamps();
+                let headers = [
+                    sigv4::Header {
+                        name: "content-type",
+                        value: KMS_CONTENT_TYPE,
+                    },
+                    sigv4::Header {
+                        name: "x-amz-target",
+                        value: target,
+                    },
+                ];
+                let s =
+                    sigv4::sign_post(creds, region, "kms", host, &amz_date, &date_stamp, &headers, &body);
+                (Box::new(tls), host.clone(), Some(s))
+            }
+        };
+
+    let io = TokioIo::new(io);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -824,29 +1040,45 @@ async fn kms_call(target: &str, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::e
         }
     });
 
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", "kms.local")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", target)
-        .body(Full::new(Bytes::from(body)))?;
+        .header("host", host_header)
+        .header("content-type", KMS_CONTENT_TYPE)
+        .header("x-amz-target", target);
+    if let Some(s) = signed {
+        builder = builder
+            .header("x-amz-date", s.amz_date)
+            .header("authorization", s.authorization);
+        if let Some(tok) = s.security_token {
+            builder = builder.header("x-amz-security-token", tok);
+        }
+    }
+    let req = builder.body(Full::new(Bytes::from(body)))?;
 
     let resp = sender.send_request(req).await?;
     let status = resp.status();
-    let body = resp.into_body().collect().await?.to_bytes().to_vec();
+    let resp_body = resp.into_body().collect().await?.to_bytes().to_vec();
     if !status.is_success() {
-        let msg = String::from_utf8_lossy(&body);
+        let msg = String::from_utf8_lossy(&resp_body);
         return Err(format!("KMS {target} returned {status}: {msg}").into());
     }
-    Ok(body)
+    Ok(resp_body)
 }
 
-async fn kms_connect() -> Result<tokio_vsock::VsockStream, Box<dyn std::error::Error>> {
-    let port: u32 = std::env::var("KMS_VSOCK_PORT")
-        .unwrap_or_else(|_| "5003".into())
-        .parse()?;
-    Ok(tokio_vsock::VsockStream::connect(2, port).await?)
+/// TLS-wrap a raw stream to AWS KMS, validating the server certificate
+/// against the Amazon (Mozilla `webpki-roots`) trust anchors compiled into
+/// this binary (hence PCR-measured). Pinned to the `ring` provider so the
+/// EIF builds without a C toolchain.
+async fn tls_connect(
+    stream: tokio_vsock::VsockStream,
+    host: &str,
+) -> Result<tokio_rustls::client::TlsStream<tokio_vsock::VsockStream>, Box<dyn std::error::Error>> {
+    use tokio_rustls::TlsConnector;
+
+    let connector = TlsConnector::from(Arc::new(kms_tls_config()));
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())?;
+    Ok(connector.connect(server_name, stream).await?)
 }
 
 #[cfg(test)]

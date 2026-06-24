@@ -31,6 +31,13 @@ name = "enclavia"
 tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "process", "time"] }
 tokio-tungstenite = "0.26"
 tokio-vsock = "0.3"
+# In-enclave TLS to AWS KMS (enclavia-crypto). Pinned to the `ring` crypto
+# provider so the musl EIF builds without a C toolchain (aws-lc-rs needs
+# cmake). webpki-roots ships the Mozilla CA bundle compiled into the binary
+# (hence PCR-measured), which covers Amazon Trust Services for kms endpoints.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "0.26"
+hmac = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"

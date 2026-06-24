@@ -1183,8 +1183,11 @@ dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "bytes 1.11.1",
+ "chrono",
  "clap",
  "enclavia-protocol",
+ "hex",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1194,9 +1197,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
