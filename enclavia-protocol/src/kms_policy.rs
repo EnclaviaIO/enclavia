@@ -11,16 +11,20 @@
 //! policy with `kms:GetKeyPolicy` and runs it through
 //! [`verify_decrypt_policy`]. A failure refuses the boot.
 //!
-//! ## Trust caveat
+//! ## Trust model
 //!
-//! In the current architecture the enclave reaches KMS over a plaintext
-//! channel that the parent proxies (no in-enclave TLS validation of the
-//! KMS endpoint). So this check is load-bearing against a *buggy or
-//! misconfigured backend* (the realistic threat: a policy-construction
-//! bug like granting the account root `kms:*`), and is defense-in-depth
-//! against a fully hostile parent, which could forge the `GetKeyPolicy`
-//! response. Closing that last gap needs end-to-end TLS to KMS and is
-//! out of scope here.
+//! The enclave establishes its own TLS session to KMS from inside the
+//! enclave (rustls + webpki-roots validating the KMS endpoint); the parent
+//! only proxies ciphertext, so it can neither read nor forge the
+//! `GetKeyPolicy` response. This check is therefore load-bearing on two
+//! fronts: against a *buggy or misconfigured backend* (the realistic
+//! threat: a policy-construction bug like granting the account root
+//! `kms:*`), whose bad-but-authentic policy KMS would faithfully return
+//! over that TLS channel; and against a *hostile parent*, which the
+//! in-enclave TLS reduces to denial of service (it can drop the connection
+//! but not substitute a weaker policy). The attestation-gated `kms:Decrypt`
+//! the policy is checked for is what ultimately binds the key to this
+//! enclave's PCR0/1/2.
 //!
 //! ## What is enforced
 //!
