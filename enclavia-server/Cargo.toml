@@ -13,6 +13,7 @@ description = "In-enclave Noise responder: terminates the encrypted channel and 
 
 [dependencies]
 enclavia-protocol = { path = "../enclavia-protocol" }
+enclavia-vsock = { path = "../enclavia-vsock" }
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

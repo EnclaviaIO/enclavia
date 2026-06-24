@@ -74,9 +74,11 @@ async fn main() {
 }
 
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Connect to the host storage daemon over vsock.
-    // CID 2 = VMADDR_CID_HOST (the parent/host)
-    let cid = 2u32;
+    // 1. Connect to the host storage daemon over vsock. The host CID is
+    // resolved at runtime (CID 3 on real Nitro, CID 2 under QEMU) so one EIF
+    // boots in both -- read from the value the init recorded at boot. See
+    // enclavia_vsock::host_cid.
+    let cid = enclavia_vsock::host_cid().await;
     info!(
         cid,
         port = config.vsock_port,

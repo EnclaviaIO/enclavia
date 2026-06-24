@@ -162,22 +162,14 @@
         # QEMU debug. See nix/synchronizer-eif.nix for the rationale.
         nitroLib = nitro-util.lib.${system};
 
+        # One EIF for both QEMU and real Nitro: the patched init heartbeats
+        # both CIDs (3 + 2), so there is no longer a QEMU-vs-Nitro build
+        # variant. (`synchronizer-eif-nitro` is kept below as an alias.)
         synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix {
           inherit pkgs nitroLib;
           synchronizerPkg = synchronizer;
           namesInitPkg = synchronizerNamesInit;
           builderSrc = builder-src;
-        };
-
-        # Real-Nitro variant: stock CID-3 init instead of the CID-2 patched
-        # init, so the enclave boots on AWS Graviton/Nitro (the QEMU one
-        # fails run-enclave E36). Same payload + PCRs caveat otherwise.
-        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix {
-          inherit pkgs nitroLib;
-          synchronizerPkg = synchronizer;
-          namesInitPkg = synchronizerNamesInit;
-          builderSrc = builder-src;
-          debugInit = false;
         };
 
       in
@@ -207,7 +199,9 @@
           synchronizer = synchronizer;
           synchronizer-names-init = synchronizerNamesInit;
           synchronizer-eif = synchronizerEif;
-          synchronizer-eif-nitro = synchronizerEifNitro;
+          # Deprecated alias: the EIF is now CID-agnostic (one build for QEMU
+          # and Nitro), so this is identical to `synchronizer-eif`.
+          synchronizer-eif-nitro = synchronizerEif;
         };
 
         # `nix run` shorthand and `nix profile install` default.

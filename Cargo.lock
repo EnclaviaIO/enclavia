@@ -1138,6 +1138,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "enclavia-protocol",
+ "enclavia-vsock",
  "hex",
  "rand 0.8.6",
  "serde",
@@ -1186,6 +1187,7 @@ dependencies = [
  "chrono",
  "clap",
  "enclavia-protocol",
+ "enclavia-vsock",
  "hex",
  "hmac",
  "http-body-util",
@@ -1210,6 +1212,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "enclavia-protocol",
+ "enclavia-vsock",
  "hickory-proto",
  "ipnet",
  "libc",
@@ -1261,6 +1264,7 @@ name = "enclavia-secrets-init"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "enclavia-vsock",
  "serde_json",
  "tokio",
  "tokio-vsock",
@@ -1277,6 +1281,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "enclavia-protocol",
+ "enclavia-vsock",
  "p256",
  "rand 0.8.6",
  "serde",
@@ -1287,6 +1292,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "enclavia-vsock"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tokio-vsock",
+ "tracing",
 ]
 
 [[package]]
@@ -2305,6 +2319,7 @@ dependencies = [
  "base64 0.22.1",
  "ciborium",
  "enclavia-protocol",
+ "enclavia-vsock",
  "libc",
  "serde",
  "serde_json",

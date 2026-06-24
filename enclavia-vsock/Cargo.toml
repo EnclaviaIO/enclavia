@@ -1,0 +1,15 @@
+# Tiny shared helper for the in-enclave binaries: detect the host vsock CID
+# at runtime so a single EIF boots on both QEMU and real Nitro. See
+# `host_cid()` and "Transport conventions" in the consuming repos.
+[package]
+name = "enclavia-vsock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime host-vsock-CID detection for in-enclave binaries (one EIF for QEMU and Nitro)."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "time"] }
+tokio-vsock = { workspace = true }
+tracing = { workspace = true }

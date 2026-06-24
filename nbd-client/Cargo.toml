@@ -28,6 +28,7 @@ synchronizer = { path = "../synchronizer", features = ["client"] }
 # and the synchronizer relay port constant. The async Noise plumbing
 # lives behind the synchronizer client, so default features stay off.
 enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+enclavia-vsock = { path = "../enclavia-vsock" }
 # SHA-256 of the primary btrfs superblock region: the pinned commitment.
 sha2.workspace = true
 # Drive /dev/nsm for the real attestation document (`nix` turns the

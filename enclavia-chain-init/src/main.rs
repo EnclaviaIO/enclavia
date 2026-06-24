@@ -49,10 +49,6 @@ use tracing::{error, info, warn};
 mod attestation;
 mod config;
 
-/// VMADDR_CID_HOST per the Linux vsock contract. Same value in real
-/// Nitro and QEMU debug mode (the latter routes the connection through
-/// `vhost-device-vsock` -> `<proxy>_5005` UDS).
-const VSOCK_HOST_CID: u32 = 2;
 
 /// Port the host-side `chain-host` daemon listens on (#47, phase 3b).
 const CHAIN_HOST_PORT: u32 = 5005;
@@ -162,9 +158,10 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
 /// means the launcher mis-wired the daemon; a write error means the parent
 /// dropped us mid-stream.
 async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(VSOCK_HOST_CID, CHAIN_HOST_PORT),
+        tokio_vsock::VsockStream::connect(cid, CHAIN_HOST_PORT),
     )
     .await
     {
@@ -172,7 +169,7 @@ async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(_) => {
             return Err(format!(
-                "vsock {VSOCK_HOST_CID}:{CHAIN_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
+                "vsock {cid}:{CHAIN_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
             )
             .into());
         }

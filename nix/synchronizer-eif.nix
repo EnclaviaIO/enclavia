@@ -23,31 +23,27 @@
   synchronizerPkg,
   namesInitPkg,
   builderSrc,
-  # QEMU debug (default) uses the CID-2 patched init; real Nitro must use
-  # the stock CID-3 init (nitro-util's blob init), or the enclave never
-  # submits the boot `ready` signal and run-enclave fails E36. Set false
-  # for the AWS/real-Nitro EIF.
-  debugInit ? true,
 }:
 
 let
   arch = "x86_64";
   blobs = nitroLib.blobs.${arch};
 
-  # Patched init with the CID-2 heartbeat, built from the builder's
-  # vendored Go source. vendorHash = null because the source ships its
-  # own vendor/ tree.
+  # The init for ALL synchronizer EIFs, built from the builder's vendored
+  # Go source (vendorHash = null because the source ships its own vendor/
+  # tree). It heartbeats BOTH CID 3 (Nitro parent) and CID 2
+  # (vhost-device-vsock host), so a single EIF boots on both QEMU and real
+  # Nitro -- never AWS' stock CID-3-only blob init. Same init the builder's
+  # enclave.nix uses.
   patchedInit = pkgs.buildGoModule {
-    name = "synchronizer-eif-init-debug";
+    name = "synchronizer-eif-init";
     src = "${builderSrc}/nix/init-patched";
     vendorHash = null;
     env.CGO_ENABLED = 0;
     ldflags = [ "-s" "-w" ];
   };
 
-  # CID-2 patched (QEMU) vs the stock CID-3 init (real Nitro), the same
-  # selection the builder's enclave.nix makes via its debugMode flag.
-  initBinary = if debugInit then "${patchedInit}/bin/init" else blobs.init;
+  initBinary = "${patchedInit}/bin/init";
 
   initScript = pkgs.writeShellScript "synchronizer-enclave-init"
     (builtins.readFile ./synchronizer-init.sh);

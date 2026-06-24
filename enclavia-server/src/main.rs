@@ -53,10 +53,6 @@ enum ChannelKind {
     Control,
 }
 
-/// CID 2 is VMADDR_CID_HOST per the Linux vsock contract. Same value in
-/// real Nitro and QEMU debug mode.
-const VSOCK_HOST_CID: u32 = 2;
-
 /// Port the host-side `chain-host` daemon listens on (#47).
 const CHAIN_HOST_PORT: u32 = 5005;
 
@@ -110,21 +106,22 @@ fn fresh_nonce() -> [u8; 32] {
 /// ~32 KiB). The shared `submit_chain_link` helper in enclavia-protocol
 /// handles chunking automatically.
 async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
+    let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         Duration::from_secs(30),
-        VsockStream::connect(VSOCK_HOST_CID, CHAIN_HOST_PORT),
+        VsockStream::connect(cid, CHAIN_HOST_PORT),
     )
     .await
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             return Err(format!(
-                "vsock {VSOCK_HOST_CID}:{CHAIN_HOST_PORT} connect failed: {e}"
+                "vsock {cid}:{CHAIN_HOST_PORT} connect failed: {e}"
             ));
         }
         Err(_) => {
             return Err(format!(
-                "vsock {VSOCK_HOST_CID}:{CHAIN_HOST_PORT} connect timed out"
+                "vsock {cid}:{CHAIN_HOST_PORT} connect timed out"
             ));
         }
     };

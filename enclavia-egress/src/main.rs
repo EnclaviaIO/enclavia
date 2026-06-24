@@ -25,7 +25,6 @@ async fn main() {
         tun_local_ip = %config.tun_local_ip,
         prefix_len = config.tun_prefix_len,
         mtu = config.mtu,
-        vsock_cid = config.vsock_cid,
         vsock_port = config.vsock_port,
         allowlist = %config.allowlist_path.display(),
         "Starting enclavia-egress",
@@ -49,8 +48,13 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let dev = tun::create_as_async(&tun_config)?;
     let (tun_reader, tun_writer) = tokio::io::split(dev);
 
+    // Resolve the host CID at runtime (CID 3 on real Nitro, CID 2 under QEMU)
+    // so one EIF boots in both -- read from the value the init recorded at
+    // boot. See enclavia_vsock::host_cid.
+    let cid = enclavia_vsock::host_cid().await;
+    info!(vsock_cid = cid, "resolved egress host vsock CID");
     let transport = Arc::new(VsockTransport {
-        cid: config.vsock_cid,
+        cid,
         port: config.vsock_port,
     });
 
