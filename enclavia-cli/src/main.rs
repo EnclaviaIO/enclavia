@@ -34,6 +34,16 @@ impl From<InstanceTypeArg> for enclavia_cli::InstanceTypeArg {
 #[derive(Parser)]
 #[command(name = "enclavia", about = "Enclavia CLI — manage your enclaves")]
 struct Cli {
+    /// Emit machine-readable JSON on stdout instead of human-readable text.
+    /// On success a single JSON value (object or array) is printed and the
+    /// process exits 0; on failure a single `{"error": ..., "kind": ...}`
+    /// object is printed and the process exits non-zero. Progress lines,
+    /// prompts (the OAuth login URL), and diagnostics go to stderr, so
+    /// stdout is always exactly one parseable JSON value. Global: works on
+    /// every subcommand and in either position (`enclavia --json enclave
+    /// list` or `enclavia enclave list --json`).
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -306,45 +316,130 @@ enum UpgradeCmd {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
 
     let result: Result<(), CliError> = match cli.command {
         Command::Auth { cmd } => match cmd {
-            AuthCmd::Login => run_login().await,
+            AuthCmd::Login => run_login(json).await,
         },
-        Command::Enclave { cmd } => run_enclave(cmd).await,
-        Command::Push { local_image, enclave_id } => push::push(&local_image, &enclave_id).await,
-        Command::Reproduce { enclave_id, upgrade } => {
-            run_reproduce(&enclave_id, upgrade.as_deref()).await
+        Command::Enclave { cmd } => run_enclave(cmd, json).await,
+        Command::Push { local_image, enclave_id } => {
+            push::push(&local_image, &enclave_id, json).await
         }
-        Command::Secret { cmd } => run_secret(cmd).await,
-        Command::Upgrade { cmd } => run_upgrade(cmd).await,
+        Command::Reproduce { enclave_id, upgrade } => {
+            run_reproduce(&enclave_id, upgrade.as_deref(), json).await
+        }
+        Command::Secret { cmd } => run_secret(cmd, json).await,
+        Command::Upgrade { cmd } => run_upgrade(cmd, json).await,
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {e}");
+        if json {
+            // The error path must still leave a single parseable JSON value
+            // on stdout so an agent can branch purely on the exit code.
+            print_json(&e.to_json());
+        } else {
+            eprintln!("Error: {e}");
+        }
         std::process::exit(1);
     }
 }
 
-async fn run_login() -> Result<(), CliError> {
+/// Print a value as pretty JSON to stdout. The single point where a
+/// success/error JSON value reaches stdout in `--json` mode.
+fn print_json<T: serde::Serialize>(value: &T) {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            // Serialising our own output types should never fail; if it
+            // somehow does, still leave a parseable error object behind.
+            let fallback = serde_json::json!({
+                "error": format!("failed to serialize output: {e}"),
+                "kind": "error",
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&fallback).unwrap_or_else(|_| {
+                    "{\"error\":\"failed to serialize output\",\"kind\":\"error\"}".to_string()
+                })
+            );
+        }
+    }
+}
+
+/// Emit `value` as a single JSON document when `json` is set, otherwise run
+/// the human-readable `human` closure (today's exact terminal output, kept
+/// byte-for-byte so the default UX never regresses).
+fn emit<T: serde::Serialize>(json: bool, value: &T, human: impl FnOnce()) {
+    if json {
+        print_json(value);
+    } else {
+        human();
+    }
+}
+
+/// A human-facing progress / diagnostic line. In `--json` mode it goes to
+/// stderr so stdout stays a single JSON value; otherwise stdout, preserving
+/// the pre-`--json` behaviour exactly.
+fn note(json: bool, msg: impl std::fmt::Display) {
+    if json {
+        eprintln!("{msg}");
+    } else {
+        println!("{msg}");
+    }
+}
+
+/// Best-effort: does the enclave need a restart for pending secret changes
+/// to land? Mirrors `print_pending_hint`: a `stopped` enclave picks the new
+/// snapshot up on its next start (no restart), anything else (including a
+/// status we couldn't fetch) needs one.
+async fn restart_required(client: &ApiClient, enclave_id: &str) -> bool {
+    let stopped = client
+        .get_enclave(enclave_id)
+        .await
+        .ok()
+        .and_then(|v| v["status"].as_str().map(|s| s == "stopped"))
+        .unwrap_or(false);
+    !stopped
+}
+
+async fn run_login(json: bool) -> Result<(), CliError> {
     let pending = auth::start_login().await?;
-    println!();
-    println!("Open this URL in your browser to authorize this device:");
-    println!();
-    println!("  {}", pending.approval_url);
-    println!();
-    println!("Waiting for approval...");
+    // The URL + prompts are interactive progress: stderr under `--json`,
+    // stdout otherwise (unchanged human flow).
+    note(json, "");
+    note(json, "Open this URL in your browser to authorize this device:");
+    note(json, "");
+    note(json, format!("  {}", pending.approval_url));
+    note(json, "");
+    note(json, "Waiting for approval...");
 
     // Best-effort browser launch — never fatal; the URL is already on the
     // screen if this fails.
     let _ = open::that(&pending.approval_url);
 
     pending.wait_for_token().await?;
-    println!("Authorized. Credentials saved.");
+
+    if json {
+        // Surface the caller's handle (their registry namespace) so an agent
+        // can confirm who it's acting as. Best-effort: a failure to fetch it
+        // shouldn't fail an otherwise-successful login.
+        let handle = match ApiClient::new() {
+            Ok(c) => c.get_registry().await.ok().map(|r| r.namespace),
+            Err(_) => None,
+        };
+        print_json(&serde_json::json!({
+            "status": "logged_in",
+            "handle": handle,
+            "backend_url": enclavia_cli::config::backend_url(),
+        }));
+    } else {
+        println!("Authorized. Credentials saved.");
+    }
     Ok(())
 }
 
-async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
+async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
     match cmd {
         EnclaveCmd::Create {
             instance_type,
@@ -381,53 +476,74 @@ async fn run_enclave(cmd: EnclaveCmd) -> Result<(), CliError> {
                 upgradable,
             )
             .await?;
-            println!("Enclave created:");
-            println!("  ID:     {}", res.id);
-            println!("  Status: {}", res.status);
-            println!();
-            println!("{}", res.next_step);
+            // JSON: the created enclave object verbatim (id, status, and
+            // every other backend field). The human "next step" hint stays
+            // on the human path only.
+            emit(json, &res.raw, || {
+                println!("Enclave created:");
+                println!("  ID:     {}", res.id);
+                println!("  Status: {}", res.status);
+                println!();
+                println!("{}", res.next_step);
+            });
             Ok(())
         }
         EnclaveCmd::List { include_archived } => {
             let client = ApiClient::new()?;
             let enclaves = enclave_cmds::list(&client, include_archived).await?;
-            print_enclave_list(&enclaves, include_archived);
+            emit(json, &enclaves, || print_enclave_list(&enclaves, include_archived));
             Ok(())
         }
         EnclaveCmd::Status { id } => {
             let client = ApiClient::new()?;
             let e = enclave_cmds::status(&client, &id).await?;
-            print_enclave_status(&e);
+            emit(json, &e, || print_enclave_status(&e));
             Ok(())
         }
         EnclaveCmd::Stop { id } => {
             let client = ApiClient::new()?;
             enclave_cmds::stop(&client, &id).await?;
-            println!("Enclave {id} stopped.");
+            emit(
+                json,
+                &serde_json::json!({ "id": id.clone(), "status": "stopped" }),
+                || println!("Enclave {id} stopped."),
+            );
             Ok(())
         }
         EnclaveCmd::Start { id } => {
             let client = ApiClient::new()?;
             enclave_cmds::start(&client, &id).await?;
-            println!("Enclave {id} started.");
+            emit(
+                json,
+                &serde_json::json!({ "id": id.clone(), "status": "started" }),
+                || println!("Enclave {id} started."),
+            );
             Ok(())
         }
         EnclaveCmd::Restart { id } => {
             let client = ApiClient::new()?;
             secrets::restart(&client, &id).await?;
-            println!("Enclave {id} restart requested.");
+            emit(
+                json,
+                &serde_json::json!({ "id": id.clone(), "status": "restart_requested" }),
+                || println!("Enclave {id} restart requested."),
+            );
             Ok(())
         }
         EnclaveCmd::Destroy { id } => {
             let client = ApiClient::new()?;
             enclave_cmds::destroy(&client, &id).await?;
-            println!("Enclave {id} destroyed.");
+            emit(
+                json,
+                &serde_json::json!({ "id": id.clone(), "status": "destroyed" }),
+                || println!("Enclave {id} destroyed."),
+            );
             Ok(())
         }
     }
 }
 
-async fn run_secret(cmd: SecretCmd) -> Result<(), CliError> {
+async fn run_secret(cmd: SecretCmd, json: bool) -> Result<(), CliError> {
     match cmd {
         SecretCmd::Set {
             enclave_id,
@@ -442,21 +558,44 @@ async fn run_secret(cmd: SecretCmd) -> Result<(), CliError> {
                     "no secrets to set (pass NAME=value pairs, --from-stdin, or --from-file)".into(),
                 ));
             }
+            // Capture the names before `set` consumes the pairs; we never
+            // echo the values back, not even in JSON.
+            let names: Vec<String> = parsed_pairs.iter().map(|(n, _)| n.clone()).collect();
             let client = ApiClient::new()?;
             let n = secrets::set(&client, &enclave_id, parsed_pairs).await?;
-            print_pending_hint(&client, &enclave_id, n, "Run").await;
+            if json {
+                let restart_required = restart_required(&client, &enclave_id).await;
+                print_json(&serde_json::json!({
+                    "enclave_id": enclave_id,
+                    "set": names,
+                    "updated": n,
+                    "restart_required": restart_required,
+                }));
+            } else {
+                print_pending_hint(&client, &enclave_id, n, "Run").await;
+            }
             Ok(())
         }
         SecretCmd::List { enclave_id } => {
             let client = ApiClient::new()?;
             let rows = secrets::list(&client, &enclave_id).await?;
-            print_secret_list(&rows);
+            // `SecretSummary` carries names + timestamps + the pending flag,
+            // never values, so the JSON array is value-free by construction.
+            emit(json, &rows, || print_secret_list(&rows));
             Ok(())
         }
         SecretCmd::Delete { enclave_id, names, yes } => {
             if names.is_empty() {
                 return Err(CliError::Other(
                     "no secret names provided to delete".into(),
+                ));
+            }
+            // Interactive per-name confirmation writes prose to stdout, which
+            // would corrupt the single-JSON-value contract, so `--json`
+            // requires the non-interactive `--yes`.
+            if json && !yes {
+                return Err(CliError::Other(
+                    "refusing to prompt for confirmation in --json mode; pass --yes".into(),
                 ));
             }
             // Per-name confirmation. The flag exists for the
@@ -475,12 +614,30 @@ async fn run_secret(cmd: SecretCmd) -> Result<(), CliError> {
                 keep
             };
             if confirmed.is_empty() {
-                println!("Nothing to do.");
+                emit(
+                    json,
+                    &serde_json::json!({
+                        "enclave_id": enclave_id,
+                        "deleted": Vec::<String>::new(),
+                        "updated": 0,
+                    }),
+                    || println!("Nothing to do."),
+                );
                 return Ok(());
             }
             let client = ApiClient::new()?;
             let n = secrets::delete(&client, &enclave_id, &confirmed).await?;
-            print_pending_hint(&client, &enclave_id, n, "Run").await;
+            if json {
+                let restart_required = restart_required(&client, &enclave_id).await;
+                print_json(&serde_json::json!({
+                    "enclave_id": enclave_id,
+                    "deleted": confirmed,
+                    "updated": n,
+                    "restart_required": restart_required,
+                }));
+            } else {
+                print_pending_hint(&client, &enclave_id, n, "Run").await;
+            }
             Ok(())
         }
     }
@@ -605,7 +762,11 @@ fn print_secret_list(rows: &[secrets::SecretSummary]) {
     }
 }
 
-async fn run_reproduce(id_or_prefix: &str, upgrade_id: Option<&str>) -> Result<(), CliError> {
+async fn run_reproduce(
+    id_or_prefix: &str,
+    upgrade_id: Option<&str>,
+    json: bool,
+) -> Result<(), CliError> {
     // Authenticated when possible (lets owners reproduce their own
     // private enclaves and resolve prefixes via the list endpoint),
     // anonymous fallback for users with no credentials reproducing a
@@ -619,6 +780,21 @@ async fn run_reproduce(id_or_prefix: &str, upgrade_id: Option<&str>) -> Result<(
         Some(uid) => reproduce::reproduce_upgrade(&client, id_or_prefix, uid).await?,
         None => reproduce::reproduce(&client, id_or_prefix).await?,
     };
+
+    if json {
+        // A reproduce that ran to completion is a SUCCESS regardless of the
+        // PCR verdict: the verdict lives in `reproducible` + `mismatches`, so
+        // an agent reads the field rather than the exit code. (The human
+        // path below still exits non-zero on divergence, unchanged.)
+        let mut v = serde_json::to_value(&result)
+            .map_err(|e| CliError::Other(format!("serialize reproduce result: {e}")))?;
+        if let Some(uid) = upgrade_id {
+            v["upgrade_id"] = serde_json::json!(uid);
+        }
+        v["reproducible"] = serde_json::json!(result.is_reproducible());
+        print_json(&v);
+        return Ok(());
+    }
 
     println!("Enclave:        {}", result.enclave_id);
     if let Some(uid) = upgrade_id {
@@ -739,18 +915,18 @@ fn print_enclave_status(e: &serde_json::Value) {
     }
 }
 
-async fn run_upgrade(cmd: UpgradeCmd) -> Result<(), CliError> {
+async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
     match cmd {
         UpgradeCmd::Chain { enclave_id } => {
             let client = ApiClient::new()?;
             let summary = upgrade::chain(&client, &enclave_id).await?;
-            print_chain(&summary);
+            emit(json, &summary, || print_chain(&summary));
             Ok(())
         }
         UpgradeCmd::List { enclave_id } => {
             let client = ApiClient::new()?;
             let rows = upgrade::list_upgrades(&client, &enclave_id).await?;
-            print_upgrade_list(&rows);
+            emit(json, &rows, || print_upgrade_list(&rows));
             Ok(())
         }
         UpgradeCmd::Confirm { enclave_id, upgrade_id, at, immediate } => {
@@ -768,14 +944,14 @@ async fn run_upgrade(cmd: UpgradeCmd) -> Result<(), CliError> {
             let result =
                 upgrade::confirm_upgrade(&client, &enclave_id, &upgrade_id, valid_from)
                     .await?;
-            print_upgrade_confirm(&result);
+            emit(json, &result, || print_upgrade_confirm(&result));
             Ok(())
         }
         UpgradeCmd::Revoke { enclave_id, upgrade_id } => {
             let client = ApiClient::new()?;
             let result =
                 upgrade::revoke_upgrade(&client, &enclave_id, &upgrade_id).await?;
-            print_upgrade_revoke(&result);
+            emit(json, &result, || print_upgrade_revoke(&result));
             Ok(())
         }
     }
