@@ -782,18 +782,27 @@ async fn run_reproduce(
     };
 
     if json {
-        // A reproduce that ran to completion is a SUCCESS regardless of the
-        // PCR verdict: the verdict lives in `reproducible` + `mismatches`, so
-        // an agent reads the field rather than the exit code. (The human
-        // path below still exits non-zero on divergence, unchanged.)
+        // reproduce is a VERIFICATION command, so the PCR verdict maps onto the
+        // exit code (like `diff` / `test`): exit 0 when the local build matches
+        // the recorded PCRs, a distinct non-zero (2) when it diverges. The full
+        // payload (including `reproducible` + `mismatches`) is printed to stdout
+        // EITHER way, so a field-reading agent gets the detail while an
+        // exit-code-only caller still fails closed. Operational errors are exit
+        // 1 with an {"error"} object (handled in `main`), so 2 is unambiguously
+        // "ran, but not reproducible". The human path below also exits non-zero
+        // on divergence.
         let mut v = serde_json::to_value(&result)
             .map_err(|e| CliError::Other(format!("serialize reproduce result: {e}")))?;
         if let Some(uid) = upgrade_id {
             v["upgrade_id"] = serde_json::json!(uid);
         }
-        v["reproducible"] = serde_json::json!(result.is_reproducible());
+        let reproducible = result.is_reproducible();
+        v["reproducible"] = serde_json::json!(reproducible);
         print_json(&v);
-        return Ok(());
+        if reproducible {
+            return Ok(());
+        }
+        std::process::exit(2);
     }
 
     println!("Enclave:        {}", result.enclave_id);

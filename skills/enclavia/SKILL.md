@@ -18,6 +18,8 @@ operations.
    - exit 0: stdout is the success object/array.
    - exit non-zero: stdout is `{"error": "<message>", "kind": "<kind>"}`
      (`kind` is one of `not_logged_in`, `unauthorized`, `error`).
+   - Exception: `reproduce` is a verification command (exit 0 = reproducible,
+     exit 2 = diverged, with the reproduce payload still on stdout). See its entry.
 4. stderr is human progress/diagnostics only; ignore it unless debugging.
 
 ## Auth (do this first)
@@ -64,7 +66,9 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
 
 - `enclavia reproduce <id> [--upgrade <upgrade-id>] --json`  (needs local `builder` + `nix`)
   -> `{enclave_id,image_digest,expected{PCR0,PCR1,PCR2},actual{...},mismatches[],reproducible:<bool>,recorded_builder_rev,recorded_crates_rev,...}`.
-  Exits 0 even when the build diverges; CHECK the `reproducible` field.
+  Verification command: exit 0 = reproducible, exit 2 = diverged (stdout still
+  carries the full payload incl. `mismatches`), exit 1 = operational error. Gate
+  on exit 0 (or `reproducible == true`).
 
 - `enclavia secret list <id> --json`
   -> ARRAY of `{name,created_at,updated_at,pending}`. Values are NEVER returned.
