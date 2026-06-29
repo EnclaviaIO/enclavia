@@ -21,7 +21,11 @@ use crate::error::CliError;
 
 const DEFAULT_TAG: &str = "latest";
 
-pub async fn push(local_image: &str, enclave_id_or_prefix: &str) -> Result<(), CliError> {
+pub async fn push(
+    local_image: &str,
+    enclave_id_or_prefix: &str,
+    json: bool,
+) -> Result<(), CliError> {
     let client = ApiClient::new()?;
     let registry = client.get_registry().await?;
     let registry_host = &registry.registry_url;
@@ -42,20 +46,22 @@ pub async fn push(local_image: &str, enclave_id_or_prefix: &str) -> Result<(), C
     // own keyring (or `~/.docker/config.json` if no helper is configured).
     docker_login(registry_host, namespace, &client.token()).await?;
 
-    println!("Tagging {local_image} -> {canonical}");
+    // Progress lines go to stderr under `--json` (stdout must end as a single
+    // JSON value); stdout otherwise, preserving the pre-`--json` flow.
+    note(json, format!("Tagging {local_image} -> {canonical}"));
     run_docker(&["tag", local_image, &canonical]).await?;
 
-    println!("Pushing {canonical}");
-    let digest = stream_docker_push(&canonical).await?;
+    note(json, format!("Pushing {canonical}"));
+    let digest = stream_docker_push(&canonical, json).await?;
 
-    println!();
-    println!("Pushed to {canonical}");
+    note(json, String::new());
+    note(json, format!("Pushed to {canonical}"));
     if let Some(d) = digest.as_deref() {
         // The manifest digest is the only content-addressed identifier here;
         // tags are mutable. Surfacing it lets the user (or scripts) confirm
         // the digest the backend will pin against, which is what shows up in
         // the dashboard once the build completes.
-        println!("Digest: {d}");
+        note(json, format!("Digest: {d}"));
     }
 
     // Tell the backend a push just landed for this enclave so it can kick
@@ -63,19 +69,86 @@ pub async fn push(local_image: &str, enclave_id_or_prefix: &str) -> Result<(), C
     // poll. Critically, a no-op re-push (same digest, layers already cached)
     // would never trigger digest-change polling — this notify is the push
     // *event* signal that bypasses that. Best-effort: the push itself
-    // succeeded, so we still print a status hint on notify failure.
+    // succeeded, so we still surface a status hint on notify failure.
     match client.notify_push(&enclave.id).await {
         Ok(resp) => {
-            print_notify_result(&resp, &enclave.id)?;
+            if json {
+                // A pure non-upgradable rejection is a hard failure in both
+                // modes; surface it as an `{"error": ...}` object + non-zero
+                // exit so the agent can branch on it.
+                if is_non_upgradable_rejection(&resp) {
+                    return Err(CliError::Other(
+                        "this enclave is non-upgradable, create a new one".into(),
+                    ));
+                }
+                emit_push_json(&canonical, digest.as_deref(), &resp);
+            } else {
+                print_notify_result(&resp, &enclave.id)?;
+            }
         }
         Err(e) => {
+            // The push itself succeeded; notify is best-effort. Keep the
+            // warning on stderr so stdout stays a single JSON value.
             eprintln!("warning: failed to notify backend of push: {e}");
-            eprintln!("  the backend's registry poll will still pick it up within ~15s");
-            println!("Check build progress with:");
-            println!("  enclavia enclave status {}", enclave.id);
+            if json {
+                emit_push_json_minimal(&canonical, digest.as_deref());
+            } else {
+                eprintln!("  the backend's registry poll will still pick it up within ~15s");
+                println!("Check build progress with:");
+                println!("  enclavia enclave status {}", enclave.id);
+            }
         }
     }
     Ok(())
+}
+
+/// A human-facing progress line: stderr under `--json`, stdout otherwise.
+fn note(json: bool, msg: impl std::fmt::Display) {
+    if json {
+        eprintln!("{msg}");
+    } else {
+        println!("{msg}");
+    }
+}
+
+/// True when the only outcome of the push-notify was a non-upgradable
+/// rejection (nothing built, nothing staged), which is a hard failure.
+fn is_non_upgradable_rejection(resp: &crate::api::NotifyPushResponse) -> bool {
+    !resp.rejected_non_upgradable.is_empty()
+        && resp.triggered.is_empty()
+        && resp.staged.is_empty()
+}
+
+/// Emit the single JSON object for a successful push: the canonical image
+/// reference, the resolved manifest digest (null if docker emitted none),
+/// and the notify outcome (triggered builds / staged upgrades).
+fn emit_push_json(canonical: &str, digest: Option<&str>, resp: &crate::api::NotifyPushResponse) {
+    let out = serde_json::json!({
+        "image": canonical,
+        "digest": digest,
+        "triggered": resp.triggered,
+        "staged": resp.staged,
+        "rejected_non_upgradable": resp.rejected_non_upgradable,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).expect("serialize push json")
+    );
+}
+
+/// Push succeeded but the best-effort notify call failed: still emit the
+/// image + digest so an agent has the canonical reference, flagged so it
+/// knows the build kick-off was not confirmed.
+fn emit_push_json_minimal(canonical: &str, digest: Option<&str>) {
+    let out = serde_json::json!({
+        "image": canonical,
+        "digest": digest,
+        "notify_failed": true,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).expect("serialize push json")
+    );
 }
 
 /// Print the result of a `POST /me/registry/push-notify` response and
@@ -89,10 +162,7 @@ pub(crate) fn print_notify_result(
 ) -> Result<(), crate::error::CliError> {
     // Non-upgradable rejection: warn and exit non-zero when nothing
     // useful happened at all.
-    if !resp.rejected_non_upgradable.is_empty()
-        && resp.triggered.is_empty()
-        && resp.staged.is_empty()
-    {
+    if is_non_upgradable_rejection(resp) {
         return Err(crate::error::CliError::Other(
             "this enclave is non-upgradable, create a new one".into(),
         ));
@@ -256,7 +326,7 @@ async fn run_docker(args: &[&str]) -> Result<(), CliError> {
 /// such line (older docker versions, registries that don't return one). The
 /// caller should treat absence as "couldn't capture", not "push failed" —
 /// the exit status is the source of truth on success.
-async fn stream_docker_push(reference: &str) -> Result<Option<String>, CliError> {
+async fn stream_docker_push(reference: &str, json: bool) -> Result<Option<String>, CliError> {
     let mut child = Command::new("docker")
         .args(["push", reference])
         .stdout(Stdio::piped())
@@ -274,7 +344,13 @@ async fn stream_docker_push(reference: &str) -> Result<Option<String>, CliError>
             if let Some(d) = parse_push_digest(&line) {
                 digest = Some(d);
             }
-            println!("{line}");
+            // docker's own per-layer progress: stderr under `--json` (stdout
+            // must stay a single JSON value), stdout otherwise.
+            if json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
         }
         digest
     });

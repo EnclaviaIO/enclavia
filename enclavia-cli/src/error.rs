@@ -21,6 +21,30 @@ pub enum CliError {
     Other(String),
 }
 
+impl CliError {
+    /// Stable machine-readable discriminant for the `--json` error shape.
+    /// Mirrors the variant; `Other` collapses to a generic `error` since it
+    /// carries no further structure today.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CliError::NotLoggedIn => "not_logged_in",
+            CliError::Unauthorized => "unauthorized",
+            CliError::Other(_) => "error",
+        }
+    }
+
+    /// Render this error as the single JSON object the CLI prints to stdout
+    /// in `--json` mode: `{"error": <message>, "kind": <kind>}`. The
+    /// `message` is the same `Display` string the human path prints to
+    /// stderr, so the two surfaces never drift.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": self.to_string(),
+            "kind": self.kind(),
+        })
+    }
+}
+
 impl From<String> for CliError {
     fn from(s: String) -> Self {
         CliError::Other(s)
@@ -30,5 +54,33 @@ impl From<String> for CliError {
 impl From<&str> for CliError {
     fn from(s: &str) -> Self {
         CliError::Other(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_json_carries_message_and_kind() {
+        let v = CliError::NotLoggedIn.to_json();
+        assert_eq!(v["kind"], "not_logged_in");
+        assert!(v["error"].as_str().unwrap().contains("not logged in"));
+
+        let v = CliError::Unauthorized.to_json();
+        assert_eq!(v["kind"], "unauthorized");
+
+        let v = CliError::Other("boom".into()).to_json();
+        assert_eq!(v["kind"], "error");
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn to_json_is_a_single_object_with_exactly_two_keys() {
+        let v = CliError::Other("x".into()).to_json();
+        let obj = v.as_object().expect("error json is an object");
+        assert_eq!(obj.len(), 2);
+        assert!(obj.contains_key("error"));
+        assert!(obj.contains_key("kind"));
     }
 }

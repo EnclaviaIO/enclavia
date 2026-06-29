@@ -60,7 +60,7 @@ pub struct NotifyPushResponse {
 }
 
 /// One entry in `NotifyPushResponse::staged`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StagedPushEntry {
     pub enclave_id: String,
     pub upgrade_id: String,
