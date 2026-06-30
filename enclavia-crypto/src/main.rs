@@ -220,13 +220,47 @@ enum Command {
     RevokeUpgrade,
 }
 
+/// TEMPORARY DEBUG TELEMETRY (not for production): tees the tracing output to
+/// an in-memory buffer alongside stderr, so it can be shipped off the enclave
+/// over vsock at exit. This lets us read the in-enclave crypto logs when the
+/// enclave runs with `debug_mode=false` (real PCRs, no serial console) —
+/// the only mode in which the attestation-gated `kms:Decrypt` recovery path
+/// can actually be exercised. Gated entirely on `TELEMETRY_VSOCK_PORT`; with
+/// the env var unset this is a stderr-only no-op. REMOVE before shipping.
+#[derive(Clone)]
+struct TeleBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for TeleBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(b);
+        if let Ok(mut g) = self.0.lock() {
+            g.extend_from_slice(b);
+        }
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeleBuf {
+    type Writer = TeleBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let telebuf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_ansi(false)
+        .with_writer(TeleBuf(telebuf.clone()))
         .init();
 
     let cli = Cli::parse();
@@ -239,8 +273,32 @@ async fn main() {
         Command::RevokeUpgrade => revoke_upgrade().await,
     };
 
-    if let Err(e) = result {
+    if let Err(ref e) = result {
         error!("fatal: {e}");
+    }
+
+    // TEMPORARY DEBUG: ship the buffered trace off the enclave over vsock so we
+    // can read it without a serial console (production / real-PCR boots, the
+    // only mode the attestation-gated Decrypt recovery path runs in). Port is
+    // hardcoded so no init.sh/env wiring is needed; best-effort + time-boxed,
+    // and a fast no-op when the parent isn't running the listener. REMOVE
+    // before ship.
+    const TELEMETRY_VSOCK_PORT: u32 = 5099;
+    {
+        let payload = telebuf.lock().map(|g| g.clone()).unwrap_or_default();
+        let cid = host_cid().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if let Ok(mut s) = tokio_vsock::VsockStream::connect(cid, TELEMETRY_VSOCK_PORT).await {
+                let _ = s.write_all(&payload).await;
+                let _ = s.flush().await;
+                // drop closes the stream; tokio-vsock's inherent shutdown() is
+                // sync + needs a Shutdown arg, so don't use it here.
+            }
+        })
+        .await;
+    }
+
+    if result.is_err() {
         std::process::exit(1);
     }
 }
