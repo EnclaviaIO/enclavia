@@ -176,11 +176,20 @@ fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
         return Ok((emit_der(id, &after_len[..len]), &after_len[len..]));
     }
 
-    // Constructed: transcode each child. For a constructed OCTET STRING (0x24)
-    // we concatenate the children's VALUES into one primitive OCTET STRING;
-    // for any other constructed tag we concatenate the children's full TLVs.
-    let is_octet = id == 0x24;
-    let mut body = Vec::new();
+    // Constructed: transcode every child first, then decide how to re-emit
+    // this node. Two cases collapse a chunked string into a single PRIMITIVE
+    // OCTET STRING (strict DER rejects the constructed form with "not
+    // canonically encoded as DER"):
+    //   * a universal constructed OCTET STRING (tag 0x24), and
+    //   * an IMPLICIT-tagged OCTET STRING carried under a context-specific
+    //     constructed tag that KMS chunked, e.g. EncryptedContentInfo's
+    //     `encryptedContent [0] IMPLICIT OCTET STRING` -> tag 0xA0 holding 0x04
+    //     segments. We detect this by the children all being OCTET STRINGs and
+    //     re-emit with the constructed bit cleared (0xA0 -> 0x80), preserving
+    //     the tag number/class.
+    // Any other constructed tag (SEQUENCE, SET, an EXPLICIT [0] wrapper, ...)
+    // keeps its children's full TLVs unchanged.
+    let mut children: Vec<Vec<u8>> = Vec::new();
     let after: &[u8];
     match len {
         Some(len) => {
@@ -191,11 +200,7 @@ fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
             after = &after_len[len..];
             while !region.is_empty() {
                 let (child, rest) = transcode_tlv(region)?;
-                if is_octet {
-                    body.extend_from_slice(&octet_value(&child)?);
-                } else {
-                    body.extend_from_slice(&child);
-                }
+                children.push(child);
                 region = rest;
             }
         }
@@ -208,18 +213,32 @@ fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
                     break;
                 }
                 let (child, rest) = transcode_tlv(region)?;
-                if is_octet {
-                    body.extend_from_slice(&octet_value(&child)?);
-                } else {
-                    body.extend_from_slice(&child);
-                }
+                children.push(child);
                 region = rest;
             }
             after = region;
         }
     }
-    let out_id = if is_octet { 0x04 } else { id };
-    Ok((emit_der(out_id, &body), after))
+
+    let is_universal_octet = id == 0x24;
+    let is_context = id & 0xc0 == 0x80; // context-specific class
+    let context_octet = is_context
+        && !children.is_empty()
+        && children.iter().all(|c| c.first() == Some(&0x04));
+    if is_universal_octet || context_octet {
+        let mut body = Vec::new();
+        for child in &children {
+            body.extend_from_slice(&octet_value(child)?);
+        }
+        let out_id = if is_universal_octet { 0x04 } else { id & !0x20 };
+        return Ok((emit_der(out_id, &body), after));
+    }
+
+    let mut body = Vec::new();
+    for child in &children {
+        body.extend_from_slice(child);
+    }
+    Ok((emit_der(id, &body), after))
 }
 
 /// Read an ASN.1 length. `None` = indefinite (0x80). Returns the content slice.
@@ -412,6 +431,25 @@ mod tests {
         let ber_nested = [0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
         let der_nested = [0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01];
         assert_eq!(ber_to_der(&ber_nested).unwrap(), der_nested);
+
+        // IMPLICIT-tagged, chunked OCTET STRING under a context-specific
+        // constructed tag [0] (0xA0), indefinite, "ab"+"cd" -> a single
+        // PRIMITIVE context [0] (0x80) 80 04 61 62 63 64. This is exactly how
+        // KMS chunks EncryptedContentInfo.encryptedContent.
+        let want_ctx = [0x80, 0x04, 0x61, 0x62, 0x63, 0x64];
+        let ber_ctx_indef = [
+            0xA0, 0x80, 0x04, 0x02, 0x61, 0x62, 0x04, 0x02, 0x63, 0x64, 0x00, 0x00,
+        ];
+        assert_eq!(ber_to_der(&ber_ctx_indef).unwrap(), want_ctx);
+        // Definite-length form of the same.
+        let ber_ctx_def = [0xA0, 0x08, 0x04, 0x02, 0x61, 0x62, 0x04, 0x02, 0x63, 0x64];
+        assert_eq!(ber_to_der(&ber_ctx_def).unwrap(), want_ctx);
+
+        // An EXPLICIT [0] wrapper (single SEQUENCE child, not an OCTET STRING)
+        // must STAY constructed -- this is ContentInfo.content.
+        let ber_explicit = [0xA0, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let der_explicit = [0xA0, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01];
+        assert_eq!(ber_to_der(&ber_explicit).unwrap(), der_explicit);
 
         // And a real CMS envelope (already DER) survives the transcode intact.
         let priv_key = ephemeral_key();

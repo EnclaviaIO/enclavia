@@ -958,6 +958,9 @@ async fn kms_decrypt(
     let resp = kms_call("TrentService.Decrypt", body).await?;
     let parsed: DecryptResp = serde_json::from_slice(&resp)?;
     let envelope = B64.decode(parsed.ciphertext_for_recipient.as_bytes())?;
+    // TEMP (debug-recovery-telemetry): ship the raw CiphertextForRecipient so a
+    // failing decode can be reproduced offline as a unit test. Revert before merge.
+    tracing::info!(envelope_b64 = %B64.encode(&envelope), "TELE: CiphertextForRecipient envelope");
     Ok(enclavia_protocol::kms_recipient::decode(&ephemeral, &envelope)?)
 }
 
