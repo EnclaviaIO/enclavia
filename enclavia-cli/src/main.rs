@@ -178,6 +178,12 @@ enum EnclaveCmd {
         /// Immutable post-create.
         #[arg(long)]
         upgradable: bool,
+        /// Launch as a PRODUCTION enclave (real EC2 Nitro) instead of the
+        /// default debug enclave (local QEMU). The deployment's launcher
+        /// must support production and the account must be entitled (a paid
+        /// plan), or the backend rejects the create. Immutable post-create.
+        #[arg(long)]
+        production: bool,
     },
     /// List your enclaves
     List {
@@ -451,6 +457,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
             egress_resolver,
             egress_config,
             upgradable,
+            production,
         } => {
             // Validate the egress allowlist BEFORE constructing the API
             // client. The validator is purely local (parses --egress-allow
@@ -474,6 +481,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 visibility.as_deref(),
                 egress_allowlist,
                 upgradable,
+                production,
             )
             .await?;
             // JSON: the created enclave object verbatim (id, status, and

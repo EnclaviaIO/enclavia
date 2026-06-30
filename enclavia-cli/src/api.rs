@@ -306,6 +306,7 @@ impl ApiClient {
         visibility: Option<&str>,
         egress_allowlist: Option<&serde_json::Value>,
         upgradable: bool,
+        production: bool,
     ) -> Result<serde_json::Value, CliError> {
         let mut body = serde_json::json!({
             "instance_type": instance_type,
@@ -330,6 +331,11 @@ impl ApiClient {
         // commit the CLI to mirroring the server-side default.
         if upgradable {
             body["upgradable"] = serde_json::json!(true);
+        }
+        // Only send `mode` for production; omitted -> backend default
+        // ("debug"), so the CLI doesn't hardcode the server-side default.
+        if production {
+            body["mode"] = serde_json::json!("production");
         }
         self.request_with_body(reqwest::Method::POST, "/enclaves", &body)
             .await
