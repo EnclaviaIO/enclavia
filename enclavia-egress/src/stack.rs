@@ -193,6 +193,12 @@ struct StackFlow {
     /// Set once the flow has gone through smoltcp's `Established`
     /// state. We use it to detect a clean close on the workload side.
     saw_established: bool,
+    /// The workload's source endpoint for this flow. Together with `dst`
+    /// it forms the TCP 4-tuple that keys the flow: two concurrent
+    /// connections to the same `dst` differ only in their source port, so
+    /// dedup MUST be by (src, dst), not `dst` alone (see
+    /// [`flow_already_exists`]).
+    src: SocketAddrV4,
     dst: SocketAddrV4,
 }
 
@@ -532,7 +538,7 @@ async fn handle_inbound(
     if let Some((dst, src)) = parse_new_tcp_syn(&packet) {
         let mut state = shared.lock().await;
         if !flow_already_exists(&state, dst, src) {
-            match allocate_flow(&mut state, dst) {
+            match allocate_flow(&mut state, dst, src) {
                 Ok(flow_stream) => {
                     let _ = state
                         .accepted_tx
@@ -568,16 +574,37 @@ fn parse_new_tcp_syn(packet: &[u8]) -> Option<(SocketAddrV4, SocketAddrV4)> {
     Some((dst, src))
 }
 
-fn flow_already_exists(state: &StackState, dst: SocketAddrV4, _src: SocketAddrV4) -> bool {
-    state.flows.values().any(|f| f.dst == dst)
+/// Has a flow already been allocated for this SYN's TCP 4-tuple?
+///
+/// Keyed on BOTH endpoints, not `dst` alone: a workload opening several
+/// simultaneous connections to the same `host:port` (connection pools,
+/// HTTP/1.1 parallel requests, keep-alive) sends distinct source ports,
+/// and each is a separate flow that needs its own smoltcp listening
+/// socket. Deduping on `dst` alone suppressed the second concurrent
+/// socket, leaving the injected SYN with no `Listen` socket to accept it,
+/// so smoltcp replied RST and the workload saw `ECONNREFUSED`. Matching
+/// the full 4-tuple still swallows SYN retransmits (same tuple) while
+/// admitting a genuinely new concurrent connection.
+fn flow_already_exists(state: &StackState, dst: SocketAddrV4, src: SocketAddrV4) -> bool {
+    state.flows.values().any(|f| f.dst == dst && f.src == src)
 }
 
-fn allocate_flow(state: &mut StackState, dst: SocketAddrV4) -> io::Result<FlowStream> {
+fn allocate_flow(
+    state: &mut StackState,
+    dst: SocketAddrV4,
+    src: SocketAddrV4,
+) -> io::Result<FlowStream> {
     let rx = vec![0u8; SMOLTCP_RX_BUFFER];
     let tx = vec![0u8; SMOLTCP_TX_BUFFER];
     let rx_buf = tcp::SocketBuffer::new(rx);
     let tx_buf = tcp::SocketBuffer::new(tx);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+    // Listen on the workload's chosen destination. Several sockets may end
+    // up listening on the SAME endpoint at once (one per concurrent
+    // connection to that `host:port`); smoltcp handles this: an already
+    // matched socket only accepts packets for its exact 4-tuple, while a
+    // still-listening socket accepts the next fresh SYN to the endpoint,
+    // so each concurrent connection lands on its own socket.
     socket
         .listen(IpListenEndpoint {
             addr: Some(IpAddress::Ipv4(*dst.ip())),
@@ -597,6 +624,7 @@ fn allocate_flow(state: &mut StackState, dst: SocketAddrV4) -> io::Result<FlowSt
         from_forwarder,
         pending_send: None,
         saw_established: false,
+        src,
         dst,
     };
     state.flows.insert(handle, stack_flow);
@@ -666,6 +694,80 @@ mod tests {
         let dst_addr: Ipv4Address = *dst.ip();
         tcp.fill_checksum(&src_addr.into(), &dst_addr.into());
         assert!(parse_new_tcp_syn(&pkt).is_none());
+    }
+
+    /// Build an empty stack state plus its device and the accepted-flow
+    /// receiver, so tests can feed raw packets through `handle_inbound`.
+    async fn make_state() -> (
+        Arc<Mutex<StackState>>,
+        Arc<Mutex<ChannelDevice>>,
+        mpsc::Receiver<AcceptedFlow>,
+    ) {
+        let device = Arc::new(Mutex::new(ChannelDevice::new(1500)));
+        let iface = {
+            let mut dev = device.lock().await;
+            build_interface(&mut *dev, Ipv4Addr::new(10, 99, 0, 1), 24)
+        };
+        let sockets = SocketSet::new(Vec::<smoltcp::iface::SocketStorage<'static>>::new());
+        let (accepted_tx, accepted_rx) = mpsc::channel(8);
+        let shared = Arc::new(Mutex::new(StackState {
+            iface,
+            sockets,
+            flows: HashMap::new(),
+            closed_scratch: Vec::new(),
+            accepted_tx,
+        }));
+        (shared, device, accepted_rx)
+    }
+
+    /// Two simultaneous connections to the same `dst` differ only in their
+    /// source port; each must get its own flow (and its own listening
+    /// smoltcp socket), otherwise the second SYN is answered with a RST and
+    /// the workload sees `ECONNREFUSED`. Regression for the concurrent-
+    /// connection bug.
+    #[tokio::test]
+    async fn concurrent_syns_same_dst_distinct_src_get_separate_flows() {
+        let (shared, device, mut accepted_rx) = make_state().await;
+        let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443);
+        let syn1 = syn_packet(SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 49152), dst);
+        let syn2 = syn_packet(SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 49153), dst);
+
+        handle_inbound(&shared, &device, syn1).await;
+        handle_inbound(&shared, &device, syn2).await;
+
+        assert_eq!(
+            shared.lock().await.flows.len(),
+            2,
+            "two concurrent connections to the same dst must each allocate a flow"
+        );
+        let a = accepted_rx.try_recv().expect("first AcceptedFlow surfaced");
+        let b = accepted_rx.try_recv().expect("second AcceptedFlow surfaced");
+        assert_eq!(a.dst, dst);
+        assert_eq!(b.dst, dst);
+    }
+
+    /// A retransmitted SYN carries the same 4-tuple, so it must reuse the
+    /// existing flow rather than allocating a second socket.
+    #[tokio::test]
+    async fn retransmitted_syn_same_4tuple_is_deduped() {
+        let (shared, device, mut accepted_rx) = make_state().await;
+        let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443);
+        let src = SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 49152);
+        let syn = syn_packet(src, dst);
+
+        handle_inbound(&shared, &device, syn.clone()).await;
+        handle_inbound(&shared, &device, syn).await;
+
+        assert_eq!(
+            shared.lock().await.flows.len(),
+            1,
+            "a SYN retransmit for the same 4-tuple must not allocate a second flow"
+        );
+        assert!(accepted_rx.try_recv().is_ok(), "one AcceptedFlow surfaced");
+        assert!(
+            accepted_rx.try_recv().is_err(),
+            "no second AcceptedFlow for a retransmitted SYN"
+        );
     }
 }
 
