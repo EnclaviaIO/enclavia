@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -383,6 +383,49 @@ async fn run_revoke_upgrade(
     )
 }
 
+/// Pull a fresh CBOR creds map from the on-demand IMDS relay the backend
+/// re-armed on the parent for this upgrade (a single-shot `secrets-host
+/// --source imds` on vsock `AWS_CREDS_VSOCK_PORT`). Same length-prefixed
+/// framing as the boot-time `enclavia-secrets-init` pull. In-memory only: the
+/// `kms:Decrypt`-capable creds never touch the enclave's disk.
+async fn pull_upgrade_kms_creds() -> Result<BTreeMap<String, Vec<u8>>, String> {
+    // Matches `enclavia-secrets-init`'s `AWS_CREDS_HOST_PORT` and the
+    // launcher's AWS-creds `secrets-host` port.
+    const AWS_CREDS_VSOCK_PORT: u32 = 5013;
+    const ACK_BYTE: u8 = 0x00;
+    const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+
+    let cid = enclavia_vsock::host_cid().await;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        VsockStream::connect(cid, AWS_CREDS_VSOCK_PORT),
+    )
+    .await
+    .map_err(|_| format!("vsock {cid}:{AWS_CREDS_VSOCK_PORT} connect timed out"))?
+    .map_err(|e| format!("vsock {cid}:{AWS_CREDS_VSOCK_PORT} connect: {e}"))?;
+
+    // 4-byte BE length prefix, then exactly N bytes of CBOR (the host stays
+    // blocked on our ack below rather than shutting down the write half).
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("reading creds length prefix: {e}"))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_PAYLOAD_BYTES {
+        return Err(format!("creds payload length {len} out of range"));
+    }
+    let mut bytes = vec![0u8; len];
+    stream
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|e| format!("reading creds payload: {e}"))?;
+    // Ack so the single-shot relay can serve-once and exit.
+    let _ = stream.write_all(&[ACK_BYTE]).await;
+
+    ciborium::de::from_reader(&bytes[..]).map_err(|e| format!("decoding creds CBOR: {e}"))
+}
+
 /// Spawn `enclavia-crypto prepare-upgrade` and translate its exit status into
 /// a user-visible result. The new public key is base64-encoded for the CLI;
 /// the key id is passed through unchanged.
@@ -394,17 +437,51 @@ async fn run_enclavia_crypto_prepare_upgrade(
     use base64::Engine as _;
     let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(new_public_key);
 
-    let output = match tokio::process::Command::new(bin)
-        .args([
-            "prepare-upgrade",
-            "--new-public-key",
-            &pubkey_b64,
-            "--new-key-id",
-            new_key_id,
-        ])
-        .output()
-        .await
-    {
+    let mut command = tokio::process::Command::new(bin);
+    command.args([
+        "prepare-upgrade",
+        "--new-public-key",
+        &pubkey_b64,
+        "--new-key-id",
+        new_key_id,
+    ]);
+
+    // The re-key re-derives the CURRENT LUKS passphrase via `kms:Decrypt`
+    // (`enclavia-crypto prepare-upgrade` step 2). On real Nitro that needs live
+    // AWS creds, but `init.sh` scrubs the boot creds before this server even
+    // starts (the workload must never see `kms:Decrypt`-capable creds). So pull
+    // a FRESH set from the on-demand relay the backend re-armed on the parent
+    // and inject them into the subprocess env ONLY. Host CID 3 == real Nitro;
+    // under QEMU (CID 2) the enclave talks to mock-kms and needs no creds.
+    if enclavia_vsock::host_cid().await == 3 {
+        match pull_upgrade_kms_creds().await {
+            Ok(creds) => {
+                let mut region: Option<String> = None;
+                for (k, v) in &creds {
+                    let value = String::from_utf8_lossy(v);
+                    if k == "AWS_REGION" {
+                        region = Some(value.to_string());
+                    }
+                    command.env(k, value.as_ref());
+                }
+                // `enclavia-crypto` selects its real-KMS transport off
+                // KMS_AWS_REGION; the creds feed delivers the region under the
+                // standard name AWS_REGION. Bridge it, mirroring init.sh's
+                // boot path (which only does so on the real-Nitro CID 3).
+                if let Some(r) = region {
+                    command.env("KMS_AWS_REGION", r);
+                }
+            }
+            Err(e) => {
+                return (
+                    false,
+                    format!("failed to pull fresh KMS creds for re-key: {e}"),
+                );
+            }
+        }
+    }
+
+    let output = match command.output().await {
         Ok(o) => o,
         Err(e) => return (false, format!("failed to spawn {bin}: {e}")),
     };
@@ -412,12 +489,27 @@ async fn run_enclavia_crypto_prepare_upgrade(
     if output.status.success() {
         (true, "prepare-upgrade completed".into())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let trimmed = stderr.trim();
-        let suffix = if trimmed.is_empty() {
+        // `enclavia-crypto` logs its fatal error via tracing to STDOUT (the
+        // subscriber default), so capturing only stderr would drop the cause
+        // and leave just the bare exit code. Surface the last non-empty line
+        // of either stream.
+        let last_line = |buf: &[u8]| -> String {
+            String::from_utf8_lossy(buf)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .next_back()
+                .unwrap_or("")
+                .to_string()
+        };
+        let detail: Vec<String> = [last_line(&output.stdout), last_line(&output.stderr)]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        let suffix = if detail.is_empty() {
             String::new()
         } else {
-            format!(": {trimmed}")
+            format!(": {}", detail.join(" | "))
         };
         (
             false,
