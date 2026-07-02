@@ -2,16 +2,16 @@
 //!
 //! Local control-key management for self-hosted custody. `generate`
 //! creates the key (on a YubiKey, on-device) and records it in the
-//! index at `~/.config/enclavia/keys/index.json`; `list` renders the
-//! index. Presentation lives in the binary, as with every other
-//! command module.
+//! index at `~/.config/enclavia/keys/index.json`; `import` recovers an
+//! index entry for a key that already lives on a device (lost laptop:
+//! the index is gone but the YubiKey still holds the private key);
+//! `list` renders the index. Presentation lives in the binary, as with
+//! every other command module.
 
-#[cfg(feature = "yubikey")]
 use base64::Engine as _;
 use serde::Serialize;
 
 use crate::error::CliError;
-#[cfg(feature = "yubikey")]
 use crate::keys::KeyEntry;
 use crate::keys::{self, KeyBackend, KeyIndex};
 
@@ -120,6 +120,127 @@ pub fn generate_yubikey(_args: &YubiKeyGenerateArgs) -> Result<GeneratedKey, Cli
     ))
 }
 
+/// Flags for `key import --yubikey`.
+#[derive(Debug, Clone)]
+pub struct YubiKeyImportArgs {
+    pub name: String,
+    /// PIV slot name (default `9c`, where `generate` puts keys).
+    pub slot: String,
+    /// Disambiguates multiple connected devices.
+    pub serial: Option<u32>,
+}
+
+/// Result of `key import`. Same core fields as [`GeneratedKey`] (the
+/// recovered entry is byte-identical to what `generate` would have
+/// recorded), plus recovery provenance and index-overlap notes.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportedKey {
+    pub name: String,
+    /// Backend discriminant, mirrors the index's `type` tag.
+    #[serde(rename = "type")]
+    pub backend: String,
+    pub serial: u32,
+    pub slot: String,
+    /// Base64 65-byte uncompressed SEC1 P-256 public key.
+    pub public_key: String,
+    pub fingerprint: String,
+    /// Name of an existing index entry with the SAME public key, if
+    /// any (the import is then just a second name for the same key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub already_registered_as: Option<String>,
+    /// Existing entries pointing at the same (serial, slot) under other
+    /// names. Harmless, but worth a note.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub same_slot_names: Vec<String>,
+}
+
+/// Recover the index entry for a key that already exists on a YubiKey:
+/// read the PUBLIC key back off the hardware (PIV GET METADATA,
+/// firmware 5.2.3+) and record it exactly as
+/// `generate` would have. Nothing is generated, no PIN is prompted,
+/// nothing is written to the device. Fails BEFORE touching the
+/// hardware if the name is taken or invalid.
+#[cfg(feature = "yubikey")]
+pub fn import_yubikey(args: &YubiKeyImportArgs) -> Result<ImportedKey, CliError> {
+    let mut index = keys::load_index()?;
+    keys::validate_name(&args.name)?;
+    if index.keys.contains_key(&args.name) {
+        return Err(CliError::Other(format!(
+            "a key named {:?} already exists; pick another --name",
+            args.name
+        )));
+    }
+    // Normalize + validate the slot before the device round-trip too.
+    crate::signer::parse_slot(&args.slot)?;
+    let slot = args.slot.to_ascii_lowercase();
+
+    let recovered = crate::signer::read_public_key_on_device(args.serial, &slot)?;
+
+    let (already_registered_as, same_slot_names) = register_imported(
+        &mut index,
+        &args.name,
+        recovered.serial,
+        &slot,
+        &recovered.public_key,
+    )?;
+    keys::save_index(&index)?;
+
+    Ok(ImportedKey {
+        name: args.name.clone(),
+        backend: "yubikey".into(),
+        serial: recovered.serial,
+        slot,
+        public_key: base64::engine::general_purpose::STANDARD.encode(recovered.public_key),
+        fingerprint: keys::fingerprint(&recovered.public_key),
+        already_registered_as,
+        same_slot_names,
+    })
+}
+
+/// Feature-off stub, mirroring [`generate_yubikey`]'s.
+#[cfg(not(feature = "yubikey"))]
+pub fn import_yubikey(_args: &YubiKeyImportArgs) -> Result<ImportedKey, CliError> {
+    Err(CliError::Other(
+        "this enclavia build was compiled without YubiKey support; rebuild enclavia-cli with \
+         the default `yubikey` feature"
+            .into(),
+    ))
+}
+
+/// Pure index step of an import: detect overlaps with existing entries
+/// and insert the recovered key under `name`. Returns the name of an
+/// existing entry with the same public key (if any) and the names of
+/// entries already pointing at the same (serial, slot). Split out from
+/// [`import_yubikey`] so the collision behaviors are testable without
+/// hardware.
+#[cfg_attr(not(feature = "yubikey"), allow(dead_code))]
+pub(crate) fn register_imported(
+    index: &mut KeyIndex,
+    name: &str,
+    serial: u32,
+    slot: &str,
+    public_key: &[u8; 65],
+) -> Result<(Option<String>, Vec<String>), CliError> {
+    let already_registered_as =
+        index.find_by_public_key(public_key).map(|(n, _)| n.to_string());
+    let same_slot_names: Vec<String> = index
+        .keys
+        .iter()
+        .filter(|(n, e)| {
+            n.as_str() != name
+                && matches!(&e.backend,
+                    KeyBackend::Yubikey { serial: s, slot: sl } if *s == serial && sl == slot)
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    let entry = KeyEntry {
+        public_key: base64::engine::general_purpose::STANDARD.encode(public_key),
+        backend: KeyBackend::Yubikey { serial, slot: slot.to_string() },
+    };
+    index.insert_new(name, entry)?;
+    Ok((already_registered_as, same_slot_names))
+}
+
 /// Read the index and render it as typed rows. Works regardless of the
 /// `yubikey` feature (the index is plain JSON).
 pub fn list() -> Result<Vec<KeyListEntry>, CliError> {
@@ -180,6 +301,71 @@ mod tests {
             public_key: base64::engine::general_purpose::STANDARD.encode(point.as_bytes()),
             backend: KeyBackend::Yubikey { serial: seed as u32, slot: "9c".into() },
         }
+    }
+
+    fn point(seed: u8) -> [u8; 65] {
+        let sk = p256::SecretKey::from_bytes(&[seed; 32].into()).unwrap();
+        sk.public_key().to_encoded_point(false).as_bytes().try_into().unwrap()
+    }
+
+    #[test]
+    fn import_into_fresh_index_has_no_notes() {
+        let mut index = KeyIndex::default();
+        let (already, same_slot) =
+            register_imported(&mut index, "recovered", 42, "9c", &point(5)).unwrap();
+        assert!(already.is_none());
+        assert!(same_slot.is_empty());
+        let entry = &index.keys["recovered"];
+        assert_eq!(entry.public_key_bytes().unwrap(), point(5));
+        match &entry.backend {
+            KeyBackend::Yubikey { serial, slot } => {
+                assert_eq!(*serial, 42);
+                assert_eq!(slot, "9c");
+            }
+        }
+    }
+
+    #[test]
+    fn import_notes_existing_entry_with_same_public_key() {
+        let mut index = KeyIndex::default();
+        register_imported(&mut index, "original", 42, "9c", &point(5)).unwrap();
+        // Same device, same slot, same key under a second name: allowed,
+        // both overlaps reported.
+        let (already, same_slot) =
+            register_imported(&mut index, "recovered", 42, "9c", &point(5)).unwrap();
+        assert_eq!(already.as_deref(), Some("original"));
+        assert_eq!(same_slot, vec!["original".to_string()]);
+        assert_eq!(index.keys.len(), 2);
+    }
+
+    #[test]
+    fn import_notes_same_slot_under_a_different_key() {
+        let mut index = KeyIndex::default();
+        // A stale entry: same (serial, slot) but an old public key (the
+        // on-device key was regenerated since).
+        register_imported(&mut index, "stale", 42, "9c", &point(6)).unwrap();
+        let (already, same_slot) =
+            register_imported(&mut index, "recovered", 42, "9c", &point(5)).unwrap();
+        assert!(already.is_none());
+        assert_eq!(same_slot, vec!["stale".to_string()]);
+    }
+
+    #[test]
+    fn import_ignores_other_devices_and_slots() {
+        let mut index = KeyIndex::default();
+        register_imported(&mut index, "other-device", 7, "9c", &point(6)).unwrap();
+        register_imported(&mut index, "other-slot", 42, "9a", &point(7)).unwrap();
+        let (already, same_slot) =
+            register_imported(&mut index, "recovered", 42, "9c", &point(5)).unwrap();
+        assert!(already.is_none());
+        assert!(same_slot.is_empty());
+    }
+
+    #[test]
+    fn import_rejects_duplicate_names() {
+        let mut index = KeyIndex::default();
+        register_imported(&mut index, "recovered", 42, "9c", &point(5)).unwrap();
+        assert!(register_imported(&mut index, "recovered", 42, "9c", &point(5)).is_err());
     }
 
     #[test]

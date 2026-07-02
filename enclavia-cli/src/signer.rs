@@ -91,7 +91,10 @@ pub fn sign_revoke_submission(
 }
 
 #[cfg(feature = "yubikey")]
-pub use yubikey_backend::{GenerateParams, YubiKeySigner, generate_on_device, parse_slot};
+pub use yubikey_backend::{
+    GenerateParams, RecoveredKey, YubiKeySigner, generate_on_device, parse_slot,
+    read_public_key_on_device,
+};
 
 #[cfg(feature = "yubikey")]
 mod yubikey_backend {
@@ -126,6 +129,15 @@ mod yubikey_backend {
     //!    complete a control command from another terminal, then finish
     //!    the touches. The submit gets a 409 and the CLI re-prepares
     //!    and retries once, successfully.
+    //! 8. Index recovery (simulated laptop loss): note the fingerprint
+    //!    from step 1, then `rm ~/.config/enclavia/keys/index.json`.
+    //!    `enclavia key import --yubikey --name recovered` re-reads the
+    //!    public key off the device WITHOUT prompting for the PIN and
+    //!    prints the SAME fingerprint as step 1; `key list` shows the
+    //!    entry, and `upgrade confirm` against the enclave from step 3
+    //!    works again using `recovered`. Re-running the import while
+    //!    the entry exists under another name succeeds with a note that
+    //!    the key is already registered.
 
     use std::io::Write as _;
     use std::sync::Mutex;
@@ -328,6 +340,14 @@ mod yubikey_backend {
         let point = spki.subject_public_key.as_bytes().ok_or_else(|| {
             CliError::Other("device returned an unaligned public-key bit string".into())
         })?;
+        let sec1 = sec1_from_point(point)?;
+        Ok((serial, sec1))
+    }
+
+    /// Validate the 65-byte uncompressed SEC1 P-256 point the device
+    /// handed back (from key generation or GET METADATA). Same checks
+    /// everywhere: 65 bytes, `0x04` prefix, parses on-curve.
+    fn sec1_from_point(point: &[u8]) -> Result<[u8; 65], CliError> {
         let sec1: [u8; 65] = point.try_into().map_err(|_| {
             CliError::Other(format!(
                 "device returned a {}-byte public key, expected 65 (uncompressed SEC1 P-256)",
@@ -344,7 +364,112 @@ mod yubikey_backend {
         crate::keys::decode_public_key(
             &base64::engine::general_purpose::STANDARD.encode(sec1),
         )?;
-        Ok((serial, sec1))
+        Ok(sec1)
+    }
+
+    /// A public key recovered from an existing on-device private key by
+    /// [`read_public_key_on_device`].
+    pub struct RecoveredKey {
+        /// Serial of the device the key was read from.
+        pub serial: u32,
+        /// The validated 65-byte uncompressed SEC1 P-256 public key.
+        pub public_key: [u8; 65],
+    }
+
+    /// Read the PUBLIC key of an existing on-device private key back
+    /// off the hardware, for `key import --yubikey` (recovering a lost
+    /// index without regenerating, which would strand enclaves bound to
+    /// the old key). Nothing is generated or written to the device, and
+    /// no PIN is needed (GET METADATA requires no PIN verification).
+    ///
+    /// Uses PIV GET METADATA (firmware 5.2.3+), which returns the
+    /// slot's algorithm and public key directly. Older firmware could
+    /// be served by the PIV attestation certificate, but that fallback
+    /// is deliberately not implemented (extra dependency for firmware
+    /// that predates 2019); it can be added if anyone actually hits it.
+    pub fn read_public_key_on_device(
+        serial: Option<u32>,
+        slot: &str,
+    ) -> Result<RecoveredKey, CliError> {
+        use yubikey::piv::ManagementAlgorithmId;
+
+        let slot_id = parse_slot(slot)?;
+        let mut device = open_device(serial)?;
+        let serial = device.serial().0;
+
+        match yubikey::piv::metadata(&mut device, slot_id) {
+            Ok(md) => {
+                match md.algorithm {
+                    ManagementAlgorithmId::Asymmetric(AlgorithmId::EccP256) => {}
+                    ManagementAlgorithmId::Asymmetric(other) => {
+                        return Err(CliError::Other(format!(
+                            "slot {slot} on YubiKey {serial} holds a {other:?} key, not \
+                             ECDSA P-256; enclavia control keys are P-256 (generate one \
+                             with `enclavia key generate --yubikey`)"
+                        )));
+                    }
+                    _ => {
+                        return Err(CliError::Other(format!(
+                            "slot {slot} on YubiKey {serial} does not hold an asymmetric key"
+                        )));
+                    }
+                }
+                let spki = md.public.ok_or_else(|| {
+                    CliError::Other(format!(
+                        "YubiKey {serial} returned no public key in the metadata for slot {slot}"
+                    ))
+                })?;
+                let point = spki.subject_public_key.as_bytes().ok_or_else(|| {
+                    CliError::Other(
+                        "device returned an unaligned public-key bit string".into(),
+                    )
+                })?;
+                let public_key = sec1_from_point(point)?;
+                Ok(RecoveredKey { serial, public_key })
+            }
+            // Firmware < 5.2.3: no GET METADATA.
+            Err(yubikey::Error::NotSupported) => Err(CliError::Other(format!(
+                "this YubiKey's firmware does not support reading the public key back \
+                 (GET METADATA needs firmware 5.2.3+); regenerate with `enclavia key \
+                 generate --yubikey` (this REPLACES the key in slot {slot} and strands \
+                 enclaves bound to the old one) or restore keys/index.json from backup"
+            ))),
+            Err(e) => Err(CliError::Other(format!(
+                "reading metadata for slot {slot} on YubiKey {serial} failed: {e}. The \
+                 slot may be empty; `ykman piv info` lists occupied slots"
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample_point(seed: u8) -> [u8; 65] {
+            use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+            let sk = p256::SecretKey::from_bytes(&[seed; 32].into()).unwrap();
+            sk.public_key().to_encoded_point(false).as_bytes().try_into().unwrap()
+        }
+
+        #[test]
+        fn point_validation_accepts_a_valid_point() {
+            let point = sample_point(0x21);
+            assert_eq!(sec1_from_point(&point).unwrap(), point);
+        }
+
+        #[test]
+        fn point_validation_rejects_bad_shapes() {
+            // Wrong length.
+            assert!(sec1_from_point(&[0x04; 64]).is_err());
+            // Compressed prefix.
+            let mut compressed = sample_point(0x21);
+            compressed[0] = 0x02;
+            assert!(sec1_from_point(&compressed[..33]).is_err());
+            // Right shape, off-curve.
+            let mut off_curve = [0u8; 65];
+            off_curve[0] = 0x04;
+            assert!(sec1_from_point(&off_curve).is_err());
+        }
     }
 }
 

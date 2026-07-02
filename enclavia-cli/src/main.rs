@@ -158,6 +158,28 @@ enum KeyCmd {
         #[arg(long)]
         serial: Option<u32>,
     },
+    /// Recover the local index entry for a control key that already
+    /// exists on a YubiKey (e.g. after losing the machine that held
+    /// ~/.config/enclavia/keys/index.json). Reads the PUBLIC key back
+    /// off the device and records it exactly as `generate` would have.
+    /// Nothing is generated and nothing is written to the device; no
+    /// PIN is needed.
+    Import {
+        /// Import from a YubiKey (PIV, ECDSA/P256). Required for now.
+        #[arg(long)]
+        yubikey: bool,
+        /// Name the key is stored under in the local index.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// PIV slot holding the key (9a, 9c, 9d, 9e). 9c is where
+        /// `generate` puts keys.
+        #[arg(long, default_value = "9c")]
+        slot: String,
+        /// YubiKey serial number, to disambiguate when several devices
+        /// are connected.
+        #[arg(long)]
+        serial: Option<u32>,
+    },
     /// List the keys in the local index (name, backend, device, public
     /// key fingerprint).
     List,
@@ -1269,12 +1291,54 @@ fn run_key(cmd: KeyCmd, json: bool) -> Result<(), CliError> {
             emit(json, &generated, || print_key_generated(&generated));
             Ok(())
         }
+        KeyCmd::Import { yubikey, name, slot, serial } => {
+            if !yubikey {
+                return Err(CliError::Other(
+                    "only the YubiKey backend is available today; pass --yubikey (a \
+                     passphrase-keyfile backend is planned)"
+                        .into(),
+                ));
+            }
+            let args = key_cmds::YubiKeyImportArgs { name, slot, serial };
+            let imported = key_cmds::import_yubikey(&args)?;
+            emit(json, &imported, || print_key_imported(&imported));
+            Ok(())
+        }
         KeyCmd::List => {
             let rows = key_cmds::list()?;
             emit(json, &rows, || print_key_list(&rows));
             Ok(())
         }
     }
+}
+
+fn print_key_imported(k: &key_cmds::ImportedKey) {
+    println!(
+        "Imported control key '{}' from YubiKey {} (slot {}).",
+        k.name, k.serial, k.slot
+    );
+    println!("  Public key:  {}", k.public_key);
+    println!("  Fingerprint: {}", k.fingerprint);
+    if let Some(existing) = &k.already_registered_as {
+        println!();
+        println!(
+            "Note: this public key is already registered as '{existing}'; '{}' is a second \
+             name for the same key.",
+            k.name
+        );
+    } else if !k.same_slot_names.is_empty() {
+        println!();
+        println!(
+            "Note: the index already has entries for this device slot under other names \
+             ({}) with a DIFFERENT public key; those entries are likely stale (the \
+             on-device key was regenerated since they were recorded).",
+            k.same_slot_names.join(", ")
+        );
+    }
+    println!();
+    println!("The private key never left the device; only the public key was read back.");
+    println!("Use it when creating an enclave:");
+    println!("  enclavia enclave create --control-key {} ...", k.name);
 }
 
 fn print_key_generated(k: &key_cmds::GeneratedKey) {
