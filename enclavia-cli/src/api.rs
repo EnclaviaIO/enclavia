@@ -307,6 +307,7 @@ impl ApiClient {
         egress_allowlist: Option<&serde_json::Value>,
         upgradable: bool,
         production: bool,
+        anti_rollback: bool,
     ) -> Result<serde_json::Value, CliError> {
         let mut body = serde_json::json!({
             "instance_type": instance_type,
@@ -336,6 +337,11 @@ impl ApiClient {
         // ("debug"), so the CLI doesn't hardcode the server-side default.
         if production {
             body["mode"] = serde_json::json!("production");
+        }
+        // Only send `anti_rollback` when requested; omitted -> backend
+        // default (false), same rationale as `upgradable`.
+        if anti_rollback {
+            body["anti_rollback"] = serde_json::json!(true);
         }
         self.request_with_body(reqwest::Method::POST, "/enclaves", &body)
             .await

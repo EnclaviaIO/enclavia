@@ -184,6 +184,12 @@ enum EnclaveCmd {
         /// plan), or the backend rejects the create. Immutable post-create.
         #[arg(long)]
         production: bool,
+        /// Request synchronizer-backed anti-rollback storage (#1). Only
+        /// takes effect for a storage enclave whose plan entitles it;
+        /// otherwise the backend ignores it. Defaults off. Immutable
+        /// post-create.
+        #[arg(long)]
+        anti_rollback: bool,
     },
     /// List your enclaves
     List {
@@ -458,6 +464,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
             egress_config,
             upgradable,
             production,
+            anti_rollback,
         } => {
             // Validate the egress allowlist BEFORE constructing the API
             // client. The validator is purely local (parses --egress-allow
@@ -482,6 +489,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 egress_allowlist,
                 upgradable,
                 production,
+                anti_rollback,
             )
             .await?;
             // JSON: the created enclave object verbatim (id, status, and

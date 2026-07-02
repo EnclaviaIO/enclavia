@@ -91,6 +91,7 @@ pub async fn create(
     egress_allowlist: Option<serde_json::Value>,
     upgradable: bool,
     production: bool,
+    anti_rollback: bool,
 ) -> Result<EnclaveCreated, CliError> {
     let enclave = client
         .create_enclave(
@@ -102,6 +103,7 @@ pub async fn create(
             egress_allowlist.as_ref(),
             upgradable,
             production,
+            anti_rollback,
         )
         .await?;
 
