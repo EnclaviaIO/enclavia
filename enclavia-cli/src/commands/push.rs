@@ -428,6 +428,7 @@ mod tests {
             archived: false,
             builder_rev: None,
             crates_rev: None,
+            control_key_mode: None,
             raw: serde_json::json!({ "push_target": format!("alice/{id}") }),
         }
     }

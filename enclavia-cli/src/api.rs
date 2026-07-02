@@ -110,6 +110,12 @@ pub struct EnclaveSummary {
     /// with. Same null semantics as `builder_rev`.
     #[serde(default)]
     pub crates_rev: Option<String>,
+    /// Control-key custody mode (#48): `"managed"` (backend holds the
+    /// key), `"self_hosted"` (user holds it; confirm/revoke go through
+    /// the two-phase prepare/submit flow), or `None` on rows from a
+    /// pre-custody backend or non-upgradable enclaves.
+    #[serde(default)]
+    pub control_key_mode: Option<String>,
     #[serde(flatten)]
     pub raw: serde_json::Value,
 }
@@ -307,6 +313,7 @@ impl ApiClient {
         egress_allowlist: Option<&serde_json::Value>,
         upgradable: bool,
         production: bool,
+        control_key: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, CliError> {
         let mut body = serde_json::json!({
             "instance_type": instance_type,
@@ -336,6 +343,13 @@ impl ApiClient {
         // ("debug"), so the CLI doesn't hardcode the server-side default.
         if production {
             body["mode"] = serde_json::json!("production");
+        }
+        // Control-key custody (#48). Omitted = managed (the backend
+        // default for upgradable enclaves); `{"mode": "self_hosted",
+        // "public_key": "<b64 65-byte SEC1>"}` registers a user-held
+        // key.
+        if let Some(ck) = control_key {
+            body["control_key"] = ck.clone();
         }
         self.request_with_body(reqwest::Method::POST, "/enclaves", &body)
             .await
@@ -464,6 +478,82 @@ impl ApiClient {
         .await
     }
 
+    // --- Self-hosted custody: two-phase confirm/revoke (#48) -------------
+
+    /// `POST /enclaves/{id}/upgrades/{uid}/confirm/prepare` (self-hosted
+    /// custody only). Returns everything the CLI needs to sign the
+    /// `PrepareUpgrade` command offline: the CBOR chain payload, the
+    /// live enclave's control nonce, and the rekey params. Idempotent;
+    /// re-called after a stale-nonce 409 from submit.
+    pub async fn confirm_prepare(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<enclavia_protocol::custody::ConfirmPrepareResponse, CliError> {
+        let body: serde_json::Value = match valid_from {
+            Some(t) => serde_json::json!({ "valid_from": t }),
+            None => serde_json::json!({}),
+        };
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}/confirm/prepare"),
+            &body,
+        )
+        .await
+    }
+
+    /// `POST /enclaves/{id}/upgrades/{uid}/confirm/submit`: the fully
+    /// assembled, envelope-signed `PrepareUpgrade` command. A stale
+    /// nonce surfaces as `CliError::Conflict`; the caller re-runs
+    /// prepare and retries once.
+    pub async fn confirm_submit(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+        submission: &enclavia_protocol::custody::ConfirmSubmitRequest,
+    ) -> Result<enclavia_protocol::staging::StagedUpgradeJson, CliError> {
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}/confirm/submit"),
+            submission,
+        )
+        .await
+    }
+
+    /// `POST /enclaves/{id}/upgrades/{uid}/revoke/prepare` (self-hosted
+    /// custody only). Same contract as [`Self::confirm_prepare`] with
+    /// the `RevokeUpgrade` field set.
+    pub async fn revoke_prepare(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+    ) -> Result<enclavia_protocol::custody::RevokePrepareResponse, CliError> {
+        let body = serde_json::json!({});
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}/revoke/prepare"),
+            &body,
+        )
+        .await
+    }
+
+    /// `POST /enclaves/{id}/upgrades/{uid}/revoke/submit`. Same 409
+    /// semantics as [`Self::confirm_submit`].
+    pub async fn revoke_submit(
+        &self,
+        enclave_id: &str,
+        upgrade_id: &str,
+        submission: &enclavia_protocol::custody::RevokeSubmitRequest,
+    ) -> Result<enclavia_protocol::staging::StagedUpgradeJson, CliError> {
+        self.request_with_body(
+            reqwest::Method::POST,
+            &format!("/enclaves/{enclave_id}/upgrades/{upgrade_id}/revoke/submit"),
+            submission,
+        )
+        .await
+    }
+
     // --- Per-enclave secrets (#169) --------------------------------------
 
     pub async fn list_secrets(
@@ -556,6 +646,12 @@ async fn handle_response<T: DeserializeOwned>(resp: reqwest::Response) -> Result
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
         return Err(CliError::Unauthorized);
+    }
+    if status == StatusCode::CONFLICT {
+        // 409 gets its own variant so the two-phase confirm/revoke flow
+        // (#48) can detect a stale-nonce rejection and re-run prepare.
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Conflict(body));
     }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

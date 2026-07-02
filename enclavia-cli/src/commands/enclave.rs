@@ -80,7 +80,6 @@ pub fn build_egress_allowlist(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub async fn create(
     client: &ApiClient,
     instance_type: crate::InstanceTypeArg,
@@ -91,7 +90,12 @@ pub async fn create(
     egress_allowlist: Option<serde_json::Value>,
     upgradable: bool,
     production: bool,
+    control_key: Option<serde_json::Value>,
 ) -> Result<EnclaveCreated, CliError> {
+    // Self-hosted custody only makes sense on an upgradable enclave (the
+    // control key exists to sign upgrade confirmations), so a control
+    // key implies `upgradable` (#48).
+    let upgradable = upgradable || control_key.is_some();
     let enclave = client
         .create_enclave(
             instance_type,
@@ -102,6 +106,7 @@ pub async fn create(
             egress_allowlist.as_ref(),
             upgradable,
             production,
+            control_key.as_ref(),
         )
         .await?;
 

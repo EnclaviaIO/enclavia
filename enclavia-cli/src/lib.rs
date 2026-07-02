@@ -12,11 +12,17 @@
 //! - [`commands`] — high-level orchestrators that combine `api` calls and
 //!   return typed results. Presentation lives in `bin/enclavia/main.rs`.
 //! - [`error`] — shared error type used by the lib surface.
+//! - [`keys`]: local control-key index for self-hosted custody (#48).
+//! - [`signer`]: `ControlSigner` trait + backends (YubiKey behind the
+//!   default `yubikey` cargo feature; build with
+//!   `default-features = false` to drop the pcsclite link dependency).
 
 pub mod api;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod keys;
+pub mod signer;
 
 pub use api::ApiClient;
 pub use error::CliError;

@@ -49,7 +49,9 @@
           src = rustSrc;
           strictDeps = true;
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ];
+          # pcsclite: the CLI's default `yubikey` feature (#48) links
+          # libpcsclite (PIV over PC/SC) via the pcsc-sys crate.
+          buildInputs = [ pkgs.openssl pkgs.pcsclite ];
         };
 
         cargoArtifacts = craneLib.buildDepsOnly rustCommonArgs;
@@ -179,6 +181,8 @@
             (rustToolchain pkgs)
             pkgs.pkg-config
             pkgs.openssl
+            # For the CLI's default `yubikey` feature (#48).
+            pkgs.pcsclite
           ];
         };
 
