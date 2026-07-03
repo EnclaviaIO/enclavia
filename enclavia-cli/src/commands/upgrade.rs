@@ -1,5 +1,5 @@
-//! Public upgrade-chain CLI surface (#47 phase 3c) and staged-upgrade
-//! management commands (#47 phase 4c).
+//! Public upgrade-chain CLI surface and staged-upgrade
+//! management commands.
 //!
 //! `enclavia upgrade chain <enclave-id>` fetches the chain from the
 //! backend and re-validates each link locally using the same
@@ -209,7 +209,7 @@ fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> 
 }
 
 // ---------------------------------------------------------------------------
-// Staged-upgrade management (#47 phase 4c)
+// Staged-upgrade management
 // ---------------------------------------------------------------------------
 
 /// Fetch all staged upgrades for an enclave, newest first.
@@ -225,7 +225,7 @@ pub async fn list_upgrades(
 /// - `valid_from = None` lets the server default to `now + 7 days`.
 /// - A past timestamp is clamped to `now` by the server.
 ///
-/// Custody dispatch (#48): the enclave row's `control_key_mode` decides
+/// Custody dispatch: the enclave row's `control_key_mode` decides
 /// the path. Managed (or absent, pre-custody backends) keeps the
 /// original single-shot call; self-hosted runs the two-phase
 /// prepare/sign/submit flow against the locally-held control key.
@@ -263,7 +263,7 @@ pub async fn revoke_upgrade(
 }
 
 // ---------------------------------------------------------------------------
-// Self-hosted custody: two-phase confirm/revoke (#48)
+// Self-hosted custody: two-phase confirm/revoke
 // ---------------------------------------------------------------------------
 
 /// Control-key custody mode read off the enclave row.
@@ -495,7 +495,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Custody detection (#48)
+    // Custody detection
     // -----------------------------------------------------------------------
 
     /// Only an explicit `"self_hosted"` selects the two-phase flow;

@@ -1,4 +1,4 @@
-//! Control-key signers for self-hosted custody (#48).
+//! Control-key signers for self-hosted custody.
 //!
 //! [`ControlSigner`] is the seam between the two-phase confirm/revoke
 //! flow and wherever the control private key actually lives. The
@@ -98,7 +98,7 @@ pub use yubikey_backend::{
 
 #[cfg(feature = "yubikey")]
 mod yubikey_backend {
-    //! YubiKey PIV backend (#48).
+    //! YubiKey PIV backend.
     //!
     //! Manual hardware test plan (no CI coverage; needs a physical
     //! YubiKey 5 with the default PIN `123456` and the default PIV

@@ -1,4 +1,4 @@
-//! CLI OAuth 2.1 + PKCE login (#88).
+//! CLI OAuth 2.1 + PKCE login.
 //!
 //! `enclavia auth login` runs the standard OAuth code-grant flow against
 //! the backend's `/oauth/authorize` + `/oauth/token` endpoints, with three

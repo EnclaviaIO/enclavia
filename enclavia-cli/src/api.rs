@@ -2,7 +2,7 @@
 //!
 //! `ApiClient::new()` defaults to using the on-disk credentials (the
 //! original CLI behaviour) and transparently refreshes the access token
-//! on a 401 (#88). `ApiClient::with_token()` takes an explicit bearer —
+//! on a 401. `ApiClient::with_token()` takes an explicit bearer —
 //! used by the MCP server, which is multi-tenant and never touches
 //! `~/.config/enclavia`. The MCP path explicitly does NOT participate in
 //! refresh-token rotation; that's the caller's job.
@@ -42,7 +42,7 @@ pub struct RegistryInfo {
 /// reference (whether or not we ended up starting a build for them).
 ///
 /// `staged` and `rejected_non_upgradable` are additive fields added for
-/// the staged-upgrade flow (#47 phase 4c). They are `#[serde(default)]`
+/// the staged-upgrade flow. They are `#[serde(default)]`
 /// so the CLI keeps working against older backends that omit them.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotifyPushResponse {
@@ -67,7 +67,7 @@ pub struct StagedPushEntry {
     pub image: String,
 }
 
-/// Per-link record on the public upgrade chain (#47 phase 3a).
+/// Per-link record on the public upgrade chain.
 ///
 /// The canonical wire spec now lives in `enclavia_protocol::chain`
 /// (re-exported here so existing `crate::api::ChainLinkJson` paths keep
@@ -110,7 +110,7 @@ pub struct EnclaveSummary {
     /// with. Same null semantics as `builder_rev`.
     #[serde(default)]
     pub crates_rev: Option<String>,
-    /// Control-key custody mode (#48): `"managed"` (backend holds the
+    /// Control-key custody mode: `"managed"` (backend holds the
     /// key), `"self_hosted"` (user holds it; confirm/revoke go through
     /// the two-phase prepare/submit flow), or `None` on rows from a
     /// pre-custody backend or non-upgradable enclaves.
@@ -277,7 +277,7 @@ impl ApiClient {
     ) -> Result<Vec<EnclaveSummary>, CliError> {
         // `?archived=all` mirrors the backend's filter: default behaviour is
         // to hide rows destroyed >30 minutes ago, the flag flips it to
-        // returning everything (#67).
+        // returning everything.
         let path = if include_archived { "/enclaves?archived=all" } else { "/enclaves" };
         self.request(reqwest::Method::GET, path).await
     }
@@ -288,7 +288,7 @@ impl ApiClient {
 
     /// Tell the backend that a push just landed for the given enclave so
     /// it can kick off the build immediately instead of waiting for the
-    /// next registry poll. Under the per-enclave repo model (#46 phase 2)
+    /// next registry poll. Under the per-enclave repo model
     /// each enclave owns its own repo (`<owner>/<enclave-uuid>`), so a
     /// push only ever maps to one enclave — the id is the natural scope.
     /// The push itself succeeds independently of this — callers should
@@ -345,7 +345,7 @@ impl ApiClient {
         if production {
             body["mode"] = serde_json::json!("production");
         }
-        // Control-key custody (#48). Omitted = managed (the backend
+        // Control-key custody. Omitted = managed (the backend
         // default for upgradable enclaves); `{"mode": "self_hosted",
         // "public_key": "<b64 65-byte SEC1>"}` registers a user-held
         // key.
@@ -366,7 +366,7 @@ impl ApiClient {
             .await
     }
 
-    /// Fetch the public upgrade chain for an enclave (#47 phase 3a). The
+    /// Fetch the public upgrade chain for an enclave. The
     /// backend route is unauthenticated (chain visibility is by design
     /// public), but we still go through `request` so refresh-on-401
     /// remains consistent if the route ever gains auth.
@@ -411,7 +411,7 @@ impl ApiClient {
     }
 
     /// Server-side stop + start. Used by `enclavia enclave restart` to
-    /// apply pending secret rotations / deletions (#169 / #175).
+    /// apply pending secret rotations / deletions.
     pub async fn restart_enclave(&self, id: &str) -> Result<(), CliError> {
         self.request_no_response(
             reqwest::Method::POST,
@@ -421,7 +421,7 @@ impl ApiClient {
         .await
     }
 
-    // --- Staged upgrades (#47) ------------------------------------------
+    // --- Staged upgrades ------------------------------------------
 
     /// List all staged upgrades for an enclave, newest first.
     pub async fn list_upgrades(
@@ -484,7 +484,7 @@ impl ApiClient {
         .await
     }
 
-    // --- Self-hosted custody: two-phase confirm/revoke (#48) -------------
+    // --- Self-hosted custody: two-phase confirm/revoke -------------
 
     /// `POST /enclaves/{id}/upgrades/{uid}/confirm/prepare` (self-hosted
     /// custody only). Returns everything the CLI needs to sign the
@@ -560,7 +560,7 @@ impl ApiClient {
         .await
     }
 
-    // --- Per-enclave secrets (#169) --------------------------------------
+    // --- Per-enclave secrets --------------------------------------
 
     pub async fn list_secrets(
         &self,
@@ -655,7 +655,7 @@ async fn handle_response<T: DeserializeOwned>(resp: reqwest::Response) -> Result
     }
     if status == StatusCode::CONFLICT {
         // 409 gets its own variant so the two-phase confirm/revoke flow
-        // (#48) can detect a stale-nonce rejection and re-run prepare.
+        // can detect a stale-nonce rejection and re-run prepare.
         let body = resp.text().await.unwrap_or_default();
         return Err(CliError::Conflict(body));
     }

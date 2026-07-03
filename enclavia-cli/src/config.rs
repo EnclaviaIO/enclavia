@@ -1,7 +1,7 @@
-//! On-disk credentials for the CLI (#88).
+//! On-disk credentials for the CLI.
 //!
 //! When the CLI migrated from the bespoke `/auth/cli/*` device flow to
-//! OAuth 2.1 + PKCE (#88), the credential schema gained `refresh_token`,
+//! OAuth 2.1 + PKCE, the credential schema gained `refresh_token`,
 //! `expires_at`, and the backend URL the credentials were minted against.
 //! Old single-`token` files from the device-flow era no longer carry
 //! enough information to refresh, so we treat them as logged-out — the
@@ -56,7 +56,7 @@ pub fn save_credentials(creds: &Credentials) -> std::io::Result<()> {
 }
 
 /// Load credentials, ignoring older single-token shapes from the
-/// pre-#88 device-flow era — those files don't have a refresh token, so
+/// pre-OAuth device-flow era — those files don't have a refresh token, so
 /// we'd just 401 silently after the access token expires. Treating them
 /// as logged-out forces an explicit `enclavia auth login`.
 pub fn load_credentials() -> Option<Credentials> {

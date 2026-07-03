@@ -95,7 +95,7 @@ pub async fn create(
 ) -> Result<EnclaveCreated, CliError> {
     // Self-hosted custody only makes sense on an upgradable enclave (the
     // control key exists to sign upgrade confirmations), so a control
-    // key implies `upgradable` (#48).
+    // key implies `upgradable`.
     let upgradable = upgradable || control_key.is_some();
     let enclave = client
         .create_enclave(
@@ -115,9 +115,9 @@ pub async fn create(
     let id = enclave["id"].as_str().unwrap_or("unknown").to_string();
     let status = enclave["status"].as_str().unwrap_or("unknown").to_string();
     // Every successful create lands the enclave in `waiting_for_image`. The
-    // build is gated on a fresh push to this enclave's repo (#82.4 / #97),
+    // build is gated on a fresh push to this enclave's repo,
     // so the next step is always "push to start". Under per-enclave repos
-    // (#46 phase 2) the destination is the enclave id itself — we surface
+    // the destination is the enclave id itself — we surface
     // an id-prefix that's unambiguous in the user's namespace today.
     let prefix = id.get(..8).unwrap_or(&id);
     let next_step = format!(

@@ -104,7 +104,7 @@ enum Command {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Inspect an enclave's public upgrade chain (#47). The chain is
+    /// Inspect an enclave's public upgrade chain. The chain is
     /// the append-only, attested log of every boot / upgrade /
     /// revocation the enclave has recorded. The CLI re-validates each
     /// link locally with the same rules the backend ingest applies,
@@ -114,7 +114,7 @@ enum Command {
         #[command(subcommand)]
         cmd: UpgradeCmd,
     },
-    /// Manage local control keys for self-hosted custody (#48). A
+    /// Manage local control keys for self-hosted custody. A
     /// self-hosted enclave's upgrade confirmations and revocations are
     /// signed by a key YOU hold (today: a YubiKey PIV slot); the
     /// backend never sees the private half. Keys are recorded in
@@ -281,7 +281,7 @@ enum EnclaveCmd {
         /// `--egress-resolver`.
         #[arg(long = "egress-config", value_name = "PATH")]
         egress_config: Option<std::path::PathBuf>,
-        /// Mark this enclave as upgradable (#47). The backend mints an
+        /// Mark this enclave as upgradable. The backend mints an
         /// ECDSA P-256 control keypair, bakes the public half into every
         /// EIF for this enclave, and accepts staged v2+ pushes against
         /// it. Without this flag the enclave is non-upgradable: it has
@@ -296,7 +296,7 @@ enum EnclaveCmd {
         /// plan), or the backend rejects the create. Immutable post-create.
         #[arg(long)]
         production: bool,
-        /// Self-hosted control-key custody (#48): register the named
+        /// Self-hosted control-key custody: register the named
         /// local key (see `enclavia key generate/list`) as this
         /// enclave's control key. The backend then cannot confirm or
         /// revoke upgrades on its own; `enclavia upgrade confirm/revoke`
@@ -304,7 +304,7 @@ enum EnclaveCmd {
         /// post-create; plain --upgradable stays managed custody.
         #[arg(long, value_name = "KEY_NAME")]
         control_key: Option<String>,
-        /// Request synchronizer-backed anti-rollback storage (#1). Only
+        /// Request synchronizer-backed anti-rollback storage. Only
         /// takes effect for a storage enclave whose plan entitles it;
         /// otherwise the backend ignores it. Defaults off. Immutable
         /// post-create.
@@ -314,7 +314,7 @@ enum EnclaveCmd {
     /// List your enclaves
     List {
         /// Include enclaves that were destroyed more than 30 minutes ago
-        /// (archived). The default list view hides them (#67).
+        /// (archived). The default list view hides them.
         #[arg(long, alias = "archived")]
         include_archived: bool,
     },
@@ -335,8 +335,7 @@ enum EnclaveCmd {
     },
     /// Restart a running (or stopped) enclave: server-side stop + start.
     /// Re-reads the secrets table so any pending `secret set` /
-    /// `secret delete` changes land in the EIF on the next boot
-    /// (#169 / #175).
+    /// `secret delete` changes land in the EIF on the next boot.
     Restart {
         /// Enclave ID
         id: String,
