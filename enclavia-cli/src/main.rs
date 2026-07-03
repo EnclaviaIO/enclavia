@@ -304,6 +304,12 @@ enum EnclaveCmd {
         /// post-create; plain --upgradable stays managed custody.
         #[arg(long, value_name = "KEY_NAME")]
         control_key: Option<String>,
+        /// Request synchronizer-backed anti-rollback storage (#1). Only
+        /// takes effect for a storage enclave whose plan entitles it;
+        /// otherwise the backend ignores it. Defaults off. Immutable
+        /// post-create.
+        #[arg(long)]
+        anti_rollback: bool,
     },
     /// List your enclaves
     List {
@@ -580,6 +586,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
             upgradable,
             production,
             control_key,
+            anti_rollback,
         } => {
             // Validate the egress allowlist BEFORE constructing the API
             // client. The validator is purely local (parses --egress-allow
@@ -619,6 +626,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 upgradable,
                 production,
                 control_key_body,
+                anti_rollback,
             )
             .await?;
             // JSON: the created enclave object verbatim (id, status, and

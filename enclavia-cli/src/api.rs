@@ -314,6 +314,7 @@ impl ApiClient {
         upgradable: bool,
         production: bool,
         control_key: Option<&serde_json::Value>,
+        anti_rollback: bool,
     ) -> Result<serde_json::Value, CliError> {
         let mut body = serde_json::json!({
             "instance_type": instance_type,
@@ -350,6 +351,11 @@ impl ApiClient {
         // key.
         if let Some(ck) = control_key {
             body["control_key"] = ck.clone();
+        }
+        // Only send `anti_rollback` when requested; omitted -> backend
+        // default (false), same rationale as `upgradable`.
+        if anti_rollback {
+            body["anti_rollback"] = serde_json::json!(true);
         }
         self.request_with_body(reqwest::Method::POST, "/enclaves", &body)
             .await

@@ -91,6 +91,7 @@ pub async fn create(
     upgradable: bool,
     production: bool,
     control_key: Option<serde_json::Value>,
+    anti_rollback: bool,
 ) -> Result<EnclaveCreated, CliError> {
     // Self-hosted custody only makes sense on an upgradable enclave (the
     // control key exists to sign upgrade confirmations), so a control
@@ -107,6 +108,7 @@ pub async fn create(
             upgradable,
             production,
             control_key.as_ref(),
+            anti_rollback,
         )
         .await?;
 
