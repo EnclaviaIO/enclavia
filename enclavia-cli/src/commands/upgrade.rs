@@ -336,6 +336,7 @@ async fn confirm_self_hosted(
         prep.valid_from
     );
     let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
+    submitting("Confirming");
     match client.confirm_submit(enclave_id, upgrade_id, &submission).await {
         Err(CliError::Conflict(msg)) => {
             eprintln!(
@@ -343,10 +344,17 @@ async fn confirm_self_hosted(
             );
             let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
             let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
+            submitting("Confirming");
             client.confirm_submit(enclave_id, upgrade_id, &submission).await
         }
         other => other,
     }
+}
+
+/// Signing is done; the submit round-trip through the backend to the
+/// enclave takes a while, so tell the user what the silence is.
+fn submitting(verb: &str) {
+    eprintln!("Signatures complete. {verb} with the enclave, do not close this terminal...");
 }
 
 /// Two-phase revoke; same retry-once-on-409 contract as
@@ -361,6 +369,7 @@ async fn revoke_self_hosted(
     let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
     eprintln!("Revoking upgrade {upgrade_id}. Two signatures are required.");
     let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
+    submitting("Revoking");
     match client.revoke_submit(enclave_id, upgrade_id, &submission).await {
         Err(CliError::Conflict(msg)) => {
             eprintln!(
@@ -368,6 +377,7 @@ async fn revoke_self_hosted(
             );
             let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
             let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
+            submitting("Revoking");
             client.revoke_submit(enclave_id, upgrade_id, &submission).await
         }
         other => other,
