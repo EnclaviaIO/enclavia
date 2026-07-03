@@ -224,23 +224,164 @@ pub async fn list_upgrades(
 ///
 /// - `valid_from = None` lets the server default to `now + 7 days`.
 /// - A past timestamp is clamped to `now` by the server.
+///
+/// Custody dispatch (#48): the enclave row's `control_key_mode` decides
+/// the path. Managed (or absent, pre-custody backends) keeps the
+/// original single-shot call; self-hosted runs the two-phase
+/// prepare/sign/submit flow against the locally-held control key.
 pub async fn confirm_upgrade(
     client: &ApiClient,
     enclave_id: &str,
     upgrade_id: &str,
     valid_from: Option<DateTime<Utc>>,
 ) -> Result<StagedUpgradeJson, CliError> {
-    client.confirm_upgrade(enclave_id, upgrade_id, valid_from).await
+    let enclave = client.get_enclave(enclave_id).await?;
+    match control_key_mode(&enclave) {
+        ControlKeyMode::SelfHosted => {
+            confirm_self_hosted(client, &enclave, enclave_id, upgrade_id, valid_from).await
+        }
+        ControlKeyMode::Managed => {
+            client.confirm_upgrade(enclave_id, upgrade_id, valid_from).await
+        }
+    }
 }
 
 /// Revoke a confirmed upgrade before it fires. The running enclave keeps
-/// its current version.
+/// its current version. Same custody dispatch as [`confirm_upgrade`].
 pub async fn revoke_upgrade(
     client: &ApiClient,
     enclave_id: &str,
     upgrade_id: &str,
 ) -> Result<StagedUpgradeJson, CliError> {
-    client.revoke_upgrade(enclave_id, upgrade_id).await
+    let enclave = client.get_enclave(enclave_id).await?;
+    match control_key_mode(&enclave) {
+        ControlKeyMode::SelfHosted => {
+            revoke_self_hosted(client, &enclave, enclave_id, upgrade_id).await
+        }
+        ControlKeyMode::Managed => client.revoke_upgrade(enclave_id, upgrade_id).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Self-hosted custody: two-phase confirm/revoke (#48)
+// ---------------------------------------------------------------------------
+
+/// Control-key custody mode read off the enclave row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKeyMode {
+    /// Backend holds the control key (or the row predates custody
+    /// modes): single-shot confirm/revoke.
+    Managed,
+    /// The user holds the control key: two-phase prepare/submit.
+    SelfHosted,
+}
+
+/// Detect the custody mode from the enclave row. Anything other than an
+/// explicit `"self_hosted"` (including a missing field on pre-custody
+/// backends) is managed, preserving the existing single-shot behaviour.
+pub fn control_key_mode(enclave: &serde_json::Value) -> ControlKeyMode {
+    match enclave.get("control_key_mode").and_then(|v| v.as_str()) {
+        Some("self_hosted") => ControlKeyMode::SelfHosted,
+        _ => ControlKeyMode::Managed,
+    }
+}
+
+/// Locate the enclave's control key in the local index and open a
+/// signer for it. Interactive: the YubiKey backend prompts for its PIN
+/// on stderr.
+fn signer_for_enclave(
+    enclave: &serde_json::Value,
+) -> Result<Box<dyn crate::signer::ControlSigner>, CliError> {
+    let pubkey_b64 = enclave
+        .get("control_public_key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            CliError::Other(
+                "enclave is self-hosted but has no control_public_key on its row (backend bug?)"
+                    .into(),
+            )
+        })?;
+    let pubkey = crate::keys::decode_public_key(pubkey_b64)?;
+    let index = crate::keys::load_index()?;
+    let (name, entry) = index.find_by_public_key(&pubkey).ok_or_else(|| {
+        CliError::Other(format!(
+            "this enclave uses self-hosted custody, but no local key matches its control \
+             public key (fingerprint {}). Run this command from the machine holding the key, \
+             or check `enclavia key list`.",
+            crate::keys::fingerprint(&pubkey)
+        ))
+    })?;
+    eprintln!(
+        "Self-hosted custody: signing with control key {name:?} ({}).",
+        crate::keys::fingerprint(&pubkey)
+    );
+    crate::signer::signer_for_entry(name, entry)
+}
+
+/// Two-phase confirm: prepare, sign locally (inner + envelope), submit.
+/// On a stale-nonce 409 from submit, re-runs prepare and retries ONCE
+/// (the enclave rotates its control nonce whenever a control command is
+/// processed, so a concurrent command invalidates our signed bytes).
+async fn confirm_self_hosted(
+    client: &ApiClient,
+    enclave: &serde_json::Value,
+    enclave_id: &str,
+    upgrade_id: &str,
+    valid_from: Option<DateTime<Utc>>,
+) -> Result<StagedUpgradeJson, CliError> {
+    let signer = signer_for_enclave(enclave)?;
+    let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
+    eprintln!(
+        "Upgrade will take effect at {} once confirmed. Two signatures are required.",
+        prep.valid_from
+    );
+    let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
+    submitting("Confirming");
+    match client.confirm_submit(enclave_id, upgrade_id, &submission).await {
+        Err(CliError::Conflict(msg)) => {
+            eprintln!(
+                "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
+            );
+            let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
+            let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
+            submitting("Confirming");
+            client.confirm_submit(enclave_id, upgrade_id, &submission).await
+        }
+        other => other,
+    }
+}
+
+/// Signing is done; the submit round-trip through the backend to the
+/// enclave takes a while, so tell the user what the silence is.
+fn submitting(verb: &str) {
+    eprintln!("Signatures complete. {verb} with the enclave, do not close this terminal...");
+}
+
+/// Two-phase revoke; same retry-once-on-409 contract as
+/// [`confirm_self_hosted`].
+async fn revoke_self_hosted(
+    client: &ApiClient,
+    enclave: &serde_json::Value,
+    enclave_id: &str,
+    upgrade_id: &str,
+) -> Result<StagedUpgradeJson, CliError> {
+    let signer = signer_for_enclave(enclave)?;
+    let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
+    eprintln!("Revoking upgrade {upgrade_id}. Two signatures are required.");
+    let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
+    submitting("Revoking");
+    match client.revoke_submit(enclave_id, upgrade_id, &submission).await {
+        Err(CliError::Conflict(msg)) => {
+            eprintln!(
+                "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
+            );
+            let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
+            let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
+            submitting("Revoking");
+            client.revoke_submit(enclave_id, upgrade_id, &submission).await
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +492,57 @@ mod tests {
         assert!(!debug_mode_from_enclave_row(&prod_row));
         let absent_row = serde_json::json!({});
         assert!(!debug_mode_from_enclave_row(&absent_row));
+    }
+
+    // -----------------------------------------------------------------------
+    // Custody detection (#48)
+    // -----------------------------------------------------------------------
+
+    /// Only an explicit `"self_hosted"` selects the two-phase flow;
+    /// everything else (managed, unknown values, missing field on
+    /// pre-custody backends, wrong type) stays on the single-shot path.
+    #[test]
+    fn control_key_mode_detection() {
+        let self_hosted = serde_json::json!({ "control_key_mode": "self_hosted" });
+        assert_eq!(control_key_mode(&self_hosted), ControlKeyMode::SelfHosted);
+
+        for row in [
+            serde_json::json!({ "control_key_mode": "managed" }),
+            serde_json::json!({ "control_key_mode": null }),
+            serde_json::json!({ "control_key_mode": 3 }),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(control_key_mode(&row), ControlKeyMode::Managed, "row: {row}");
+        }
+    }
+
+    /// A self-hosted row without any matching local key must fail with
+    /// the "no local key matches" guidance (and never fall back to the
+    /// managed single-shot path).
+    #[test]
+    fn signer_for_enclave_errors_without_matching_key() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+        // A valid control pubkey that is certainly not in the (possibly
+        // existing) index on the machine running the tests.
+        let sk = p256::SecretKey::from_bytes(&[0xE7u8; 32].into()).unwrap();
+        let pk = sk.public_key().to_encoded_point(false);
+        let row = serde_json::json!({
+            "control_key_mode": "self_hosted",
+            "control_public_key": base64::engine::general_purpose::STANDARD.encode(pk.as_bytes()),
+        });
+        let err = match signer_for_enclave(&row) {
+            Err(e) => e,
+            Ok(_) => panic!("must not find a signer"),
+        };
+        assert!(err.to_string().contains("no local key matches"), "got: {err}");
+
+        // Missing pubkey on a self-hosted row is a distinct, clear error.
+        let row = serde_json::json!({ "control_key_mode": "self_hosted" });
+        let err = match signer_for_enclave(&row) {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        assert!(err.to_string().contains("control_public_key"), "got: {err}");
     }
 
     // -----------------------------------------------------------------------

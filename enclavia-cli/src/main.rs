@@ -7,7 +7,9 @@ use std::io::{IsTerminal, Read, Write};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use enclavia_cli::api::{ApiClient, EnclaveSummary};
-use enclavia_cli::commands::{auth, enclave as enclave_cmds, push, reproduce, secrets, upgrade};
+use enclavia_cli::commands::{
+    auth, enclave as enclave_cmds, key as key_cmds, push, reproduce, secrets, upgrade,
+};
 use enclavia_cli::error::CliError;
 
 /// Local clap-friendly mirror of the lib's `InstanceTypeArg`. We can't
@@ -112,6 +114,116 @@ enum Command {
         #[command(subcommand)]
         cmd: UpgradeCmd,
     },
+    /// Manage local control keys for self-hosted custody (#48). A
+    /// self-hosted enclave's upgrade confirmations and revocations are
+    /// signed by a key YOU hold (today: a YubiKey PIV slot); the
+    /// backend never sees the private half. Keys are recorded in
+    /// `~/.config/enclavia/keys/index.json` and referenced by name at
+    /// create time (`enclave create --control-key <name>`).
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Generate a new ECDSA P-256 control key. With --yubikey the key
+    /// is generated ON-DEVICE in a PIV slot and is never extractable;
+    /// signing later requires the device (PIN + touch). A
+    /// passphrase-protected keyfile backend will follow; --yubikey is
+    /// required for now.
+    Generate {
+        /// Generate on a YubiKey (PIV, ECDSA/P256). Required for now.
+        #[arg(long)]
+        yubikey: bool,
+        /// Name the key is stored under in the local index.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// PIV slot to generate into (9a, 9c, 9d, 9e). 9c is the
+        /// Digital Signature slot. Any existing key in the slot is
+        /// REPLACED.
+        #[arg(long, default_value = "9c")]
+        slot: String,
+        /// When the device requires a physical touch: on every
+        /// signature (always), cached for 15s (cached), or never.
+        #[arg(long, value_enum, default_value = "always")]
+        touch_policy: TouchPolicyArg,
+        /// When the device requires the PIN: once per session (once),
+        /// before every signature (always), or never.
+        #[arg(long, value_enum, default_value = "once")]
+        pin_policy: PinPolicyArg,
+        /// YubiKey serial number, to disambiguate when several devices
+        /// are connected.
+        #[arg(long)]
+        serial: Option<u32>,
+        /// Skip the slot-replacement confirmation prompt (for
+        /// non-interactive use).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Recover the local index entry for a control key that already
+    /// exists on a YubiKey (e.g. after losing the machine that held
+    /// ~/.config/enclavia/keys/index.json). Reads the PUBLIC key back
+    /// off the device and records it exactly as `generate` would have.
+    /// Nothing is generated and nothing is written to the device; no
+    /// PIN is needed.
+    Import {
+        /// Import from a YubiKey (PIV, ECDSA/P256). Required for now.
+        #[arg(long)]
+        yubikey: bool,
+        /// Name the key is stored under in the local index.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// PIV slot holding the key (9a, 9c, 9d, 9e). 9c is where
+        /// `generate` puts keys.
+        #[arg(long, default_value = "9c")]
+        slot: String,
+        /// YubiKey serial number, to disambiguate when several devices
+        /// are connected.
+        #[arg(long)]
+        serial: Option<u32>,
+    },
+    /// List the keys in the local index (name, backend, device, public
+    /// key fingerprint).
+    List,
+}
+
+/// Clap mirror of the YubiKey touch policy (the lib takes plain strings
+/// so it stays clap-free, like `InstanceTypeArg`).
+#[derive(Clone, Copy, ValueEnum)]
+enum TouchPolicyArg {
+    Always,
+    Cached,
+    Never,
+}
+
+impl TouchPolicyArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            TouchPolicyArg::Always => "always",
+            TouchPolicyArg::Cached => "cached",
+            TouchPolicyArg::Never => "never",
+        }
+    }
+}
+
+/// Clap mirror of the YubiKey PIN policy.
+#[derive(Clone, Copy, ValueEnum)]
+enum PinPolicyArg {
+    Once,
+    Always,
+    Never,
+}
+
+impl PinPolicyArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            PinPolicyArg::Once => "once",
+            PinPolicyArg::Always => "always",
+            PinPolicyArg::Never => "never",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -184,6 +296,14 @@ enum EnclaveCmd {
         /// plan), or the backend rejects the create. Immutable post-create.
         #[arg(long)]
         production: bool,
+        /// Self-hosted control-key custody (#48): register the named
+        /// local key (see `enclavia key generate/list`) as this
+        /// enclave's control key. The backend then cannot confirm or
+        /// revoke upgrades on its own; `enclavia upgrade confirm/revoke`
+        /// sign with your key. Implies --upgradable. Immutable
+        /// post-create; plain --upgradable stays managed custody.
+        #[arg(long, value_name = "KEY_NAME")]
+        control_key: Option<String>,
         /// Request synchronizer-backed anti-rollback storage (#1). Only
         /// takes effect for a storage enclave whose plan entitles it;
         /// otherwise the backend ignores it. Defaults off. Immutable
@@ -343,6 +463,7 @@ async fn main() {
         }
         Command::Secret { cmd } => run_secret(cmd, json).await,
         Command::Upgrade { cmd } => run_upgrade(cmd, json).await,
+        Command::Key { cmd } => run_key(cmd, json),
     };
 
     if let Err(e) = result {
@@ -464,6 +585,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
             egress_config,
             upgradable,
             production,
+            control_key,
             anti_rollback,
         } => {
             // Validate the egress allowlist BEFORE constructing the API
@@ -478,6 +600,20 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 config_path: egress_config,
             };
             let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress_inputs)?;
+            // Resolve the control key locally BEFORE creating anything:
+            // a typo'd key name should error out, not create a managed
+            // enclave. Registering the key implies --upgradable.
+            let control_key_body = match control_key.as_deref() {
+                Some(key_name) => {
+                    if !upgradable {
+                        note(json, format!(
+                            "--control-key {key_name} implies --upgradable; creating an upgradable enclave."
+                        ));
+                    }
+                    Some(key_cmds::control_key_body_for(key_name)?)
+                }
+                None => None,
+            };
             let client = ApiClient::new()?;
             let res = enclave_cmds::create(
                 &client,
@@ -489,6 +625,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 egress_allowlist,
                 upgradable,
                 production,
+                control_key_body,
                 anti_rollback,
             )
             .await?;
@@ -922,6 +1059,9 @@ fn print_enclave_status(e: &serde_json::Value) {
     if let Some(mode) = e["mode"].as_str() {
         println!("  Mode:         {mode}");
     }
+    if let Some(custody) = e["control_key_mode"].as_str() {
+        println!("  Control key:  {custody}");
+    }
     println!("  Instance:     {}", e["instance_type"].as_str().unwrap_or("-"));
     println!("  Image:        {}", e["docker_image"].as_str().unwrap_or("-"));
     println!("  vSock CID:    {}", e["vsock_cid"]);
@@ -1138,6 +1278,109 @@ fn print_upgrade_confirm(r: &upgrade::StagedUpgradeJson) {
         );
         println!(
             "  The enclave will swap to the new version automatically at that time."
+        );
+    }
+}
+
+fn run_key(cmd: KeyCmd, json: bool) -> Result<(), CliError> {
+    match cmd {
+        KeyCmd::Generate { yubikey, name, slot, touch_policy, pin_policy, serial, yes } => {
+            if !yubikey {
+                return Err(CliError::Other(
+                    "only the YubiKey backend is available today; pass --yubikey (a \
+                     passphrase-keyfile backend is planned)"
+                        .into(),
+                ));
+            }
+            let args = key_cmds::YubiKeyGenerateArgs {
+                name,
+                slot,
+                touch_policy: touch_policy.as_str().into(),
+                pin_policy: pin_policy.as_str().into(),
+                serial,
+                assume_yes: yes,
+            };
+            let generated = key_cmds::generate_yubikey(&args)?;
+            emit(json, &generated, || print_key_generated(&generated));
+            Ok(())
+        }
+        KeyCmd::Import { yubikey, name, slot, serial } => {
+            if !yubikey {
+                return Err(CliError::Other(
+                    "only the YubiKey backend is available today; pass --yubikey (a \
+                     passphrase-keyfile backend is planned)"
+                        .into(),
+                ));
+            }
+            let args = key_cmds::YubiKeyImportArgs { name, slot, serial };
+            let imported = key_cmds::import_yubikey(&args)?;
+            emit(json, &imported, || print_key_imported(&imported));
+            Ok(())
+        }
+        KeyCmd::List => {
+            let rows = key_cmds::list()?;
+            emit(json, &rows, || print_key_list(&rows));
+            Ok(())
+        }
+    }
+}
+
+fn print_key_imported(k: &key_cmds::ImportedKey) {
+    println!(
+        "Imported control key '{}' from YubiKey {} (slot {}).",
+        k.name, k.serial, k.slot
+    );
+    println!("  Public key:  {}", k.public_key);
+    println!("  Fingerprint: {}", k.fingerprint);
+    if let Some(existing) = &k.already_registered_as {
+        println!();
+        println!(
+            "Note: this public key is already registered as '{existing}'; '{}' is a second \
+             name for the same key.",
+            k.name
+        );
+    } else if !k.same_slot_names.is_empty() {
+        println!();
+        println!(
+            "Note: the index already has entries for this device slot under other names \
+             ({}) with a DIFFERENT public key; those entries are likely stale (the \
+             on-device key was regenerated since they were recorded).",
+            k.same_slot_names.join(", ")
+        );
+    }
+    println!();
+    println!("The private key never left the device; only the public key was read back.");
+    println!("Use it when creating an enclave:");
+    println!("  enclavia enclave create --control-key {} ...", k.name);
+}
+
+fn print_key_generated(k: &key_cmds::GeneratedKey) {
+    println!("Generated control key '{}' on YubiKey {} (slot {}).", k.name, k.serial, k.slot);
+    println!("  Public key:  {}", k.public_key);
+    println!("  Fingerprint: {}", k.fingerprint);
+    println!();
+    println!("The private key was generated on-device and cannot be extracted.");
+    println!("Use it when creating an enclave:");
+    println!("  enclavia enclave create --control-key {} ...", k.name);
+}
+
+fn print_key_list(rows: &[key_cmds::KeyListEntry]) {
+    if rows.is_empty() {
+        println!(
+            "No control keys yet. Generate one with `enclavia key generate --yubikey --name <name>`."
+        );
+        return;
+    }
+    println!("{:<24} {:<10} {:<12} {:<6} FINGERPRINT", "NAME", "TYPE", "SERIAL", "SLOT");
+    println!("{}", "-".repeat(80));
+    for r in rows {
+        println!(
+            "{:<24} {:<10} {:<12} {:<6} {}",
+            r.name,
+            r.backend,
+            r.serial.map(|s| s.to_string()).unwrap_or_else(|| "-".to_string()),
+            r.slot.as_deref().unwrap_or("-"),
+            r.fingerprint,
         );
     }
 }

@@ -46,3 +46,21 @@ enclavia-protocol = { path = "../enclavia-protocol" }
 # CBOR decoder for the per-link payloads the upgrade-chain
 # pretty-printer surfaces.
 ciborium = { workspace = true }
+# Self-hosted control-key custody (#48): P-256 is needed unconditionally
+# (public-key parsing, fingerprints, and verifying assembled commands in
+# tests exactly as enclavia-server does).
+p256 = { workspace = true }
+# YubiKey PIV backend for the control key (#48). Optional: the closed
+# workspace consumes this crate's library face with
+# default-features = false to avoid linking pcsclite into server-side
+# binaries.
+yubikey = { version = "0.8", optional = true }
+# Hidden-input PIN prompt for the YubiKey signing path.
+rpassword = { version = "7", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["yubikey"]
+yubikey = ["dep:yubikey", "dep:rpassword"]

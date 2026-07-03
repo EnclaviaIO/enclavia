@@ -15,6 +15,12 @@ pub enum CliError {
     #[error("unauthorized — run `enclavia auth login` to re-authenticate")]
     Unauthorized,
 
+    /// Backend returned 409 Conflict. Surfaced as its own variant so
+    /// the self-hosted two-phase confirm/revoke flow (#48) can detect a
+    /// stale-nonce dispatch failure and re-run prepare once.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Anything else, formatted as a string. Most call sites still use
     /// `String` errors today; this keeps the migration small.
     #[error("{0}")]
@@ -29,6 +35,7 @@ impl CliError {
         match self {
             CliError::NotLoggedIn => "not_logged_in",
             CliError::Unauthorized => "unauthorized",
+            CliError::Conflict(_) => "conflict",
             CliError::Other(_) => "error",
         }
     }
