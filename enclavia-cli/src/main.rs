@@ -157,6 +157,10 @@ enum KeyCmd {
         /// are connected.
         #[arg(long)]
         serial: Option<u32>,
+        /// Skip the slot-replacement confirmation prompt (for
+        /// non-interactive use).
+        #[arg(long)]
+        yes: bool,
     },
     /// Recover the local index entry for a control key that already
     /// exists on a YubiKey (e.g. after losing the machine that held
@@ -1272,7 +1276,7 @@ fn print_upgrade_confirm(r: &upgrade::StagedUpgradeJson) {
 
 fn run_key(cmd: KeyCmd, json: bool) -> Result<(), CliError> {
     match cmd {
-        KeyCmd::Generate { yubikey, name, slot, touch_policy, pin_policy, serial } => {
+        KeyCmd::Generate { yubikey, name, slot, touch_policy, pin_policy, serial, yes } => {
             if !yubikey {
                 return Err(CliError::Other(
                     "only the YubiKey backend is available today; pass --yubikey (a \
@@ -1286,6 +1290,7 @@ fn run_key(cmd: KeyCmd, json: bool) -> Result<(), CliError> {
                 touch_policy: touch_policy.as_str().into(),
                 pin_policy: pin_policy.as_str().into(),
                 serial,
+                assume_yes: yes,
             };
             let generated = key_cmds::generate_yubikey(&args)?;
             emit(json, &generated, || print_key_generated(&generated));

@@ -53,6 +53,8 @@ pub struct YubiKeyGenerateArgs {
     pub pin_policy: String,
     /// Disambiguates multiple connected devices.
     pub serial: Option<u32>,
+    /// Skip the interactive slot-replacement confirmation (`--yes`).
+    pub assume_yes: bool,
 }
 
 /// Generate a P-256 control key on a YubiKey and record it in the
@@ -74,12 +76,17 @@ pub fn generate_yubikey(args: &YubiKeyGenerateArgs) -> Result<GeneratedKey, CliE
     let slot = args.slot.to_ascii_lowercase();
 
     // Warn about slot replacement up front: PIV generation into an
-    // occupied slot silently replaces whatever key was there.
+    // occupied slot silently replaces whatever key was there. Make the
+    // user acknowledge it before the hardware is touched (--yes skips
+    // the prompt for scripted use).
     eprintln!(
         "Generating an ECDSA P-256 key on-device in PIV slot {slot} (touch policy: {}, \
          PIN policy: {}). Any existing key in that slot will be REPLACED.",
         args.touch_policy, args.pin_policy
     );
+    if !args.assume_yes {
+        confirm_or_abort()?;
+    }
 
     let params = crate::signer::GenerateParams {
         serial: args.serial,
@@ -105,6 +112,28 @@ pub fn generate_yubikey(args: &YubiKeyGenerateArgs) -> Result<GeneratedKey, CliE
         public_key: public_key_b64,
         fingerprint: keys::fingerprint(&public_key),
     })
+}
+
+/// Wait for the user to press Enter before proceeding (Ctrl-C aborts).
+/// A closed stdin (EOF: piped input that ran out, or a non-interactive
+/// caller that forgot `--yes`) aborts rather than proceeding.
+#[cfg(feature = "yubikey")]
+fn confirm_or_abort() -> Result<(), CliError> {
+    use std::io::BufRead as _;
+    eprint!("Press Enter to continue, or Ctrl-C to abort... ");
+    let mut line = String::new();
+    let n = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| CliError::Other(format!("failed to read confirmation from stdin: {e}")))?;
+    if n == 0 {
+        return Err(CliError::Other(
+            "stdin closed before confirmation; pass --yes to skip the prompt in \
+             non-interactive use"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Feature-off stub: the clap surface still exposes `key generate
