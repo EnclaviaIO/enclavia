@@ -1,4 +1,4 @@
-//! `enclavia key` command orchestration (#48).
+//! `enclavia key` command orchestration.
 //!
 //! Local control-key management for self-hosted custody. `generate`
 //! creates the key (on a YubiKey, on-device) and records it in the

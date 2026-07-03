@@ -1,4 +1,4 @@
-//! `enclavia secret` subcommands (#169).
+//! `enclavia secret` subcommands.
 //!
 //! Per-enclave environment-variable secrets. Encryption + storage lives
 //! in the backend; the CLI is a thin REST client plus client-side input
@@ -6,9 +6,8 @@
 //! consistent error message before the request hits the wire.
 //!
 //! The validation rules mirror `enclavia-backend`'s
-//! `services::secrets::validate_name` exactly (locked design from
-//! enclavia-crates#169). The backend re-runs the same checks so this is
-//! a UX optimisation, never the security boundary.
+//! `services::secrets::validate_name` exactly. The backend re-runs the
+//! same checks so this is a UX optimisation, never the security boundary.
 
 use serde::{Deserialize, Serialize};
 
@@ -139,7 +138,7 @@ pub async fn delete(
     Ok(removed)
 }
 
-/// `enclavia enclave restart`: server-side stop + start (#169 / #175).
+/// `enclavia enclave restart`: server-side stop + start.
 pub async fn restart(client: &ApiClient, enclave_id: &str) -> Result<(), CliError> {
     client.restart_enclave(enclave_id).await
 }

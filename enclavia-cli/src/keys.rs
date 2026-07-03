@@ -1,4 +1,4 @@
-//! Local control-key index for self-hosted custody (#48).
+//! Local control-key index for self-hosted custody.
 //!
 //! Self-hosted enclaves are created against a control public key the
 //! user holds; the private half never reaches the backend. This module

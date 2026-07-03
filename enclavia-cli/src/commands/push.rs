@@ -2,7 +2,7 @@
 //! registry repo and ship it to the registry. The CLI mediates so testers
 //! don't need to know the registry hostname or run `docker login` themselves.
 //!
-//! Under the per-enclave namespace (#46 phase 2) every enclave owns its own
+//! Under the per-enclave namespace every enclave owns its own
 //! repo at `<owner>/<enclave-uuid>`, so the push target is derived from the
 //! enclave id rather than a free-form name. Tags don't matter for binding
 //! — the enclave's identity is pinned to the digest of the first push — so
@@ -318,8 +318,8 @@ async fn run_docker(args: &[&str]) -> Result<(), CliError> {
 }
 
 /// Run `docker push` and stream both stdout and stderr to the user as they
-/// arrive — docker's own per-layer progress is the friendly output the issue
-/// asks for, we just don't buffer it.
+/// arrive — docker's own per-layer progress is the friendly output we
+/// want, we just don't buffer it.
 ///
 /// Returns the manifest digest extracted from docker's final summary line
 /// (`<tag>: digest: sha256:<hex> size: <n>`), or `None` if docker emitted no

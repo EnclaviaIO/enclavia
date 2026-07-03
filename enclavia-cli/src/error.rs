@@ -16,7 +16,7 @@ pub enum CliError {
     Unauthorized,
 
     /// Backend returned 409 Conflict. Surfaced as its own variant so
-    /// the self-hosted two-phase confirm/revoke flow (#48) can detect a
+    /// the self-hosted two-phase confirm/revoke flow can detect a
     /// stale-nonce dispatch failure and re-run prepare once.
     #[error("conflict: {0}")]
     Conflict(String),
