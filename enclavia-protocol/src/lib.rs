@@ -1,5 +1,6 @@
 pub mod attestation;
 pub mod chain;
+pub mod custody;
 #[cfg(feature = "async-transport")]
 pub mod egress;
 pub mod kms_policy;
