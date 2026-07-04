@@ -1,9 +1,17 @@
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::tungstenite;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("WebSocket error: {0}")]
     WebSocket(#[from] tungstenite::Error),
+
+    /// On wasm the host WebSocket API doesn't expose a typed error (browsers
+    /// deliberately hide details), so the variant carries a message instead.
+    #[cfg(target_arch = "wasm32")]
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
 
     #[error("Noise protocol error: {0}")]
     Noise(#[from] snow::Error),

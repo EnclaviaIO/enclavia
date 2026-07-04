@@ -1,0 +1,24 @@
+[package]
+name = "enclavia-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wasm-bindgen bindings for the enclavia client SDK: attested Noise tunnel to an enclave from browsers and JS runtimes (Node >= 22, Deno)."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+enclavia = { path = "../enclavia" }
+# Pinned exactly: wasm-bindgen's ABI schema must match the wasm-bindgen-cli
+# that post-processes the .wasm (nixpkgs currently ships 0.2.117).
+wasm-bindgen = "=0.2.117"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+uuid = { workspace = true }
+hex = { workspace = true }
+# io-util for split() + AsyncReadExt/AsyncWriteExt on UpgradedStream, sync
+# for the per-half async Mutexes. Both are wasm-supported tokio features.
+tokio = { version = "1", default-features = false, features = ["sync", "io-util"] }
