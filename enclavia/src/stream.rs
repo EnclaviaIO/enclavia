@@ -176,17 +176,36 @@ impl AsyncWrite for UpgradedStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.write_closed {
             return Poll::Ready(Ok(()));
         }
-        let _ = this.cmd_tx.try_send(OutboundCommand::StreamClose {
+        // The close frame MUST reach the transport: it is what lets the
+        // in-enclave server half-close the workload connection and release
+        // the stream's in-flight permit. Silently dropping it when the
+        // command queue is momentarily full leaks the server-side stream
+        // for the life of the session (and a session with open streams
+        // never idle-times-out), so back off and retry like poll_write.
+        match this.cmd_tx.try_send(OutboundCommand::StreamClose {
             id: this.id,
             half: StreamHalf::Write,
-        });
-        this.write_closed = true;
-        Poll::Ready(Ok(()))
+        }) {
+            Ok(()) => {
+                this.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Transport gone: the whole session (and every server-side
+                // stream with it) is already being torn down.
+                this.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+        }
     }
 }
 

@@ -224,6 +224,22 @@ mod imp {
             let _ = self.ws.close();
         }
     }
+
+    impl Drop for Ws {
+        fn drop(&mut self) {
+            // Detach the event handlers BEFORE the Closures are dropped: the
+            // socket can still fire events after we go away (at minimum the
+            // close event that follows our own `close()`), and a JS callback
+            // hitting a dropped Closure aborts with "closure invoked
+            // recursively or after being dropped" — poisoning the whole wasm
+            // instance for every other connection sharing it.
+            self.ws.set_onopen(None);
+            self.ws.set_onmessage(None);
+            self.ws.set_onerror(None);
+            self.ws.set_onclose(None);
+            let _ = self.ws.close();
+        }
+    }
 }
 
 pub(crate) use imp::Ws;
