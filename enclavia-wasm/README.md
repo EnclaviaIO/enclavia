@@ -50,6 +50,13 @@ nix build .#enclavia-wasm
 ls result/   # enclavia_wasm.js, enclavia_wasm.d.ts, enclavia_wasm_bg.wasm (wasm-opt'd)
 ```
 
+To publish to npm as `@enclavia/client-wasm`:
+
+```bash
+nix build .#enclavia-wasm-npm
+npm publish result/            # or `npm pack result/` to inspect the tarball
+```
+
 Or by hand inside `nix develop` (the devshell ships the wasm32 toolchain,
 wasm-bindgen-cli, wasm-opt, and the clang env vars below preconfigured):
 

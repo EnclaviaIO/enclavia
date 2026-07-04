@@ -1,0 +1,38 @@
+{
+  "name": "@enclavia/client-wasm",
+  "version": "0.1.0",
+  "description": "Enclavia client SDK compiled to WebAssembly: attested Noise tunnel to an enclave from browsers and JS runtimes (Node >= 22, Deno). Same Rust security core as the native SDK.",
+  "license": "(Apache-2.0 OR MIT)",
+  "repository": "github:EnclaviaIO/enclavia",
+  "homepage": "https://enclavia.io",
+  "type": "module",
+  "main": "enclavia_wasm.js",
+  "types": "enclavia_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./enclavia_wasm.d.ts",
+      "import": "./enclavia_wasm.js"
+    },
+    "./wasm": "./enclavia_wasm_bg.wasm"
+  },
+  "files": [
+    "enclavia_wasm.js",
+    "enclavia_wasm.d.ts",
+    "enclavia_wasm_bg.wasm",
+    "enclavia_wasm_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "enclavia",
+    "enclave",
+    "attestation",
+    "nitro",
+    "confidential-computing",
+    "wasm",
+    "noise-protocol"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

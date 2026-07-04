@@ -203,6 +203,17 @@
           '';
         });
 
+        # The publish-ready npm package: the reproducible wasm build plus
+        # package.json and README. `npm publish result/` (or `npm pack`) from
+        # the output. Kept as a separate derivation so the artifact build
+        # doesn't rebuild when only packaging metadata changes.
+        enclaviaWasmNpm = pkgs.runCommand "enclavia-client-wasm-npm" { } ''
+          mkdir -p $out
+          cp ${enclaviaWasm}/* $out/
+          cp ${./enclavia-wasm/npm/package.json} $out/package.json
+          cp ${./enclavia-wasm/README.md} $out/README.md
+        '';
+
         # --- Dedicated synchronizer EIF ---------------------------------
         #
         # NOT the builder's OCI pipeline: the synchronizer is the entire
@@ -255,6 +266,9 @@
           # The client SDK as a wasm library (wasm-bindgen output, ready to
           # publish/vendor). Reproducible: two builds yield the same store path.
           enclavia-wasm = enclaviaWasm;
+          # The same, assembled as the @enclavia/client-wasm npm package:
+          # `nix build .#enclavia-wasm-npm && npm publish result/`.
+          enclavia-wasm-npm = enclaviaWasmNpm;
 
           # Synchronizer node binary (qemu variant) + its runtime
           # identity fetcher, plus the dedicated EIF that wraps them.
