@@ -13,8 +13,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 enclavia = { path = "../enclavia" }
 # Pinned exactly: wasm-bindgen's ABI schema must match the wasm-bindgen-cli
-# that post-processes the .wasm (nixpkgs currently ships 0.2.117).
-wasm-bindgen = "=0.2.117"
+# that post-processes the .wasm — the flake's nixpkgs pin ships 0.2.121, and
+# the devshell provides that same CLI. Bump the two together.
+wasm-bindgen = "=0.2.121"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 uuid = { workspace = true }

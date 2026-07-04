@@ -42,21 +42,33 @@ Differences from the native SDK, both inherent to the host WebSocket API:
 
 ## Building
 
-`ring`'s C sources must be compiled by a **wasm-capable clang** — without one,
-cargo *silently* emits the EC math as unresolved `env` imports and the module
-fails only at instantiation. Then run `wasm-bindgen` (CLI version must match
-the pinned `wasm-bindgen` crate, currently 0.2.117):
+Reproducible build via the flake (this is the release path — two builds yield
+the same store path):
 
 ```bash
-export CC_wasm32_unknown_unknown=clang
-# On Nix, clang-unwrapped also needs its builtin headers on the include path:
-#   export CFLAGS_wasm32_unknown_unknown="-I$(dirname $(dirname $(command -v clang)))-lib/lib/clang/<ver>/include"
+nix build .#enclavia-wasm
+ls result/   # enclavia_wasm.js, enclavia_wasm.d.ts, enclavia_wasm_bg.wasm (wasm-opt'd)
+```
 
+Or by hand inside `nix develop` (the devshell ships the wasm32 toolchain,
+wasm-bindgen-cli, wasm-opt, and the clang env vars below preconfigured):
+
+```bash
 cargo build -p enclavia-wasm --target wasm32-unknown-unknown --release
 wasm-bindgen --target web --out-dir enclavia-wasm/pkg \
   target/wasm32-unknown-unknown/release/enclavia_wasm.wasm
-# optional: wasm-opt -Os pkg/enclavia_wasm_bg.wasm -o pkg/enclavia_wasm_bg.wasm
+wasm-opt -Os enclavia-wasm/pkg/enclavia_wasm_bg.wasm -o enclavia-wasm/pkg/enclavia_wasm_bg.wasm
 ```
+
+Two build-time invariants, both handled by the flake:
+
+- `ring`'s C sources must be compiled by a **wasm-capable clang**
+  (`CC_wasm32_unknown_unknown=clang`, plus clang's builtin-headers include
+  path in `CFLAGS_wasm32_unknown_unknown`). Without one, cargo *silently*
+  emits the EC math as unresolved `env` imports and the module fails only at
+  instantiation.
+- the `wasm-bindgen` crate pin and the `wasm-bindgen-cli` version must be
+  equal (ABI schema check; both currently 0.2.121).
 
 ## Smoke test
 
