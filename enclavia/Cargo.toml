@@ -15,15 +15,6 @@ json = ["serde_json"]
 # its own `noise.rs` over WebSocket frames rather than the
 # `async-transport` byte-stream variant, so disable that feature.
 enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
-tokio = { workspace = true, features = ["sync", "macros", "rt"] }
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
-# rustls 0.23 dropped the implicit default CryptoProvider — without an
-# explicit `install_default()` call, the first TLS handshake panics with
-# "Could not automatically determine the process-level CryptoProvider".
-# Pull in the `ring` provider here so `Client::build()` can install it
-# once before connect_async runs.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-futures-util = { workspace = true }
 snow.workspace = true
 serde.workspace = true
 ciborium.workspace = true
@@ -33,12 +24,47 @@ url.workspace = true
 tracing.workspace = true
 uuid = { workspace = true }
 chrono = { workspace = true }
+
+serde_json = { version = "1", optional = true }
+
+# ---- native transport: tokio-tungstenite over rustls -----------------------
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+# rustls 0.23 dropped the implicit default CryptoProvider — without an
+# explicit `install_default()` call, the first TLS handshake panics with
+# "Could not automatically determine the process-level CryptoProvider".
+# Pull in the `ring` provider here so `Ws::connect()` can install it
+# once before connect_async runs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = { workspace = true }
 # `trust_upgrades` fetches the enclave's public upgrade chain over HTTPS.
 # rustls (not native-tls) to match the WebSocket transport's TLS stack
 # and avoid pulling OpenSSL into the SDK.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
-serde_json = { version = "1", optional = true }
+# ---- wasm transport: the host WebSocket via web-sys -------------------------
+# tokio is deliberately NOT `workspace = true` here: the workspace pin unions
+# in native-only features (net, rt-multi-thread). `sync` (channels), `macros`
+# (select!) and `io-util` (the AsyncRead/AsyncWrite traits UpgradedStream
+# implements) are the wasm-supported subset — there is no runtime; the
+# transport task runs on the JS microtask queue via wasm-bindgen-futures.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "Event"] }
+# reqwest's wasm backend is the host `fetch` — no TLS stack to configure.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# chrono::Utc::now() panics on wasm32-unknown-unknown without `wasmbind` (it
+# needs the JS Date); trust_upgrades passes the current time to the
+# chain-descent verifier.
+chrono = { version = "0.4", features = ["wasmbind"] }
+# Route the RNG (snow's ephemeral keys, uuid v4) through the host's
+# crypto.getRandomValues.
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["js"] }
 
 [dev-dependencies]
 # Integration tests spin up an in-process Noise responder; that needs the

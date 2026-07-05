@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crate::message::{ClientMessage, ServerMessage, StreamHalf};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::connect_async;
 use tracing::info;
 use url::Url;
 
@@ -15,8 +14,7 @@ use crate::noise;
 use crate::request::RequestBuilder;
 use crate::stream::UpgradedStream;
 use crate::transport::{self, OutboundCommand};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use crate::ws::{self, Ws};
 
 /// Maximum HTTP response head we'll buffer while waiting for the double-CRLF.
 /// Anything past this means the workload is misbehaving (or attacking the
@@ -382,32 +380,10 @@ impl ClientBuilder {
 
         info!(url = %self.url, "Connecting to enclavia proxy");
 
-        // rustls 0.23 requires a CryptoProvider to be installed in the
-        // process before the first TLS handshake; otherwise tokio-tungstenite
-        // panics. install_default() is process-global and idempotent — the
-        // Err case ("already installed") is benign and ignored, so it's
-        // safe to call on every build().
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        // 1. WebSocket connect. Build the upgrade request explicitly so we
-        // can stamp caller-supplied extra headers (the e2e harness uses this
-        // for `X-Enclave-Host`).
-        let mut request = self
-            .url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Error::InvalidUrl(e.to_string()))?;
-        for (name, value) in &self.extra_headers {
-            let header_name: tokio_tungstenite::tungstenite::http::HeaderName =
-                name.parse().map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderName| {
-                    Error::InvalidUrl(format!("invalid header name {name:?}: {e}"))
-                })?;
-            let header_value = HeaderValue::from_str(value).map_err(|e| {
-                Error::InvalidUrl(format!("invalid header value for {name:?}: {e}"))
-            })?;
-            request.headers_mut().insert(header_name, header_value);
-        }
-        let (mut ws, _) = connect_async(request).await?;
+        // 1. WebSocket connect. The backend-specific parts (TLS setup and
+        // caller-supplied upgrade headers natively; the host WebSocket API on
+        // wasm) live in `ws::Ws`.
+        let mut ws = Ws::connect(&self.url, &self.extra_headers).await?;
         info!("WebSocket connected");
 
         // 2. Noise handshake
@@ -459,9 +435,10 @@ impl ClientBuilder {
             },
         }
 
-        // 4. Spawn background transport task
+        // 4. Spawn background transport task (tokio natively, the JS
+        // microtask queue on wasm).
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        tokio::spawn(transport::run_transport(ws, transport, cmd_rx));
+        ws::spawn_transport(transport::run_transport(ws, transport, cmd_rx));
 
         Ok(Client {
             inner: Arc::new(ClientInner { cmd_tx, host }),

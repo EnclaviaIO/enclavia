@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "enclavia",
+    "enclavia-wasm",
     "enclavia-chain-init",
     "enclavia-cli",
     "enclavia-crypto",

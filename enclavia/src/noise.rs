@@ -1,22 +1,13 @@
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info};
 
 use crate::error::Error;
+use crate::ws::{Ws, WsEvent};
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
-
-/// Receive the next binary WebSocket frame, skipping non-binary messages.
-pub(crate) async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, Error> {
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Binary(data))) => return Ok(data.into()),
-            Some(Ok(Message::Close(_))) | None => return Err(Error::ConnectionClosed),
-            Some(Ok(_)) => continue,
-            Some(Err(e)) => return Err(Error::WebSocket(e)),
-        }
+/// Receive the next binary WebSocket frame.
+pub(crate) async fn recv_binary(ws: &mut Ws) -> Result<Vec<u8>, Error> {
+    match ws.recv().await? {
+        WsEvent::Frame(data) => Ok(data),
+        WsEvent::Closed => Err(Error::ConnectionClosed),
     }
 }
 
@@ -25,7 +16,7 @@ pub(crate) async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, Error> {
 /// Returns the `TransportState` for encrypting/decrypting messages and the
 /// handshake hash (used as the attestation nonce).
 pub(crate) async fn perform_handshake(
-    ws: &mut WsStream,
+    ws: &mut Ws,
 ) -> Result<(snow::TransportState, Vec<u8>), Error> {
     let mut handshake = snow::Builder::new(
         crate::message::NOISE_PATTERN
@@ -38,8 +29,7 @@ pub(crate) async fn perform_handshake(
 
     // -> e
     let len = handshake.write_message(&[], &mut buf)?;
-    ws.send(Message::Binary(buf[..len].to_vec().into()))
-        .await?;
+    ws.send(buf[..len].to_vec()).await?;
     debug!("Sent handshake -> e");
 
     // <- e, ee

@@ -1,17 +1,12 @@
 use std::collections::HashMap;
 
 use crate::message::{ClientMessage, ServerMessage, StreamHalf};
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, trace, warn};
 
 use crate::error::Error;
 use crate::noise::recv_binary;
-
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+use crate::ws::{Ws, WsEvent};
 
 type PendingMap = HashMap<u64, oneshot::Sender<Result<Vec<u8>, Error>>>;
 type StreamMap = HashMap<u64, mpsc::Sender<Result<Vec<u8>, Error>>>;
@@ -94,13 +89,13 @@ fn try_decrypt<T: serde::de::DeserializeOwned>(
 ///
 /// Used during the connection phase for the attestation exchange.
 pub(crate) async fn send_and_receive<S: serde::Serialize, R: serde::de::DeserializeOwned>(
-    ws: &mut WsStream,
+    ws: &mut Ws,
     transport: &mut snow::TransportState,
     msg: &S,
 ) -> Result<R, Error> {
     let mut write_buf = vec![0u8; 65535];
     let data = encrypt_cbor(transport, msg, &mut write_buf)?;
-    ws.send(Message::Binary(data.into())).await?;
+    ws.send(data).await?;
 
     let mut accum = Vec::new();
     let mut read_buf = vec![0u8; 65535];
@@ -126,7 +121,7 @@ pub(crate) async fn send_and_receive<S: serde::Serialize, R: serde::de::Deserial
 /// - `streams`: long-lived `OpenStream` consumers, keyed by id, removed on
 ///   `StreamClose` or an error.
 pub(crate) async fn run_transport(
-    mut ws: WsStream,
+    mut ws: Ws,
     mut transport: snow::TransportState,
     mut cmd_rx: mpsc::Receiver<OutboundCommand>,
 ) {
@@ -142,7 +137,7 @@ pub(crate) async fn run_transport(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
                     debug!("All client handles dropped, shutting down transport");
-                    let _ = ws.close(None).await;
+                    ws.close().await;
                     break;
                 };
 
@@ -153,8 +148,8 @@ pub(crate) async fn run_transport(
                         let msg = ClientMessage::Data { id, payload };
                         match encrypt_cbor(&mut transport, &msg, &mut write_buf) {
                             Ok(data) => {
-                                if let Err(e) = ws.send(Message::Binary(data.into())).await {
-                                    let _ = response_tx.send(Err(Error::WebSocket(e)));
+                                if let Err(e) = ws.send(data).await {
+                                    let _ = response_tx.send(Err(e));
                                     continue;
                                 }
                                 pending.insert(id, response_tx);
@@ -171,8 +166,8 @@ pub(crate) async fn run_transport(
                         let msg = ClientMessage::OpenStream { id, payload };
                         match encrypt_cbor(&mut transport, &msg, &mut write_buf) {
                             Ok(data) => {
-                                if let Err(e) = ws.send(Message::Binary(data.into())).await {
-                                    let _ = id_tx.send(Err(Error::WebSocket(e)));
+                                if let Err(e) = ws.send(data).await {
+                                    let _ = id_tx.send(Err(e));
                                     continue;
                                 }
                                 streams.insert(id, stream_tx);
@@ -188,9 +183,9 @@ pub(crate) async fn run_transport(
                         let msg = ClientMessage::StreamData { id, payload };
                         match encrypt_cbor(&mut transport, &msg, &mut write_buf) {
                             Ok(data) => {
-                                if let Err(e) = ws.send(Message::Binary(data.into())).await {
+                                if let Err(e) = ws.send(data).await {
                                     warn!(id, error = %e, "Failed to send StreamData");
-                                    fail_stream(&mut streams, id, Error::WebSocket(e));
+                                    fail_stream(&mut streams, id, e);
                                 }
                             }
                             Err(e) => {
@@ -202,7 +197,7 @@ pub(crate) async fn run_transport(
                     OutboundCommand::StreamClose { id, half } => {
                         let msg = ClientMessage::StreamClose { id, half };
                         if let Ok(data) = encrypt_cbor(&mut transport, &msg, &mut write_buf) {
-                            let _ = ws.send(Message::Binary(data.into())).await;
+                            let _ = ws.send(data).await;
                         }
                         if matches!(half, StreamHalf::Both) {
                             streams.remove(&id);
@@ -211,9 +206,9 @@ pub(crate) async fn run_transport(
                 }
             }
 
-            frame = ws.next() => {
+            frame = ws.recv() => {
                 match frame {
-                    Some(Ok(Message::Binary(data))) => {
+                    Ok(WsEvent::Frame(data)) => {
                         accum.extend_from_slice(&data);
                         loop {
                             match try_decrypt::<ServerMessage>(&mut transport, &accum, &mut read_buf) {
@@ -229,13 +224,12 @@ pub(crate) async fn run_transport(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => {
+                    Ok(WsEvent::Closed) => {
                         debug!("WebSocket closed");
                         notify_all_closed(&mut pending, &mut streams);
                         break;
                     }
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => {
+                    Err(e) => {
                         warn!("WebSocket error: {e}");
                         notify_all_closed(&mut pending, &mut streams);
                         break;

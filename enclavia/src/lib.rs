@@ -15,6 +15,7 @@ mod request;
 mod response;
 mod stream;
 mod transport;
+mod ws;
 
 pub use enclavia_protocol::attestation::Pcrs;
 pub use client::{Client, ClientBuilder};

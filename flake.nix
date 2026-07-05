@@ -39,6 +39,8 @@
 
         rustToolchain = pkgs: (pkgs.rust-bin.stable."1.88.0".default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
+          # The client SDK also compiles to wasm (enclavia-wasm bindings).
+          targets = [ "wasm32-unknown-unknown" ];
         });
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -155,6 +157,63 @@
           }
         );
 
+        # --- enclavia-wasm: the client SDK compiled to wasm --------------
+        #
+        # ring's C sources must be compiled by a wasm-capable clang; without
+        # one, cargo SILENTLY emits the EC math as unresolved `env` imports
+        # and the module only fails at instantiation. The unwrapped clang
+        # (no glibc wrapper flags) targets wasm natively, but needs its own
+        # builtin headers (stddef.h & co) put back on the include path.
+        clangUnwrapped = pkgs.llvmPackages.clang-unwrapped;
+        wasmRingEnv = {
+          CC_wasm32_unknown_unknown = "${clangUnwrapped}/bin/clang";
+          CFLAGS_wasm32_unknown_unknown =
+            "-I${pkgs.lib.getLib clangUnwrapped}/lib/clang/${pkgs.lib.versions.major clangUnwrapped.version}/include";
+        };
+
+        # Scoped to `-p enclavia-wasm`, so only the SDK subtree is built for
+        # wasm32 (no openssl/pcsclite — those belong to the native CLI).
+        wasmCommonArgs = rustCommonArgs // wasmRingEnv // {
+          pname = "enclavia-wasm";
+          version = "0.1.0";
+          cargoExtraArgs = "-p enclavia-wasm";
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          doCheck = false;
+          buildInputs = [ ];
+        };
+
+        cargoArtifactsWasm = craneLib.buildDepsOnly wasmCommonArgs;
+
+        # `nix build .#enclavia-wasm` -> $out with the wasm-bindgen output
+        # (enclavia_wasm.js + .d.ts + the wasm-opt'd .wasm), ready to publish
+        # or vendor. wasm-bindgen-cli's version must equal the crate's pinned
+        # `wasm-bindgen` (the ABI schema must match) — both currently 0.2.121,
+        # via nixpkgs and enclavia-wasm/Cargo.toml respectively.
+        enclaviaWasm = craneLib.buildPackage (wasmCommonArgs // {
+          cargoArtifacts = cargoArtifactsWasm;
+          nativeBuildInputs = rustCommonArgs.nativeBuildInputs ++ [
+            pkgs.wasm-bindgen-cli
+            pkgs.binaryen
+          ];
+          installPhaseCommand = ''
+            mkdir -p $out
+            wasm-bindgen --target web --out-dir $out \
+              target/wasm32-unknown-unknown/release/enclavia_wasm.wasm
+            wasm-opt -Os $out/enclavia_wasm_bg.wasm -o $out/enclavia_wasm_bg.wasm
+          '';
+        });
+
+        # The publish-ready npm package: the reproducible wasm build plus
+        # package.json and README. `npm publish result/` (or `npm pack`) from
+        # the output. Kept as a separate derivation so the artifact build
+        # doesn't rebuild when only packaging metadata changes.
+        enclaviaWasmNpm = pkgs.runCommand "enclavia-client-wasm-npm" { } ''
+          mkdir -p $out
+          cp ${enclaviaWasm}/* $out/
+          cp ${./enclavia-wasm/npm/package.json} $out/package.json
+          cp ${./enclavia-wasm/README.md} $out/README.md
+        '';
+
         # --- Dedicated synchronizer EIF ---------------------------------
         #
         # NOT the builder's OCI pipeline: the synchronizer is the entire
@@ -176,15 +235,21 @@
 
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           buildInputs = [
-            (rustToolchain pkgs)
+            (rustToolchain pkgs)  # includes the wasm32-unknown-unknown target
             pkgs.pkg-config
             pkgs.openssl
             # For the CLI's default `yubikey` feature (#48).
             pkgs.pcsclite
+            # wasm client (enclavia-wasm): bindgen glue + wasm-opt. The clang
+            # that compiles ring's C for wasm32 is injected via the CC_/CFLAGS_
+            # env vars below, so `cargo build --target wasm32-unknown-unknown`
+            # just works in this shell.
+            pkgs.wasm-bindgen-cli
+            pkgs.binaryen
           ];
-        };
+        } // wasmRingEnv);
 
         packages = {
           nbd-client = nbdClient;
@@ -197,6 +262,13 @@
           # Beta-tester install entry point. Must stay named `enclavia`
           # so `nix profile install ...#enclavia` matches the binary.
           enclavia = enclaviaCli;
+
+          # The client SDK as a wasm library (wasm-bindgen output, ready to
+          # publish/vendor). Reproducible: two builds yield the same store path.
+          enclavia-wasm = enclaviaWasm;
+          # The same, assembled as the @enclavia/client-wasm npm package:
+          # `nix build .#enclavia-wasm-npm && npm publish result/`.
+          enclavia-wasm-npm = enclaviaWasmNpm;
 
           # Synchronizer node binary (qemu variant) + its runtime
           # identity fetcher, plus the dedicated EIF that wraps them.
