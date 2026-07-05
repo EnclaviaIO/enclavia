@@ -27,6 +27,9 @@ p256 = { workspace = true }
 rand.workspace = true
 base64.workspace = true
 sha2.workspace = true
+# Own-clock enforcement of the measured minimum upgrade delay
+# (`UpgradePayload.valid_from` floor in `run_prepare_upgrade`).
+chrono = { workspace = true }
 tokio-vsock = { workspace = true }
 # Re-enable the `nix` feature: enclavia-server is the one place that
 # actually drives `/dev/nsm` to produce attestations.
@@ -38,4 +41,3 @@ path = "src/main.rs"
 
 [dev-dependencies]
 uuid = { workspace = true }
-chrono = { workspace = true }
