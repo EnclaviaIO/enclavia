@@ -315,6 +315,7 @@ impl ApiClient {
         production: bool,
         control_key: Option<&serde_json::Value>,
         anti_rollback: bool,
+        min_upgrade_delay_secs: Option<u64>,
     ) -> Result<serde_json::Value, CliError> {
         let mut body = serde_json::json!({
             "instance_type": instance_type,
@@ -356,6 +357,12 @@ impl ApiClient {
         // default (false), same rationale as `upgradable`.
         if anti_rollback {
             body["anti_rollback"] = serde_json::json!(true);
+        }
+        // Only send `min_upgrade_delay_secs` when the user asked for a
+        // floor; omitted -> backend default (0 = no floor), same
+        // rationale as `upgradable`.
+        if let Some(secs) = min_upgrade_delay_secs {
+            body["min_upgrade_delay_secs"] = serde_json::json!(secs);
         }
         self.request_with_body(reqwest::Method::POST, "/enclaves", &body)
             .await
