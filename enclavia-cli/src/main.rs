@@ -332,6 +332,11 @@ enum EnclaveCmd {
         /// Enclave ID
         id: String,
     },
+    /// Fetch an enclave's build log and (debug/QEMU) runtime log
+    Logs {
+        /// Enclave ID
+        id: String,
+    },
     /// Stop a running enclave
     Stop {
         /// Enclave ID
@@ -682,6 +687,12 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
             let client = ApiClient::new()?;
             let e = enclave_cmds::status(&client, &id).await?;
             emit(json, &e, || print_enclave_status(&e));
+            Ok(())
+        }
+        EnclaveCmd::Logs { id } => {
+            let client = ApiClient::new()?;
+            let logs = enclave_cmds::logs(&client, &id).await?;
+            emit(json, &logs, || print_enclave_logs(&logs));
             Ok(())
         }
         EnclaveCmd::Stop { id } => {
@@ -1109,6 +1120,28 @@ fn print_enclave_status(e: &serde_json::Value) {
             println!("    {k}: {}", v.as_str().unwrap_or("-"));
         }
     }
+}
+
+/// Human-readable rendering of `GET /enclaves/:id/logs`
+/// (`{ build_log, runtime_log }`). Both are optional: `build_log` is the EIF
+/// build output; `runtime_log` is the guest serial console, captured only for
+/// debug/QEMU enclaves. In `--json` mode `emit` prints the raw object instead,
+/// so a pipeline gets `{"build_log": ..., "runtime_log": ...}` verbatim.
+fn print_enclave_logs(v: &serde_json::Value) {
+    let section = |title: &str, log: Option<&str>, empty_hint: &str| {
+        println!("=== {title} ===");
+        match log {
+            Some(l) if !l.trim().is_empty() => println!("{}", l.trim_end()),
+            _ => println!("({empty_hint})"),
+        }
+    };
+    section("Build log", v["build_log"].as_str(), "none");
+    println!();
+    section(
+        "Runtime log",
+        v["runtime_log"].as_str(),
+        "none — runtime logs are captured for debug/QEMU enclaves",
+    );
 }
 
 async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {

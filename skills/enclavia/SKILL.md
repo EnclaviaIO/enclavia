@@ -1,6 +1,6 @@
 ---
 name: enclavia
-description: Manage Enclavia confidential-compute enclaves (create, list, status, stop/start/restart/destroy, push images, secrets, staged upgrades) via the `enclavia` CLI with `--json`; use when a task asks to deploy, inspect, or operate an Enclavia enclave from a terminal or agent.
+description: Manage Enclavia confidential-compute enclaves (create, list, status, logs, stop/start/restart/destroy, push images, secrets, staged upgrades) via the `enclavia` CLI with `--json`; use when a task asks to deploy, inspect, or operate an Enclavia enclave from a terminal or agent.
 ---
 
 # enclavia CLI (agent guide)
@@ -53,6 +53,9 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
 
 - `enclavia enclave status <id> --json`
   -> one enclave object: `{id,name,status,status_detail?,mode,instance_type,docker_image,vsock_cid,endpoint?,created_at,pcrs?,error_message?}`.
+
+- `enclavia enclave logs <id> --json`
+  -> `{"build_log":<str|null>,"runtime_log":<str|null>}`. `build_log` is the EIF build output (always available once building); `runtime_log` is the guest serial console, captured only for debug/QEMU enclaves (null on production Nitro). `--json` emits the raw object verbatim (pipe into a log viewer); without it the two logs print as labeled sections. Good first stop when `status` shows `error` or a build/boot failure.
 
 - `enclavia enclave create [--instance-type small|medium|large] [--container-port N] [--storage-size-bytes N] [--name S] [--visibility private|public] [--upgradable] [--egress-allow HOST:PORT[/PROTO]]... [--egress-resolver IPV4]... [--egress-config PATH] --json`
   -> created enclave object `{id,status,...}`. Status starts `waiting_for_image`; next step is `push`.
