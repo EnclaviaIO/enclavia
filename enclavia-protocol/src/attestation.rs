@@ -81,7 +81,7 @@ pub enum AttestationError {
     #[error("attestation document PCR {0} is not valid hex")]
     InvalidPcrHex(usize),
     /// The doc's `user_data` field is missing or not a 65-byte
-    /// uncompressed SEC1 ECDSA P-256 verifying key (#47). Required by
+    /// uncompressed SEC1 ECDSA P-256 verifying key. Required by
     /// [`verify_and_extract`] — the synchronizer needs the control
     /// pubkey to verify `Transition` signatures later in the session.
     #[error(
@@ -106,8 +106,8 @@ pub enum AttestationError {
     /// The document verified (structure, signature, nonce binding) but
     /// its PCR0/1/2 equal NONE of the caller's expected triples.
     /// Returned by [`verify_and_extract_pcrs`]: the presenting enclave
-    /// is genuine but is not the identity the caller trusts (#208
-    /// server authentication).
+    /// is genuine but is not the identity the caller trusts
+    /// (server authentication).
     #[error("attestation document PCRs match none of the expected values")]
     PcrsNotExpected,
 }
@@ -116,7 +116,7 @@ pub enum AttestationError {
 /// (`0x04 || X(32) || Y(32)`). Locked at the protocol layer because
 /// every caller — synchronizer node, in-enclave server, attestation
 /// emitter — needs to agree on the shape carried in
-/// `AttestationDoc::user_data`. See EnclaviaIO/enclavia-crates#47.
+/// `AttestationDoc::user_data`.
 pub const CONTROL_PUBKEY_LEN: usize = 65;
 
 /// Domain-separation string the canonical non-upgradable control key is
@@ -127,7 +127,7 @@ pub const NON_UPGRADABLE_CONTROL_KEY_DST: &[u8] =
     b"enclavia/synchronizer/non-upgradable-control-key/v1";
 
 /// The canonical "provably un-signable" control key for enclaves that
-/// have no #47 upgrade chain.
+/// have no public upgrade chain.
 ///
 /// ## What it is for
 ///
@@ -219,7 +219,7 @@ pub fn verify_against(
 
 /// Verify a control-nonce attestation and return the attested nonce.
 ///
-/// Backend control-dispatch entry point (#47 hardening). Before signing
+/// Backend control-dispatch entry point (upgrade-chain hardening). Before signing
 /// and sending a control command, the dispatcher requests an attestation
 /// over the control channel; the in-enclave server's reply binds the
 /// live Noise session (doc `nonce` = `base64(handshake_hash)`) and
@@ -323,7 +323,7 @@ pub fn verify_and_extract(
 /// requirement. Returns the verified PCRs (which of the expected set
 /// matched).
 ///
-/// Server-authentication entry point (EnclaviaIO/enclavia-crates#208).
+/// Server-authentication entry point.
 /// The synchronizer's CUSTOMER client uses this to authenticate the
 /// ORACLE back to itself: the synchronizer sends its own NSM document
 /// bound to the live Noise session and the client validates it here
@@ -420,8 +420,8 @@ pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationErro
 
 /// Verify a chain-link attestation document.
 ///
-/// Used by the backend's `POST /enclaves/{id}/chain-links` ingest path
-/// (#47): each chain link (`boot`, `upgrade`, `revocation`) carries a
+/// Used by the backend's `POST /enclaves/{id}/chain-links` ingest
+/// path: each chain link (`boot`, `upgrade`, `revocation`) carries a
 /// hardware-signed `attestation` whose `user_data` field commits to the
 /// link's `payload` via `sha256(payload)`. This function performs the
 /// minimum-trust check required at ingest:
@@ -568,7 +568,7 @@ pub mod test_utils {
         /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key. Encoded
         /// into the doc's `user_data` field — [`super::verify_and_extract`]
         /// requires this to be a 65-byte pubkey with the SEC1 prefix
-        /// `0x04` (#47).
+        /// `0x04`.
         pub control_pubkey: [u8; super::CONTROL_PUBKEY_LEN],
     }
 

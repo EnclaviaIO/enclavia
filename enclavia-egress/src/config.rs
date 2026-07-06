@@ -101,8 +101,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct RawAllowlist {
     /// Schema version. Only `SCHEMA_VERSION` is accepted today.
     pub version: u32,
-    /// DNS resolvers the daemon is allowed to reach (#136 territory).
-    /// Parsed but not enforced in this issue.
+    /// DNS resolvers the daemon is allowed to reach. Parsed here;
+    /// enforcement belongs to the hostname-enforcement layer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolvers: Vec<String>,
     /// The allow list itself.
@@ -150,7 +150,7 @@ pub struct AllowlistEntry {
 }
 
 /// One canonical, typed hostname-shaped allowlist entry. Enforced via
-/// a stub query to the in-enclave `unbound` (#136).
+/// a stub query to the in-enclave `unbound`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostnameEntry {
     /// Lowercased ASCII hostname. We do not preserve trailing dots; the

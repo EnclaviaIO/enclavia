@@ -143,7 +143,8 @@ pub struct RekeyParams {
 ///
 /// # Wire-stability note
 ///
-/// `PrepareUpgrade` was redesigned for issue #47. There were no live senders
+/// `PrepareUpgrade` was redesigned as part of the public upgrade-chain
+/// work. There were no live senders
 /// of the previous shape (`new_public_key / new_key_id / nonce`), so the
 /// wire change is safe. The new shape carries the chain artifact inline so
 /// the enclave can emit the chain link as part of the same atomic operation

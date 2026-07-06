@@ -4,7 +4,7 @@
 //! This module wires it into the [`ConnectPolicy`] trait that
 //! [`crate::forward_flow`] calls between accept and transport dial.
 //!
-//! Hostname enforcement (this is #136):
+//! Hostname enforcement:
 //! - IP literal / CIDR entries are tried first; a hit short-circuits to
 //!   Allow without ever touching DNS. That keeps the hot path (workload
 //!   talking to a fixed AWS endpoint, say) cache-free and resolver-free.
@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(policy.allow_tcp(dst).await, PolicyDecision::Deny);
     }
 
-    // --- Hostname enforcement (#136) ---
+    // --- Hostname enforcement ---
 
     #[tokio::test]
     async fn hostname_match_allows_when_resolver_returns_target_ip() {

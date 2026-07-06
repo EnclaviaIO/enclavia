@@ -21,10 +21,10 @@ Configuration:
 - `~/.config/enclavia/` holds credentials and config.
 - `ENCLAVIA_BACKEND_URL` overrides the API endpoint (defaults to `https://api.beta.enclavia.io`). Useful when running against a local dev backend.
 
-Also exposes a library face (`enclavia_cli::{api, commands, config}`) that other tools consume. The closed-source MCP server wraps these as MCP tools so Claude can drive the same operations from the chat.
+Also exposes a library face (`enclavia_cli::{api, commands, config}`) that other tools consume. The hosted MCP server at `mcp.beta.enclavia.io` wraps these as MCP tools so Claude can drive the same operations from the chat.
 
 The CLI is what most people interact with day to day; if it gets a feature, this is the surface to land it on first.
 
 ## License
 
-Dual-licensed under Apache-2.0 OR MIT. See [`../LICENSE-APACHE`](../LICENSE-APACHE) and [`../LICENSE-MIT`](../LICENSE-MIT).
+Dual-licensed under Apache-2.0 OR MIT. See [`LICENSE-APACHE`](LICENSE-APACHE) and [`LICENSE-MIT`](LICENSE-MIT).

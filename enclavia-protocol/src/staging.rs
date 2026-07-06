@@ -1,4 +1,4 @@
-//! Wire DTOs for the staged-upgrade API surface (#47).
+//! Wire DTOs for the staged-upgrade API surface.
 //!
 //! These types are shared between:
 //! - The backend's `POST /enclaves/{id}/upgrades` response and

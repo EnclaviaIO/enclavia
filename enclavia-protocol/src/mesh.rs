@@ -3,10 +3,9 @@
 //! The synchronizer cluster is a set of in-enclave nodes that need to
 //! talk to one another. An in-enclave node cannot dial another enclave
 //! directly: it can only reach its own host over vsock. The future
-//! `mesh-host` daemon (shipped from `enclavia-crates`, following the
-//! `chain-host` host-side conventions: `debug`/`enclave` feature split,
-//! paired flake outputs, ACK framing, 32 KiB vsock write chunking) is
-//! the host-side relay that bridges these vsock connections into
+//! `mesh-host` daemon (part of the host-side tooling, following the
+//! `chain-host` conventions: ACK framing, 32 KiB vsock write chunking)
+//! is the host-side relay that bridges these vsock connections into
 //! plain-TCP inter-host links between the parent EC2 instances. The
 //! end-to-end Noise channel between the two enclaves is load-bearing for
 //! confidentiality, so the relay never sees plaintext; in production
@@ -40,7 +39,7 @@
 //! The relays never inspect any byte after the [`Open`] frame: the ack is
 //! the first byte the far relay forwards from its guest-side leg, so it is
 //! the relay's only structured signal that the far leg came up before the
-//! enclave-to-enclave Noise handshake takes over. (#125's `mesh-host`
+//! enclave-to-enclave Noise handshake takes over. (`mesh-host`
 //! mirrors this contract: dial the named peer's bootstrap port, and on
 //! success write [`OPEN_ACK_OK`] toward the originating side before
 //! splicing; on failure write [`OPEN_ACK_FAILED`] and close.)
@@ -62,19 +61,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::attestation::CONTROL_PUBKEY_LEN;
 
 /// vsock port the in-enclave node dials to reach `mesh-host`, the
-/// host-side relay that bridges the mesh into inter-host TCP. See
-/// EnclaviaIO/enclavia-crates#125. Assignment settled in the #16 design
+/// host-side relay that bridges the mesh into inter-host TCP.
+/// Assignment settled in the synchronizer mesh design
 /// pass (5004/5007 from the earlier draft collided with `secrets-host`
 /// and the control channel).
 pub const MESH_VSOCK_PORT: u32 = 5009;
 
 /// vsock port a synchronizer node listens on for cluster bootstrap /
-/// peer-join traffic. Assignment settled in the #16 design pass.
+/// peer-join traffic. Assignment settled in the synchronizer mesh
+/// design pass.
 pub const SYNCHRONIZER_BOOTSTRAP_PORT: u32 = 5008;
 
 /// vsock port a synchronizer node listens on for customer-enclave RPC
-/// (`Pin` / `Get` / `Transition`). Assignment settled in the #16 design
-/// pass; supersedes the single-node binary's interim default of 5004.
+/// (`Pin` / `Get` / `Transition`). Assignment settled in the
+/// synchronizer mesh design pass; supersedes the single-node binary's interim default of 5004.
 pub const SYNCHRONIZER_CLIENT_PORT: u32 = 5010;
 
 /// vsock port a CUSTOMER enclave's `nbd-client` dials on its OWN host
@@ -82,8 +82,8 @@ pub const SYNCHRONIZER_CLIENT_PORT: u32 = 5010;
 ///
 /// A customer enclave cannot dial the synchronizer enclaves directly (an
 /// in-enclave binary only reaches its own parent over vsock), so a
-/// host-side relay (follow-up in enclavia-crates, same conventions as
-/// `egress-host` / the future `mesh-host`) listens here and splices the
+/// host-side relay (same conventions as `egress-host` / `mesh-host`)
+/// listens here and splices the
 /// byte stream to a cluster node's [`SYNCHRONIZER_CLIENT_PORT`] (5010).
 /// The relay never sees plaintext: the end-to-end Noise channel between
 /// the customer enclave and the synchronizer node is load-bearing.
