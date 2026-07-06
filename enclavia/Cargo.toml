@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 description = "Encrypted HTTP client SDK for the Enclavia enclave runtime: Noise tunnel over WebSocket with built-in attestation verification."
+readme = "README.md"
+documentation = "https://docs.rs/enclavia"
+keywords = ["enclave", "attestation", "nitro", "confidential-computing", "https"]
+categories = ["cryptography", "network-programming", "api-bindings"]
 
 [features]
 default = []
@@ -14,7 +20,7 @@ json = ["serde_json"]
 # enclavia-protocol owns the shared attestation verifier. The SDK uses
 # its own `noise.rs` over WebSocket frames rather than the
 # `async-transport` byte-stream variant, so disable that feature.
-enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+enclavia-protocol = { path = "../enclavia-protocol", version = "0.1.0", default-features = false }
 snow.workspace = true
 serde.workspace = true
 ciborium.workspace = true
@@ -70,7 +76,7 @@ uuid = { version = "1", features = ["js"] }
 # Integration tests spin up an in-process Noise responder; that needs the
 # async-transport helpers (perform_cbor_handshake_as_responder + CborTransport)
 # plus the `test-utils` FakeAttestation builder for the debug-mode handshake.
-enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }
+enclavia-protocol = { path = "../enclavia-protocol", version = "0.1.0", features = ["test-utils"] }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "sync"] }
 bytes = { workspace = true }
 tokio-tungstenite = { workspace = true }

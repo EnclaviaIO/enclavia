@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 description = "Shared wire types and Noise+CBOR responder helpers used by the Enclavia server, router, and SDK."
+readme = "README.md"
+documentation = "https://docs.rs/enclavia-protocol"
+keywords = ["enclave", "attestation", "nitro", "noise-protocol"]
+categories = ["cryptography", "network-programming"]
 
 [features]
 default = ["async-transport"]
@@ -18,7 +24,7 @@ test-utils = []
 snow = { workspace = true }
 serde.workspace = true
 # Used by kms_policy.rs to parse the stringified KMS key policy the enclave
-# verifies at boot (#198 follow-up). A regular dependency (not dev-only)
+# verifies at boot. A regular dependency (not dev-only)
 # because the verification runs in production.
 serde_json.workspace = true
 ciborium.workspace = true
@@ -45,7 +51,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 p256 = { workspace = true }
 serde_bytes = "0.11"
-# KMS phase 2 (#198) CiphertextForRecipient codec (kms_recipient.rs): the
+# Attestation-gated KMS decrypt: the CiphertextForRecipient codec (kms_recipient.rs), the
 # RSA-OAEP-wrapped AES-256-CBC CMS envelope KMS returns to an attested
 # enclave, plus its mock-kms producer side.
 rsa = { workspace = true }
