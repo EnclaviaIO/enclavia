@@ -79,6 +79,43 @@ pub fn build_egress_allowlist(
     Ok(Some(value))
 }
 
+/// Parse a `--min-upgrade-delay` value into whole seconds. Accepts a
+/// bare integer (seconds) or an integer with an `s` / `m` / `h` / `d`
+/// suffix. Zero is rejected: "no delay" is expressed by omitting the
+/// flag, so a literal `0` is almost certainly a mistake.
+pub fn parse_min_upgrade_delay(raw: &str) -> Result<u64, CliError> {
+    let raw = raw.trim();
+    let (number, multiplier) = match raw.chars().last() {
+        Some('s') => (&raw[..raw.len() - 1], 1u64),
+        Some('m') => (&raw[..raw.len() - 1], 60),
+        Some('h') => (&raw[..raw.len() - 1], 3_600),
+        Some('d') => (&raw[..raw.len() - 1], 86_400),
+        Some(c) if c.is_ascii_digit() => (raw, 1),
+        _ => {
+            return Err(CliError::Other(format!(
+                "invalid --min-upgrade-delay {raw:?}: expected an integer with an optional \
+                 s/m/h/d suffix, e.g. `30m`, `48h`, `7d`, or `3600` (seconds)"
+            )));
+        }
+    };
+    let n: u64 = number.parse().map_err(|_| {
+        CliError::Other(format!(
+            "invalid --min-upgrade-delay {raw:?}: {number:?} is not a valid non-negative \
+             integer (expected e.g. `30m`, `48h`, `7d`, or `3600` for seconds)"
+        ))
+    })?;
+    let secs = n.checked_mul(multiplier).ok_or_else(|| {
+        CliError::Other(format!("--min-upgrade-delay {raw:?} overflows seconds"))
+    })?;
+    if secs == 0 {
+        return Err(CliError::Other(
+            "--min-upgrade-delay must be greater than zero; omit the flag for no delay floor"
+                .into(),
+        ));
+    }
+    Ok(secs)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create(
     client: &ApiClient,
@@ -92,6 +129,7 @@ pub async fn create(
     production: bool,
     control_key: Option<serde_json::Value>,
     anti_rollback: bool,
+    min_upgrade_delay_secs: Option<u64>,
 ) -> Result<EnclaveCreated, CliError> {
     // Self-hosted custody only makes sense on an upgradable enclave (the
     // control key exists to sign upgrade confirmations), so a control
@@ -109,6 +147,7 @@ pub async fn create(
             production,
             control_key.as_ref(),
             anti_rollback,
+            min_upgrade_delay_secs,
         )
         .await?;
 
@@ -197,5 +236,32 @@ mod tests {
             config_path: None,
         };
         assert!(build_egress_allowlist(&inputs).is_err());
+    }
+
+    #[test]
+    fn parse_min_upgrade_delay_accepts_suffixes_and_bare_seconds() {
+        assert_eq!(parse_min_upgrade_delay("3600").unwrap(), 3_600);
+        assert_eq!(parse_min_upgrade_delay("45s").unwrap(), 45);
+        assert_eq!(parse_min_upgrade_delay("30m").unwrap(), 1_800);
+        assert_eq!(parse_min_upgrade_delay("48h").unwrap(), 172_800);
+        assert_eq!(parse_min_upgrade_delay("7d").unwrap(), 604_800);
+        assert_eq!(parse_min_upgrade_delay(" 1h ").unwrap(), 3_600);
+    }
+
+    #[test]
+    fn parse_min_upgrade_delay_rejects_zero_and_junk() {
+        // Zero in every spelling: "no floor" is expressed by omission.
+        assert!(parse_min_upgrade_delay("0").is_err());
+        assert!(parse_min_upgrade_delay("0h").is_err());
+        // Junk shapes get a helpful error, not a panic.
+        assert!(parse_min_upgrade_delay("").is_err());
+        assert!(parse_min_upgrade_delay("h").is_err());
+        assert!(parse_min_upgrade_delay("-5m").is_err());
+        assert!(parse_min_upgrade_delay("1.5h").is_err());
+        assert!(parse_min_upgrade_delay("1w").is_err());
+        assert!(parse_min_upgrade_delay("30 m").is_err());
+        assert!(parse_min_upgrade_delay("abc").is_err());
+        // Multiplication overflow is caught, not wrapped.
+        assert!(parse_min_upgrade_delay("18446744073709551615d").is_err());
     }
 }

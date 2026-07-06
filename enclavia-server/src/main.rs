@@ -162,6 +162,7 @@ async fn handle_control(
     control_pubkey: Option<&VerifyingKey>,
     nonce: &ControlNonce,
     crypto_bin: &str,
+    min_upgrade_delay_secs: u64,
 ) -> (bool, String) {
     // Rotate the nonce after this call, regardless of outcome — a leaked
     // nonce is single-use whether or not the command verified.
@@ -213,6 +214,7 @@ async fn handle_control(
                 &payload_signature,
                 rekey.as_ref(),
                 crypto_bin,
+                min_upgrade_delay_secs,
             )
             .await
         }
@@ -237,12 +239,40 @@ async fn handle_control(
     }
 }
 
+/// Tolerance subtracted from the minimum-upgrade-delay floor to absorb
+/// host/backend clock skew: the backend stamps `valid_from = its_now +
+/// min_delay` moments before we check against our own clock, so a floor
+/// with zero slack would reject every legitimate confirm whose backend
+/// clock runs slightly behind ours. 60s is negligible against delays
+/// measured in hours.
+const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
+
+/// Does `valid_from` land before this enclave's measured minimum upgrade
+/// delay floor (`now + min_delay_secs - CLOCK_SKEW_TOLERANCE_SECS`)?
+///
+/// `min_delay_secs == 0` means no floor was configured (pre-existing
+/// behavior) and never rejects. Pure so the comparison is unit-testable
+/// without the chain-host machinery.
+fn violates_min_upgrade_delay(
+    valid_from: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    min_delay_secs: u64,
+) -> bool {
+    if min_delay_secs == 0 {
+        return false;
+    }
+    let floor = now + chrono::Duration::seconds(min_delay_secs as i64)
+        - chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS);
+    valid_from < floor
+}
+
 /// Execute the `PrepareUpgrade` flow:
 /// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
 /// 2. Validate the CBOR payload decodes as `UpgradePayload`.
-/// 3. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
-/// 4. Get a chain attestation binding `sha256(payload)`.
-/// 5. Submit the `Upgrade` chain link to `chain-host`; wait for ACK.
+/// 3. Enforce the measured minimum upgrade delay on `valid_from`.
+/// 4. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
+/// 5. Get a chain attestation binding `sha256(payload)`.
+/// 6. Submit the `Upgrade` chain link to `chain-host`; wait for ACK.
 ///
 /// The chain link is submitted BEFORE returning success so the backend sees
 /// the link already ingested when the reply arrives on the Noise channel.
@@ -258,6 +288,7 @@ async fn run_prepare_upgrade(
     payload_signature: &[u8],
     rekey: Option<&RekeyParams>,
     bin: &str,
+    min_upgrade_delay_secs: u64,
 ) -> (bool, String) {
     // Defence-in-depth: verify payload_signature against the control pubkey.
     let sig = match Signature::from_slice(payload_signature) {
@@ -272,13 +303,42 @@ async fn run_prepare_upgrade(
     }
 
     // Validate the chain payload shape. Fail before touching storage.
-    if let Err(e) =
-        ciborium::from_reader::<enclavia_protocol::chain::UpgradePayload, _>(chain_payload)
-    {
-        return (
-            false,
-            format!("chain payload is not a valid UpgradePayload: {e}"),
-        );
+    let payload =
+        match ciborium::from_reader::<enclavia_protocol::chain::UpgradePayload, _>(chain_payload) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    false,
+                    format!("chain payload is not a valid UpgradePayload: {e}"),
+                );
+            }
+        };
+
+    // The measured minimum upgrade delay. `valid_from` is checked
+    // against this enclave's OWN clock, not the signer-supplied
+    // `issued_at`, so a compromised control key cannot fast-track an
+    // activation past watching verifiers by backdating the payload.
+    // CLOCK_SKEW_TOLERANCE_SECS absorbs host/backend clock skew (the
+    // backend stamps `valid_from = its_now + min_delay` moments before
+    // we check); it is negligible against delays measured in hours.
+    // Enforced BEFORE the storage re-key and chain submission so a
+    // rejected activation leaves no trace. Caveat (documented in the
+    // issue): the guest clock is host-influenced, so a host that warps
+    // the clock forward can shrink the effective delay.
+    if min_upgrade_delay_secs > 0 {
+        let now = chrono::Utc::now();
+        if violates_min_upgrade_delay(payload.valid_from, now, min_upgrade_delay_secs) {
+            let earliest = now + chrono::Duration::seconds(min_upgrade_delay_secs as i64)
+                - chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS);
+            return (
+                false,
+                format!(
+                    "valid_from {} violates the measured minimum upgrade delay: this enclave \
+                     requires activation at least {}s after now ({}); earliest acceptable is {}",
+                    payload.valid_from, min_upgrade_delay_secs, now, earliest,
+                ),
+            );
+        }
     }
 
     // Storage re-key (only for storage enclaves).
@@ -704,6 +764,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
     control_pubkey: Option<Arc<VerifyingKey>>,
     nonce: ControlNonce,
     crypto_bin: Arc<String>,
+    min_upgrade_delay_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(?kind, "Client connected, performing handshake");
 
@@ -817,6 +878,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                             control_pubkey.as_deref(),
                             &nonce,
                             crypto_bin.as_str(),
+                            min_upgrade_delay_secs,
                         ).await;
                         if !success {
                             warn!(message = %message, "Control command rejected");
@@ -973,6 +1035,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config::ServerConfig::default()
     });
     let control_pubkey = server_config.control_public_key.map(Arc::new);
+    let min_upgrade_delay_secs = server_config.min_upgrade_delay_secs;
     let nonce: ControlNonce = Arc::new(Mutex::new(fresh_nonce()));
     let crypto_bin = Arc::new(
         std::env::var("ENCLAVIA_CRYPTO_BIN").unwrap_or_else(|_| "/bin/enclavia-crypto".into()),
@@ -982,6 +1045,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         container = %container_addr,
         max_clients,
         control_enabled = control_pubkey.is_some(),
+        min_upgrade_delay_secs,
         crypto_bin = %crypto_bin,
         "Starting enclavia server",
     );
@@ -1010,6 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         control_pubkey.clone(),
         Arc::clone(&nonce),
         Arc::clone(&crypto_bin),
+        min_upgrade_delay_secs,
     ));
     let control_task = tokio::spawn(accept_loop(
         control_listener,
@@ -1019,6 +1084,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         control_pubkey,
         nonce,
         crypto_bin,
+        min_upgrade_delay_secs,
     ));
 
     // Both loops run forever; if either task exits the server is in an
@@ -1029,6 +1095,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     mut listener: VsockListener,
     kind: ChannelKind,
@@ -1037,6 +1104,7 @@ async fn accept_loop(
     control_pubkey: Option<Arc<VerifyingKey>>,
     nonce: ControlNonce,
     crypto_bin: Arc<String>,
+    min_upgrade_delay_secs: u64,
 ) {
     loop {
         match listener.accept().await {
@@ -1055,7 +1123,17 @@ async fn accept_loop(
                         }
                     };
                     info!(?kind, "Client admitted (permit acquired)");
-                    if let Err(e) = handle_client(stream, kind, addr, pubkey, nonce, crypto).await {
+                    if let Err(e) = handle_client(
+                        stream,
+                        kind,
+                        addr,
+                        pubkey,
+                        nonce,
+                        crypto,
+                        min_upgrade_delay_secs,
+                    )
+                    .await
+                    {
                         error!(error = %e, "Error handling client");
                     }
                 });
@@ -1182,7 +1260,7 @@ mod tests {
         let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
 
-        let (ok, msg) = handle_control(&payload, &signature, None, &nonce, "true").await;
+        let (ok, msg) = handle_control(&payload, &signature, None, &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
         assert!(msg.contains("control channel disabled"), "msg = {msg}");
         // Nonce is still rotated even without a configured key — leakage of
@@ -1198,7 +1276,7 @@ mod tests {
         let chain_payload = sample_upgrade_payload(0x02);
         let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
 
-        let (ok, msg) = handle_control(&payload, &[0u8; 5], Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&payload, &[0u8; 5], Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("64 bytes"), "msg = {msg}");
     }
@@ -1218,7 +1296,7 @@ mod tests {
         let payload = make_prepare_upgrade_command(nonce_value, &wrong_sk, chain_payload, None);
         let signature = sign_raw(&wrong_sk, &payload);
 
-        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("signature verification"), "msg = {msg}");
     }
@@ -1231,7 +1309,7 @@ mod tests {
         let bogus = b"\xff\xff\xff not cbor".to_vec();
         let signature = sign_raw(&sk, &bogus);
 
-        let (ok, msg) = handle_control(&bogus, &signature, Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&bogus, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("malformed payload"), "msg = {msg}");
     }
@@ -1247,7 +1325,7 @@ mod tests {
         let payload = make_prepare_upgrade_command([0u8; 32], &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
 
-        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("stale nonce"), "msg = {msg}");
     }
@@ -1264,14 +1342,14 @@ mod tests {
         let chain_payload = sample_upgrade_payload(0x05);
         let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
         let signature = sign_raw(&sk, &payload);
-        let _ = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
+        let _ = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
 
         // Server nonce should have rotated to something new.
         let after = *nonce.lock().await;
         assert_ne!(after, initial);
 
         // Replaying the same payload (still bearing the old nonce) must fail.
-        let (ok2, msg2) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
+        let (ok2, msg2) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok2);
         assert!(msg2.contains("stale nonce"), "msg = {msg2}");
     }
@@ -1289,7 +1367,7 @@ mod tests {
         // reported back rather than silently masked.
         // Chain attestation (NSM) also fails in unit-test context (no /dev/nsm),
         // so any of those error strings is a valid signal that failures surface.
-        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "false").await;
+        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "false", 0).await;
         assert!(!ok);
         assert!(
             msg.contains("enclavia-crypto exited")
@@ -1309,7 +1387,7 @@ mod tests {
         let payload = make_revoke_upgrade_command([0u8; 32], &sk, chain_payload, false);
         let signature = sign_raw(&sk, &payload);
 
-        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("stale nonce"), "msg = {msg}");
     }
@@ -1331,7 +1409,7 @@ mod tests {
         });
         let signature = sign_raw(&sk, &cmd);
 
-        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
         assert!(msg.contains("RevocationPayload"), "msg = {msg}");
     }
@@ -1357,9 +1435,90 @@ mod tests {
         });
         let signature = sign_raw(&sk, &cmd);
 
-        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true").await;
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
         assert!(msg.contains("payload_signature"), "msg = {msg}");
+    }
+
+    #[test]
+    fn min_delay_floor_comparison() {
+        use chrono::{Duration, Utc};
+        let now = Utc::now();
+        let day: u64 = 86_400;
+
+        // Zero configured delay never rejects, however early valid_from is.
+        assert!(!violates_min_upgrade_delay(
+            now - Duration::days(365),
+            now,
+            0
+        ));
+
+        // Exactly at the floor (now + delay - tolerance) passes.
+        let floor =
+            now + Duration::seconds(day as i64) - Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS);
+        assert!(!violates_min_upgrade_delay(floor, now, day));
+
+        // One second under the floor is rejected: the tolerance is the
+        // only slack, anything below it violates the measured delay.
+        assert!(violates_min_upgrade_delay(
+            floor - Duration::seconds(1),
+            now,
+            day
+        ));
+
+        // Exactly now + delay (no skew slack needed) passes comfortably.
+        assert!(!violates_min_upgrade_delay(
+            now + Duration::seconds(day as i64),
+            now,
+            day
+        ));
+
+        // "Immediate" activation (valid_from = now) is rejected.
+        assert!(violates_min_upgrade_delay(now, now, day));
+    }
+
+    #[tokio::test]
+    async fn prepare_upgrade_rejects_valid_from_under_min_delay() {
+        let server_nonce = [0x11u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+        let (sk, pk) = fixed_pair();
+
+        // sample_upgrade_payload stamps valid_from = now + 1 day; a
+        // configured 2-day floor must reject it with the delay message,
+        // BEFORE any enclavia-crypto / chain-host dispatch is attempted.
+        let chain_payload = sample_upgrade_payload(0x0A);
+        let payload = make_prepare_upgrade_command(server_nonce, &sk, chain_payload, None);
+        let signature = sign_raw(&sk, &payload);
+
+        let (ok, msg) =
+            handle_control(&payload, &signature, Some(&pk), &nonce, "true", 2 * 86_400).await;
+        assert!(!ok, "msg = {msg}");
+        assert!(
+            msg.contains("measured minimum upgrade delay"),
+            "msg = {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_upgrade_min_delay_satisfied_proceeds_past_the_check() {
+        let server_nonce = [0x22u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+        let (sk, pk) = fixed_pair();
+
+        // valid_from = now + 1 day satisfies a 1-hour floor; the command
+        // proceeds past the delay check and fails later at chain
+        // attestation / chain-host (no NSM or daemon in unit tests).
+        let chain_payload = sample_upgrade_payload(0x0B);
+        let payload = make_prepare_upgrade_command(server_nonce, &sk, chain_payload, None);
+        let signature = sign_raw(&sk, &payload);
+
+        let (ok, msg) =
+            handle_control(&payload, &signature, Some(&pk), &nonce, "true", 3_600).await;
+        assert!(!ok, "unit tests cannot reach the happy path (no NSM)");
+        assert!(
+            !msg.contains("measured minimum upgrade delay"),
+            "msg = {msg}"
+        );
     }
 }
 
@@ -1551,6 +1710,7 @@ mod channel_gating_tests {
                 Some(Arc::new(pk)),
                 nonce,
                 Arc::new("true".to_string()),
+                0,
             )
             .await;
         });

@@ -310,6 +310,15 @@ enum EnclaveCmd {
         /// post-create.
         #[arg(long)]
         anti_rollback: bool,
+        /// Minimum upgrade activation delay, baked into the measured
+        /// image: the enclave itself refuses any upgrade activation
+        /// scheduled earlier than its own now + this delay, so watchers
+        /// always get at least this long to react (or revoke) before a
+        /// confirmed upgrade can fire. Accepts `30m`, `48h`, `7d`, or a
+        /// plain integer meaning seconds. Requires --upgradable (or
+        /// --control-key, which implies it). Immutable post-create.
+        #[arg(long, value_name = "DURATION")]
+        min_upgrade_delay: Option<String>,
     },
     /// List your enclaves
     List {
@@ -429,7 +438,10 @@ enum UpgradeCmd {
         #[arg(long, value_name = "RFC3339", conflicts_with = "immediate")]
         at: Option<String>,
         /// Schedule the upgrade to take effect immediately (sets valid_from
-        /// to the current UTC time). Mutually exclusive with --at.
+        /// to the current UTC time). Mutually exclusive with --at. Enclaves
+        /// created with --min-upgrade-delay reject immediate activation:
+        /// the backend (and the enclave itself) refuse any valid_from
+        /// earlier than now + the enclave's measured minimum delay.
         #[arg(long, conflicts_with = "at")]
         immediate: bool,
     },
@@ -586,6 +598,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
             production,
             control_key,
             anti_rollback,
+            min_upgrade_delay,
         } => {
             // Validate the egress allowlist BEFORE constructing the API
             // client. The validator is purely local (parses --egress-allow
@@ -613,6 +626,24 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 }
                 None => None,
             };
+            // Parse and gate --min-upgrade-delay locally BEFORE creating
+            // anything: the delay floor only exists on upgradable
+            // enclaves (a non-upgradable enclave never activates an
+            // upgrade), so silently accepting it would give the user a
+            // false sense of a knob that does nothing.
+            let min_upgrade_delay_secs = match min_upgrade_delay.as_deref() {
+                Some(raw) => {
+                    if !upgradable && control_key_body.is_none() {
+                        return Err(CliError::Other(
+                            "--min-upgrade-delay requires an upgradable enclave: pass \
+                             --upgradable (or --control-key, which implies it)"
+                                .into(),
+                        ));
+                    }
+                    Some(enclave_cmds::parse_min_upgrade_delay(raw)?)
+                }
+                None => None,
+            };
             let client = ApiClient::new()?;
             let res = enclave_cmds::create(
                 &client,
@@ -626,6 +657,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
                 production,
                 control_key_body,
                 anti_rollback,
+                min_upgrade_delay_secs,
             )
             .await?;
             // JSON: the created enclave object verbatim (id, status, and

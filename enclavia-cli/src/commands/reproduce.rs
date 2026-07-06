@@ -449,6 +449,21 @@ async fn run_builder(
         }
     }
 
+    // Replay the measured minimum upgrade delay exactly as recorded on
+    // the enclave row. The builder writes it into the measured
+    // `enclavia-config.json`, so omitting (or changing) it moves PCR0
+    // and PCR2. Create-time immutable, hence enclave-level like the
+    // control pubkey. Absent or zero means the original build never
+    // passed the flag (pre-existing enclaves stay reproducible).
+    if let Some(delay) = enclave
+        .get("min_upgrade_delay_secs")
+        .and_then(|v| v.as_u64())
+    {
+        if delay > 0 {
+            cmd.arg("--min-upgrade-delay-secs").arg(delay.to_string());
+        }
+    }
+
     // If the backend recorded the source revs, materialise both as
     // /nix/store paths and hand them to the builder via the env vars
     // its `nix build` invocation honours as `--override-input`.
