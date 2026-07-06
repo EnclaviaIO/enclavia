@@ -127,7 +127,7 @@ pub const NON_UPGRADABLE_CONTROL_KEY_DST: &[u8] =
     b"enclavia/synchronizer/non-upgradable-control-key/v1";
 
 /// The canonical "provably un-signable" control key for enclaves that
-/// have no public upgrade chain.
+/// have no upgrade path at all (non-upgradable enclaves).
 ///
 /// ## What it is for
 ///
