@@ -219,7 +219,11 @@ impl Client {
     /// first byte.
     pub async fn open_stream(&self, payload: Vec<u8>) -> Result<UpgradedStream, Error> {
         let (id_tx, id_rx) = oneshot::channel();
-        let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(32);
+        // 64 slots to match the server side's per-connection MAX_IN_FLIGHT
+        // buffering. The transport task now blocks (backpressure) instead of
+        // dropping frames when this fills, so the capacity only sets how much
+        // burst we absorb before the WebSocket read stalls.
+        let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(64);
 
         self.inner
             .cmd_tx

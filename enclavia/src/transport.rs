@@ -214,7 +214,19 @@ pub(crate) async fn run_transport(
                             match try_decrypt::<ServerMessage>(&mut transport, &accum, &mut read_buf) {
                                 Ok(Some((msg, consumed))) => {
                                     accum.drain(..consumed);
-                                    dispatch_response(&mut pending, &mut streams, msg);
+                                    // May suspend on a full per-stream buffer
+                                    // (see dispatch_response). While suspended
+                                    // the cmd_rx arm is not polled either, but
+                                    // that cannot deadlock: stream consumers
+                                    // never block on issuing a command before
+                                    // draining. UpgradedStream's poll_write /
+                                    // poll_shutdown use try_send (WouldBlock
+                                    // semantics, never a suspended await), its
+                                    // Drop uses try_send, and poll_read only
+                                    // polls the receiving side, so any task
+                                    // that is polling the stream keeps
+                                    // draining slots and eventually resumes us.
+                                    dispatch_response(&mut pending, &mut streams, msg).await;
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
@@ -256,7 +268,7 @@ fn notify_all_closed(pending: &mut PendingMap, streams: &mut StreamMap) {
     }
 }
 
-fn dispatch_response(
+async fn dispatch_response(
     pending: &mut PendingMap,
     streams: &mut StreamMap,
     msg: ServerMessage,
@@ -272,10 +284,22 @@ fn dispatch_response(
         }
         ServerMessage::StreamData { id, payload } => {
             if let Some(tx) = streams.get(&id) {
-                if tx.try_send(Ok(payload)).is_err() {
-                    // Receiver dropped (the UpgradedStream went away) or its
-                    // buffer is full. In either case, drop the stream entry;
-                    // a follow-up StreamClose will land on `streams.get(None)`.
+                // Backpressured on purpose: awaiting here suspends the whole
+                // transport task, so we stop reading further WebSocket frames
+                // until the stream's consumer drains a slot, and the pressure
+                // propagates over TCP back to the in-enclave server (whose
+                // own per-stream channels already block the same way). The
+                // previous try_send silently DISCARDED the frame and tore the
+                // stream down when the 64-slot buffer filled, which truncated
+                // responses under load ("ConnectionClosed while reading
+                // response headers, bytes already read: 0" on the proxy).
+                // Accepted tradeoff, mirroring the server side: one slow
+                // consumer head-of-line-blocks the other multiplexed streams
+                // of this client for the duration of the stall.
+                if tx.send(Ok(payload)).await.is_err() {
+                    // Receiver dropped: the UpgradedStream was abandoned
+                    // locally. Drop the stream entry; a follow-up StreamClose
+                    // will land on `streams.get(None)`.
                     streams.remove(&id);
                 }
             } else {
@@ -291,7 +315,10 @@ fn dispatch_response(
             if let Some(tx) = pending.remove(&id) {
                 let _ = tx.send(Err(Error::ServerError { id, message }));
             } else if let Some(tx) = streams.remove(&id) {
-                let _ = tx.try_send(Err(Error::ServerError { id, message }));
+                // Same backpressured send as StreamData: the error is the
+                // stream's terminal event and must not be lost to a full
+                // buffer (dropping the Sender right after delivers EOF).
+                let _ = tx.send(Err(Error::ServerError { id, message })).await;
             } else {
                 warn!(id, "Received error for unknown request id");
             }
