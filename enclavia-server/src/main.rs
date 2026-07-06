@@ -618,6 +618,74 @@ const FORWARD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Read chunk size for the byte pump on an open stream.
 const STREAM_READ_CHUNK: usize = 16 * 1024;
 
+/// How long a dial to the workload may keep retrying `ConnectionRefused`
+/// while the workload is still booting.
+///
+/// The enclave starts serving the control/data channels (and the launcher
+/// publishes the proxy target) as soon as `enclavia-server` is up, but the
+/// customer container may take much longer to bind its port: on a customer's
+/// slow-booting Lightning node we measured ~20 seconds between the
+/// proxy-target being published and the workload's own "Listening on
+/// 0.0.0.0:3001" log line. During that window every proxied request used to
+/// fail instantly with "Connection refused (os error 111)", which the proxy
+/// surfaced to end users as a 502.
+const WORKLOAD_STARTUP_GRACE: Duration = Duration::from_secs(60);
+
+/// Sleep between dial attempts inside the startup grace window.
+const WORKLOAD_DIAL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Set once the first dial to the workload succeeds. After that, a refused
+/// dial means the workload crashed or closed its listener, and we fail fast
+/// instead of stalling clients for up to [`WORKLOAD_STARTUP_GRACE`].
+static WORKLOAD_SEEN_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Dial the workload, absorbing `ConnectionRefused` during startup.
+///
+/// While `seen_up` is still false (the workload has never been observed
+/// listening), a refused dial is retried every `retry_interval` until
+/// `grace` has elapsed. The first successful connect sets `seen_up`, after
+/// which refused dials (and any other error kind, always) fail immediately
+/// with the original error, preserving the caller's error reporting.
+async fn connect_with_startup_grace(
+    addr: &str,
+    seen_up: &std::sync::atomic::AtomicBool,
+    retry_interval: Duration,
+    grace: Duration,
+) -> std::io::Result<TcpStream> {
+    use std::sync::atomic::Ordering;
+
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                seen_up.store(true, Ordering::Relaxed);
+                return Ok(stream);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && !seen_up.load(Ordering::Relaxed)
+                    && tokio::time::Instant::now() + retry_interval <= deadline =>
+            {
+                trace!(addr, "workload not listening yet, retrying dial");
+                tokio::time::sleep(retry_interval).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// [`connect_with_startup_grace`] with the production constants and the
+/// process-wide [`WORKLOAD_SEEN_UP`] flag.
+async fn connect_to_workload(addr: &str) -> std::io::Result<TcpStream> {
+    connect_with_startup_grace(
+        addr,
+        &WORKLOAD_SEEN_UP,
+        WORKLOAD_DIAL_RETRY_INTERVAL,
+        WORKLOAD_STARTUP_GRACE,
+    )
+    .await
+}
+
 /// Commands handed from the per-connection handler to a per-stream pump after
 /// the initial `OpenStream` request: extra bytes to write into the TCP, or a
 /// close signal.
@@ -640,7 +708,7 @@ enum StreamCommand {
 /// workload close after responding; `read_to_end` returns once the workload
 /// sends its FIN.
 async fn forward_to_container(container_addr: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-    let mut stream = TcpStream::connect(container_addr)
+    let mut stream = connect_to_workload(container_addr)
         .await
         .map_err(|e| e.to_string())?;
     stream.write_all(payload).await.map_err(|e| e.to_string())?;
@@ -680,7 +748,7 @@ async fn pump_bidirectional(
     response_tx: mpsc::Sender<ServerMessage>,
     mut cmd_rx: mpsc::Receiver<StreamCommand>,
 ) {
-    let tcp = match TcpStream::connect(container_addr).await {
+    let tcp = match connect_to_workload(container_addr).await {
         Ok(s) => s,
         Err(e) => {
             let _ = response_tx
@@ -1826,5 +1894,90 @@ mod channel_gating_tests {
             other => panic!("expected ControlResult, got {other:?}"),
         }
         assert!(cbor.receive::<ServerMessage>().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod workload_dial_grace_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+
+    use super::connect_with_startup_grace;
+
+    /// Test-scale timings: real code uses 250ms/60s, tests shrink both.
+    const RETRY: Duration = Duration::from_millis(20);
+    const GRACE: Duration = Duration::from_secs(5);
+
+    /// Grab a loopback port that currently has no listener.
+    async fn free_addr() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn refused_then_listening_within_grace_succeeds_and_sets_flag() {
+        let addr = free_addr().await;
+        let seen_up = AtomicBool::new(false);
+
+        // Workload "boots" 100ms in: nothing is listening at first, then a
+        // listener appears on the same port.
+        let bind_addr = addr.clone();
+        let binder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let listener = TcpListener::bind(&bind_addr).await.unwrap();
+            // Hold the listener long enough for the dial to land.
+            let _ = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        });
+
+        let result = connect_with_startup_grace(&addr, &seen_up, RETRY, GRACE).await;
+        assert!(result.is_ok(), "dial should succeed once the workload binds");
+        assert!(seen_up.load(Ordering::Relaxed), "first success must set the flag");
+        binder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_after_seen_up_fails_immediately() {
+        let addr = free_addr().await;
+        let seen_up = AtomicBool::new(true);
+
+        let start = tokio::time::Instant::now();
+        let err = connect_with_startup_grace(&addr, &seen_up, RETRY, GRACE)
+            .await
+            .expect_err("nothing is listening");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        // No retry loop: the failure must come back well before even one
+        // retry interval elapses.
+        assert!(
+            start.elapsed() < GRACE / 2,
+            "post-startup refused dial must fail fast, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_refused_errors_fail_immediately() {
+        // An unresolvable hostname yields a non-ConnectionRefused error.
+        let seen_up = AtomicBool::new(false);
+
+        let start = tokio::time::Instant::now();
+        let err = connect_with_startup_grace(
+            "this-host-does-not-exist.invalid:1",
+            &seen_up,
+            RETRY,
+            GRACE,
+        )
+        .await
+        .expect_err("resolution must fail");
+        assert_ne!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(!seen_up.load(Ordering::Relaxed));
+        assert!(
+            start.elapsed() < GRACE / 2,
+            "non-refused errors must not be retried, took {:?}",
+            start.elapsed()
+        );
     }
 }
