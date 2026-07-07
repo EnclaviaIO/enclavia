@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::api::{ApiClient, EnclaveSummary};
+use crate::commands::resolve::resolve_enclave;
 use crate::error::CliError;
 
 const DEFAULT_TAG: &str = "latest";
@@ -35,7 +36,15 @@ pub async fn push(
     // enclaves. We accept prefixes so users can paste the short id printed by
     // `enclave create` without having to look up the full UUID; an ambiguous
     // prefix is a hard error rather than picking arbitrarily.
-    let enclave = resolve_enclave(&client, enclave_id_or_prefix).await?;
+    let mut enclave = resolve_enclave(&client, enclave_id_or_prefix).await?;
+    // A full-UUID argument short-circuits prefix resolution without a
+    // listing, so the summary carries no backend fields; fetch the row to
+    // get `push_target` (we need auth for the push anyway).
+    if enclave.raw.get("push_target").is_none() {
+        let row = client.get_enclave(&enclave.id).await?;
+        enclave = serde_json::from_value(row)
+            .map_err(|e| CliError::Other(format!("malformed enclave row: {e}")))?;
+    }
     let push_target = extract_push_target(&enclave)?;
 
     let canonical = format!("{registry_host}/{push_target}:{DEFAULT_TAG}");
@@ -196,50 +205,6 @@ pub(crate) fn print_notify_result(
     }
 
     Ok(())
-}
-
-/// Resolve a user-supplied id or unique prefix to exactly one enclave.
-///
-/// We list the caller's enclaves (the backend already filters to ownership)
-/// and match by id-prefix. Two terminal failures are distinguished:
-///   * no match → the prefix didn't hit any of the caller's enclaves
-///   * multiple matches → the prefix was ambiguous; we list the candidates
-///     so the user can disambiguate without re-running `enclave list`.
-async fn resolve_enclave(
-    client: &ApiClient,
-    id_or_prefix: &str,
-) -> Result<EnclaveSummary, CliError> {
-    if id_or_prefix.is_empty() {
-        return Err("enclave id cannot be empty".into());
-    }
-
-    // Include archived enclaves so a user who pushes to a destroyed enclave
-    // gets a clear "destroyed" error from the backend on `notify_push`,
-    // rather than the more confusing "no such enclave" from prefix
-    // resolution. The match list is small (per-user cap), so this is cheap.
-    let all = client.list_enclaves(true).await?;
-    let matches: Vec<EnclaveSummary> = all
-        .into_iter()
-        .filter(|e| e.id.starts_with(id_or_prefix))
-        .collect();
-
-    match matches.as_slice() {
-        [] => Err(CliError::Other(format!(
-            "no enclave matches `{id_or_prefix}`. List your enclaves with `enclavia enclave list`."
-        ))),
-        [one] => Ok(one.clone()),
-        many => {
-            let mut msg = format!(
-                "prefix `{id_or_prefix}` matches {} enclaves; pass a longer prefix:\n",
-                many.len()
-            );
-            for e in many {
-                let name = e.name.as_deref().unwrap_or("-");
-                msg.push_str(&format!("  {} ({name})\n", e.id));
-            }
-            Err(CliError::Other(msg.trim_end().to_string()))
-        }
-    }
 }
 
 /// Pull the `push_target` field out of the backend's enclave row. The
