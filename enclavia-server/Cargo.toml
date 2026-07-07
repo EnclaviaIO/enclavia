@@ -5,6 +5,9 @@
 
 [package]
 name = "enclavia-server"
+# In-enclave/dev binary, not part of the crates.io publish set (the SDK,
+# protocol, and CLI are). Flip deliberately if that ever changes.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

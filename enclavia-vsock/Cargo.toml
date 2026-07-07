@@ -8,6 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Runtime host-vsock-CID detection for in-enclave binaries (one EIF for QEMU and Nitro)."
+readme = "README.md"
 
 [dependencies]
 tokio = { workspace = true, features = ["net", "time"] }

@@ -14,6 +14,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "In-enclave outbound TCP daemon: TUN + smoltcp + vsock client with allowlist enforcement."
+readme = "README.md"
 
 [features]
 default = []
