@@ -10,6 +10,7 @@ use enclavia_cli::api::{ApiClient, EnclaveSummary};
 use enclavia_cli::commands::{
     auth, enclave as enclave_cmds, key as key_cmds, push, reproduce, secrets, upgrade,
 };
+use enclavia_cli::commands::resolve::resolve_enclave_id;
 use enclavia_cli::error::CliError;
 
 /// Local clap-friendly mirror of the lib's `InstanceTypeArg`. We can't
@@ -329,34 +330,40 @@ enum EnclaveCmd {
     },
     /// Get enclave status and details
     Status {
-        /// Enclave ID
+        /// Enclave id. Accepts a unique prefix as long as it resolves
+        /// to exactly one of your enclaves.
         id: String,
     },
     /// Fetch an enclave's build log and (debug/QEMU) runtime log
     Logs {
-        /// Enclave ID
+        /// Enclave id. Accepts a unique prefix as long as it resolves
+        /// to exactly one of your enclaves.
         id: String,
     },
     /// Stop a running enclave
     Stop {
-        /// Enclave ID
+        /// Enclave id. Accepts a unique prefix as long as it resolves
+        /// to exactly one of your enclaves.
         id: String,
     },
     /// Start a previously-stopped enclave against its on-disk EIF + storage
     Start {
-        /// Enclave ID
+        /// Enclave id. Accepts a unique prefix as long as it resolves
+        /// to exactly one of your enclaves.
         id: String,
     },
     /// Restart a running (or stopped) enclave: server-side stop + start.
     /// Re-reads the secrets table so any pending `secret set` /
     /// `secret delete` changes land in the EIF on the next boot.
     Restart {
-        /// Enclave ID
+        /// Enclave id. Accepts a unique prefix as long as it resolves
+        /// to exactly one of your enclaves.
         id: String,
     },
     /// Destroy an enclave
     Destroy {
-        /// Enclave ID
+        /// Enclave id. Accepts a unique prefix as long as it resolves
+        /// to exactly one of your enclaves.
         id: String,
     },
 }
@@ -685,18 +692,21 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
         }
         EnclaveCmd::Status { id } => {
             let client = ApiClient::new()?;
+            let id = resolve_enclave_id(&client, &id).await?;
             let e = enclave_cmds::status(&client, &id).await?;
             emit(json, &e, || print_enclave_status(&e));
             Ok(())
         }
         EnclaveCmd::Logs { id } => {
             let client = ApiClient::new()?;
+            let id = resolve_enclave_id(&client, &id).await?;
             let logs = enclave_cmds::logs(&client, &id).await?;
             emit(json, &logs, || print_enclave_logs(&logs));
             Ok(())
         }
         EnclaveCmd::Stop { id } => {
             let client = ApiClient::new()?;
+            let id = resolve_enclave_id(&client, &id).await?;
             enclave_cmds::stop(&client, &id).await?;
             emit(
                 json,
@@ -707,6 +717,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
         }
         EnclaveCmd::Start { id } => {
             let client = ApiClient::new()?;
+            let id = resolve_enclave_id(&client, &id).await?;
             enclave_cmds::start(&client, &id).await?;
             emit(
                 json,
@@ -717,6 +728,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
         }
         EnclaveCmd::Restart { id } => {
             let client = ApiClient::new()?;
+            let id = resolve_enclave_id(&client, &id).await?;
             secrets::restart(&client, &id).await?;
             emit(
                 json,
@@ -727,6 +739,7 @@ async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
         }
         EnclaveCmd::Destroy { id } => {
             let client = ApiClient::new()?;
+            let id = resolve_enclave_id(&client, &id).await?;
             enclave_cmds::destroy(&client, &id).await?;
             emit(
                 json,
@@ -757,6 +770,7 @@ async fn run_secret(cmd: SecretCmd, json: bool) -> Result<(), CliError> {
             // echo the values back, not even in JSON.
             let names: Vec<String> = parsed_pairs.iter().map(|(n, _)| n.clone()).collect();
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let n = secrets::set(&client, &enclave_id, parsed_pairs).await?;
             if json {
                 let restart_required = restart_required(&client, &enclave_id).await;
@@ -773,6 +787,7 @@ async fn run_secret(cmd: SecretCmd, json: bool) -> Result<(), CliError> {
         }
         SecretCmd::List { enclave_id } => {
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let rows = secrets::list(&client, &enclave_id).await?;
             // `SecretSummary` carries names + timestamps + the pending flag,
             // never values, so the JSON array is value-free by construction.
@@ -821,6 +836,7 @@ async fn run_secret(cmd: SecretCmd, json: bool) -> Result<(), CliError> {
                 return Ok(());
             }
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let n = secrets::delete(&client, &enclave_id, &confirmed).await?;
             if json {
                 let restart_required = restart_required(&client, &enclave_id).await;
@@ -1148,12 +1164,14 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
     match cmd {
         UpgradeCmd::Chain { enclave_id } => {
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let summary = upgrade::chain(&client, &enclave_id).await?;
             emit(json, &summary, || print_chain(&summary));
             Ok(())
         }
         UpgradeCmd::List { enclave_id } => {
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let rows = upgrade::list_upgrades(&client, &enclave_id).await?;
             emit(json, &rows, || print_upgrade_list(&rows));
             Ok(())
@@ -1170,6 +1188,7 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
                 None
             };
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let result =
                 upgrade::confirm_upgrade(&client, &enclave_id, &upgrade_id, valid_from)
                     .await?;
@@ -1178,6 +1197,7 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
         }
         UpgradeCmd::Revoke { enclave_id, upgrade_id } => {
             let client = ApiClient::new()?;
+            let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let result =
                 upgrade::revoke_upgrade(&client, &enclave_id, &upgrade_id).await?;
             emit(json, &result, || print_upgrade_revoke(&result));

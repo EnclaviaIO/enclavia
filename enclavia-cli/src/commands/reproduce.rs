@@ -18,7 +18,8 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::api::{ApiClient, EnclaveSummary};
+use crate::api::ApiClient;
+use crate::commands::resolve::resolve_enclave;
 use crate::error::CliError;
 
 /// Result of `enclavia reproduce`. The CLI binary turns this into a
@@ -674,54 +675,6 @@ pub fn diff_pcrs(expected: &PcrTriple, actual: &PcrTriple) -> Vec<PcrMismatch> {
         });
     }
     diffs
-}
-
-/// Same prefix-matching the `push` command uses. Returns the `EnclaveSummary`
-/// for the unique match; errors with a candidate list when the prefix is
-/// ambiguous, and with a "no match" when nothing hits.
-///
-/// A full UUID short-circuits the listing — we don't need
-/// `list_enclaves` to disambiguate, and skipping it lets the anonymous
-/// reproduce path (no credentials, querying a public enclave) work
-/// without ever hitting the authenticated list endpoint.
-async fn resolve_enclave(
-    client: &ApiClient,
-    id_or_prefix: &str,
-) -> Result<EnclaveSummary, CliError> {
-    if id_or_prefix.is_empty() {
-        return Err("enclave id cannot be empty".into());
-    }
-
-    if uuid::Uuid::parse_str(id_or_prefix).is_ok() {
-        return Ok(EnclaveSummary {
-            id: id_or_prefix.to_string(),
-            ..Default::default()
-        });
-    }
-
-    let all = client.list_enclaves(true).await?;
-    let matches: Vec<EnclaveSummary> = all
-        .into_iter()
-        .filter(|e| e.id.starts_with(id_or_prefix))
-        .collect();
-
-    match matches.as_slice() {
-        [] => Err(CliError::Other(format!(
-            "no enclave matches `{id_or_prefix}`. List your enclaves with `enclavia enclave list`."
-        ))),
-        [one] => Ok(one.clone()),
-        many => {
-            let mut msg = format!(
-                "prefix `{id_or_prefix}` matches {} enclaves; pass a longer prefix:\n",
-                many.len()
-            );
-            for e in many {
-                let name = e.name.as_deref().unwrap_or("-");
-                msg.push_str(&format!("  {} ({name})\n", e.id));
-            }
-            Err(CliError::Other(msg.trim_end().to_string()))
-        }
-    }
 }
 
 #[cfg(test)]
