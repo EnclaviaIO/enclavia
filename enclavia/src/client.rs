@@ -49,12 +49,10 @@ impl Client {
     /// # Example
     ///
     /// ```no_run
-    /// # async fn example() -> Result<(), enclavia::Error> {
-    /// let pcrs = enclavia::Pcrs {
-    ///     pcr0: vec![/* ... */],
-    ///     pcr1: vec![/* ... */],
-    ///     pcr2: vec![/* ... */],
-    /// };
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Hex PCRs exactly as printed by `enclavia enclave status` /
+    /// // `enclavia reproduce`, copy/paste friendly:
+    /// let pcrs = enclavia::Pcrs::from_hex("6be2...", "4b4d...", "21b9...")?;
     /// let client = enclavia::Client::connect("wss://proxy.example.com", pcrs).await?;
     /// let resp = client.get("/api/data").send().await?;
     /// # Ok(())

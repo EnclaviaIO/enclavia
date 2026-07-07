@@ -1,32 +1,41 @@
 # Enclavia
 
-Open-source crates that make up the Enclavia enclave runtime: the in-enclave services that run inside the EIF (Enclave Image File), the shared protocol types that describe the wire format between client and enclave, the client SDK, and the CLI.
+Open-source crates that make up the Enclavia enclave runtime: the in-enclave services that run inside the EIF (Enclave Image File), the shared protocol types that describe the wire format between client and enclave, the client SDK (native and wasm), and the CLI.
 
 Enclavia lets you run arbitrary Docker images inside an AWS Nitro Enclave (or a local QEMU debug enclave) and reach them through an end-to-end-encrypted channel that is anchored to a Nitro attestation. The hosted control plane (website, builder, router) lives in a separate, closed-source repository. The code that runs inside the enclave (which is PCR-measured and therefore part of the attestation contract) and the code that talks to it must be auditable, so it lives here.
 
 See https://beta.enclavia.io for the hosted service.
 
+> **Agents**: [`skills/enclavia/SKILL.md`](skills/enclavia/SKILL.md) is a
+> machine-oriented guide to driving the `enclavia` CLI with `--json`. If you
+> are an AI agent operating enclaves, start there.
+
 ## Crates
 
 In-enclave binaries (run inside the EIF, reach the host over `tokio-vsock`):
 
-- `enclavia-server`: Noise responder that terminates the encrypted channel from the router and forwards plaintext bytes to the inner container over loopback TCP.
+- `enclavia-server`: Noise responder that terminates the encrypted channel from the router, forwards plaintext bytes to the inner container over loopback TCP, and dispatches signed control commands (upgrades).
 - `enclavia-egress`: Outbound TCP daemon. Owns `tun0`, runs a `smoltcp` userspace TCP/IP stack, and dials `egress-host` over vsock for every accepted outbound flow. Enforces a deny-by-default allowlist of IP literals, CIDRs, and hostnames (resolved through an in-enclave `unbound`).
 - `enclavia-crypto`: Key management. Talks to KMS over vsock and unseals the LUKS volume that backs persistent storage.
-- `nbd-client`: NBD client that backs the encrypted filesystem on top of `storage-host`.
-- `synchronizer`: Multi-node storage sync (mesh replication of the LUKS-encrypted volume).
+- `nbd-client`: NBD client that backs the encrypted filesystem on top of `storage-host`, and the anti-rollback enforcement point (pins volume freshness against the synchronizer).
+- `synchronizer`: The storage anti-rollback oracle. A mutually-attested, Raft-replicated cluster of identical enclaves that tracks each volume's latest transaction id, so a malicious host cannot serve a stale (rolled-back) copy of the encrypted volume unnoticed.
+- `enclavia-chain-init`: Boot-time hook that submits each boot/upgrade link of the enclave's attested history chain.
+- `enclavia-secrets-init`: Boot-time hook that pulls the per-enclave secrets payload from the host and injects it into the workload's environment.
+- `synchronizer-names-init`: Boot-time identity side-channel for synchronizer nodes (routing labels only; identity comes from attestation).
 
 Shared / client-side crates (build for any target):
 
-- `enclavia-protocol`: Wire types and Noise+CBOR responder helpers. Shared between the in-enclave server, the host-side router, and the SDK. Includes attestation verification.
-- `enclavia`: Client SDK. Opens a Noise tunnel through the router's WebSocket and exposes it as an `http`-compatible client to your application.
-- `enclavia-cli`: The `enclavia` binary. Commands for auth, `push`, and enclave lifecycle. Also exposes a library face (`enclavia_cli::{api, commands, config}`) for tools that want to reuse the same API client.
+- `enclavia-protocol`: Wire types and Noise+CBOR responder helpers. Shared between the in-enclave server, the host-side router, and the SDK. Includes attestation verification, the upgrade-chain and custody helpers, and the mesh/egress hand-off frames.
+- `enclavia`: Client SDK. Opens a Noise tunnel through the router's WebSocket, verifies the enclave's attestation against your pinned PCRs, and exposes the channel as an `http`-compatible client. Compiles for native targets and `wasm32-unknown-unknown`.
+- `enclavia-wasm`: wasm-bindgen bindings over the SDK for browsers and JS runtimes (Node >= 22, Deno): `connect(url, pcrs, opts)`, `fetch(...)`, and raw `openStream(...)` byte pipes. Same attestation verification as native.
+- `enclavia-cli`: The `enclavia` binary: auth, enclave lifecycle, image push, secrets, signed upgrades (managed or self-hosted YubiKey custody), `reproduce`, and a global `--json` mode. Also exposes a library face (`enclavia_cli::{api, commands, config}`); see [`enclavia-cli/README.md`](enclavia-cli/README.md).
+- `enclavia-vsock`: Small shared vsock plumbing used by the in-enclave crates.
 
 Dev tools:
 
 - `mock-kms`: A KMS Trent endpoint for QEMU dev wrappers and the local dev stack.
 
-The host-side relays (`egress-host`, `storage-host`), the WebSocket-to-vsock router, the control-plane API, the frontend, and the EIF builder live in separate repositories.
+The host-side relays (`egress-host`, `storage-host`, `mesh-host`, ...), the WebSocket-to-vsock router, the control-plane API, the frontend, and the EIF builder live in separate repositories.
 
 ## Build
 
@@ -48,8 +57,12 @@ nix build .#enclavia-server
 nix build .#enclavia-egress
 nix build .#enclavia-crypto
 nix build .#nbd-client
+nix build .#synchronizer
+nix build .#enclavia-secrets-init
+nix build .#enclavia-chain-init
 nix build .#mock-kms
-nix build .#enclavia
+nix build .#enclavia        # the CLI binary
+nix build .#enclavia-wasm
 ```
 
 The in-enclave binaries only really run inside an enclave or QEMU. To exercise them end-to-end you also need the builder (which constructs the EIF). See https://github.com/EnclaviaIO/builder.

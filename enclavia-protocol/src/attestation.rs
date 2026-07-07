@@ -46,6 +46,38 @@ pub struct Pcrs {
 }
 
 impl Pcrs {
+    /// Build [`Pcrs`] from the three hex-encoded measurements, exactly as
+    /// printed by `enclavia enclave status` / `enclavia reproduce` and
+    /// shown on the dashboard, so they can be copy/pasted verbatim.
+    /// Accepts upper- or lower-case hex and surrounding whitespace. Each
+    /// value must decode to 32, 48, or 64 bytes (real Nitro PCRs are
+    /// 48-byte SHA-384, 96 hex characters).
+    ///
+    /// ```
+    /// let pcrs = enclavia_protocol::attestation::Pcrs::from_hex(
+    ///     &"ab".repeat(48),
+    ///     &"cd".repeat(48),
+    ///     &"ef".repeat(48),
+    /// )
+    /// .unwrap();
+    /// assert_eq!(pcrs.pcr0.len(), 48);
+    /// ```
+    pub fn from_hex(pcr0: &str, pcr1: &str, pcr2: &str) -> Result<Self, AttestationError> {
+        fn decode(idx: usize, s: &str) -> Result<Vec<u8>, AttestationError> {
+            let bytes =
+                hex::decode(s.trim()).map_err(|_| AttestationError::InvalidPcrHex(idx))?;
+            if !matches!(bytes.len(), 32 | 48 | 64) {
+                return Err(AttestationError::InvalidPcrLength { idx, len: bytes.len() });
+            }
+            Ok(bytes)
+        }
+        Ok(Pcrs {
+            pcr0: decode(0, pcr0)?,
+            pcr1: decode(1, pcr1)?,
+            pcr2: decode(2, pcr2)?,
+        })
+    }
+
     /// SHA-256 over `PCR0 || PCR1 || PCR2`. The synchronizer uses this
     /// 32-byte digest as the per-enclave session key.
     pub fn digest(&self) -> [u8; 32] {

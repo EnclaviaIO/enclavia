@@ -6,15 +6,16 @@ Client SDK for the Enclavia enclave runtime. Opens an end-to-end-encrypted chann
 use enclavia::{Client, Pcrs};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-// Pin the enclave's expected measurements (e.g. from `enclavia reproduce`
-// or your own build). The SDK verifies the Nitro attestation against these
-// during connect and refuses to return a client if it does not match, so
-// the channel is already attested before you send any plaintext.
-let pcrs = Pcrs {
-    pcr0: vec![/* 48 bytes */],
-    pcr1: vec![/* 48 bytes */],
-    pcr2: vec![/* 48 bytes */],
-};
+// Pin the enclave's expected measurements: copy/paste the hex PCRs
+// straight from `enclavia enclave status`, `enclavia reproduce`, or the
+// dashboard. The SDK verifies the Nitro attestation against these during
+// connect and refuses to return a client if it does not match, so the
+// channel is already attested before you send any plaintext.
+let pcrs = Pcrs::from_hex(
+    "6be2...", // pcr0: the EIF measurement (96 hex chars)
+    "4b4d...", // pcr1: the enclave OS measurement
+    "21b9...", // pcr2: the application configuration measurement
+)?;
 let client = Client::connect("wss://<enclave-id>.enclaves.beta.enclavia.io", pcrs).await?;
 
 let resp = client.get("/health").send().await?;
