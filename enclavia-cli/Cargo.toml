@@ -44,7 +44,6 @@ open = "5"
 # Egress allowlist parser. Same crate the backend and in-enclave daemon
 # share, so all three agree on what is well-formed for the
 # --egress-allow / --egress-resolver / --egress-config flags.
-enclavia-egress = { path = "../enclavia-egress", version = "0.1.0" }
 # Public upgrade-chain wire types + pure validator. Used by
 # `enclavia upgrade chain` to re-verify a chain locally against the
 # same rules the backend ingest applies.

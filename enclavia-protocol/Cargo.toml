@@ -13,8 +13,13 @@ keywords = ["enclave", "attestation", "nitro", "noise-protocol"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-default = ["async-transport"]
+default = ["async-transport", "egress-config"]
 async-transport = ["tokio", "tracing"]
+# The egress allowlist schema + validation (egress_config module): the
+# shared contract between the CLI/backend (authors) and the in-enclave
+# daemon (enforcer). Default-on; the wasm SDK build (default-features =
+# false) never needs it.
+egress-config = ["dep:ipnet", "tracing"]
 # Enables test_utils::FakeAttestation for downstream test suites. Pulls
 # in nothing optional — the helpers only use deps that are already
 # unconditionally required for attestation verification.
@@ -30,6 +35,7 @@ serde_json.workspace = true
 ciborium.workspace = true
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+ipnet = { workspace = true, optional = true }
 # Attestation verification (used by SDK and synchronizer). Unconditional
 # because the module is small, has no IO dependencies, and is wanted by
 # both production callers — gating it behind a feature would just be
@@ -63,3 +69,7 @@ der = { workspace = true }
 spki = { workspace = true }
 x509-cert = { workspace = true }
 
+
+[dev-dependencies]
+# egress_config's load_or_empty tests write allowlist files to a tempdir.
+tempfile = "3"

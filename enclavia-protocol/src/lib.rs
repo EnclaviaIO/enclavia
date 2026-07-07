@@ -3,6 +3,8 @@ pub mod chain;
 pub mod custody;
 #[cfg(feature = "async-transport")]
 pub mod egress;
+#[cfg(feature = "egress-config")]
+pub mod egress_config;
 pub mod kms_policy;
 pub mod kms_recipient;
 #[cfg(feature = "async-transport")]
