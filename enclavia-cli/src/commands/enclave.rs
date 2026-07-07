@@ -66,13 +66,13 @@ pub fn build_egress_allowlist(
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
             CliError::Other(format!("parsing {} as JSON: {e}", path.display()))
         })?;
-        enclavia_egress::validate_json(&value)
+        enclavia_protocol::egress_config::validate_json(&value)
             .map_err(|e| CliError::Other(format!("invalid egress allowlist: {e}")))?;
         return Ok(Some(value));
     }
     let allow_refs: Vec<&str> = inputs.allows.iter().map(String::as_str).collect();
     let resolver_refs: Vec<&str> = inputs.resolvers.iter().map(String::as_str).collect();
-    let raw = enclavia_egress::assemble_from_cli(&allow_refs, &resolver_refs)
+    let raw = enclavia_protocol::egress_config::assemble_from_cli(&allow_refs, &resolver_refs)
         .map_err(|e| CliError::Other(format!("invalid egress flags: {e}")))?;
     let value = serde_json::to_value(&raw)
         .map_err(|e| CliError::Other(format!("serialising allowlist: {e}")))?;
