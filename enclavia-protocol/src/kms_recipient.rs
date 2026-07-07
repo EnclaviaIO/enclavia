@@ -1,4 +1,4 @@
-//! KMS phase 2 (#198): the `CiphertextForRecipient` envelope.
+//! Attestation-gated KMS decrypt: the `CiphertextForRecipient` envelope.
 //!
 //! When a Nitro enclave calls `kms:Decrypt` with a `Recipient` parameter,
 //! KMS does NOT return the plaintext on the wire. Instead it returns

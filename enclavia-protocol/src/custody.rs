@@ -1,4 +1,4 @@
-//! Self-hosted control-key custody helpers (#48).
+//! Self-hosted control-key custody helpers.
 //!
 //! In self-hosted custody the backend never holds the control private
 //! key: the CLI signs upgrade confirmations and revocations with a key
@@ -84,7 +84,7 @@ pub enum DerSignatureError {
 }
 
 /// Re-encode a DER ECDSA P-256 signature to the locked-in 64-byte raw
-/// `r || s` wire format (#47): each scalar 32 bytes, big-endian,
+/// `r || s` wire format: each scalar 32 bytes, big-endian,
 /// zero-padded.
 ///
 /// PIV hardware (YubiKey) and OpenSSL emit DER, and may emit a high-S
@@ -99,7 +99,7 @@ pub fn der_signature_to_raw(der: &[u8]) -> Result<[u8; 64], DerSignatureError> {
 }
 
 /// Response body of `POST /enclaves/{id}/upgrades/{uid}/confirm/prepare`
-/// (self-hosted custody, #48): everything the CLI needs to assemble and
+/// (self-hosted custody): everything the CLI needs to assemble and
 /// sign the `PrepareUpgrade` command offline.
 ///
 /// The CLI signs `payload` (inner signature), calls
@@ -130,7 +130,7 @@ pub struct ConfirmPrepareResponse {
 }
 
 /// Request body of `POST /enclaves/{id}/upgrades/{uid}/confirm/submit`
-/// and `.../revoke/submit` (#48): the fully-assembled command plus its
+/// and `.../revoke/submit`: the fully-assembled command plus its
 /// envelope signature. The backend checks the decoded command matches
 /// what prepare issued (state-machine consistency only; the enclave is
 /// the real verifier) and dispatches it over the control channel.
@@ -149,7 +149,7 @@ pub struct ConfirmSubmitRequest {
 pub type RevokeSubmitRequest = ConfirmSubmitRequest;
 
 /// Response body of `POST /enclaves/{id}/upgrades/{uid}/revoke/prepare`
-/// (#48). Mirrors [`ConfirmPrepareResponse`] with the `RevokeUpgrade`
+/// (self-hosted custody). Mirrors [`ConfirmPrepareResponse`] with the `RevokeUpgrade`
 /// command's field set: `rollback` instead of `rekey`, and no
 /// `valid_from` (revocations take effect immediately).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,7 +376,7 @@ mod tests {
         assert!(v["nonce"].is_string());
     }
 
-    /// The load-bearing property (#48): a command the CLI assembles from a
+    /// The load-bearing property: a command the CLI assembles from a
     /// JSON-round-tripped prepare response is byte-identical to the one the
     /// backend would have assembled from its in-memory values.
     #[test]

@@ -23,8 +23,8 @@ default = []
 test-utils = []
 
 [dependencies]
-enclavia-protocol = { path = "../enclavia-protocol" }
-enclavia-vsock = { path = "../enclavia-vsock" }
+enclavia-protocol = { path = "../enclavia-protocol", version = "0.1.0" }
+enclavia-vsock = { path = "../enclavia-vsock", version = "0.1.0" }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-vsock = { workspace = true }
 tracing.workspace = true
@@ -43,8 +43,8 @@ rand.workspace = true
 
 [dev-dependencies]
 # Note: the integration test in tests/forward.rs re-implements a minimal
-# stand-in for the host-side `egress-host` relay (which lives in the
-# closed-source workspace) so this crate has no dependency on it. See
+# stand-in for the host-side `egress-host` relay (which lives outside
+# this repository) so this crate has no dependency on it. See
 # the comment at the top of that test for context.
 tempfile = "3"
 

@@ -71,10 +71,10 @@ pub struct StagedPushEntry {
 ///
 /// The canonical wire spec now lives in `enclavia_protocol::chain`
 /// (re-exported here so existing `crate::api::ChainLinkJson` paths keep
-/// resolving). It mirrors `enclavia_backend::routes::chain::ChainLinkJson`
-/// and the matching shape `enclavia_crates::chain-host` POSTs to the
-/// backend; an enclavia-crates follow-up switches those two onto this
-/// shared definition so backend, chain-host, and the CLI share one type.
+/// resolving). It mirrors the backend's route DTO and the matching
+/// shape the host-side `chain-host` daemon POSTs to the backend; a
+/// follow-up switches those two onto this shared definition so backend,
+/// chain-host, and the CLI share one type.
 ///
 /// `payload`, `attestation`, and `signature` are standard base64 with
 /// padding. The CLI decodes them before handing the bytes to

@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 description = "Enclavia CLI: auth, push, and enclave lifecycle commands. Also exposes a reusable library face for tooling."
+readme = "README.md"
+documentation = "https://docs.enclavia.io"
+keywords = ["enclave", "attestation", "nitro", "confidential-computing", "cli"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "enclavia_cli"
@@ -25,7 +31,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-# OAuth 2.1 + PKCE flow (#88) — hand-rolled in `commands::auth` so the CLI
+# OAuth 2.1 + PKCE flow, hand-rolled in `commands::auth` so the CLI
 # isn't pulled into a heavyweight oauth2-crate dependency just to mint a
 # challenge and run a one-shot loopback callback server.
 axum = { workspace = true }
@@ -38,20 +44,20 @@ open = "5"
 # Egress allowlist parser. Same crate the backend and in-enclave daemon
 # share, so all three agree on what is well-formed for the
 # --egress-allow / --egress-resolver / --egress-config flags.
-enclavia-egress = { path = "../enclavia-egress" }
-# Public upgrade-chain wire types + pure validator (#47). Used by
+enclavia-egress = { path = "../enclavia-egress", version = "0.1.0" }
+# Public upgrade-chain wire types + pure validator. Used by
 # `enclavia upgrade chain` to re-verify a chain locally against the
 # same rules the backend ingest applies.
-enclavia-protocol = { path = "../enclavia-protocol" }
+enclavia-protocol = { path = "../enclavia-protocol", version = "0.1.0" }
 # CBOR decoder for the per-link payloads the upgrade-chain
 # pretty-printer surfaces.
 ciborium = { workspace = true }
-# Self-hosted control-key custody (#48): P-256 is needed unconditionally
+# Self-hosted control-key custody: P-256 is needed unconditionally
 # (public-key parsing, fingerprints, and verifying assembled commands in
 # tests exactly as enclavia-server does).
 p256 = { workspace = true }
-# YubiKey PIV backend for the control key (#48). Optional: the closed
-# workspace consumes this crate's library face with
+# YubiKey PIV backend for the control key. Optional: server-side
+# consumers of this crate's library face use
 # default-features = false to avoid linking pcsclite into server-side
 # binaries.
 yubikey = { version = "0.8", optional = true }

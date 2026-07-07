@@ -2,11 +2,11 @@
 //! stack on it, and for every accepted outbound TCP connection dials
 //! `egress-host` over vsock to splice bytes to the destination.
 //!
-//! Allowlist enforcement is wired through the [`ConnectPolicy`] trait
-//! (#135): [`StaticAllowlistPolicy`] reads `/etc/enclavia/egress.json`
+//! Allowlist enforcement is wired through the [`ConnectPolicy`]
+//! trait: [`StaticAllowlistPolicy`] reads `/etc/enclavia/egress.json`
 //! at boot, classifies entries into IP literals, CIDR blocks, and
 //! hostname entries, and denies anything not on the list. Hostname
-//! entries are enforced (#136) by calling out to a separate `unbound`
+//! entries are enforced by calling out to a separate `unbound`
 //! process running inside the EIF (listening on `127.0.0.1:53`): the
 //! policy issues an A query for every hostname entry whose port + proto
 //! matches the connect, and admits the connect iff its IP appears in

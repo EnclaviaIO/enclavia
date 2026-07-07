@@ -581,7 +581,7 @@ async fn fetch_flake_source(label: &str, url: &str, rev: &str) -> Result<PathBuf
 
     if !output.status.success() {
         return Err(CliError::Other(format!(
-            "`nix flake metadata {flake_ref}` failed ({}). The recorded {label} rev is {rev}; verify your nix has access to the source URL (SSH key for the private repos pre-flip).",
+            "`nix flake metadata {flake_ref}` failed ({}). The recorded {label} rev is {rev}; verify your nix has access to the source URL (older enclaves may pin revisions that predate the repositories becoming public, which need SSH access).",
             output.status,
         )));
     }

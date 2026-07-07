@@ -9,8 +9,8 @@
 //! root) and a network namespace, which makes this test fragile on
 //! shared CI runners. The TUN-to-smoltcp path is exercised by the
 //! `parse_new_tcp_syn_*` unit tests, and the splice path is exercised
-//! here. Sub-issue #135 plans to add real-TUN coverage once the CI
-//! environment is reliably namespace-capable.
+//! here. Real-TUN coverage is planned once the CI environment is
+//! reliably namespace-capable.
 
 #![cfg(feature = "test-utils")]
 
@@ -32,11 +32,11 @@ use enclavia_egress::{
 };
 use enclavia_protocol::egress::{read_open_frame, Open};
 
-/// Test-local stand-in for the closed-source `egress-host` relay. Reads one
+/// Test-local stand-in for the host-side `egress-host` relay. Reads one
 /// `Open` frame, dials the requested IPv4 destination, splices bytes. The
-/// production relay (in the host-side `egress-host` crate, which stays in
-/// the closed-source workspace) has the same shape; we re-implement it
-/// here so the public workspace has no dep on a private crate.
+/// production relay (the host-side `egress-host` crate, which lives
+/// outside this repository) has the same shape; we re-implement it
+/// here so this workspace has no dependency on it.
 async fn handle_connection<S>(mut stream: S) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

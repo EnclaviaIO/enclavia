@@ -1,4 +1,4 @@
-//! In-enclave verification of a KMS key's policy (#198 follow-up).
+//! In-enclave verification of a KMS key's policy.
 //!
 //! The backend mints one asymmetric KMS key per storage enclave whose
 //! policy is supposed to gate `kms:Decrypt` on the enclave's attestation

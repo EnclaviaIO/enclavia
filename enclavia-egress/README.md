@@ -4,9 +4,9 @@ In-enclave outbound TCP daemon. Owns `/dev/net/tun`, creates `tun0` as the workl
 
 1. Checks the destination against `/etc/enclavia/egress.json` (deny-all by default).
 2. For hostname entries: queries the in-enclave `unbound` resolver on `127.0.0.1:53` (DNSSEC-validating, configured at boot from `egress.json`'s `resolvers` array), and pins the resolved IP for the duration of the flow.
-3. Dials [`egress-host`](https://github.com/EnclaviaIO/enclavia-crates) over vsock and splices bytes.
+3. Dials the host-side `egress-host` relay over vsock and splices bytes.
 
-The wire format for the host hand-off (length-prefixed CBOR `Open` frame) lives in [`enclavia-protocol::egress`](../enclavia-protocol/). The host-side relay is closed-source and runs alongside QEMU/Nitro on the parent.
+The wire format for the host hand-off (length-prefixed CBOR `Open` frame) lives in [`enclavia-protocol::egress`](../enclavia-protocol/). The host-side relay lives outside this repository and runs alongside QEMU/Nitro on the parent.
 
 Allowlist grammar:
 - IPv4 literal or CIDR (e.g. `1.2.3.4` or `10.0.0.0/8`)

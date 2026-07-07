@@ -111,9 +111,9 @@ mod serde_bytes_opt {
 /// JSON wire shape of a chain link on the public `GET
 /// /enclaves/{id}/upgrade-chain` route. The opaque byte fields are
 /// carried as base64 strings here (vs. the raw-bytes [`ChainLink`] used
-/// at rest and inside the validator). Consumed by the CLI today and, after
-/// the enclavia-crates follow-up, by the backend + chain-host so all three
-/// surfaces share one definition.
+/// at rest and inside the validator). Consumed by the CLI today and,
+/// eventually, by the backend + chain-host so all three surfaces share
+/// one definition.
 ///
 /// `payload`, `attestation`, and `signature` are standard base64 with
 /// padding. Decode them before handing the bytes to [`validate_chain_link`]

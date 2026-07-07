@@ -22,6 +22,9 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/EnclaviaIO/enclavia"
+homepage = "https://enclavia.io"
+# The toolchain the flake pins and CI tests against.
+rust-version = "1.88"
 
 # Silences a `crane will use a placeholder value since `name` cannot be found`
 # warning. The root Cargo.toml is workspace-only, so crane has no `[package].name`
