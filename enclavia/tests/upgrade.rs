@@ -436,3 +436,85 @@ async fn upgrade_surfaces_non_101_as_error() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+/// Regression test for the transport dropping inbound `StreamData` under
+/// backpressure: the server floods far more frames than the per-stream
+/// buffer holds while the client isn't reading yet. The old `try_send`
+/// dispatch silently discarded the overflow and tore the stream down
+/// (surfacing to consumers as a truncated response / EOF at 0 bytes); the
+/// awaited `send` must instead stall the WebSocket read and deliver every
+/// byte once the consumer starts draining.
+#[tokio::test]
+async fn slow_consumer_receives_every_frame_under_burst() {
+    const FRAMES: usize = 200; // well past the 64-slot per-stream buffer
+    const FRAME_LEN: usize = 1024;
+
+    let url = spawn_test_server(|mut t| async move {
+        match t.receive::<ClientMessage>().await.unwrap() {
+            ClientMessage::RequestAttestation => {}
+            other => panic!("expected RequestAttestation, got {other:?}"),
+        }
+        let hash = t.handshake_hash().to_vec();
+        let doc = fake_attestation_for(hash);
+        t.send(&ServerMessage::Attestation {
+            data: doc,
+            control_nonce: [0u8; 32],
+        })
+        .await
+        .unwrap();
+
+        let id = match t.receive::<ClientMessage>().await.unwrap() {
+            ClientMessage::OpenStream { id, .. } => id,
+            other => panic!("expected OpenStream, got {other:?}"),
+        };
+
+        // Flood: burst every frame before the client reads anything.
+        for i in 0..FRAMES {
+            t.send(&ServerMessage::StreamData {
+                id,
+                payload: vec![(i % 256) as u8; FRAME_LEN],
+            })
+            .await
+            .unwrap();
+        }
+        t.send(&ServerMessage::StreamClose { id }).await.unwrap();
+
+        // Drain whatever the client sends on teardown.
+        while t.receive::<ClientMessage>().await.is_ok() {}
+    })
+    .await;
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(matching_pcrs())
+        .build()
+        .await
+        .expect("client connect");
+
+    let mut stream = client
+        .open_stream(Vec::new())
+        .await
+        .expect("open_stream ok");
+
+    // Let the burst pile up while the consumer sits idle, so the per-stream
+    // buffer genuinely fills and the transport task has to block.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut received))
+        .await
+        .expect("drain timeout")
+        .expect("drain");
+
+    assert_eq!(
+        received.len(),
+        FRAMES * FRAME_LEN,
+        "every frame must survive the burst"
+    );
+    for (i, chunk) in received.chunks(FRAME_LEN).enumerate() {
+        assert!(
+            chunk.iter().all(|&b| b == (i % 256) as u8),
+            "frame {i} corrupted or out of order"
+        );
+    }
+}
