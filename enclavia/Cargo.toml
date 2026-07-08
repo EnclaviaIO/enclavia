@@ -9,7 +9,7 @@ rust-version.workspace = true
 description = "Encrypted HTTP client SDK for the Enclavia enclave runtime: Noise tunnel over WebSocket with built-in attestation verification."
 readme = "README.md"
 documentation = "https://docs.rs/enclavia"
-keywords = ["enclave", "attestation", "nitro", "confidential-computing", "https"]
+keywords = ["enclave", "attestation", "nitro", "tee", "https"]
 categories = ["cryptography", "network-programming", "api-bindings"]
 
 [features]
