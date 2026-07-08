@@ -9,7 +9,7 @@ rust-version.workspace = true
 description = "Enclavia CLI: auth, push, and enclave lifecycle commands. Also exposes a reusable library face for tooling."
 readme = "README.md"
 documentation = "https://docs.enclavia.io"
-keywords = ["enclave", "attestation", "nitro", "confidential-computing", "cli"]
+keywords = ["enclave", "attestation", "nitro", "tee", "cli"]
 categories = ["command-line-utilities"]
 
 [lib]
