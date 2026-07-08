@@ -7,6 +7,25 @@ The `enclavia` command-line binary. Drives the hosted Enclavia control plane: cr
 > documenting every command's `--json` output shape and the recommended
 > polling patterns. If you are an AI agent driving this CLI, start there.
 
+## Install
+
+Published on crates.io as
+[`enclavia-cli`](https://crates.io/crates/enclavia-cli); the installed
+binary is called `enclavia`.
+
+```sh
+cargo install enclavia-cli
+```
+
+Or via Nix, straight from this repo:
+
+```sh
+nix run github:EnclaviaIO/enclavia#enclavia -- --help
+```
+
+Prerequisites and upgrade paths are covered at
+[docs.enclavia.io/install](https://docs.enclavia.io/install).
+
 ## Quickstart
 
 The image is pushed *after* the enclave is created: each enclave owns its own

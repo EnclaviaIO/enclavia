@@ -10,6 +10,17 @@ See https://beta.enclavia.io for the hosted service.
 > machine-oriented guide to driving the `enclavia` CLI with `--json`. If you
 > are an AI agent operating enclaves, start there.
 
+## Published packages
+
+The client-facing pieces are published to the public registries:
+
+- **CLI**: `cargo install enclavia-cli` installs the `enclavia` binary ([`enclavia-cli`](https://crates.io/crates/enclavia-cli) on crates.io), or `nix run github:EnclaviaIO/enclavia#enclavia`.
+- **Rust SDK**: [`enclavia`](https://crates.io/crates/enclavia) on crates.io (`cargo add enclavia`).
+- **Browser/Node SDK**: [`@enclavia/client-wasm`](https://www.npmjs.com/package/@enclavia/client-wasm) on npm (Node 22+, Deno, bundlers).
+- **Protocol types**: [`enclavia-protocol`](https://crates.io/crates/enclavia-protocol) on crates.io, pulled in transitively by the SDK and CLI.
+
+Everything else in this workspace (the in-enclave binaries, dev tools) is consumed from git/Nix and is not on crates.io.
+
 ## Crates
 
 In-enclave binaries (run inside the EIF, reach the host over `tokio-vsock`):

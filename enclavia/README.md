@@ -2,6 +2,8 @@
 
 Client SDK for the Enclavia enclave runtime. Opens an end-to-end-encrypted channel through the host-side router and exposes it as an `http`-compatible client to your application.
 
+Published on crates.io as [`enclavia`](https://crates.io/crates/enclavia) (`cargo add enclavia`). For browsers and JS runtimes, the same core ships on npm as [`@enclavia/client-wasm`](https://www.npmjs.com/package/@enclavia/client-wasm) via [`enclavia-wasm`](../enclavia-wasm/).
+
 ```rust
 use enclavia::{Client, Pcrs};
 
