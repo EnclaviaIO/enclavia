@@ -22,24 +22,79 @@ use crate::error::CliError;
 
 const DEFAULT_TAG: &str = "latest";
 
+/// What [`push_to_enclave`] hands back to its caller once the docker push
+/// itself has succeeded. `notify` is `None` when the best-effort backend
+/// notify failed (the registry poll still picks the push up within ~15s).
+pub struct PushOutcome {
+    pub canonical: String,
+    pub digest: Option<String>,
+    pub notify: Option<crate::api::NotifyPushResponse>,
+}
+
 pub async fn push(
     local_image: &str,
     enclave_id_or_prefix: &str,
     json: bool,
 ) -> Result<(), CliError> {
     let client = ApiClient::new()?;
-    let registry = client.get_registry().await?;
-    let registry_host = &registry.registry_url;
-    let namespace = &registry.namespace;
 
     // Resolve the user-supplied id or prefix to exactly one of the caller's
     // enclaves. We accept prefixes so users can paste the short id printed by
     // `enclave create` without having to look up the full UUID; an ambiguous
     // prefix is a hard error rather than picking arbitrarily.
-    let mut enclave = resolve_enclave(&client, enclave_id_or_prefix).await?;
-    // A full-UUID argument short-circuits prefix resolution without a
-    // listing, so the summary carries no backend fields; fetch the row to
-    // get `push_target` (we need auth for the push anyway).
+    let enclave = resolve_enclave(&client, enclave_id_or_prefix).await?;
+    let enclave_id = enclave.id.clone();
+
+    let PushOutcome { canonical, digest, notify } =
+        push_to_enclave(&client, local_image, enclave, json).await?;
+
+    match notify {
+        Some(resp) => {
+            if json {
+                // A pure non-upgradable rejection is a hard failure in both
+                // modes; surface it as an `{"error": ...}` object + non-zero
+                // exit so the agent can branch on it.
+                if is_non_upgradable_rejection(&resp) {
+                    return Err(CliError::Other(
+                        "this enclave is non-upgradable, create a new one".into(),
+                    ));
+                }
+                emit_push_json(&canonical, digest.as_deref(), &resp);
+            } else {
+                print_notify_result(&resp, &enclave_id)?;
+            }
+        }
+        None => {
+            if json {
+                emit_push_json_minimal(&canonical, digest.as_deref());
+            } else {
+                println!("Check build progress with:");
+                println!("  enclavia enclave status {enclave_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The docker half of a push, shared by `enclavia push` and
+/// `enclavia deploy`: registry login, tag, streamed `docker push`, and the
+/// best-effort backend notify. Streams docker's own per-layer progress but
+/// leaves the final result presentation to the caller (`push` prints
+/// next-step hints; `deploy` rolls straight into the build watch).
+///
+/// `enclave` may come from prefix resolution (`push`) or the create
+/// response (`deploy`); if its raw row lacks `push_target` (a full-UUID
+/// resolve short-circuits without backend fields), the row is refetched.
+pub async fn push_to_enclave(
+    client: &ApiClient,
+    local_image: &str,
+    mut enclave: EnclaveSummary,
+    json: bool,
+) -> Result<PushOutcome, CliError> {
+    let registry = client.get_registry().await?;
+    let registry_host = &registry.registry_url;
+    let namespace = &registry.namespace;
+
     if enclave.raw.get("push_target").is_none() {
         let row = client.get_enclave(&enclave.id).await?;
         enclave = serde_json::from_value(row)
@@ -79,36 +134,17 @@ pub async fn push(
     // would never trigger digest-change polling — this notify is the push
     // *event* signal that bypasses that. Best-effort: the push itself
     // succeeded, so we still surface a status hint on notify failure.
-    match client.notify_push(&enclave.id).await {
-        Ok(resp) => {
-            if json {
-                // A pure non-upgradable rejection is a hard failure in both
-                // modes; surface it as an `{"error": ...}` object + non-zero
-                // exit so the agent can branch on it.
-                if is_non_upgradable_rejection(&resp) {
-                    return Err(CliError::Other(
-                        "this enclave is non-upgradable, create a new one".into(),
-                    ));
-                }
-                emit_push_json(&canonical, digest.as_deref(), &resp);
-            } else {
-                print_notify_result(&resp, &enclave.id)?;
-            }
-        }
+    let notify = match client.notify_push(&enclave.id).await {
+        Ok(resp) => Some(resp),
         Err(e) => {
             // The push itself succeeded; notify is best-effort. Keep the
             // warning on stderr so stdout stays a single JSON value.
             eprintln!("warning: failed to notify backend of push: {e}");
-            if json {
-                emit_push_json_minimal(&canonical, digest.as_deref());
-            } else {
-                eprintln!("  the backend's registry poll will still pick it up within ~15s");
-                println!("Check build progress with:");
-                println!("  enclavia enclave status {}", enclave.id);
-            }
+            eprintln!("  the backend's registry poll will still pick it up within ~15s");
+            None
         }
-    }
-    Ok(())
+    };
+    Ok(PushOutcome { canonical, digest, notify })
 }
 
 /// A human-facing progress line: stderr under `--json`, stdout otherwise.
