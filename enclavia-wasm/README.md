@@ -9,11 +9,18 @@ shared attestation verifier from `enclavia-protocol` (including production
 Nitro COSE ES384 + cert-chain validation), stream multiplexing. Only the
 WebSocket is the host's.
 
+Published on npm as
+[`@enclavia/client-wasm`](https://www.npmjs.com/package/@enclavia/client-wasm).
+
 ## Usage
 
+```bash
+npm install @enclavia/client-wasm
+```
+
 ```js
-import init, { connect } from "./pkg/enclavia_wasm.js";
-await init();
+import init, { connect } from "@enclavia/client-wasm";
+await init();   // bundlers resolve the .wasm asset; for plain Node see below
 
 const client = await connect(
   "wss://<id>.enclaves.beta.enclavia.io",
@@ -33,6 +40,19 @@ const chunk = await stream.recv();   // Uint8Array | null on EOF
 
 `connect` also accepts `trustUpgrades: { backendUrl, enclaveId }`, mirroring
 the native `ClientBuilder::trust_upgrades`.
+
+In plain Node (no bundler), pass the wasm bytes to `init` yourself:
+
+```js
+import { readFileSync } from "node:fs";
+import init, { connect } from "@enclavia/client-wasm";
+
+await init({
+  module_or_path: readFileSync(
+    new URL(import.meta.resolve("@enclavia/client-wasm/wasm")),
+  ),
+});
+```
 
 Differences from the native SDK, both inherent to the host WebSocket API:
 
