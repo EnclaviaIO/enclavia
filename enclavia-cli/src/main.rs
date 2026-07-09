@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use enclavia_cli::api::{ApiClient, EnclaveSummary};
 use enclavia_cli::commands::{
-    auth, enclave as enclave_cmds, key as key_cmds, push, reproduce, secrets, upgrade,
+    auth, deploy, enclave as enclave_cmds, key as key_cmds, push, reproduce, secrets, upgrade,
 };
 use enclavia_cli::commands::resolve::resolve_enclave_id;
 use enclavia_cli::error::CliError;
@@ -62,6 +62,20 @@ enum Command {
     Enclave {
         #[command(subcommand)]
         cmd: EnclaveCmd,
+    },
+    /// Create an enclave, push a local Docker image into it, and follow
+    /// the build until the enclave is running: `enclave create` +
+    /// `push` + status polling as one command. Takes every `enclave
+    /// create` flag. Streams the build log while the EIF builds and
+    /// prints the endpoint + PCRs once the enclave is up. Interrupting
+    /// it (Ctrl-C) stops the watch only, never the build; pick back up
+    /// with `enclavia enclave status <id>`.
+    Deploy {
+        /// Local image reference (the source for `docker tag`), e.g.
+        /// `myapp:dev` or `localhost/myapp:dev`.
+        local_image: String,
+        #[command(flatten)]
+        create: Box<CreateFlags>,
     },
     /// Push a local Docker image into the registry repo for one of your
     /// enclaves. Each enclave owns its own repo (`<your-handle>/<uuid>`),
@@ -243,83 +257,8 @@ enum EnclaveCmd {
     /// `enclavia push <local-image> <enclave-id-prefix>` to start the
     /// build.
     Create {
-        /// Instance type (small, medium, large)
-        #[arg(long, default_value = "small")]
-        instance_type: InstanceTypeArg,
-        /// Port the container listens on inside the enclave. The proxy
-        /// forwards plaintext HTTP to localhost:<port>.
-        #[arg(long)]
-        container_port: Option<u16>,
-        /// Persistent encrypted storage size in bytes. Minimum 134217728
-        /// (128 MiB); typical 268435456 (256 MiB). Omit or set to 0 to
-        /// provision the enclave without storage.
-        #[arg(long)]
-        storage_size_bytes: Option<u64>,
-        /// Optional freeform display name (max 64 chars). Shown in the
-        /// dashboard header and `enclavia enclave list`. Empty / omitted
-        /// gets an auto-generated `<adjective>-<animal>-<NNN>` name.
-        #[arg(long)]
-        name: Option<String>,
-        /// Registry visibility for anonymous pulls: `private` (default)
-        /// or `public`. Public lets anyone pull the enclave's image
-        /// without auth. Owner pulls/pushes are governed by ownership.
-        #[arg(long)]
-        visibility: Option<String>,
-        /// Allow outbound traffic to `HOST:PORT[/PROTO]`. Repeatable.
-        /// HOST is an IPv4 literal, an IPv4 CIDR (e.g. `10.0.0.0/8`),
-        /// or a hostname. PROTO defaults to `tcp`. Without any of the
-        /// egress flags the enclave denies all outbound traffic.
-        /// Mutually exclusive with `--egress-config`.
-        #[arg(long = "egress-allow", value_name = "HOST:PORT[/PROTO]")]
-        egress_allow: Vec<String>,
-        /// DNS resolver IPv4 address used by the in-enclave validating
-        /// resolver to resolve hostname allowlist entries. Repeatable.
-        /// Mutually exclusive with `--egress-config`.
-        #[arg(long = "egress-resolver", value_name = "IPV4")]
-        egress_resolver: Vec<String>,
-        /// Path to a pre-written egress allowlist JSON document.
-        /// Mutually exclusive with `--egress-allow` /
-        /// `--egress-resolver`.
-        #[arg(long = "egress-config", value_name = "PATH")]
-        egress_config: Option<std::path::PathBuf>,
-        /// Mark this enclave as upgradable. The backend mints an
-        /// ECDSA P-256 control keypair, bakes the public half into every
-        /// EIF for this enclave, and accepts staged v2+ pushes against
-        /// it. Without this flag the enclave is non-upgradable: it has
-        /// a single genesis push, no control pubkey is baked in, and
-        /// the in-enclave server refuses every signed control command.
-        /// Immutable post-create.
-        #[arg(long)]
-        upgradable: bool,
-        /// Launch as a PRODUCTION enclave (real EC2 Nitro) instead of the
-        /// default debug enclave (local QEMU). The deployment's launcher
-        /// must support production and the account must be entitled (a paid
-        /// plan), or the backend rejects the create. Immutable post-create.
-        #[arg(long)]
-        production: bool,
-        /// Self-hosted control-key custody: register the named
-        /// local key (see `enclavia key generate/list`) as this
-        /// enclave's control key. The backend then cannot confirm or
-        /// revoke upgrades on its own; `enclavia upgrade confirm/revoke`
-        /// sign with your key. Implies --upgradable. Immutable
-        /// post-create; plain --upgradable stays managed custody.
-        #[arg(long, value_name = "KEY_NAME")]
-        control_key: Option<String>,
-        /// Request synchronizer-backed anti-rollback storage. Only
-        /// takes effect for a storage enclave whose plan entitles it;
-        /// otherwise the backend ignores it. Defaults off. Immutable
-        /// post-create.
-        #[arg(long)]
-        anti_rollback: bool,
-        /// Minimum upgrade activation delay, baked into the measured
-        /// image: the enclave itself refuses any upgrade activation
-        /// scheduled earlier than its own now + this delay, so watchers
-        /// always get at least this long to react (or revoke) before a
-        /// confirmed upgrade can fire. Accepts `30m`, `48h`, `7d`, or a
-        /// plain integer meaning seconds. Requires --upgradable (or
-        /// --control-key, which implies it). Immutable post-create.
-        #[arg(long, value_name = "DURATION")]
-        min_upgrade_delay: Option<String>,
+        #[command(flatten)]
+        flags: Box<CreateFlags>,
     },
     /// List your enclaves
     List {
@@ -366,6 +305,89 @@ enum EnclaveCmd {
         /// to exactly one of your enclaves.
         id: String,
     },
+}
+
+/// The full `enclave create` flag set, shared verbatim by `enclave create`
+/// and `deploy` (which is create + push + watch in one command).
+#[derive(clap::Args)]
+struct CreateFlags {
+    /// Instance type (small, medium, large)
+    #[arg(long, default_value = "small")]
+    instance_type: InstanceTypeArg,
+    /// Port the container listens on inside the enclave. The proxy
+    /// forwards plaintext HTTP to localhost:<port>.
+    #[arg(long)]
+    container_port: Option<u16>,
+    /// Persistent encrypted storage size in bytes. Minimum 134217728
+    /// (128 MiB); typical 268435456 (256 MiB). Omit or set to 0 to
+    /// provision the enclave without storage.
+    #[arg(long)]
+    storage_size_bytes: Option<u64>,
+    /// Optional freeform display name (max 64 chars). Shown in the
+    /// dashboard header and `enclavia enclave list`. Empty / omitted
+    /// gets an auto-generated `<adjective>-<animal>-<NNN>` name.
+    #[arg(long)]
+    name: Option<String>,
+    /// Registry visibility for anonymous pulls: `private` (default)
+    /// or `public`. Public lets anyone pull the enclave's image
+    /// without auth. Owner pulls/pushes are governed by ownership.
+    #[arg(long)]
+    visibility: Option<String>,
+    /// Allow outbound traffic to `HOST:PORT[/PROTO]`. Repeatable.
+    /// HOST is an IPv4 literal, an IPv4 CIDR (e.g. `10.0.0.0/8`),
+    /// or a hostname. PROTO defaults to `tcp`. Without any of the
+    /// egress flags the enclave denies all outbound traffic.
+    /// Mutually exclusive with `--egress-config`.
+    #[arg(long = "egress-allow", value_name = "HOST:PORT[/PROTO]")]
+    egress_allow: Vec<String>,
+    /// DNS resolver IPv4 address used by the in-enclave validating
+    /// resolver to resolve hostname allowlist entries. Repeatable.
+    /// Mutually exclusive with `--egress-config`.
+    #[arg(long = "egress-resolver", value_name = "IPV4")]
+    egress_resolver: Vec<String>,
+    /// Path to a pre-written egress allowlist JSON document.
+    /// Mutually exclusive with `--egress-allow` /
+    /// `--egress-resolver`.
+    #[arg(long = "egress-config", value_name = "PATH")]
+    egress_config: Option<std::path::PathBuf>,
+    /// Mark this enclave as upgradable. The backend mints an
+    /// ECDSA P-256 control keypair, bakes the public half into every
+    /// EIF for this enclave, and accepts staged v2+ pushes against
+    /// it. Without this flag the enclave is non-upgradable: it has
+    /// a single genesis push, no control pubkey is baked in, and
+    /// the in-enclave server refuses every signed control command.
+    /// Immutable post-create.
+    #[arg(long)]
+    upgradable: bool,
+    /// Launch as a PRODUCTION enclave (real EC2 Nitro) instead of the
+    /// default debug enclave (local QEMU). The deployment's launcher
+    /// must support production and the account must be entitled (a paid
+    /// plan), or the backend rejects the create. Immutable post-create.
+    #[arg(long)]
+    production: bool,
+    /// Self-hosted control-key custody: register the named
+    /// local key (see `enclavia key generate/list`) as this
+    /// enclave's control key. The backend then cannot confirm or
+    /// revoke upgrades on its own; `enclavia upgrade confirm/revoke`
+    /// sign with your key. Implies --upgradable. Immutable
+    /// post-create; plain --upgradable stays managed custody.
+    #[arg(long, value_name = "KEY_NAME")]
+    control_key: Option<String>,
+    /// Request synchronizer-backed anti-rollback storage. Only
+    /// takes effect for a storage enclave whose plan entitles it;
+    /// otherwise the backend ignores it. Defaults off. Immutable
+    /// post-create.
+    #[arg(long)]
+    anti_rollback: bool,
+    /// Minimum upgrade activation delay, baked into the measured
+    /// image: the enclave itself refuses any upgrade activation
+    /// scheduled earlier than its own now + this delay, so watchers
+    /// always get at least this long to react (or revoke) before a
+    /// confirmed upgrade can fire. Accepts `30m`, `48h`, `7d`, or a
+    /// plain integer meaning seconds. Requires --upgradable (or
+    /// --control-key, which implies it). Immutable post-create.
+    #[arg(long, value_name = "DURATION")]
+    min_upgrade_delay: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -478,6 +500,7 @@ async fn main() {
             AuthCmd::Login => run_login(json).await,
         },
         Command::Enclave { cmd } => run_enclave(cmd, json).await,
+        Command::Deploy { local_image, create } => run_deploy(&local_image, *create, json).await,
         Command::Push { local_image, enclave_id } => {
             push::push(&local_image, &enclave_id, json).await
         }
@@ -595,83 +618,105 @@ async fn run_login(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Validate the create flags locally, then create the enclave. Shared by
+/// `enclave create` and `deploy`; doesn't print the result, so each caller
+/// keeps its own epilogue.
+async fn create_from_flags(
+    flags: CreateFlags,
+    json: bool,
+) -> Result<enclave_cmds::EnclaveCreated, CliError> {
+    // Validate the egress allowlist BEFORE constructing the API
+    // client. The validator is purely local (parses --egress-allow
+    // / --egress-config, runs the same checks the daemon would
+    // run at boot). A logged-out user passing a bad allowlist
+    // should see the actual local error (e.g. "UDP egress is not
+    // supported yet"), not "not logged in" from ApiClient::new().
+    let egress_inputs = enclave_cmds::EgressInputs {
+        allows: flags.egress_allow,
+        resolvers: flags.egress_resolver,
+        config_path: flags.egress_config,
+    };
+    let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress_inputs)?;
+    // Resolve the control key locally BEFORE creating anything:
+    // a typo'd key name should error out, not create a managed
+    // enclave. Registering the key implies --upgradable.
+    let control_key_body = match flags.control_key.as_deref() {
+        Some(key_name) => {
+            if !flags.upgradable {
+                note(json, format!(
+                    "--control-key {key_name} implies --upgradable; creating an upgradable enclave."
+                ));
+            }
+            Some(key_cmds::control_key_body_for(key_name)?)
+        }
+        None => None,
+    };
+    // Parse and gate --min-upgrade-delay locally BEFORE creating
+    // anything: the delay floor only exists on upgradable
+    // enclaves (a non-upgradable enclave never activates an
+    // upgrade), so silently accepting it would give the user a
+    // false sense of a knob that does nothing.
+    let min_upgrade_delay_secs = match flags.min_upgrade_delay.as_deref() {
+        Some(raw) => {
+            if !flags.upgradable && control_key_body.is_none() {
+                return Err(CliError::Other(
+                    "--min-upgrade-delay requires an upgradable enclave: pass \
+                     --upgradable (or --control-key, which implies it)"
+                        .into(),
+                ));
+            }
+            Some(enclave_cmds::parse_min_upgrade_delay(raw)?)
+        }
+        None => None,
+    };
+    let client = ApiClient::new()?;
+    enclave_cmds::create(
+        &client,
+        flags.instance_type.into(),
+        flags.container_port,
+        flags.storage_size_bytes,
+        flags.name.as_deref(),
+        flags.visibility.as_deref(),
+        egress_allowlist,
+        flags.upgradable,
+        flags.production,
+        control_key_body,
+        flags.anti_rollback,
+        min_upgrade_delay_secs,
+    )
+    .await
+}
+
+/// `enclavia deploy`: create + push + watch-until-running in one command.
+/// Human-facing sugar over the three-step flow; agents keep using the
+/// individual steps (see the agent skill).
+async fn run_deploy(local_image: &str, flags: CreateFlags, json: bool) -> Result<(), CliError> {
+    let started = std::time::Instant::now();
+    let res = create_from_flags(flags, json).await?;
+    note(json, format!("Enclave created: {}", res.id));
+    note(json, String::new());
+
+    let client = ApiClient::new()?;
+    // The create response is the enclave row itself, so no refetch or
+    // prefix resolution is needed before pushing.
+    let enclave: EnclaveSummary = serde_json::from_value(res.raw.clone())
+        .map_err(|e| CliError::Other(format!("malformed enclave row: {e}")))?;
+    push::push_to_enclave(&client, local_image, enclave, json).await?;
+    note(json, String::new());
+
+    let row = deploy::watch_until_running(&client, &res.id, json).await?;
+    if json {
+        print_json(&row);
+    } else {
+        deploy::print_deployed(&row, started.elapsed());
+    }
+    Ok(())
+}
+
 async fn run_enclave(cmd: EnclaveCmd, json: bool) -> Result<(), CliError> {
     match cmd {
-        EnclaveCmd::Create {
-            instance_type,
-            container_port,
-            storage_size_bytes,
-            name,
-            visibility,
-            egress_allow,
-            egress_resolver,
-            egress_config,
-            upgradable,
-            production,
-            control_key,
-            anti_rollback,
-            min_upgrade_delay,
-        } => {
-            // Validate the egress allowlist BEFORE constructing the API
-            // client. The validator is purely local (parses --egress-allow
-            // / --egress-config, runs the same checks the daemon would
-            // run at boot). A logged-out user passing a bad allowlist
-            // should see the actual local error (e.g. "UDP egress is not
-            // supported yet"), not "not logged in" from ApiClient::new().
-            let egress_inputs = enclave_cmds::EgressInputs {
-                allows: egress_allow,
-                resolvers: egress_resolver,
-                config_path: egress_config,
-            };
-            let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress_inputs)?;
-            // Resolve the control key locally BEFORE creating anything:
-            // a typo'd key name should error out, not create a managed
-            // enclave. Registering the key implies --upgradable.
-            let control_key_body = match control_key.as_deref() {
-                Some(key_name) => {
-                    if !upgradable {
-                        note(json, format!(
-                            "--control-key {key_name} implies --upgradable; creating an upgradable enclave."
-                        ));
-                    }
-                    Some(key_cmds::control_key_body_for(key_name)?)
-                }
-                None => None,
-            };
-            // Parse and gate --min-upgrade-delay locally BEFORE creating
-            // anything: the delay floor only exists on upgradable
-            // enclaves (a non-upgradable enclave never activates an
-            // upgrade), so silently accepting it would give the user a
-            // false sense of a knob that does nothing.
-            let min_upgrade_delay_secs = match min_upgrade_delay.as_deref() {
-                Some(raw) => {
-                    if !upgradable && control_key_body.is_none() {
-                        return Err(CliError::Other(
-                            "--min-upgrade-delay requires an upgradable enclave: pass \
-                             --upgradable (or --control-key, which implies it)"
-                                .into(),
-                        ));
-                    }
-                    Some(enclave_cmds::parse_min_upgrade_delay(raw)?)
-                }
-                None => None,
-            };
-            let client = ApiClient::new()?;
-            let res = enclave_cmds::create(
-                &client,
-                instance_type.into(),
-                container_port,
-                storage_size_bytes,
-                name.as_deref(),
-                visibility.as_deref(),
-                egress_allowlist,
-                upgradable,
-                production,
-                control_key_body,
-                anti_rollback,
-                min_upgrade_delay_secs,
-            )
-            .await?;
+        EnclaveCmd::Create { flags } => {
+            let res = create_from_flags(*flags, json).await?;
             // JSON: the created enclave object verbatim (id, status, and
             // every other backend field). The human "next step" hint stays
             // on the human path only.

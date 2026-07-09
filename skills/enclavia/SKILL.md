@@ -67,6 +67,13 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
   -> `{"image":"<registry>/<owner>/<uuid>:latest","digest":"sha256:..."|null,"triggered":[<id>...],"staged":[{enclave_id,upgrade_id,image}],"rejected_non_upgradable":[<id>...]}`.
   Pushing to a non-upgradable enclave that already has an image is an error (non-zero exit).
 
+- `enclavia deploy <local-image> [create flags]` is a HUMAN convenience
+  (create + push + a long-lived watch with a spinner and streamed build
+  log). Agents should NOT use it: run `create`, `push`, and poll `status`
+  instead (see Examples), which keeps each step's JSON and exit code
+  separately actionable and avoids holding a process open for many
+  minutes.
+
 - `enclavia reproduce <id> [--upgrade <upgrade-id>] --json`  (needs local `builder` + `nix`)
   -> `{enclave_id,image_digest,expected{PCR0,PCR1,PCR2},actual{...},mismatches[],reproducible:<bool>,recorded_builder_rev,recorded_crates_rev,...}`.
   Verification command: exit 0 = reproducible, exit 2 = diverged (stdout still

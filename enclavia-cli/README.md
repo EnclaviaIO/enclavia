@@ -34,6 +34,15 @@ the measured EIF build.
 
 ```sh
 enclavia auth login                       # browser OAuth; token lands in ~/.config/enclavia/
+enclavia deploy myapp:v1 --name api --container-port 8080
+#   -> create + push + build in one command; streams the build log and
+#      prints the endpoint + PCRs once the enclave is running
+```
+
+`deploy` takes every `enclave create` flag. The three steps also exist
+individually, which is what scripts and agents should use:
+
+```sh
 enclavia enclave create --name api --container-port 8080
 #   -> prints the new enclave id; status starts as waiting_for_image
 enclavia push myapp:v1 <enclave-id>       # docker tag + push; kicks off the build
@@ -85,6 +94,7 @@ All create-time flags are immutable: to change one, create a new enclave.
 ### Images
 
 ```sh
+enclavia deploy <local-image> [FLAGS]      # create + push + watch until running (takes the create flags)
 enclavia push <local-image> <enclave-id>   # docker tag + push into the enclave's repo
 enclavia reproduce <enclave-id> [--upgrade <upgrade-id>]
 ```

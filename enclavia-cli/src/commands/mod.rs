@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod deploy;
 pub mod enclave;
 pub mod key;
 pub mod push;
