@@ -91,9 +91,23 @@
             "${muslCc}/bin/${muslCc.targetPrefix}cc";
         };
 
-        # One deps-only build shared by every in-enclave crate.
+        # One deps-only build shared by every in-enclave crate. Scoped to
+        # the in-enclave packages: the workspace also carries the CLI,
+        # whose pcsc-sys/openssl-sys deps neither build on static musl
+        # nor belong in an enclave.
         cargoArtifactsMusl = craneLibMusl.buildDepsOnly (muslCommonArgs // {
           pname = "enclavia-in-enclave-musl";
+          cargoExtraArgs = pkgs.lib.concatStringsSep " " [
+            "-p enclavia-server"
+            "-p enclavia-crypto"
+            "-p enclavia-egress"
+            "-p enclavia-secrets-init"
+            "-p enclavia-chain-init"
+            "-p nbd-client"
+            "-p synchronizer"
+            "-p synchronizer-names-init"
+            "--features synchronizer/qemu,synchronizer/raft"
+          ];
         });
 
         individualMuslCrateArgs = muslCommonArgs // {
