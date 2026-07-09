@@ -74,7 +74,10 @@
         # in-enclave crates are pure Rust (TLS is rustls/ring, no
         # openssl/pcsclite -- those belong to the native CLI), so the
         # musl build only needs a musl C compiler for ring's C sources.
-        muslTarget = "x86_64-unknown-linux-musl";
+        # Derived from the host platform: the in-enclave binaries build on
+        # x86_64 (customer enclaves) AND aarch64 (the Graviton
+        # synchronizer EIF), each targeting its own musl triple.
+        muslTarget = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-musl";
         muslTargetEnv = builtins.replaceStrings [ "-" ] [ "_" ] muslTarget;
         muslCc = pkgs.pkgsStatic.stdenv.cc;
         rustToolchainMusl = pkgs: (pkgs.rust-bin.stable."1.88.0".default.override {
