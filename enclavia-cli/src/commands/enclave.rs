@@ -30,17 +30,22 @@ pub struct EgressInputs {
     pub allows: Vec<String>,
     /// `--egress-resolver IP`, repeatable.
     pub resolvers: Vec<String>,
+    /// `--egress-dns <allowlist|open>`.
+    pub dns: Option<String>,
     /// `--egress-config <path>` to a pre-written JSON file.
     pub config_path: Option<std::path::PathBuf>,
 }
 
 impl EgressInputs {
     fn is_empty(&self) -> bool {
-        self.allows.is_empty() && self.resolvers.is_empty() && self.config_path.is_none()
+        self.allows.is_empty()
+            && self.resolvers.is_empty()
+            && self.dns.is_none()
+            && self.config_path.is_none()
     }
 
     fn has_flags(&self) -> bool {
-        !self.allows.is_empty() || !self.resolvers.is_empty()
+        !self.allows.is_empty() || !self.resolvers.is_empty() || self.dns.is_some()
     }
 }
 
@@ -56,7 +61,7 @@ pub fn build_egress_allowlist(
     }
     if inputs.config_path.is_some() && inputs.has_flags() {
         return Err(CliError::Other(
-            "--egress-config is mutually exclusive with --egress-allow / --egress-resolver"
+            "--egress-config is mutually exclusive with --egress-allow / --egress-resolver / --egress-dns"
                 .into(),
         ));
     }
@@ -72,8 +77,17 @@ pub fn build_egress_allowlist(
     }
     let allow_refs: Vec<&str> = inputs.allows.iter().map(String::as_str).collect();
     let resolver_refs: Vec<&str> = inputs.resolvers.iter().map(String::as_str).collect();
-    let raw = enclavia_protocol::egress_config::assemble_from_cli(&allow_refs, &resolver_refs)
-        .map_err(|e| CliError::Other(format!("invalid egress flags: {e}")))?;
+    let dns = inputs
+        .dns
+        .as_deref()
+        .map(|s| {
+            s.parse::<enclavia_protocol::egress_config::DnsMode>()
+                .map_err(|e| CliError::Other(format!("invalid egress flags: {e}")))
+        })
+        .transpose()?;
+    let raw =
+        enclavia_protocol::egress_config::assemble_from_cli(&allow_refs, &resolver_refs, dns)
+            .map_err(|e| CliError::Other(format!("invalid egress flags: {e}")))?;
     let value = serde_json::to_value(&raw)
         .map_err(|e| CliError::Other(format!("serialising allowlist: {e}")))?;
     Ok(Some(value))
@@ -209,6 +223,7 @@ mod tests {
         let inputs = EgressInputs {
             allows: vec!["1.2.3.4:443".into(), "api.example.com:443/tcp".into()],
             resolvers: vec!["1.1.1.1".into()],
+            dns: None,
             config_path: None,
         };
         let out = build_egress_allowlist(&inputs).unwrap().expect("present");
@@ -216,6 +231,41 @@ mod tests {
         assert_eq!(out["resolvers"][0], "1.1.1.1");
         assert_eq!(out["egress"][0]["host"], "1.2.3.4");
         assert_eq!(out["egress"][1]["host"], "api.example.com");
+        assert!(out.get("dns").is_none());
+    }
+
+    #[test]
+    fn build_egress_allowlist_carries_dns_mode() {
+        let inputs = EgressInputs {
+            allows: vec!["0.0.0.0/0:443".into()],
+            resolvers: vec!["1.1.1.1".into()],
+            dns: Some("open".into()),
+            config_path: None,
+        };
+        let out = build_egress_allowlist(&inputs).unwrap().expect("present");
+        assert_eq!(out["dns"], "open");
+    }
+
+    #[test]
+    fn build_egress_allowlist_rejects_bad_dns_mode() {
+        let inputs = EgressInputs {
+            allows: vec![],
+            resolvers: vec![],
+            dns: Some("everything".into()),
+            config_path: None,
+        };
+        assert!(build_egress_allowlist(&inputs).is_err());
+    }
+
+    #[test]
+    fn build_egress_allowlist_rejects_dns_flag_with_config_file() {
+        let inputs = EgressInputs {
+            allows: vec![],
+            resolvers: vec![],
+            dns: Some("open".into()),
+            config_path: Some(std::path::PathBuf::from("/dev/null")),
+        };
+        assert!(build_egress_allowlist(&inputs).is_err());
     }
 
     #[test]
@@ -223,6 +273,7 @@ mod tests {
         let inputs = EgressInputs {
             allows: vec!["1.2.3.4:443".into()],
             resolvers: vec![],
+            dns: None,
             config_path: Some(std::path::PathBuf::from("/dev/null")),
         };
         assert!(build_egress_allowlist(&inputs).is_err());
@@ -233,6 +284,7 @@ mod tests {
         let inputs = EgressInputs {
             allows: vec!["bogus".into()],
             resolvers: vec![],
+            dns: None,
             config_path: None,
         };
         assert!(build_egress_allowlist(&inputs).is_err());

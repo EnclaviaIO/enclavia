@@ -22,8 +22,8 @@ pub mod transport;
 
 pub use config::{
     assemble_from_cli, parse_cli_entry, parse_cli_resolver, validate_json, AllowlistConfig,
-    AllowlistEntry, AllowlistFlagError, AllowlistLoadError, Config, HostMatcher, HostnameEntry,
-    Protocol, RawAllowlist, RawEgressEntry, SCHEMA_VERSION,
+    AllowlistEntry, AllowlistFlagError, AllowlistLoadError, Config, DnsMode, HostMatcher,
+    HostnameEntry, Protocol, RawAllowlist, RawEgressEntry, SCHEMA_VERSION,
 };
 pub use policy::{AllowAll, ConnectPolicy, PolicyDecision, StaticAllowlistPolicy};
 pub use resolver::{Resolver, UnboundClient};
