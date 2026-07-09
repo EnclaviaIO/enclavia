@@ -64,16 +64,54 @@
           doCheck = false;
         };
 
-        nbdClient = craneLib.buildPackage (
-          individualCrateArgs
+        # --- static musl builds for the in-enclave binaries -------------
+        #
+        # Everything that ships inside an EIF is built as a fully static
+        # x86_64-unknown-linux-musl binary. The point is initramfs size:
+        # a glibc-dynamic binary drags the whole glibc + libgcc closure
+        # (~43 MiB uncompressed, including i18n locale data) into the
+        # measured image via its /nix/store RPATH references. The
+        # in-enclave crates are pure Rust (TLS is rustls/ring, no
+        # openssl/pcsclite -- those belong to the native CLI), so the
+        # musl build only needs a musl C compiler for ring's C sources.
+        muslTarget = "x86_64-unknown-linux-musl";
+        muslTargetEnv = builtins.replaceStrings [ "-" ] [ "_" ] muslTarget;
+        muslCc = pkgs.pkgsStatic.stdenv.cc;
+        rustToolchainMusl = pkgs: (pkgs.rust-bin.stable."1.88.0".default.override {
+          targets = [ muslTarget ];
+        });
+        craneLibMusl = (crane.mkLib pkgs).overrideToolchain rustToolchainMusl;
+
+        muslCommonArgs = {
+          src = rustSrc;
+          strictDeps = true;
+          CARGO_BUILD_TARGET = muslTarget;
+          "CC_${muslTargetEnv}" = "${muslCc}/bin/${muslCc.targetPrefix}cc";
+          "CARGO_TARGET_${pkgs.lib.toUpper muslTargetEnv}_LINKER" =
+            "${muslCc}/bin/${muslCc.targetPrefix}cc";
+        };
+
+        # One deps-only build shared by every in-enclave crate.
+        cargoArtifactsMusl = craneLibMusl.buildDepsOnly (muslCommonArgs // {
+          pname = "enclavia-in-enclave-musl";
+        });
+
+        individualMuslCrateArgs = muslCommonArgs // {
+          cargoArtifacts = cargoArtifactsMusl;
+          inherit (craneLibMusl.crateNameFromCargoToml { src = rustSrc; }) version;
+          doCheck = false;
+        };
+
+        nbdClient = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "nbd-client";
             cargoExtraArgs = "-p nbd-client";
           }
         );
 
-        enclaviaEgress = craneLib.buildPackage (
-          individualCrateArgs
+        enclaviaEgress = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "enclavia-egress";
             cargoExtraArgs = "-p enclavia-egress";
@@ -88,32 +126,32 @@
           }
         );
 
-        enclaviaCrypto = craneLib.buildPackage (
-          individualCrateArgs
+        enclaviaCrypto = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "enclavia-crypto";
             cargoExtraArgs = "-p enclavia-crypto";
           }
         );
 
-        enclaviaServer = craneLib.buildPackage (
-          individualCrateArgs
+        enclaviaServer = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "enclavia-server";
             cargoExtraArgs = "-p enclavia-server";
           }
         );
 
-        enclaviaSecretsInit = craneLib.buildPackage (
-          individualCrateArgs
+        enclaviaSecretsInit = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "enclavia-secrets-init";
             cargoExtraArgs = "-p enclavia-secrets-init";
           }
         );
 
-        enclaviaChainInit = craneLib.buildPackage (
-          individualCrateArgs
+        enclaviaChainInit = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "enclavia-chain-init";
             cargoExtraArgs = "-p enclavia-chain-init";
@@ -138,8 +176,8 @@
         # cluster path (mesh + openraft). One identical binary runs on
         # all three nodes; identity is injected at runtime (see
         # synchronizer-names-init), never baked in, so PCRs stay equal.
-        synchronizer = craneLib.buildPackage (
-          individualCrateArgs
+        synchronizer = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "enclavia-synchronizer";
             cargoExtraArgs = "-p synchronizer --features qemu,raft";
@@ -149,8 +187,8 @@
         # In-enclave runtime identity fetcher (vsock 5011 -> host names
         # responder). Keeps MESH_SELF_NAME / MESH_PEERS out of the
         # measured image and cmdline so the three nodes share one PCR set.
-        synchronizerNamesInit = craneLib.buildPackage (
-          individualCrateArgs
+        synchronizerNamesInit = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
           // {
             pname = "synchronizer-names-init";
             cargoExtraArgs = "-p synchronizer-names-init";
