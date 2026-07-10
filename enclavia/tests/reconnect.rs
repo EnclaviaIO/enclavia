@@ -1,0 +1,266 @@
+//! Integration tests for the SDK's transparent reconnect on the
+//! request/response path.
+//!
+//! The enclave restarts on every deploy/upgrade, which kills the attested
+//! WebSocket channel. The SDK re-establishes it, RE-RUNNING the full Noise
+//! and attestation handshake against the originally-pinned expectations,
+//! before retrying the request. These tests exercise two invariants:
+//!
+//! 1. A plain transport drop is transparently recovered (the caller's next
+//!    request succeeds against a freshly re-attested channel).
+//! 2. If, after a restart, the enclave's attestation no longer matches the
+//!    pinned PCRs, the reconnect FAILS CLOSED with a distinct attestation
+//!    error rather than attaching to the wrong enclave.
+//!
+//! The harness stands up a small in-process Noise responder that mimics
+//! enclavia-server (attestation reply + a single `Data` response per
+//! request). Unlike `upgrade.rs` it accepts MULTIPLE TCP connections in
+//! sequence, so the SDK can be observed reconnecting.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use enclavia::{Client, Pcrs, ReconnectPolicy};
+use enclavia_protocol::attestation::test_utils::FakeAttestation;
+use enclavia_protocol::{perform_cbor_handshake_as_responder, ClientMessage, ServerMessage};
+use tokio::net::TcpListener;
+
+#[path = "ws_adapter.rs"]
+mod ws_adapter;
+use ws_adapter::wrap_ws;
+
+type Transport = enclavia_protocol::CborTransport<ws_adapter::WsByteStream>;
+
+/// A single accepted enclave connection: the Noise responder plus the
+/// handshake hash it derived (used to bind the synthetic attestation).
+struct Conn {
+    transport: Transport,
+    hash: Vec<u8>,
+}
+
+impl Conn {
+    async fn send(&mut self, msg: &ServerMessage) -> Result<(), Box<dyn std::error::Error>> {
+        self.transport.send(msg).await
+    }
+    async fn receive<T>(&mut self) -> Result<T, Box<dyn std::error::Error>>
+    where
+        T: for<'de> serde::Deserialize<'de>,
+    {
+        self.transport.receive().await
+    }
+}
+
+/// Accept one TCP connection, run the responder-side Noise handshake, and
+/// hand the caller a [`Conn`].
+async fn accept_one(listener: &TcpListener) -> Conn {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let stream = wrap_ws(ws);
+    let (transport, hash) = perform_cbor_handshake_as_responder(stream).await.unwrap();
+    Conn { transport, hash }
+}
+
+/// Do the attestation exchange: expect `RequestAttestation`, reply with a
+/// [`FakeAttestation`] seeded by `seed` and bound to the live handshake
+/// hash. A different `seed` yields different PCRs, which is how the
+/// "PCRs changed after restart" case is simulated.
+async fn do_attestation(conn: &mut Conn, seed: u8) {
+    match conn.receive::<ClientMessage>().await.unwrap() {
+        ClientMessage::RequestAttestation => {}
+        other => panic!("expected RequestAttestation, got {other:?}"),
+    }
+    let doc = FakeAttestation::with_seed(seed, conn.hash.clone()).encode();
+    conn.send(&ServerMessage::Attestation {
+        data: doc,
+        control_nonce: [0u8; 32],
+    })
+    .await
+    .unwrap();
+}
+
+/// Answer exactly one `Data` request, echoing back `body` in the response.
+async fn answer_one_request(conn: &mut Conn, body: &[u8]) {
+    let id = match conn.receive::<ClientMessage>().await.unwrap() {
+        ClientMessage::Data { id, .. } => id,
+        other => panic!("expected Data, got {other:?}"),
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut payload = resp.into_bytes();
+    payload.extend_from_slice(body);
+    conn.send(&ServerMessage::Data { id, payload }).await.unwrap();
+}
+
+/// The PCRs a [`FakeAttestation::with_seed(0x11, _)`] doc carries.
+fn pcrs_for_seed(seed: u8) -> Pcrs {
+    Pcrs {
+        pcr0: vec![seed; 48],
+        pcr1: vec![seed.wrapping_add(1); 48],
+        pcr2: vec![seed.wrapping_add(2); 48],
+    }
+}
+
+/// A dropped channel is transparently recovered: the second request
+/// succeeds against a freshly re-attested connection.
+#[tokio::test]
+async fn transport_drop_is_transparently_recovered() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}");
+    let accepted = Arc::new(AtomicUsize::new(0));
+
+    let server_accepted = accepted.clone();
+    tokio::spawn(async move {
+        // First connection: attest, answer one request, then DROP (simulate
+        // an enclave restart mid-session by closing the socket).
+        let mut c1 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c1, 0x11).await;
+        answer_one_request(&mut c1, b"first").await;
+        drop(c1); // close the WebSocket / TCP connection
+
+        // Second connection: the SDK reconnects here, re-attests (same
+        // seed = same PCRs, so verification passes), and the retried
+        // request is answered.
+        let mut c2 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c2, 0x11).await;
+        answer_one_request(&mut c2, b"second").await;
+        // Keep the task alive so the connection is not torn down early.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(pcrs_for_seed(0x11))
+        .build()
+        .await
+        .expect("initial connect");
+
+    let r1 = client.get("/one").send().await.expect("first request");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(r1.bytes(), b"first");
+
+    // The server dropped the channel after the first response. The next
+    // request must transparently reconnect (re-attest) and succeed.
+    let r2 = client.get("/two").send().await.expect("second request after reconnect");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(r2.bytes(), b"second");
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "SDK should have opened a second connection (reconnect)"
+    );
+}
+
+/// If the enclave's attestation no longer matches the pinned PCRs after a
+/// restart, the reconnect FAILS CLOSED with an attestation error and does
+/// NOT attach to the (differently-measured) enclave.
+#[tokio::test]
+async fn reconnect_fails_closed_on_pcr_mismatch() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}");
+
+    tokio::spawn(async move {
+        // First connection: attest with the PINNED seed, answer one
+        // request, then drop.
+        let mut c1 = accept_one(&listener).await;
+        do_attestation(&mut c1, 0x11).await;
+        answer_one_request(&mut c1, b"first").await;
+        drop(c1);
+
+        // Every subsequent reconnect attempt presents a DIFFERENT
+        // measurement (seed 0x22 => different PCRs), as if the enclave was
+        // upgraded to an unpinned image. The SDK must refuse each one.
+        loop {
+            let mut c = match tokio::time::timeout(Duration::from_secs(5), accept_one(&listener))
+                .await
+            {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            // The client's re-attestation runs verify_against with the
+            // pinned PCRs; seed 0x22 does not match, so verify fails and
+            // the client tears the connection down. We just need to serve
+            // the wrong doc; the request is never answered.
+            do_attestation(&mut c, 0x22).await;
+        }
+    });
+
+    // Keep the retry budget small and the backoff tiny so the test is fast.
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(pcrs_for_seed(0x11))
+        .reconnect(
+            ReconnectPolicy::default()
+                .max_retries(3)
+                .backoff(Duration::from_millis(10), Duration::from_millis(50)),
+        )
+        .build()
+        .await
+        .expect("initial connect");
+
+    let r1 = client.get("/one").send().await.expect("first request");
+    assert_eq!(r1.bytes(), b"first");
+
+    // The channel dropped; the reconnect re-attests against a mismatched
+    // measurement and must fail closed with a distinct attestation error,
+    // NOT silently connect.
+    let err = client
+        .get("/two")
+        .send()
+        .await
+        .expect_err("reconnect must fail closed on PCR mismatch");
+    match err {
+        enclavia::Error::Attestation(_) => {}
+        other => panic!("expected fail-closed Error::Attestation, got {other:?}"),
+    }
+}
+
+/// With reconnect disabled, a dropped channel surfaces as an error (the
+/// pre-reconnect behavior), never a silent retry.
+#[tokio::test]
+async fn reconnect_disabled_surfaces_the_drop() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}");
+
+    tokio::spawn(async move {
+        let mut c1 = accept_one(&listener).await;
+        do_attestation(&mut c1, 0x11).await;
+        answer_one_request(&mut c1, b"first").await;
+        drop(c1);
+        // No further connections are accepted; if the SDK tried to
+        // reconnect it would hang, but with reconnect disabled it must
+        // surface the drop immediately.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(pcrs_for_seed(0x11))
+        .reconnect(ReconnectPolicy::disabled())
+        .build()
+        .await
+        .expect("initial connect");
+
+    let r1 = client.get("/one").send().await.expect("first request");
+    assert_eq!(r1.bytes(), b"first");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get("/two").send(),
+    )
+    .await
+    .expect("must not hang when reconnect is disabled")
+    .expect_err("dropped channel must surface an error");
+    match err {
+        enclavia::Error::ConnectionClosed | enclavia::Error::WebSocket(_) => {}
+        other => panic!("expected a transport-drop error, got {other:?}"),
+    }
+}
