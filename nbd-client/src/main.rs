@@ -199,7 +199,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // 6. NBD_DO_IT blocks until the device is disconnected.
     let nbd_fd_copy = nbd_fd;
     let do_it_handle = tokio::task::spawn_blocking(move || unsafe {
-        let ret = libc::ioctl(nbd_fd_copy, nbd::NBD_DO_IT as libc::c_ulong);
+        // `as _`: glibc declares the ioctl request as c_ulong, musl as
+        // c_int; let the cast follow whichever libc we're built against.
+        let ret = libc::ioctl(nbd_fd_copy, nbd::NBD_DO_IT as _);
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             // ENOTCONN is normal on disconnect.
@@ -598,7 +600,8 @@ unsafe fn nbd_ioctl(
     request: libc::c_ulong,
     arg: libc::c_ulong,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ret = unsafe { libc::ioctl(fd, request, arg) };
+    // `as _`: glibc declares the ioctl request as c_ulong, musl as c_int.
+    let ret = unsafe { libc::ioctl(fd, request as _, arg) };
     if ret < 0 {
         Err(format!(
             "ioctl {request:#x} failed: {}",
