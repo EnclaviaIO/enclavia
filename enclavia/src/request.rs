@@ -63,8 +63,10 @@ impl RequestBuilder {
         let raw_request =
             http::serialize_request(self.method, &self.path, &self.headers, self.body.as_deref());
 
-        // send_request transparently reconnects (re-running the full
-        // attestation handshake) on a dropped channel; see its doc comment.
+        // send_request re-establishes and RE-VERIFIES the attested channel
+        // if it is down, but never silently re-sends an in-flight request:
+        // a mid-flight drop returns a retryable `Error` (see its doc comment
+        // and `Error::is_retryable`). The caller owns the retry decision.
         let raw_response = self.client.send_request(raw_request).await?;
 
         http::parse_response(&raw_response)

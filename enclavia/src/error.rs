@@ -51,6 +51,22 @@ pub enum Error {
     UpgradeFailed { status: u16, head: Vec<u8> },
 }
 
+impl Error {
+    /// True for a transient transport/connection drop that a retry can
+    /// recover from. When auto-reconnect is on, the next request will
+    /// transparently re-establish and RE-VERIFY the attested channel
+    /// before sending, so retrying a request that failed with a
+    /// retryable error is safe with respect to attestation (the caller
+    /// still owns the idempotency decision for the request itself, since
+    /// an in-flight request is never silently re-sent).
+    ///
+    /// Attestation / server-level / protocol errors are a genuine,
+    /// verified outcome and are NOT retryable.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::ConnectionClosed | Error::WebSocket(_))
+    }
+}
+
 impl From<ciborium::ser::Error<std::io::Error>> for Error {
     fn from(e: ciborium::ser::Error<std::io::Error>) -> Self {
         Error::Cbor(e.to_string())

@@ -54,41 +54,50 @@ Under the hood the SDK does:
 ### Reconnection
 
 The enclave restarts on every deploy/upgrade (and can drop at any time),
-which kills the attested channel. By default the SDK transparently
-reconnects on the request/response path: when a `.send()` finds the
-channel dropped, it re-opens the WebSocket, redoes the Noise handshake,
-and RE-VERIFIES the attestation against the SAME PCRs you originally
-pinned before retrying the request (bounded retries with exponential
-backoff). If the enclave's attestation no longer matches (for example it
-was upgraded to an image whose PCRs are not the pinned ones), the
-reconnect FAILS CLOSED with an attestation error rather than attaching to
-a different enclave: reconnection is held to exactly the same trust bar
-as the initial connect.
+which kills the attested channel. By default the SDK re-establishes it for
+you: when a `.send()` finds the channel down, it re-opens the WebSocket,
+redoes the Noise handshake, and RE-VERIFIES the attestation against the
+SAME PCRs you originally pinned before sending. If the enclave's
+attestation no longer matches (for example it was upgraded to an image
+whose PCRs are not the pinned ones), reconnection FAILS CLOSED with an
+attestation error rather than attaching to a different enclave: it is held
+to exactly the same trust bar as the initial connect.
 
-Tune or disable it via the builder:
+What the SDK does NOT do is silently re-send a request that was in flight
+when the channel dropped: it may already have reached the enclave, and
+re-sending it would double-execute a non-idempotent call. Such a request
+returns a retryable error (`Error::is_retryable()` is `true`), and you
+decide whether to retry it. The retry runs on the already re-established,
+re-verified channel, so you re-implement neither Noise nor attestation,
+only the "is this request safe to retry" decision:
 
 ```rust
-use enclavia::{Client, Pcrs, ReconnectPolicy};
-use std::time::Duration;
+use enclavia::{Client, Pcrs};
 
 # async fn run(pcrs: Pcrs) -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::builder("wss://<enclave-id>.enclaves.beta.enclavia.io")
     .pcrs(pcrs)
-    .reconnect(
-        ReconnectPolicy::default()
-            .max_retries(5)
-            .backoff(Duration::from_millis(100), Duration::from_secs(5)),
-    )
     .build()
     .await?;
+
+// Retry an idempotent GET across a reconnect. A POST you would only retry
+// if it is safe (or carries an idempotency key).
+let response = loop {
+    match client.get("/health").send().await {
+        Ok(r) => break r,
+        Err(e) if e.is_retryable() => continue, // channel re-established; try again
+        Err(e) => return Err(e.into()),         // attestation / server error: give up
+    }
+};
+# let _ = response;
 # Ok(())
 # }
 ```
 
-Pass `ReconnectPolicy::disabled()` to surface a dropped channel as an
-error and own recovery yourself. Streams opened with `open_stream` /
-`upgrade` are not auto-reconnected (a live byte pipe carries workload
-socket state that cannot be transparently rebuilt); re-open them on error.
+Pass `.auto_reconnect(false)` to the builder to turn this off and own
+recovery yourself. Streams opened with `open_stream` / `upgrade` are not
+auto-reconnected (a live byte pipe carries workload socket state that
+cannot be transparently rebuilt); re-open them on error.
 
 Use [`enclavia-protocol`](../enclavia-protocol/) directly if you need finer control or want to build a non-HTTP transport.
 
