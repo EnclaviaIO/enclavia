@@ -17,7 +17,7 @@ mod stream;
 mod transport;
 
 pub use enclavia_protocol::attestation::Pcrs;
-pub use client::{Client, ClientBuilder};
+pub use client::{Client, ClientBuilder, ReconnectPolicy};
 pub use error::Error;
 pub use http::Method;
 pub use request::RequestBuilder;

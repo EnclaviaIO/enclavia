@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::message::{ClientMessage, ServerMessage, StreamHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::connect_async;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::error::Error;
@@ -23,9 +24,30 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 /// client) and we bail rather than grow unboundedly.
 const MAX_UPGRADE_HEAD: usize = 64 * 1024;
 
-struct ClientInner {
-    cmd_tx: mpsc::Sender<OutboundCommand>,
+/// Everything needed to re-establish the attested channel from scratch.
+///
+/// Held behind an `Arc` so a reconnect re-runs the EXACT same connection
+/// sequence (WebSocket, Noise handshake, attestation request + verify
+/// against the originally-pinned expectations) as the first connect. The
+/// pinned PCRs, the debug-mode / cert-chain policy, and the
+/// `trust_upgrades` inputs all live here, so a reconnect can never relax
+/// what the first connect verified.
+struct ConnectConfig {
+    url: String,
     host: String,
+    pcrs: Pcrs,
+    debug_mode: bool,
+    extra_headers: Vec<(String, String)>,
+    trust_upgrades: Option<TrustUpgrades>,
+    reconnect: ReconnectPolicy,
+}
+
+struct ClientInner {
+    /// The current transport task's command sender. Swapped under the
+    /// lock when a reconnect stands up a fresh transport task, so all
+    /// `Client` clones pick up the new channel.
+    cmd_tx: Mutex<mpsc::Sender<OutboundCommand>>,
+    config: ConnectConfig,
 }
 
 /// An encrypted HTTP client that communicates through an enclavia proxy.
@@ -48,17 +70,33 @@ impl Client {
     /// 2. Noise NN handshake
     /// 3. Attestation request and verification
     ///
+    /// The returned client auto-reconnects on the request/response path by
+    /// default (re-verifying attestation against the same pinned PCRs); see
+    /// [`ClientBuilder::reconnect`] to tune or disable it.
+    ///
     /// # Example
     ///
     /// ```no_run
     /// # async fn example() -> Result<(), enclavia::Error> {
     /// let pcrs = enclavia::Pcrs {
-    ///     pcr0: vec![/* ... */],
+    ///     pcr0: vec![/* 48 bytes */],
     ///     pcr1: vec![/* ... */],
     ///     pcr2: vec![/* ... */],
     /// };
     /// let client = enclavia::Client::connect("wss://proxy.example.com", pcrs).await?;
-    /// let resp = client.get("/api/data").send().await?;
+    ///
+    /// // A request carries an arbitrary method, path, headers, and body.
+    /// let resp = client
+    ///     .post("/api/data")
+    ///     .header("Content-Type", "application/json")
+    ///     .body(br#"{"k":"v"}"#.to_vec())
+    ///     .send()
+    ///     .await?;
+    ///
+    /// // The response exposes status, headers, and body.
+    /// let _status: u16 = resp.status();
+    /// let _content_type: Option<&str> = resp.header("Content-Type");
+    /// let _body: &[u8] = resp.bytes();
     /// # Ok(())
     /// # }
     /// ```
@@ -158,8 +196,8 @@ impl Client {
                 None => {
                     if head_buf.len() >= MAX_UPGRADE_HEAD {
                         let _ = self
-                            .inner
-                            .cmd_tx
+                            .current_cmd_tx()
+                            .await
                             .try_send(OutboundCommand::StreamClose { id, half: StreamHalf::Both });
                         return Err(Error::HttpParse(format!(
                             "response head exceeded {MAX_UPGRADE_HEAD} bytes before \\r\\n\\r\\n"
@@ -182,8 +220,8 @@ impl Client {
             // here is incidental: its Drop fires a StreamClose{Both} too, but
             // we send one eagerly so the close races the head into the wire.
             let _ = self
-                .inner
-                .cmd_tx
+                .current_cmd_tx()
+                .await
                 .try_send(OutboundCommand::StreamClose { id, half: StreamHalf::Both });
             // Truncate the buffer to the head so callers only see what the
             // workload produced as its HTTP response, not any trailing body.
@@ -223,8 +261,8 @@ impl Client {
         let (id_tx, id_rx) = oneshot::channel();
         let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(32);
 
-        self.inner
-            .cmd_tx
+        let cmd_tx = self.current_cmd_tx().await;
+        cmd_tx
             .send(OutboundCommand::OpenStream {
                 payload,
                 id_tx,
@@ -235,31 +273,144 @@ impl Client {
 
         let id = id_rx.await.map_err(|_| Error::ConnectionClosed)??;
 
-        Ok(UpgradedStream::new(
-            id,
-            self.inner.cmd_tx.clone(),
-            stream_rx,
-            Vec::new(),
-        ))
+        Ok(UpgradedStream::new(id, cmd_tx, stream_rx, Vec::new()))
     }
 
     /// The host portion of the proxy URL (used for the HTTP Host header).
     pub(crate) fn host(&self) -> &str {
-        &self.inner.host
+        &self.inner.config.host
     }
 
-    /// Send a one-shot request to the background transport task.
+    /// Clone the current transport task's command sender.
+    ///
+    /// Taken behind the lock so a concurrent reconnect that swaps the
+    /// sender is observed atomically.
+    async fn current_cmd_tx(&self) -> mpsc::Sender<OutboundCommand> {
+        self.inner.cmd_tx.lock().await.clone()
+    }
+
+    /// Send a one-shot request to the current background transport task,
+    /// transparently reconnecting (re-running the full attestation
+    /// handshake) if the channel has dropped.
+    ///
+    /// This is the reconnect entry point for the request/response path.
+    /// A dropped channel (enclave restart / deploy / transient network
+    /// blip) is recovered here without the caller seeing it, EXCEPT when
+    /// reconnect is disabled or the re-attestation fails closed (a
+    /// distinct terminal error), in which case the underlying error is
+    /// surfaced.
+    ///
+    /// Streams ([`Client::open_stream`] / [`Client::upgrade`]) are NOT
+    /// auto-reconnected: a live bidirectional byte pipe carries workload
+    /// socket state that cannot be transparently rebuilt, so a dropped
+    /// stream still surfaces as an error and the caller re-opens it.
     pub(crate) async fn send_request(
         &self,
         payload: Vec<u8>,
-        response_tx: oneshot::Sender<Result<Vec<u8>, Error>>,
-    ) -> Result<(), Error> {
-        self.inner
-            .cmd_tx
-            .send(OutboundCommand::Request { payload, response_tx })
-            .await
-            .map_err(|_| Error::ConnectionClosed)
+    ) -> Result<Vec<u8>, Error> {
+        let policy = &self.inner.config.reconnect;
+        // attempt 0 is the initial try on the existing channel; attempts
+        // 1..=max_retries are post-reconnect retries.
+        let mut attempt: u32 = 0;
+        loop {
+            let cmd_tx = self.current_cmd_tx().await;
+            let (response_tx, response_rx) = oneshot::channel();
+            let send_res = cmd_tx
+                .send(OutboundCommand::Request {
+                    payload: payload.clone(),
+                    response_tx,
+                })
+                .await;
+
+            let result = match send_res {
+                Ok(()) => response_rx.await.unwrap_or(Err(Error::ConnectionClosed)),
+                // The transport task is gone (its receiver was dropped).
+                Err(_) => Err(Error::ConnectionClosed),
+            };
+
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => {
+                    // Only a transport drop is retryable. A ServerError,
+                    // HTTP-level failure, etc. is a real answer from a
+                    // verified enclave and must be surfaced as-is.
+                    if !policy.enabled || !is_transport_drop(&err) || attempt >= policy.max_retries {
+                        return Err(err);
+                    }
+                    attempt += 1;
+                    let backoff = policy.backoff_for(attempt);
+                    warn!(
+                        attempt,
+                        max_retries = policy.max_retries,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "channel dropped, reconnecting (re-verifying attestation)"
+                    );
+                    sleep(backoff).await;
+                    // Re-establish: re-open WS, redo Noise, re-request and
+                    // re-verify attestation against the ORIGINALLY-PINNED
+                    // expectations. Fails closed if attestation no longer
+                    // matches (surfaced as Error::Attestation /
+                    // Error::TrustUpgrades, which is NOT a transport drop,
+                    // so the loop above will terminate on the next pass).
+                    match self.reconnect().await {
+                        Ok(()) => continue,
+                        Err(reconnect_err) => {
+                            // A re-attestation failure (PCRs changed, chain
+                            // no longer descends, etc.) is terminal: return
+                            // it verbatim so the caller sees WHY, rather
+                            // than the generic transport drop.
+                            if !is_transport_drop(&reconnect_err)
+                                || attempt >= policy.max_retries
+                            {
+                                return Err(reconnect_err);
+                            }
+                            // Transport-level reconnect failure (WS could
+                            // not be re-opened yet): keep retrying under the
+                            // same budget.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    /// Re-establish the attested channel and swap in the fresh transport
+    /// task's command sender.
+    ///
+    /// Runs the identical connection sequence as the initial connect via
+    /// [`ConnectConfig::establish`], so the full attestation verification
+    /// (session-nonce binding, pinned-PCR equality, cert-chain / debug
+    /// policy, and the `trust_upgrades` descent check) runs again against
+    /// the SAME pinned expectations. If the enclave's attestation no
+    /// longer matches, `establish` returns a fail-closed
+    /// [`Error::Attestation`] / [`Error::TrustUpgrades`] and this never
+    /// swaps in a channel to an unverified enclave.
+    async fn reconnect(&self) -> Result<(), Error> {
+        let new_tx = self.inner.config.establish().await?;
+        *self.inner.cmd_tx.lock().await = new_tx;
+        info!("reconnected and re-verified attestation");
+        Ok(())
+    }
+}
+
+/// A transport drop is the only condition a reconnect can recover from.
+/// A server-level error, HTTP parse failure, or attestation failure is a
+/// genuine (verified) outcome and must never trigger a silent reconnect.
+fn is_transport_drop(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::ConnectionClosed | Error::WebSocket(_)
+    )
+}
+
+/// Sleep helper. Uses `tokio::time::sleep`; kept as a thin wrapper so the
+/// reconnect backoff reads clearly.
+async fn sleep(dur: Duration) {
+    if dur.is_zero() {
+        return;
+    }
+    tokio::time::sleep(dur).await;
 }
 
 /// Inputs the SDK needs to follow an enclave's upgrade chain when the
@@ -273,6 +424,88 @@ struct TrustUpgrades {
     enclave_id: Uuid,
 }
 
+/// How the client recovers a dropped request/response channel.
+///
+/// The enclave restarts on every deploy/upgrade (and can drop at any
+/// time), which kills the attested WebSocket channel. Rather than make
+/// every app reimplement lazy-connect + retry, the SDK transparently
+/// re-establishes the channel, RE-RUNNING THE FULL ATTESTATION
+/// HANDSHAKE against the originally-pinned expectations, before retrying
+/// the request. See [`ClientBuilder::reconnect`].
+///
+/// Reconnect is on by default. It applies only to the request/response
+/// path ([`RequestBuilder::send`]); streams are not auto-reconnected
+/// (see [`Client::send_request`]).
+#[derive(Clone, Debug)]
+pub struct ReconnectPolicy {
+    /// Whether transparent reconnect is enabled at all.
+    enabled: bool,
+    /// Maximum number of reconnect+retry attempts for a single request
+    /// after the first send fails. Zero means "surface the drop, never
+    /// retry" (equivalent to the pre-reconnect behavior).
+    max_retries: u32,
+    /// Base backoff before the first retry. Doubles each attempt
+    /// (capped at `max_backoff`).
+    base_backoff: Duration,
+    /// Upper bound on a single backoff interval.
+    max_backoff: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries: 5,
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// A disabled policy: a dropped channel surfaces as an error and the
+    /// request is never retried. Restores the pre-reconnect behavior for
+    /// callers that want to own recovery themselves.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// Enable/disable transparent reconnect.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Set the maximum number of reconnect+retry attempts per request.
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Set the base and maximum backoff. The delay before retry `n` is
+    /// `min(base * 2^(n-1), max)`.
+    pub fn backoff(mut self, base: Duration, max: Duration) -> Self {
+        self.base_backoff = base;
+        self.max_backoff = max;
+        self
+    }
+
+    /// Exponential backoff for the `attempt`-th retry (1-based).
+    fn backoff_for(&self, attempt: u32) -> Duration {
+        if attempt == 0 {
+            return Duration::ZERO;
+        }
+        let shift = attempt.saturating_sub(1).min(32);
+        let scaled = self
+            .base_backoff
+            .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX));
+        scaled.min(self.max_backoff)
+    }
+}
+
 /// Builder for configuring and establishing a [`Client`] connection.
 pub struct ClientBuilder {
     url: String,
@@ -280,6 +513,7 @@ pub struct ClientBuilder {
     debug_mode: bool,
     extra_headers: Vec<(String, String)>,
     trust_upgrades: Option<TrustUpgrades>,
+    reconnect: ReconnectPolicy,
 }
 
 impl ClientBuilder {
@@ -290,7 +524,31 @@ impl ClientBuilder {
             debug_mode: false,
             extra_headers: Vec::new(),
             trust_upgrades: None,
+            reconnect: ReconnectPolicy::default(),
         }
+    }
+
+    /// Configure transparent reconnect for the request/response path.
+    ///
+    /// Reconnect is ON by default (see [`ReconnectPolicy`]): when the
+    /// attested channel drops (enclave restart / deploy / transient
+    /// network error), the SDK re-opens the WebSocket, redoes the Noise
+    /// handshake, and RE-VERIFIES the enclave's attestation against the
+    /// SAME pinned expectations (PCRs, debug-mode / cert-chain policy,
+    /// and `trust_upgrades` inputs) that the initial connect verified,
+    /// before retrying the in-flight request. If the enclave's
+    /// attestation no longer matches (e.g. it was upgraded to an image
+    /// whose PCRs are not the pinned ones and `trust_upgrades` is off or
+    /// the new image does not descend from the pin), the reconnect FAILS
+    /// CLOSED with the underlying [`Error::Attestation`] /
+    /// [`Error::TrustUpgrades`]; it never attaches to an unverified
+    /// enclave.
+    ///
+    /// Pass [`ReconnectPolicy::disabled`] to restore the old behavior
+    /// (surface the drop, let the caller reconnect).
+    pub fn reconnect(mut self, policy: ReconnectPolicy) -> Self {
+        self.reconnect = policy;
+        self
     }
 
     /// Set the expected PCR values for attestation verification.
@@ -366,6 +624,12 @@ impl ClientBuilder {
 
     /// Build the client: connect, handshake, verify attestation, and start the
     /// background transport task.
+    ///
+    /// The verified connection parameters (pinned PCRs, debug-mode
+    /// policy, `trust_upgrades` inputs, reconnect policy) are retained on
+    /// the returned [`Client`] so a later transparent reconnect re-runs
+    /// this identical sequence, re-verifying attestation against the SAME
+    /// expectations. See [`ClientBuilder::reconnect`].
     pub async fn build(self) -> Result<Client, Error> {
         let pcrs = self.pcrs.unwrap_or(Pcrs {
             pcr0: Vec::new(),
@@ -380,13 +644,50 @@ impl ClientBuilder {
             .ok_or_else(|| Error::InvalidUrl("Missing host".into()))?
             .to_string();
 
+        let config = ConnectConfig {
+            url: self.url,
+            host,
+            pcrs,
+            debug_mode: self.debug_mode,
+            extra_headers: self.extra_headers,
+            trust_upgrades: self.trust_upgrades,
+            reconnect: self.reconnect,
+        };
+
+        // The initial connect and every later reconnect share one code
+        // path, so attestation is verified identically each time.
+        let cmd_tx = config.establish().await?;
+
+        Ok(Client {
+            inner: Arc::new(ClientInner {
+                cmd_tx: Mutex::new(cmd_tx),
+                config,
+            }),
+        })
+    }
+}
+
+impl ConnectConfig {
+    /// Open the WebSocket, run the Noise handshake, request the
+    /// attestation document, VERIFY it against the pinned expectations,
+    /// and spawn the background transport task. Returns the new task's
+    /// command sender.
+    ///
+    /// This is the single connection sequence shared by the initial
+    /// connect ([`ClientBuilder::build`]) and every reconnect
+    /// ([`Client::reconnect`]). Because both go through here, a reconnect
+    /// enforces the EXACT same attestation policy as the first connect:
+    /// it fails closed (returns [`Error::Attestation`] /
+    /// [`Error::TrustUpgrades`]) rather than attaching to an enclave
+    /// whose measurement no longer matches.
+    async fn establish(&self) -> Result<mpsc::Sender<OutboundCommand>, Error> {
         info!(url = %self.url, "Connecting to enclavia proxy");
 
         // rustls 0.23 requires a CryptoProvider to be installed in the
         // process before the first TLS handshake; otherwise tokio-tungstenite
-        // panics. install_default() is process-global and idempotent — the
+        // panics. install_default() is process-global and idempotent: the
         // Err case ("already installed") is benign and ignored, so it's
-        // safe to call on every build().
+        // safe to call on every connect.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // 1. WebSocket connect. Build the upgrade request explicitly so we
@@ -428,10 +729,14 @@ impl ClientBuilder {
             _ => return Err(Error::UnexpectedMessage),
         };
 
+        // The attestation verification below is the load-bearing security
+        // step, and it is identical on the first connect and on every
+        // reconnect: same pinned PCRs, same debug/cert-chain policy, same
+        // handshake-hash binding, same trust_upgrades descent check.
         match attestation::verify_against(
             &attestation_data,
             &handshake_hash,
-            &pcrs,
+            &self.pcrs,
             self.debug_mode,
         ) {
             Ok(()) => info!("Attestation verified (pinned PCRs match)"),
@@ -440,7 +745,10 @@ impl ClientBuilder {
                 // following upgrades: try to verify the running enclave
                 // as a descendant of the pinned version.
                 Some(tu) => {
-                    if pcrs.pcr0.is_empty() && pcrs.pcr1.is_empty() && pcrs.pcr2.is_empty() {
+                    if self.pcrs.pcr0.is_empty()
+                        && self.pcrs.pcr1.is_empty()
+                        && self.pcrs.pcr2.is_empty()
+                    {
                         return Err(Error::TrustUpgrades(
                             "trust_upgrades requires pinned PCRs (call .pcrs(..))".into(),
                         ));
@@ -448,13 +756,14 @@ impl ClientBuilder {
                     verify_via_upgrade_chain(
                         &attestation_data,
                         &handshake_hash,
-                        &pcrs,
+                        &self.pcrs,
                         self.debug_mode,
                         tu,
                     )
                     .await?;
                     info!("Attestation verified (descends from pinned PCRs via upgrade chain)");
                 }
+                // Fail closed: no matching pin, no upgrade path opted in.
                 None => return Err(Error::Attestation(pinned_err.to_string())),
             },
         }
@@ -463,9 +772,7 @@ impl ClientBuilder {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         tokio::spawn(transport::run_transport(ws, transport, cmd_rx));
 
-        Ok(Client {
-            inner: Arc::new(ClientInner { cmd_tx, host }),
-        })
+        Ok(cmd_tx)
     }
 }
 
