@@ -4,13 +4,17 @@
 //! The enclave restarts on every deploy/upgrade, which kills the attested
 //! WebSocket channel. The SDK re-establishes it, RE-RUNNING the full Noise
 //! and attestation handshake against the originally-pinned expectations,
-//! before retrying the request. These tests exercise two invariants:
+//! before the next request. These tests exercise the invariants:
 //!
-//! 1. A plain transport drop is transparently recovered (the caller's next
-//!    request succeeds against a freshly re-attested channel).
-//! 2. If, after a restart, the enclave's attestation no longer matches the
+//! 1. A channel dropped BETWEEN requests is transparently re-established:
+//!    the caller's next request reconnects, re-attests, and succeeds.
+//! 2. A request whose channel drops WHILE IT IS IN FLIGHT is not silently
+//!    re-sent (it may already have executed); it surfaces as a retryable
+//!    error, and the caller's explicit retry succeeds on the fresh channel.
+//! 3. If, after a restart, the enclave's attestation no longer matches the
 //!    pinned PCRs, the reconnect FAILS CLOSED with a distinct attestation
 //!    error rather than attaching to the wrong enclave.
+//! 4. With auto-reconnect disabled, a dropped channel just surfaces.
 //!
 //! The harness stands up a small in-process Noise responder that mimics
 //! enclavia-server (attestation reply + a single `Data` response per
@@ -21,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use enclavia::{Client, Pcrs, ReconnectPolicy};
+use enclavia::{Client, Pcrs};
 use enclavia_protocol::attestation::test_utils::FakeAttestation;
 use enclavia_protocol::{perform_cbor_handshake_as_responder, ClientMessage, ServerMessage};
 use tokio::net::TcpListener;
@@ -79,6 +83,15 @@ async fn do_attestation(conn: &mut Conn, seed: u8) {
     .unwrap();
 }
 
+/// Receive exactly one `Data` request WITHOUT answering it, to simulate
+/// the enclave dropping while a request is in flight.
+async fn receive_one_request(conn: &mut Conn) {
+    match conn.receive::<ClientMessage>().await.unwrap() {
+        ClientMessage::Data { .. } => {}
+        other => panic!("expected Data, got {other:?}"),
+    }
+}
+
 /// Answer exactly one `Data` request, echoing back `body` in the response.
 async fn answer_one_request(conn: &mut Conn, body: &[u8]) {
     let id = match conn.receive::<ClientMessage>().await.unwrap() {
@@ -103,10 +116,10 @@ fn pcrs_for_seed(seed: u8) -> Pcrs {
     }
 }
 
-/// A dropped channel is transparently recovered: the second request
-/// succeeds against a freshly re-attested connection.
+/// A channel dropped BETWEEN requests is transparently re-established: the
+/// second request reconnects, re-attests (same PCRs), and succeeds.
 #[tokio::test]
-async fn transport_drop_is_transparently_recovered() {
+async fn channel_dropped_between_requests_reconnects() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("ws://127.0.0.1:{port}");
@@ -157,6 +170,70 @@ async fn transport_drop_is_transparently_recovered() {
     );
 }
 
+/// A request whose channel drops WHILE IT IS IN FLIGHT is not silently
+/// re-sent (it may already have executed). It surfaces as a retryable
+/// error; the caller's explicit retry then succeeds on a freshly
+/// re-established, re-attested channel.
+#[tokio::test]
+async fn inflight_drop_surfaces_retryable_then_retry_succeeds() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}");
+    let accepted = Arc::new(AtomicUsize::new(0));
+
+    let server_accepted = accepted.clone();
+    tokio::spawn(async move {
+        // First connection: attest, RECEIVE the request, then drop WITHOUT
+        // answering (the enclave died mid-request).
+        let mut c1 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c1, 0x11).await;
+        receive_one_request(&mut c1).await;
+        drop(c1);
+
+        // Second connection: only the caller's explicit retry reaches here.
+        // Re-attest (same PCRs) and answer. The SDK sends a request on this
+        // connection ONLY because the caller called send() again; it never
+        // re-sent the in-flight one itself (reconnect does attestation, not
+        // request replay).
+        let mut c2 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c2, 0x11).await;
+        answer_one_request(&mut c2, b"second").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(pcrs_for_seed(0x11))
+        .build()
+        .await
+        .expect("initial connect");
+
+    // In-flight drop: a retryable error, not a hang and not a silent resend.
+    let err = client
+        .get("/one")
+        .send()
+        .await
+        .expect_err("in-flight drop should surface an error, not resend");
+    assert!(err.is_retryable(), "expected a retryable drop, got {err:?}");
+
+    // The caller retries; the SDK reconnects + re-attests under the hood and
+    // this fresh request succeeds.
+    let r2 = client
+        .get("/two")
+        .send()
+        .await
+        .expect("retry after reconnect");
+    assert_eq!(r2.bytes(), b"second");
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "SDK should have reconnected exactly once"
+    );
+}
+
 /// If the enclave's attestation no longer matches the pinned PCRs after a
 /// restart, the reconnect FAILS CLOSED with an attestation error and does
 /// NOT attach to the (differently-measured) enclave.
@@ -192,15 +269,9 @@ async fn reconnect_fails_closed_on_pcr_mismatch() {
         }
     });
 
-    // Keep the retry budget small and the backoff tiny so the test is fast.
     let client = Client::builder(&url)
         .debug_mode(true)
         .pcrs(pcrs_for_seed(0x11))
-        .reconnect(
-            ReconnectPolicy::default()
-                .max_retries(3)
-                .backoff(Duration::from_millis(10), Duration::from_millis(50)),
-        )
         .build()
         .await
         .expect("initial connect");
@@ -208,9 +279,9 @@ async fn reconnect_fails_closed_on_pcr_mismatch() {
     let r1 = client.get("/one").send().await.expect("first request");
     assert_eq!(r1.bytes(), b"first");
 
-    // The channel dropped; the reconnect re-attests against a mismatched
-    // measurement and must fail closed with a distinct attestation error,
-    // NOT silently connect.
+    // The channel dropped; the next request reconnects, re-attests against a
+    // mismatched measurement, and must fail closed with a distinct
+    // attestation error rather than silently connecting.
     let err = client
         .get("/two")
         .send()
@@ -244,7 +315,7 @@ async fn reconnect_disabled_surfaces_the_drop() {
     let client = Client::builder(&url)
         .debug_mode(true)
         .pcrs(pcrs_for_seed(0x11))
-        .reconnect(ReconnectPolicy::disabled())
+        .auto_reconnect(false)
         .build()
         .await
         .expect("initial connect");
