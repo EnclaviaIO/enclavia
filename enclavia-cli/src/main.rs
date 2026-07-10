@@ -335,9 +335,10 @@ struct CreateFlags {
     visibility: Option<String>,
     /// Allow outbound traffic to `HOST:PORT[/PROTO]`. Repeatable.
     /// HOST is an IPv4 literal, an IPv4 CIDR (e.g. `10.0.0.0/8`),
-    /// or a hostname. PROTO defaults to `tcp`. Without any of the
-    /// egress flags the enclave denies all outbound traffic.
-    /// Mutually exclusive with `--egress-config`.
+    /// or a hostname. PORT is a number or `*` to allow every port to
+    /// that host (e.g. `1.2.3.4:*`). PROTO defaults to `tcp`. Without
+    /// any of the egress flags the enclave denies all outbound
+    /// traffic. Mutually exclusive with `--egress-config`.
     #[arg(long = "egress-allow", value_name = "HOST:PORT[/PROTO]")]
     egress_allow: Vec<String>,
     /// DNS resolver IPv4 address used by the in-enclave validating

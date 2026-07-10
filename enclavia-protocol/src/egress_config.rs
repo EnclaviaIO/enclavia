@@ -39,12 +39,84 @@ pub enum Protocol {
     Udp,
 }
 
+/// Port half of an allowlist entry as it appears in the JSON file:
+/// either a bare number (`443`) or the wildcard string `"*"` (any
+/// port). Kept as a distinct raw type so serde deserialises both
+/// JSON shapes; the number-vs-`"*"` validation happens in
+/// [`RawPort::to_matcher`] alongside the rest of `from_raw`.
+///
+/// A numeric port serialises back to a JSON number and `"*"` back to
+/// the string, so canonical JSON for pre-existing (all-numeric)
+/// configs is byte-identical.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RawPort {
+    Num(u16),
+    Str(String),
+}
+
+impl std::fmt::Display for RawPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RawPort::Num(n) => write!(f, "{n}"),
+            RawPort::Str(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl RawPort {
+    /// The wildcard token accepted in the `port` field.
+    pub const WILDCARD: &'static str = "*";
+
+    /// Validate and canonicalise into a [`PortMatcher`]. A number must
+    /// be `1..=65535`; the only accepted string is `"*"`.
+    fn to_matcher(&self) -> Result<PortMatcher, AllowlistLoadError> {
+        match self {
+            RawPort::Num(0) => Err(AllowlistLoadError::BadPort("0".to_string())),
+            RawPort::Num(n) => Ok(PortMatcher::Single(*n)),
+            RawPort::Str(s) if s == RawPort::WILDCARD => Ok(PortMatcher::Any),
+            RawPort::Str(s) => Err(AllowlistLoadError::BadPort(s.clone())),
+        }
+    }
+}
+
+/// Port-side matcher for a typed allowlist entry: a single port or the
+/// wildcard that matches every destination port (`HOST:*`), which lets
+/// a user allow all traffic to a given IP/CIDR/hostname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortMatcher {
+    /// Match any destination port.
+    Any,
+    /// Match exactly this port.
+    Single(u16),
+}
+
+impl PortMatcher {
+    pub fn matches(&self, port: u16) -> bool {
+        match self {
+            PortMatcher::Any => true,
+            PortMatcher::Single(p) => *p == port,
+        }
+    }
+}
+
+impl std::fmt::Display for PortMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortMatcher::Any => write!(f, "*"),
+            PortMatcher::Single(p) => write!(f, "{p}"),
+        }
+    }
+}
+
 /// Raw entry as it appears in the JSON file. Host is `String` so we
-/// can defer the IPv4 / IPv6 / hostname classification to load time.
+/// can defer the IPv4 / IPv6 / hostname classification to load time;
+/// `port` is a [`RawPort`] so `"*"` (any port) is accepted alongside
+/// a bare number.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawEgressEntry {
     pub host: String,
-    pub port: u16,
+    pub port: RawPort,
     pub protocol: Protocol,
 }
 
@@ -150,7 +222,7 @@ impl HostMatcher {
 #[derive(Clone, Debug)]
 pub struct AllowlistEntry {
     pub host: HostMatcher,
-    pub port: u16,
+    pub port: PortMatcher,
     pub protocol: Protocol,
     /// When true, the entry only matches connections originating from
     /// the daemon's trusted source address (the init-netns side, i.e.
@@ -169,7 +241,7 @@ pub struct HostnameEntry {
     /// Lowercased ASCII hostname. We do not preserve trailing dots; the
     /// resolver code re-adds them as part of building a `Name`.
     pub host: String,
-    pub port: u16,
+    pub port: PortMatcher,
     pub protocol: Protocol,
 }
 
@@ -207,7 +279,9 @@ pub enum AllowlistLoadError {
     #[error("unsupported allowlist schema version {0} (expected 1)")]
     UnsupportedVersion(u32),
     #[error("UDP egress is not supported yet (entry `{host}:{port}/udp`); see https://github.com/EnclaviaIO/enclavia/issues/1")]
-    UdpNotSupported { host: String, port: u16 },
+    UdpNotSupported { host: String, port: String },
+    #[error("invalid port `{0}` (expected 1..=65535 or \"*\" for any port)")]
+    BadPort(String),
     #[error("`dns: open` requires at least one IPv4 entry in `resolvers` (the in-enclave resolver has no upstream to forward to)")]
     DnsOpenWithoutResolvers,
 }
@@ -276,14 +350,17 @@ impl AllowlistConfig {
             if matches!(raw_entry.protocol, Protocol::Udp) {
                 return Err(AllowlistLoadError::UdpNotSupported {
                     host: raw_entry.host.trim().to_string(),
-                    port: raw_entry.port,
+                    port: raw_entry.port.to_string(),
                 });
             }
+            // Validate `port` (number in 1..=65535 or "*") before host
+            // classification so a bad port errors regardless of host shape.
+            let port = raw_entry.port.to_matcher()?;
             let host = raw_entry.host.trim().to_string();
             if let Ok(net) = host.parse::<Ipv4Net>() {
                 entries.push(AllowlistEntry {
                     host: HostMatcher::Cidr(net),
-                    port: raw_entry.port,
+                    port,
                     protocol: raw_entry.protocol,
                     trusted_source_only: false,
                 });
@@ -292,14 +369,14 @@ impl AllowlistConfig {
             match host.parse::<IpAddr>() {
                 Ok(IpAddr::V4(v4)) => entries.push(AllowlistEntry {
                     host: HostMatcher::Literal(v4),
-                    port: raw_entry.port,
+                    port,
                     protocol: raw_entry.protocol,
                     trusted_source_only: false,
                 }),
                 Ok(IpAddr::V6(v6)) => {
                     warn!(
                         host = %v6,
-                        port = raw_entry.port,
+                        port = %port,
                         protocol = ?raw_entry.protocol,
                         "Ignoring IPv6 allowlist entry: IPv6 egress is always denied",
                     );
@@ -307,7 +384,7 @@ impl AllowlistConfig {
                 Err(_) => {
                     hostnames.push(HostnameEntry {
                         host: host.to_ascii_lowercase(),
-                        port: raw_entry.port,
+                        port,
                         protocol: raw_entry.protocol,
                     });
                 }
@@ -359,7 +436,7 @@ impl AllowlistConfig {
     pub fn allows_tcp(&self, ip: Ipv4Addr, port: u16, trusted_src: bool) -> bool {
         self.entries.iter().any(|e| {
             matches!(e.protocol, Protocol::Tcp)
-                && e.port == port
+                && e.port.matches(port)
                 && e.host.contains(ip)
                 && (!e.trusted_source_only || trusted_src)
         })
@@ -371,7 +448,7 @@ impl AllowlistConfig {
     pub fn tcp_hostnames_for_port(&self, port: u16) -> impl Iterator<Item = &HostnameEntry> {
         self.hostnames
             .iter()
-            .filter(move |h| matches!(h.protocol, Protocol::Tcp) && h.port == port)
+            .filter(move |h| matches!(h.protocol, Protocol::Tcp) && h.port.matches(port))
     }
 
     /// Append a fresh IP literal entry. Used at boot to auto-inject the
@@ -424,6 +501,7 @@ pub enum AllowlistFlagError {
 ///   - `1.2.3.4:443`
 ///   - `10.0.0.0/8:443`
 ///   - `api.example.com:443`
+///   - `1.2.3.4:*` (any-port wildcard: allow all ports to the host)
 ///   - any of the above with an explicit `/tcp` or `/udp` suffix
 ///
 /// Defaults to `tcp` when the protocol suffix is omitted (tcp is the
@@ -468,13 +546,20 @@ pub fn parse_cli_entry(spec: &str) -> Result<RawEgressEntry, AllowlistFlagError>
         return Err(AllowlistFlagError::EmptyHost(spec.to_string()));
     }
 
-    let port: u16 = port_str
-        .trim()
-        .parse()
-        .map_err(|e| AllowlistFlagError::InvalidPort(spec.to_string(), e))?;
-    if port == 0 {
-        return Err(AllowlistFlagError::PortZero(spec.to_string()));
-    }
+    // `*` is the any-port wildcard (`HOST:*`); otherwise a 1..=65535
+    // number. Both round-trip through `from_raw`'s validation.
+    let port = if port_str.trim() == RawPort::WILDCARD {
+        RawPort::Str(RawPort::WILDCARD.to_string())
+    } else {
+        let n: u16 = port_str
+            .trim()
+            .parse()
+            .map_err(|e| AllowlistFlagError::InvalidPort(spec.to_string(), e))?;
+        if n == 0 {
+            return Err(AllowlistFlagError::PortZero(spec.to_string()));
+        }
+        RawPort::Num(n)
+    };
 
     // Up-front rejection of obviously-bad hosts. The `from_raw` pipeline
     // would otherwise silently demote them to hostname entries that
@@ -626,7 +711,7 @@ mod tests {
         assert!(cfg.entries.is_empty());
         assert_eq!(cfg.hostnames.len(), 1);
         assert_eq!(cfg.hostnames[0].host, "api.openai.com");
-        assert_eq!(cfg.hostnames[0].port, 443);
+        assert_eq!(cfg.hostnames[0].port, PortMatcher::Single(443));
         assert!(matches!(cfg.hostnames[0].protocol, Protocol::Tcp));
     }
 
@@ -681,7 +766,7 @@ mod tests {
         let err = AllowlistConfig::from_bytes(raw).expect_err("must reject UDP");
         assert!(matches!(
             err,
-            AllowlistLoadError::UdpNotSupported { ref host, port: 53 } if host == "1.1.1.1"
+            AllowlistLoadError::UdpNotSupported { ref host, ref port } if host == "1.1.1.1" && port == "53"
         ));
     }
 
@@ -754,7 +839,7 @@ mod tests {
     fn cli_entry_parses_literal_default_tcp() {
         let e = parse_cli_entry("1.2.3.4:443").unwrap();
         assert_eq!(e.host, "1.2.3.4");
-        assert_eq!(e.port, 443);
+        assert_eq!(e.port, RawPort::Num(443));
         assert_eq!(e.protocol, Protocol::Tcp);
     }
 
@@ -774,7 +859,7 @@ mod tests {
     fn cli_entry_parses_cidr() {
         let e = parse_cli_entry("10.0.0.0/8:443").unwrap();
         assert_eq!(e.host, "10.0.0.0/8");
-        assert_eq!(e.port, 443);
+        assert_eq!(e.port, RawPort::Num(443));
     }
 
     #[test]
@@ -788,7 +873,7 @@ mod tests {
     fn cli_entry_parses_hostname() {
         let e = parse_cli_entry("api.example.com:443").unwrap();
         assert_eq!(e.host, "api.example.com");
-        assert_eq!(e.port, 443);
+        assert_eq!(e.port, RawPort::Num(443));
     }
 
     #[test]
@@ -983,5 +1068,113 @@ mod tests {
         .unwrap();
         let raw = validate_json(&v).unwrap();
         assert_eq!(raw.dns, DnsMode::Open);
+    }
+
+    // --- Port wildcard (`HOST:*`) ---
+
+    #[test]
+    fn port_wildcard_literal_matches_every_port() {
+        let raw = br#"{
+            "version": 1,
+            "egress": [ {"host": "1.2.3.4", "port": "*", "protocol": "tcp"} ]
+        }"#;
+        let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
+        assert_eq!(cfg.entries[0].port, PortMatcher::Any);
+        // Any port on the allowed IP passes; a different IP still fails.
+        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 443, false));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 1, false));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 65535, false));
+        assert!(!cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 5), 443, false));
+    }
+
+    #[test]
+    fn port_wildcard_cidr_matches_every_port() {
+        let raw = br#"{
+            "version": 1,
+            "egress": [ {"host": "10.0.0.0/8", "port": "*", "protocol": "tcp"} ]
+        }"#;
+        let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
+        assert!(cfg.allows_tcp(Ipv4Addr::new(10, 1, 2, 3), 22, false));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(10, 9, 9, 9), 8080, false));
+        assert!(!cfg.allows_tcp(Ipv4Addr::new(11, 0, 0, 1), 22, false));
+    }
+
+    #[test]
+    fn port_wildcard_hostname_matches_every_port() {
+        let raw = br#"{
+            "version": 1,
+            "egress": [ {"host": "api.example.com", "port": "*", "protocol": "tcp"} ]
+        }"#;
+        let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
+        assert_eq!(cfg.hostnames[0].port, PortMatcher::Any);
+        // The hostname entry is returned for any queried port.
+        assert_eq!(cfg.tcp_hostnames_for_port(443).count(), 1);
+        assert_eq!(cfg.tcp_hostnames_for_port(9000).count(), 1);
+    }
+
+    #[test]
+    fn numeric_port_still_specific() {
+        let raw = br#"{
+            "version": 1,
+            "egress": [ {"host": "1.2.3.4", "port": 443, "protocol": "tcp"} ]
+        }"#;
+        let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
+        assert_eq!(cfg.entries[0].port, PortMatcher::Single(443));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 443, false));
+        assert!(!cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 444, false));
+    }
+
+    #[test]
+    fn port_zero_rejected() {
+        let raw = br#"{ "version": 1, "egress": [ {"host": "1.2.3.4", "port": 0, "protocol": "tcp"} ] }"#;
+        let err = AllowlistConfig::from_bytes(raw).expect_err("must reject");
+        assert!(matches!(err, AllowlistLoadError::BadPort(ref p) if p == "0"));
+    }
+
+    #[test]
+    fn non_wildcard_port_string_rejected() {
+        // A numeric string (not a bare number) and any non-`*` string
+        // are rejected; the port must be a JSON number or exactly "*".
+        for bad in [r#""443""#, r#""all""#, r#""8080-9090""#] {
+            let raw = format!(
+                r#"{{ "version": 1, "egress": [ {{"host": "1.2.3.4", "port": {bad}, "protocol": "tcp"}} ] }}"#
+            );
+            let err = AllowlistConfig::from_bytes(raw.as_bytes()).expect_err("must reject");
+            assert!(matches!(err, AllowlistLoadError::BadPort(_)), "port {bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn port_wildcard_canonical_json_round_trips() {
+        // `*` serialises back to the string; a numeric port to a number.
+        let raw = assemble_from_cli(&["1.2.3.4:*", "5.6.7.8:443"], &[], None).unwrap();
+        let v = serde_json::to_value(&raw).unwrap();
+        assert_eq!(v["egress"][0]["port"], "*");
+        assert_eq!(v["egress"][1]["port"], 443);
+        // And it parses back to the same matchers.
+        let cfg = AllowlistConfig::from_raw(raw).unwrap();
+        assert_eq!(cfg.entries[0].port, PortMatcher::Any);
+        assert_eq!(cfg.entries[1].port, PortMatcher::Single(443));
+    }
+
+    #[test]
+    fn cli_entry_parses_wildcard_port() {
+        let e = parse_cli_entry("1.2.3.4:*").unwrap();
+        assert_eq!(e.host, "1.2.3.4");
+        assert_eq!(e.port, RawPort::Str("*".to_string()));
+        // With an explicit proto too.
+        let e = parse_cli_entry("10.0.0.0/8:*/tcp").unwrap();
+        assert_eq!(e.host, "10.0.0.0/8");
+        assert_eq!(e.port, RawPort::Str("*".to_string()));
+    }
+
+    #[test]
+    fn validate_json_accepts_wildcard_port() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"version": 1, "egress": [{"host":"1.2.3.4","port":"*","protocol":"tcp"}]}"#,
+        )
+        .unwrap();
+        let raw = validate_json(&v).expect("valid");
+        assert_eq!(raw.egress[0].port, RawPort::Str("*".to_string()));
     }
 }
