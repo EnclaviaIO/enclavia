@@ -345,6 +345,15 @@ struct CreateFlags {
     /// Mutually exclusive with `--egress-config`.
     #[arg(long = "egress-resolver", value_name = "IPV4")]
     egress_resolver: Vec<String>,
+    /// DNS resolution mode for the in-enclave resolver: `allowlist`
+    /// (default) only resolves hostnames listed via `--egress-allow`;
+    /// `open` resolves any name (requires at least one
+    /// `--egress-resolver`). Connect-time enforcement is identical in
+    /// both modes; `open` only widens name resolution. Mutually
+    /// exclusive with `--egress-config` (put a `"dns"` key in the
+    /// JSON document instead).
+    #[arg(long = "egress-dns", value_name = "allowlist|open")]
+    egress_dns: Option<String>,
     /// Path to a pre-written egress allowlist JSON document.
     /// Mutually exclusive with `--egress-allow` /
     /// `--egress-resolver`.
@@ -634,6 +643,7 @@ async fn create_from_flags(
     let egress_inputs = enclave_cmds::EgressInputs {
         allows: flags.egress_allow,
         resolvers: flags.egress_resolver,
+        dns: flags.egress_dns,
         config_path: flags.egress_config,
     };
     let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress_inputs)?;

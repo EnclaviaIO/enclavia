@@ -48,6 +48,50 @@ pub struct RawEgressEntry {
     pub protocol: Protocol,
 }
 
+/// How the in-enclave resolver (`unbound`) answers workload queries.
+///
+/// This knob only widens or narrows name *resolution*. Connect-time
+/// enforcement (IP/CIDR entries plus hostname entries checked against
+/// A records) is identical in both modes; a name the workload can
+/// resolve is not a name it can connect to. The trade is the DNS
+/// exfiltration surface: under `allowlist`, a workload cannot even ask
+/// the resolver about names outside the allowlist, while under `open`
+/// arbitrary queries reach the configured upstream resolvers.
+///
+/// Consumed by the builder's init script when it renders unbound.conf
+/// (`local-zone: "." refuse` vs resolve-anything); the egress daemon
+/// itself does not branch on it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsMode {
+    /// Default: refuse every name that is not an explicit
+    /// hostname-shaped allowlist entry.
+    #[default]
+    Allowlist,
+    /// Resolve any name the workload asks for.
+    Open,
+}
+
+impl DnsMode {
+    /// serde `skip_serializing_if` helper so canonical JSON emitted for
+    /// pre-existing configs stays byte-identical (no `dns` key).
+    pub fn is_default(&self) -> bool {
+        matches!(self, DnsMode::Allowlist)
+    }
+}
+
+impl std::str::FromStr for DnsMode {
+    type Err = AllowlistFlagError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "allowlist" => Ok(DnsMode::Allowlist),
+            "open" => Ok(DnsMode::Open),
+            _ => Err(AllowlistFlagError::InvalidDnsMode(s.to_string())),
+        }
+    }
+}
+
 /// Schema version currently supported. Bump in lockstep with
 /// `from_raw` when the on-disk shape changes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -64,6 +108,10 @@ pub struct RawAllowlist {
     /// The allow list itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<RawEgressEntry>,
+    /// DNS resolution mode for the in-enclave resolver. Absent means
+    /// [`DnsMode::Allowlist`], which is the pre-existing behaviour.
+    #[serde(default, skip_serializing_if = "DnsMode::is_default")]
+    pub dns: DnsMode,
 }
 
 impl RawAllowlist {
@@ -75,6 +123,7 @@ impl RawAllowlist {
             version: SCHEMA_VERSION,
             resolvers: Vec::new(),
             egress: Vec::new(),
+            dns: DnsMode::default(),
         }
     }
 }
@@ -133,6 +182,11 @@ pub struct AllowlistConfig {
     /// in-enclave `unbound` at connect time and checking the
     /// destination IP against the returned A records.
     pub hostnames: Vec<HostnameEntry>,
+    /// Resolution mode carried through from the raw document. The
+    /// daemon's connect-time policy does not branch on this; it is
+    /// here so consumers of the typed config see the same document
+    /// the builder's init script renders unbound.conf from.
+    pub dns: DnsMode,
 }
 
 /// Errors surfaced while loading the allowlist from disk.
@@ -146,6 +200,8 @@ pub enum AllowlistLoadError {
     UnsupportedVersion(u32),
     #[error("UDP egress is not supported yet (entry `{host}:{port}/udp`); see https://github.com/EnclaviaIO/enclavia/issues/1")]
     UdpNotSupported { host: String, port: u16 },
+    #[error("`dns: open` requires at least one IPv4 entry in `resolvers` (the in-enclave resolver has no upstream to forward to)")]
+    DnsOpenWithoutResolvers,
 }
 
 impl AllowlistConfig {
@@ -261,10 +317,22 @@ impl AllowlistConfig {
             }
         }
 
+        // `dns: open` with no usable resolver is always a
+        // misconfiguration: unbound would accept any query and then
+        // SERVFAIL every one of them. Reject it here so the CLI and
+        // the backend surface the error at submit time instead of the
+        // enclave shipping a resolver that can never answer. The
+        // equivalent hostname-entries-without-resolvers case stays a
+        // boot-time warning for backward compatibility.
+        if raw.dns == DnsMode::Open && resolvers.is_empty() {
+            return Err(AllowlistLoadError::DnsOpenWithoutResolvers);
+        }
+
         Ok(Self {
             entries,
             resolvers,
             hostnames,
+            dns: raw.dns,
         })
     }
 
@@ -322,6 +390,8 @@ pub enum AllowlistFlagError {
     InvalidHostname { spec: String, host: String, reason: &'static str },
     #[error("resolver spec `{0}` must be an IPv4 address")]
     InvalidResolver(String),
+    #[error("dns mode `{0}` is not recognised (expected `allowlist` or `open`)")]
+    InvalidDnsMode(String),
     #[error("invalid allowlist: {0}")]
     Validation(#[from] AllowlistLoadError),
 }
@@ -430,10 +500,12 @@ pub fn parse_cli_resolver(spec: &str) -> Result<String, AllowlistFlagError> {
 /// `allow_specs` are `HOST:PORT[/PROTO]` strings. `resolver_specs` are
 /// IPv4 literals. Either list may be empty; an empty allowlist is
 /// deny-all on the daemon side, which is the same behaviour as a
-/// missing file.
+/// missing file. `dns` is the resolution mode; `None` means the
+/// default ([`DnsMode::Allowlist`]).
 pub fn assemble_from_cli(
     allow_specs: &[&str],
     resolver_specs: &[&str],
+    dns: Option<DnsMode>,
 ) -> Result<RawAllowlist, AllowlistFlagError> {
     let mut raw = RawAllowlist::new_v1();
     for s in allow_specs {
@@ -441,6 +513,9 @@ pub fn assemble_from_cli(
     }
     for r in resolver_specs {
         raw.resolvers.push(parse_cli_resolver(r)?);
+    }
+    if let Some(dns) = dns {
+        raw.dns = dns;
     }
     // Run the typed-validation pipeline so CLI/backend/daemon agree on
     // what is well-formed. We discard the typed config here — the
@@ -605,7 +680,7 @@ mod tests {
 
     #[test]
     fn udp_via_assemble_from_cli_is_rejected() {
-        let err = assemble_from_cli(&["1.1.1.1:53/udp"], &[]).expect_err("must reject UDP");
+        let err = assemble_from_cli(&["1.1.1.1:53/udp"], &[], None).expect_err("must reject UDP");
         assert!(matches!(
             err,
             AllowlistFlagError::Validation(AllowlistLoadError::UdpNotSupported { .. })
@@ -763,6 +838,7 @@ mod tests {
         let raw = assemble_from_cli(
             &["10.0.0.0/8:443", "api.example.com:443/tcp", "1.2.3.4:80"],
             &["1.1.1.1"],
+            None,
         )
         .unwrap();
         assert_eq!(raw.version, SCHEMA_VERSION);
@@ -809,5 +885,84 @@ mod tests {
         assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 19444));
         assert!(cfg.allows_tcp(Ipv4Addr::new(192, 168, 1, 1), 19444));
         assert!(!cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 19445));
+    }
+
+    #[test]
+    fn dns_mode_defaults_to_allowlist_when_absent() {
+        let raw = br#"{ "version": 1, "egress": [] }"#;
+        let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
+        assert_eq!(cfg.dns, DnsMode::Allowlist);
+    }
+
+    #[test]
+    fn dns_open_parses_with_resolvers() {
+        let raw = br#"{
+            "version": 1,
+            "resolvers": ["1.1.1.1"],
+            "dns": "open",
+            "egress": [
+                {"host": "0.0.0.0/0", "port": 443, "protocol": "tcp"}
+            ]
+        }"#;
+        let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
+        assert_eq!(cfg.dns, DnsMode::Open);
+        assert_eq!(cfg.resolvers.len(), 1);
+    }
+
+    #[test]
+    fn dns_open_without_resolvers_is_rejected() {
+        let raw = br#"{ "version": 1, "dns": "open", "egress": [] }"#;
+        let err = AllowlistConfig::from_bytes(raw).expect_err("must reject");
+        assert!(matches!(err, AllowlistLoadError::DnsOpenWithoutResolvers));
+    }
+
+    #[test]
+    fn dns_unknown_value_is_rejected_at_json_parse() {
+        let raw = br#"{ "version": 1, "dns": "wide-open", "egress": [] }"#;
+        let err = AllowlistConfig::from_bytes(raw).expect_err("must reject");
+        assert!(matches!(err, AllowlistLoadError::Json(_, _)));
+    }
+
+    #[test]
+    fn dns_default_is_not_serialised() {
+        // Canonical JSON for pre-existing configs must stay
+        // byte-identical: no `dns` key unless it is non-default.
+        let raw = assemble_from_cli(&["1.2.3.4:80"], &[], None).unwrap();
+        let v = serde_json::to_value(&raw).unwrap();
+        assert!(v.get("dns").is_none());
+
+        let raw = assemble_from_cli(&["1.2.3.4:80"], &["1.1.1.1"], Some(DnsMode::Open)).unwrap();
+        let v = serde_json::to_value(&raw).unwrap();
+        assert_eq!(v["dns"], "open");
+    }
+
+    #[test]
+    fn dns_open_via_assemble_requires_resolver() {
+        let err = assemble_from_cli(&["1.2.3.4:80"], &[], Some(DnsMode::Open))
+            .expect_err("must reject open without resolvers");
+        assert!(matches!(
+            err,
+            AllowlistFlagError::Validation(AllowlistLoadError::DnsOpenWithoutResolvers)
+        ));
+    }
+
+    #[test]
+    fn dns_mode_from_str_parses_and_rejects() {
+        assert_eq!("open".parse::<DnsMode>().unwrap(), DnsMode::Open);
+        assert_eq!("Allowlist".parse::<DnsMode>().unwrap(), DnsMode::Allowlist);
+        assert!(matches!(
+            "everything".parse::<DnsMode>(),
+            Err(AllowlistFlagError::InvalidDnsMode(_))
+        ));
+    }
+
+    #[test]
+    fn validate_json_accepts_dns_open_doc() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"version": 1, "resolvers": ["1.1.1.1"], "dns": "open", "egress": [{"host":"0.0.0.0/0","port":443,"protocol":"tcp"}]}"#,
+        )
+        .unwrap();
+        let raw = validate_json(&v).unwrap();
+        assert_eq!(raw.dns, DnsMode::Open);
     }
 }
