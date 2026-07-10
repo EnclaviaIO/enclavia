@@ -103,6 +103,14 @@ pub struct AllowlistEntry {
     pub host: HostMatcher,
     pub port: u16,
     pub protocol: Protocol,
+    /// When true, the entry only matches connections originating from
+    /// the daemon's trusted source address (the init-netns side, i.e.
+    /// `unbound`), never from the workload. Set for the auto-injected
+    /// `resolvers[i]:53/tcp` entries so a workload cannot sidestep the
+    /// in-enclave resolver by dialing the upstream resolvers directly
+    /// (the resolver-bypass hardening). Never true for user-supplied
+    /// entries; there is no JSON surface for it.
+    pub trusted_source_only: bool,
 }
 
 /// One canonical, typed hostname-shaped allowlist entry. Enforced via
@@ -221,6 +229,7 @@ impl AllowlistConfig {
                     host: HostMatcher::Cidr(net),
                     port: raw_entry.port,
                     protocol: raw_entry.protocol,
+                    trusted_source_only: false,
                 });
                 continue;
             }
@@ -229,6 +238,7 @@ impl AllowlistConfig {
                     host: HostMatcher::Literal(v4),
                     port: raw_entry.port,
                     protocol: raw_entry.protocol,
+                    trusted_source_only: false,
                 }),
                 Ok(IpAddr::V6(v6)) => {
                     warn!(
@@ -272,9 +282,18 @@ impl AllowlistConfig {
     /// `(ip, port)`. Hostname entries are NOT consulted here; they are
     /// evaluated separately by the policy (which needs an async
     /// resolver call).
-    pub fn allows_tcp(&self, ip: Ipv4Addr, port: u16) -> bool {
+    ///
+    /// `trusted_src` says whether the connection originated from the
+    /// daemon's trusted source address (init-netns infra, i.e.
+    /// `unbound`) rather than the workload. Entries flagged
+    /// `trusted_source_only` (the auto-injected resolver entries) only
+    /// match when it is true; user-supplied entries match either way.
+    pub fn allows_tcp(&self, ip: Ipv4Addr, port: u16, trusted_src: bool) -> bool {
         self.entries.iter().any(|e| {
-            matches!(e.protocol, Protocol::Tcp) && e.port == port && e.host.contains(ip)
+            matches!(e.protocol, Protocol::Tcp)
+                && e.port == port
+                && e.host.contains(ip)
+                && (!e.trusted_source_only || trusted_src)
         })
     }
 
@@ -653,7 +672,7 @@ mod tests {
         }"#;
         let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
         assert_eq!(cfg.entries.len(), 2);
-        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 80));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 80, false));
     }
 
     #[test]
@@ -806,8 +825,8 @@ mod tests {
             ]
         }"#;
         let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
-        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 19444));
-        assert!(cfg.allows_tcp(Ipv4Addr::new(192, 168, 1, 1), 19444));
-        assert!(!cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 19445));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 19444, false));
+        assert!(cfg.allows_tcp(Ipv4Addr::new(192, 168, 1, 1), 19444, false));
+        assert!(!cfg.allows_tcp(Ipv4Addr::new(1, 2, 3, 4), 19445, false));
     }
 }

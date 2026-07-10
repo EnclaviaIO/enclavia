@@ -45,6 +45,17 @@ pub use transport::UdsTransport;
 /// the JSON only has hostname-based resolvers later), we synthesize
 /// `resolvers[i]:53/tcp` literal entries at boot. The auto-injected
 /// entries are returned for logging.
+///
+/// The injected entries are flagged `trusted_source_only`: they exist
+/// for `unbound`, not for the workload, so the policy only honours
+/// them for connections sourced from the daemon's trusted address
+/// (the init netns, where `unbound` lives). Without the flag a
+/// workload could sidestep the in-enclave resolver entirely by
+/// dialing the upstream resolvers on TCP/53 itself (the
+/// resolver-bypass hardening). Under the pre-netns-split
+/// topology workload traffic also sources from the trusted address,
+/// so the flag is a no-op there; it bites once the builder moves the
+/// workload behind its own netns/veth.
 pub fn inject_resolver_entries(cfg: &mut AllowlistConfig) -> Vec<std::net::SocketAddrV4> {
     let mut injected = Vec::with_capacity(cfg.resolvers.len());
     for resolver in cfg.resolvers.clone() {
@@ -52,6 +63,7 @@ pub fn inject_resolver_entries(cfg: &mut AllowlistConfig) -> Vec<std::net::Socke
             host: HostMatcher::Literal(resolver),
             port: 53,
             protocol: Protocol::Tcp,
+            trusted_source_only: true,
         });
         injected.push(std::net::SocketAddrV4::new(resolver, 53));
     }
@@ -69,11 +81,12 @@ use enclavia_protocol::egress::{write_open_frame, Open};
 
 /// Forward one accepted TCP flow to `egress-host`.
 ///
-/// Reads the destination from `dst`, runs it through `policy`, dials
-/// the transport, sends the `Open` frame, and splices bytes between
-/// the in-stack TCP socket and the transport. The function returns once
-/// either half closes or the transport errors.
+/// Runs the `(src, dst)` pair through `policy`, dials the transport,
+/// sends the `Open` frame, and splices bytes between the in-stack TCP
+/// socket and the transport. The function returns once either half
+/// closes or the transport errors.
 pub async fn forward_flow<S, T, P>(
+    src: SocketAddrV4,
     dst: SocketAddrV4,
     mut local: S,
     transport: &T,
@@ -84,10 +97,10 @@ where
     T: EgressTransport,
     P: ConnectPolicy,
 {
-    match policy.allow_tcp(dst).await {
+    match policy.allow_tcp(*src.ip(), dst).await {
         PolicyDecision::Allow => {}
         PolicyDecision::Deny => {
-            warn!(%dst, "Egress policy denied TCP connection");
+            warn!(%src, %dst, "Egress policy denied TCP connection");
             return Err(ForwardError::Denied(dst));
         }
     }
@@ -144,6 +157,12 @@ pub enum ForwardError {
 /// The stack hands these out via an [`mpsc::Receiver`]; the caller spawns
 /// a forwarding task per flow and lets it run through to completion.
 pub struct AcceptedFlow {
+    /// Source endpoint from the SYN. Under the netns-split topology
+    /// this distinguishes workload traffic (veth subnet) from
+    /// init-netns infra traffic (`unbound`, sourced from the tun
+    /// address); the policy uses it to gate `trusted_source_only`
+    /// entries.
+    pub src: SocketAddrV4,
     pub dst: SocketAddrV4,
     pub stream: stack::FlowStream,
 }
@@ -165,10 +184,16 @@ pub async fn run_supervisor<T, P>(
         let transport = transport.clone();
         let policy = policy.clone();
         tokio::spawn(async move {
-            if let Err(e) = forward_flow(flow.dst, flow.stream, transport.as_ref(), policy.as_ref())
-                .await
+            if let Err(e) = forward_flow(
+                flow.src,
+                flow.dst,
+                flow.stream,
+                transport.as_ref(),
+                policy.as_ref(),
+            )
+            .await
             {
-                error!(dst = %flow.dst, "Flow forwarding failed: {e}");
+                error!(src = %flow.src, dst = %flow.dst, "Flow forwarding failed: {e}");
             }
         });
     }

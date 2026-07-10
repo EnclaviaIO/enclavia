@@ -77,10 +77,10 @@ async fn policy_allows_when_real_resolver_returns_target_ip() {
         ] }"#,
     )
     .expect("parse");
-    let policy = StaticAllowlistPolicy::new(cfg, resolver);
+    let policy = StaticAllowlistPolicy::new(cfg, resolver, Ipv4Addr::new(10, 99, 0, 1));
 
     let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443);
-    assert_eq!(policy.allow_tcp(dst).await, PolicyDecision::Allow);
+    assert_eq!(policy.allow_tcp(Ipv4Addr::new(10, 99, 1, 2), dst).await, PolicyDecision::Allow);
 }
 
 #[tokio::test]
@@ -94,8 +94,8 @@ async fn policy_denies_when_real_resolver_does_not_return_target_ip() {
         ] }"#,
     )
     .expect("parse");
-    let policy = StaticAllowlistPolicy::new(cfg, resolver);
+    let policy = StaticAllowlistPolicy::new(cfg, resolver, Ipv4Addr::new(10, 99, 0, 1));
 
     let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443);
-    assert_eq!(policy.allow_tcp(dst).await, PolicyDecision::Deny);
+    assert_eq!(policy.allow_tcp(Ipv4Addr::new(10, 99, 1, 2), dst).await, PolicyDecision::Deny);
 }
