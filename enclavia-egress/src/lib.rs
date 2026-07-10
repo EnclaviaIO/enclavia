@@ -23,7 +23,7 @@ pub mod transport;
 pub use config::{
     assemble_from_cli, parse_cli_entry, parse_cli_resolver, validate_json, AllowlistConfig,
     AllowlistEntry, AllowlistFlagError, AllowlistLoadError, Config, DnsMode, HostMatcher,
-    HostnameEntry, Protocol, RawAllowlist, RawEgressEntry, SCHEMA_VERSION,
+    HostnameEntry, PortMatcher, Protocol, RawAllowlist, RawEgressEntry, RawPort, SCHEMA_VERSION,
 };
 pub use policy::{AllowAll, ConnectPolicy, PolicyDecision, StaticAllowlistPolicy};
 pub use resolver::{Resolver, UnboundClient};
@@ -61,7 +61,7 @@ pub fn inject_resolver_entries(cfg: &mut AllowlistConfig) -> Vec<std::net::Socke
     for resolver in cfg.resolvers.clone() {
         cfg.push_entry(AllowlistEntry {
             host: HostMatcher::Literal(resolver),
-            port: 53,
+            port: PortMatcher::Single(53),
             protocol: Protocol::Tcp,
             trusted_source_only: true,
         });
