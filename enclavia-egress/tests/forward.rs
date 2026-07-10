@@ -102,7 +102,7 @@ async fn forward_flow_round_trips_through_egress_host() {
     let transport = UdsTransport { path: uds };
     let policy = AllowAll;
     let forwarder = tokio::spawn(async move {
-        forward_flow(dst, daemon_side, &transport, &policy).await
+        forward_flow(SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 40000), dst, daemon_side, &transport, &policy).await
     });
 
     let payload = b"hello enclavia egress";
@@ -146,7 +146,7 @@ async fn forward_flow_surfaces_destination_unreachable() {
     let transport = UdsTransport { path: uds };
     let policy = AllowAll;
     let forwarder = tokio::spawn(async move {
-        forward_flow(dst, daemon_side, &transport, &policy).await
+        forward_flow(SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 40000), dst, daemon_side, &transport, &policy).await
     });
 
     let mut buf = [0u8; 16];
@@ -185,8 +185,8 @@ async fn forward_flow_denies_when_policy_rejects() {
         ] }"#,
     )
     .expect("parse allowlist");
-    let policy = StaticAllowlistPolicy::new(cfg, Arc::new(MockResolver::new()));
-    let result = forward_flow(dst, daemon_side, &transport, &policy).await;
+    let policy = StaticAllowlistPolicy::new(cfg, Arc::new(MockResolver::new()), Ipv4Addr::new(10, 99, 0, 1));
+    let result = forward_flow(SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 40000), dst, daemon_side, &transport, &policy).await;
     assert!(matches!(result, Err(ForwardError::Denied(_))));
 }
 
@@ -202,7 +202,7 @@ async fn forward_flow_surfaces_transport_failure() {
 
     let transport = UdsTransport { path: uds };
     let policy = AllowAll;
-    let result = forward_flow(dst, daemon_side, &transport, &policy).await;
+    let result = forward_flow(SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 2), 40000), dst, daemon_side, &transport, &policy).await;
     assert!(matches!(
         result,
         Err(enclavia_egress::ForwardError::Transport(_))
