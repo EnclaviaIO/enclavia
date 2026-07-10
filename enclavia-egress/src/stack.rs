@@ -543,6 +543,7 @@ async fn handle_inbound(
                     let _ = state
                         .accepted_tx
                         .send(AcceptedFlow {
+                            src,
                             dst,
                             stream: flow_stream,
                         })

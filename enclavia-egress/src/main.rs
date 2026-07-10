@@ -90,7 +90,19 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let resolver = Arc::new(UnboundClient::loopback());
-    let policy = Arc::new(StaticAllowlistPolicy::new(allowlist, resolver));
+    // Only connections sourced from the trusted address (the isolated
+    // unbound's resolver-netns veth address; defaults to the tun
+    // address pre-netns-split, making the gate inert) may use the
+    // auto-injected resolver:53 entries (resolver-bypass hardening).
+    // The builder's
+    // init.sh drops an iptables OUTPUT rule so a workload cannot forge
+    // this source with CAP_NET_RAW.
+    info!(trusted_src = %config.trusted_src, "Egress trusted source address");
+    let policy = Arc::new(StaticAllowlistPolicy::new(
+        allowlist,
+        resolver,
+        config.trusted_src,
+    ));
 
     let (flows_tx, flows_rx) = mpsc::channel(64);
 

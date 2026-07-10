@@ -26,6 +26,20 @@ pub struct Config {
     pub vsock_port: u32,
     /// Path to the JSON allowlist file. Missing or empty == deny-all.
     pub allowlist_path: PathBuf,
+    /// Source address that in-enclave infrastructure (the isolated
+    /// `unbound`) egresses from. Connections observed on `tun0` with
+    /// this source may match the auto-injected `resolvers[i]:53/tcp`
+    /// entries; workload connections (any other source) may not. See
+    /// [`crate::inject_resolver_entries`] and the in-enclave
+    /// resolver-bypass hardening.
+    ///
+    /// Defaults to `tun_local_ip`: pre-netns-split, ALL traffic
+    /// (workload included) sources from the tun address, so the gate
+    /// is inert and behaviour matches the shared-netns topology. The
+    /// builder sets `EGRESS_TRUSTED_SRC` to the resolver netns'
+    /// veth address once `unbound` is isolated, at which point the
+    /// gate distinguishes resolver traffic from workload traffic.
+    pub trusted_src: Ipv4Addr,
 }
 
 impl Config {
@@ -51,6 +65,9 @@ impl Config {
             std::env::var("EGRESS_CONFIG_PATH")
                 .unwrap_or_else(|_| "/etc/enclavia/egress.json".into()),
         );
+        let trusted_src: Ipv4Addr = std::env::var("EGRESS_TRUSTED_SRC")
+            .map(|s| s.parse().expect("invalid EGRESS_TRUSTED_SRC"))
+            .unwrap_or(tun_local_ip);
 
         Self {
             tun_name,
@@ -59,6 +76,7 @@ impl Config {
             mtu,
             vsock_port,
             allowlist_path,
+            trusted_src,
         }
     }
 }
