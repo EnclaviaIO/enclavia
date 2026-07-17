@@ -278,7 +278,7 @@ async fn fetch_payload(
     let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(cid, host_port),
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, host_port)),
     )
     .await
     {

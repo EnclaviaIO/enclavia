@@ -695,7 +695,10 @@ async fn meta_connect() -> Result<tokio_vsock::VsockStream, Box<dyn std::error::
     let port: u32 = std::env::var("META_VSOCK_PORT")
         .unwrap_or_else(|_| "5002".into())
         .parse()?;
-    Ok(tokio_vsock::VsockStream::connect(host_cid().await, port).await?)
+    Ok(
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(host_cid().await, port))
+            .await?,
+    )
 }
 
 // === KMS HTTP client ===
@@ -1005,7 +1008,11 @@ fn amz_timestamps() -> (String, String) {
 
 async fn kms_call(target: &str, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let transport = kms_transport()?;
-    let stream = tokio_vsock::VsockStream::connect(host_cid().await, kms_vsock_port()?).await?;
+    let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+        host_cid().await,
+        kms_vsock_port()?,
+    ))
+    .await?;
 
     // TLS-wrap (AWS) or pass through (mock), and compute the signing headers.
     let (io, host_header, signed): (Box<dyn TokioIoStream>, String, Option<sigv4::SignedHeaders>) =

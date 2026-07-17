@@ -858,7 +858,12 @@ where
 /// upgrade ever happened" (fail-stop on a written-but-unpinned device).
 pub async fn fetch_latest_upgrade_link() -> Option<ChainLink> {
     let fetch = async {
-        match tokio_vsock::VsockStream::connect(enclavia_vsock::host_cid().await, CHAIN_HOST_PORT).await {
+        match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+            enclavia_vsock::host_cid().await,
+            CHAIN_HOST_PORT,
+        ))
+        .await
+        {
             Ok(mut stream) => fetch_link_over(&mut stream).await,
             Err(e) => {
                 warn!("chain-host connect failed ({e}); treating as no upgrade link available");
@@ -1299,7 +1304,7 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
     let cid = enclavia_vsock::host_cid().await;
     let stream = tokio::time::timeout(
         SYNC_CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(cid, port),
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port)),
     )
     .await
     .map_err(|_| {

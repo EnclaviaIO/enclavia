@@ -109,7 +109,7 @@ async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
     let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         Duration::from_secs(30),
-        VsockStream::connect(cid, CHAIN_HOST_PORT),
+        VsockStream::connect(tokio_vsock::VsockAddr::new(cid, CHAIN_HOST_PORT)),
     )
     .await
     {
@@ -458,7 +458,7 @@ async fn pull_upgrade_kms_creds() -> Result<BTreeMap<String, Vec<u8>>, String> {
     let cid = enclavia_vsock::host_cid().await;
     let mut stream = tokio::time::timeout(
         Duration::from_secs(10),
-        VsockStream::connect(cid, AWS_CREDS_VSOCK_PORT),
+        VsockStream::connect(tokio_vsock::VsockAddr::new(cid, AWS_CREDS_VSOCK_PORT)),
     )
     .await
     .map_err(|_| format!("vsock {cid}:{AWS_CREDS_VSOCK_PORT} connect timed out"))?
@@ -1118,12 +1118,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting enclavia server",
     );
 
-    let public_listener = VsockListener::bind(VSOCK_CID, VSOCK_PORT)?;
+    let public_listener = VsockListener::bind(tokio_vsock::VsockAddr::new(VSOCK_CID, VSOCK_PORT))?;
     info!(
         "Server listening on vsock port: {} (CID: {})",
         VSOCK_PORT, VSOCK_CID
     );
-    let control_listener = VsockListener::bind(VSOCK_CID, CONTROL_VSOCK_PORT)?;
+    let control_listener =
+        VsockListener::bind(tokio_vsock::VsockAddr::new(VSOCK_CID, CONTROL_VSOCK_PORT))?;
     info!(
         "Control channel listening on vsock port: {} (CID: {})",
         CONTROL_VSOCK_PORT, VSOCK_CID
@@ -1165,7 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
-    mut listener: VsockListener,
+    listener: VsockListener,
     kind: ChannelKind,
     container_addr: String,
     semaphore: Arc<Semaphore>,

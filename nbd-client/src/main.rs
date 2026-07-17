@@ -84,7 +84,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         port = config.vsock_port,
         "Connecting to storage host via vsock"
     );
-    let mut stream = tokio_vsock::VsockStream::connect(cid, config.vsock_port).await?;
+    let mut stream =
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, config.vsock_port))
+            .await?;
 
     // 2. Perform NBD newstyle negotiation.
     let export_info = negotiate(&mut stream).await?;

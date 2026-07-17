@@ -110,7 +110,7 @@ async fn probe_reachable(cid: u32) -> bool {
     matches!(
         tokio::time::timeout(
             PROBE_TIMEOUT,
-            tokio_vsock::VsockStream::connect(cid, PROBE_PORT),
+            tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, PROBE_PORT)),
         )
         .await,
         Ok(Ok(_))

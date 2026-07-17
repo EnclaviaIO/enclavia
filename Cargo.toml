@@ -35,7 +35,7 @@ name = "enclavia"
 [workspace.dependencies]
 tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread", "process", "time"] }
 tokio-tungstenite = "0.26"
-tokio-vsock = "0.3"
+tokio-vsock = "0.7.2"
 # In-enclave TLS to AWS KMS (enclavia-crypto). Pinned to the `ring` crypto
 # provider so the musl EIF builds without a C toolchain (aws-lc-rs needs
 # cmake). webpki-roots ships the Mozilla CA bundle compiled into the binary

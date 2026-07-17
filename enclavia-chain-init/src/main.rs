@@ -161,7 +161,7 @@ async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send
     let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(cid, CHAIN_HOST_PORT),
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, CHAIN_HOST_PORT)),
     )
     .await
     {

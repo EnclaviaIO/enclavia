@@ -107,9 +107,10 @@ pub struct VsockMeshDialer {
 #[async_trait]
 impl MeshDialer for VsockMeshDialer {
     async fn dial(&self, target_peer: &str) -> io::Result<BoxedStream> {
-        let mut stream = tokio_vsock::VsockStream::connect(self.cid, self.port)
-            .await
-            .map_err(io::Error::other)?;
+        let mut stream =
+            tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(self.cid, self.port))
+                .await
+                .map_err(io::Error::other)?;
         open_and_await_ack(&mut stream, target_peer).await?;
         Ok(Box::new(stream))
     }
@@ -130,7 +131,8 @@ impl VsockMeshAcceptor {
     pub fn bind(port: u32) -> io::Result<Self> {
         // VMADDR_CID_ANY: accept on any CID.
         let listener =
-            tokio_vsock::VsockListener::bind(u32::MAX, port).map_err(io::Error::other)?;
+            tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(u32::MAX, port))
+                .map_err(io::Error::other)?;
         Ok(Self { listener })
     }
 }

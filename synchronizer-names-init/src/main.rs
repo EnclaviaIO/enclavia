@@ -141,7 +141,10 @@ async fn fetch_names() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Syn
     let host_cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(host_cid, NAMES_HOST_PORT),
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+            host_cid,
+            NAMES_HOST_PORT,
+        )),
     )
     .await
     {

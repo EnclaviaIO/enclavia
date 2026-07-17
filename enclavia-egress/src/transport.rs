@@ -40,9 +40,10 @@ pub struct VsockTransport {
 #[async_trait]
 impl EgressTransport for VsockTransport {
     async fn connect(&self) -> io::Result<BoxedStream> {
-        let stream = tokio_vsock::VsockStream::connect(self.cid, self.port)
-            .await
-            .map_err(io::Error::other)?;
+        let stream =
+            tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(self.cid, self.port))
+                .await
+                .map_err(io::Error::other)?;
         Ok(Box::new(stream))
     }
 }

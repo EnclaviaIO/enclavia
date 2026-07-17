@@ -491,13 +491,14 @@ async fn main() {
             .unwrap_or(DEFAULT_VSOCK_PORT);
         // VMADDR_CID_ANY: accept connections on any CID.
         let cid: u32 = u32::MAX;
-        let mut listener = match tokio_vsock::VsockListener::bind(cid, port) {
-            Ok(l) => l,
-            Err(e) => {
-                error!(port, error = %e, "failed to bind vsock");
-                std::process::exit(1);
-            }
-        };
+        let listener =
+            match tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(cid, port)) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(port, error = %e, "failed to bind vsock");
+                    std::process::exit(1);
+                }
+            };
         info!(port, "synchronizer listening on vsock");
         loop {
             match listener.accept().await {
