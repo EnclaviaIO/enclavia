@@ -73,9 +73,9 @@ impl Client {
     /// 2. Noise NN handshake
     /// 3. Attestation request and verification
     ///
-    /// The returned client auto-reconnects on the request/response path by
+    /// The returned client auto-reconnects before new requests and streams by
     /// default (re-verifying attestation against the same pinned PCRs); see
-    /// [`ClientBuilder::reconnect`] to tune or disable it.
+    /// [`ClientBuilder::auto_reconnect`] to tune or disable it.
     ///
     /// # Example
     ///
@@ -260,7 +260,15 @@ impl Client {
     /// receive buffer; if you don't have any prologue to ship, pass an empty
     /// `Vec<u8>` and the channel becomes a plain TCP-shaped pipe from the
     /// first byte.
+    ///
+    /// If auto-reconnect is enabled and the attested channel was already
+    /// dropped, this call establishes and re-attests a fresh channel before
+    /// opening the stream. An existing stream is never silently recreated:
+    /// its workload socket state cannot be recovered, so it still surfaces
+    /// the disconnect and the caller decides whether to open a replacement.
     pub async fn open_stream(&self, payload: Vec<u8>) -> Result<UpgradedStream, Error> {
+        self.ensure_connected().await?;
+
         let (id_tx, id_rx) = oneshot::channel();
         let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(32);
 
@@ -309,10 +317,10 @@ impl Client {
     ///
     /// Attestation failures on reconnect are terminal, not retryable.
     ///
-    /// Streams ([`Client::open_stream`] / [`Client::upgrade`]) are NOT
-    /// auto-reconnected: a live bidirectional byte pipe carries workload
-    /// socket state that cannot be transparently rebuilt, so a dropped
-    /// stream still surfaces as an error and the caller re-opens it.
+    /// A live stream ([`Client::open_stream`] / [`Client::upgrade`]) is NOT
+    /// auto-reconnected: its workload socket state cannot be transparently
+    /// rebuilt, so a dropped stream still surfaces as an error. A later call
+    /// to open a replacement stream does reconnect and re-attest first.
     pub(crate) async fn send_request(&self, payload: Vec<u8>) -> Result<Vec<u8>, Error> {
         // If reconnect is enabled and the channel is already down (a prior
         // request's drop tore down the transport task), re-establish it
@@ -344,8 +352,8 @@ impl Client {
         }
     }
 
-    /// Re-establish the attested channel and swap in the fresh transport
-    /// task's command sender.
+    /// Ensure there is a live attested channel before starting a new
+    /// request or stream.
     ///
     /// Runs the identical connection sequence as the initial connect via
     /// [`ConnectConfig::establish`], so the full attestation verification
@@ -413,8 +421,8 @@ impl ClientBuilder {
         }
     }
 
-    /// Enable or disable transparent reconnect for the request/response
-    /// path. ON by default.
+    /// Enable or disable transparent reconnect before new requests and
+    /// streams. ON by default.
     ///
     /// When enabled, a request that finds the attested channel down (the
     /// enclave restarted on a deploy/upgrade, or the channel dropped)
@@ -434,6 +442,9 @@ impl ClientBuilder {
     /// [`Error::ConnectionClosed`] (see [`Error::is_retryable`]) so the
     /// caller decides whether to retry (idempotency stays the caller's
     /// call); the retry runs on the re-established, re-verified channel.
+    /// Existing live streams are never recreated, but a subsequent
+    /// [`Client::open_stream`] or [`Client::upgrade`] call reconnects and
+    /// re-attests before opening its replacement stream.
     ///
     /// Pass `false` to restore the old behavior (a dropped channel
     /// surfaces as an error and the caller owns recovery entirely).
@@ -520,7 +531,7 @@ impl ClientBuilder {
     /// policy, `trust_upgrades` inputs, reconnect policy) are retained on
     /// the returned [`Client`] so a later transparent reconnect re-runs
     /// this identical sequence, re-verifying attestation against the SAME
-    /// expectations. See [`ClientBuilder::reconnect`].
+    /// expectations. See [`ClientBuilder::auto_reconnect`].
     pub async fn build(self) -> Result<Client, Error> {
         let pcrs = self.pcrs.unwrap_or(Pcrs {
             pcr0: Vec::new(),
