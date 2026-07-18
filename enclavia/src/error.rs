@@ -63,7 +63,36 @@ impl Error {
     /// Attestation / server-level / protocol errors are a genuine,
     /// verified outcome and are NOT retryable.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Error::ConnectionClosed | Error::WebSocket(_))
+        match self {
+            Error::ConnectionClosed => true,
+            Error::WebSocket(error) => match error {
+                tungstenite::Error::ConnectionClosed
+                | tungstenite::Error::AlreadyClosed
+                | tungstenite::Error::Io(_) => true,
+                tungstenite::Error::Http(response) => {
+                    matches!(response.status().as_u16(), 408 | 429 | 500..=599)
+                }
+                tungstenite::Error::Tls(_)
+                | tungstenite::Error::Capacity(_)
+                | tungstenite::Error::Protocol(_)
+                | tungstenite::Error::WriteBufferFull(_)
+                | tungstenite::Error::Utf8
+                | tungstenite::Error::AttackAttempt
+                | tungstenite::Error::Url(_)
+                | tungstenite::Error::HttpFormat(_) => false,
+            },
+            Error::Noise(_)
+            | Error::Attestation(_)
+            | Error::TrustUpgrades(_)
+            | Error::AttestationNonceMismatch
+            | Error::PcrMismatch { .. }
+            | Error::ServerError { .. }
+            | Error::HttpParse(_)
+            | Error::Cbor(_)
+            | Error::InvalidUrl(_)
+            | Error::UnexpectedMessage
+            | Error::UpgradeFailed { .. } => false,
+        }
     }
 }
 
@@ -76,5 +105,31 @@ impl From<ciborium::ser::Error<std::io::Error>> for Error {
 impl From<ciborium::de::Error<std::io::Error>> for Error {
     fn from(e: ciborium::de::Error<std::io::Error>) -> Self {
         Error::Cbor(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_errors_are_limited_to_transient_failures() {
+        assert!(Error::ConnectionClosed.is_retryable());
+        assert!(Error::WebSocket(tungstenite::Error::ConnectionClosed).is_retryable());
+
+        let unavailable = tungstenite::http::Response::builder()
+            .status(503)
+            .body(None)
+            .expect("valid response");
+        assert!(Error::WebSocket(tungstenite::Error::Http(unavailable)).is_retryable());
+
+        assert!(!Error::Attestation("PCR mismatch".to_string()).is_retryable());
+        assert!(!Error::WebSocket(tungstenite::Error::Utf8).is_retryable());
+
+        let unauthorized = tungstenite::http::Response::builder()
+            .status(401)
+            .body(None)
+            .expect("valid response");
+        assert!(!Error::WebSocket(tungstenite::Error::Http(unauthorized)).is_retryable());
     }
 }
