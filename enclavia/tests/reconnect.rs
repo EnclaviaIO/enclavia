@@ -15,7 +15,9 @@
 //!    pinned PCRs, the reconnect FAILS CLOSED with a distinct attestation
 //!    error rather than attaching to the wrong enclave.
 //! 4. With auto-reconnect disabled, a dropped channel just surfaces.
-//! 5. Concurrent callers share one reconnect attempt instead of each
+//! 5. Opening a new upgraded stream after a drop reconnects and re-attests;
+//!    an already-open stream is never silently recreated.
+//! 6. Concurrent callers share one reconnect attempt instead of each
 //!    performing its own WebSocket, Noise, and attestation handshakes.
 //!
 //! The harness stands up a small in-process Noise responder that mimics
@@ -27,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use enclavia::{Client, Pcrs};
+use enclavia::{Client, Method, Pcrs};
 use enclavia_protocol::attestation::test_utils::FakeAttestation;
 use enclavia_protocol::{perform_cbor_handshake_as_responder, ClientMessage, ServerMessage};
 use tokio::net::TcpListener;
@@ -110,6 +112,23 @@ async fn answer_one_request(conn: &mut Conn, body: &[u8]) {
     conn.send(&ServerMessage::Data { id, payload }).await.unwrap();
 }
 
+/// Accept one stream-opening request and complete its HTTP upgrade.
+async fn answer_one_upgrade(conn: &mut Conn) {
+    let id = match conn.receive::<ClientMessage>().await.unwrap() {
+        ClientMessage::OpenStream { id, .. } => id,
+        other => panic!("expected OpenStream, got {other:?}"),
+    };
+    conn.send(&ServerMessage::StreamData {
+        id,
+        payload: b"HTTP/1.1 101 Switching Protocols\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: Upgrade\r\n\r\n"
+            .to_vec(),
+    })
+    .await
+    .unwrap();
+}
+
 /// The PCRs a [`FakeAttestation::with_seed(0x11, _)`] doc carries.
 fn pcrs_for_seed(seed: u8) -> Pcrs {
     Pcrs {
@@ -172,6 +191,62 @@ async fn channel_dropped_between_requests_reconnects() {
         accepted.load(Ordering::SeqCst),
         2,
         "SDK should have opened a second connection (reconnect)"
+    );
+}
+
+/// Opening a new stream after the previous attested channel dropped performs
+/// the same reconnect and re-attestation preflight as a one-shot request.
+#[tokio::test]
+async fn channel_dropped_before_new_stream_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}");
+    let accepted = Arc::new(AtomicUsize::new(0));
+
+    let server_accepted = accepted.clone();
+    tokio::spawn(async move {
+        let mut c1 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c1, 0x11).await;
+        drop(c1);
+
+        let mut c2 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c2, 0x11).await;
+        answer_one_upgrade(&mut c2).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(pcrs_for_seed(0x11))
+        .build()
+        .await
+        .expect("initial connect");
+
+    // Give the transport reader time to observe the server-side close. A
+    // replacement stream must then use a fresh, fully-attested connection.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.upgrade(
+            Method::Get,
+            "/v1/ws",
+            &[
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Connection".to_string(), "Upgrade".to_string()),
+            ],
+        ),
+    )
+    .await
+    .expect("stream reconnect must not hang")
+    .expect("stream should open after reconnect");
+    drop(stream);
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "opening a replacement stream should reconnect exactly once"
     );
 }
 
@@ -410,4 +485,15 @@ async fn reconnect_disabled_surfaces_the_drop() {
         enclavia::Error::ConnectionClosed | enclavia::Error::WebSocket(_) => {}
         other => panic!("expected a transport-drop error, got {other:?}"),
     }
+
+    let stream_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.open_stream(Vec::new()),
+    )
+    .await
+    .expect("opening a stream must not hang when reconnect is disabled");
+    assert!(matches!(
+        stream_result,
+        Err(enclavia::Error::ConnectionClosed | enclavia::Error::WebSocket(_))
+    ));
 }
