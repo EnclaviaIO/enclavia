@@ -15,6 +15,8 @@
 //!    pinned PCRs, the reconnect FAILS CLOSED with a distinct attestation
 //!    error rather than attaching to the wrong enclave.
 //! 4. With auto-reconnect disabled, a dropped channel just surfaces.
+//! 5. Concurrent callers share one reconnect attempt instead of each
+//!    performing its own WebSocket, Noise, and attestation handshakes.
 //!
 //! The harness stands up a small in-process Noise responder that mimics
 //! enclavia-server (attestation reply + a single `Data` response per
@@ -29,6 +31,7 @@ use enclavia::{Client, Pcrs};
 use enclavia_protocol::attestation::test_utils::FakeAttestation;
 use enclavia_protocol::{perform_cbor_handshake_as_responder, ClientMessage, ServerMessage};
 use tokio::net::TcpListener;
+use tokio::sync::Barrier;
 
 #[path = "ws_adapter.rs"]
 mod ws_adapter;
@@ -158,7 +161,9 @@ async fn channel_dropped_between_requests_reconnects() {
     assert_eq!(r1.bytes(), b"first");
 
     // The server dropped the channel after the first response. The next
-    // request must transparently reconnect (re-attest) and succeed.
+    // request must transparently reconnect (re-attest) and succeed once the
+    // background reader has observed that drop.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let r2 = client.get("/two").send().await.expect("second request after reconnect");
     assert_eq!(r2.status(), 200);
     assert_eq!(r2.bytes(), b"second");
@@ -167,6 +172,76 @@ async fn channel_dropped_between_requests_reconnects() {
         accepted.load(Ordering::SeqCst),
         2,
         "SDK should have opened a second connection (reconnect)"
+    );
+}
+
+/// All clones that discover the same dropped channel share one reconnect
+/// attempt and use the sender installed by its winner.
+#[tokio::test]
+async fn concurrent_requests_share_one_reconnect() {
+    const CALLERS: usize = 8;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}");
+    let accepted = Arc::new(AtomicUsize::new(0));
+
+    let server_accepted = accepted.clone();
+    tokio::spawn(async move {
+        let mut c1 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c1, 0x11).await;
+        answer_one_request(&mut c1, b"first").await;
+        drop(c1);
+
+        let mut c2 = accept_one(&listener).await;
+        server_accepted.fetch_add(1, Ordering::SeqCst);
+        do_attestation(&mut c2, 0x11).await;
+        for _ in 0..CALLERS {
+            answer_one_request(&mut c2, b"shared").await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    let client = Client::builder(&url)
+        .debug_mode(true)
+        .pcrs(pcrs_for_seed(0x11))
+        .build()
+        .await
+        .expect("initial connect");
+
+    let first = client.get("/first").send().await.expect("first request");
+    assert_eq!(first.bytes(), b"first");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let barrier = Arc::new(Barrier::new(CALLERS + 1));
+    let mut requests = Vec::with_capacity(CALLERS);
+    for index in 0..CALLERS {
+        let client = client.clone();
+        let barrier = barrier.clone();
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client.get(&format!("/concurrent/{index}")).send().await
+        }));
+    }
+    barrier.wait().await;
+
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        for request in requests {
+            let response = request
+                .await
+                .expect("request task should not panic")
+                .expect("request should succeed after the shared reconnect");
+            assert_eq!(response.bytes(), b"shared");
+        }
+    })
+    .await
+    .expect("concurrent reconnect should not hang");
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "concurrent callers should establish only one replacement session"
     );
 }
 
@@ -282,6 +357,7 @@ async fn reconnect_fails_closed_on_pcr_mismatch() {
     // The channel dropped; the next request reconnects, re-attests against a
     // mismatched measurement, and must fail closed with a distinct
     // attestation error rather than silently connecting.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let err = client
         .get("/two")
         .send()
