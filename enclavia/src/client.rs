@@ -46,6 +46,10 @@ struct ClientInner {
     /// lock when a reconnect stands up a fresh transport task, so all
     /// `Client` clones pick up the new channel.
     cmd_tx: Mutex<mpsc::Sender<OutboundCommand>>,
+    /// Serializes reconnect attempts across all `Client` clones. Callers
+    /// re-check `cmd_tx` after taking this lock so only one of them performs
+    /// the WebSocket, Noise, and attestation handshakes.
+    reconnect_lock: Mutex<()>,
     config: ConnectConfig,
 }
 
@@ -316,9 +320,7 @@ impl Client {
         // measurement mismatch. We only ever reconnect here, ahead of the
         // single send below, so a request whose response was lost is never
         // re-sent by the SDK; the caller re-drives that.
-        if self.inner.config.auto_reconnect && self.current_cmd_tx().await.is_closed() {
-            self.reconnect().await?;
-        }
+        self.ensure_connected().await?;
 
         let cmd_tx = self.current_cmd_tx().await;
         let (response_tx, response_rx) = oneshot::channel();
@@ -353,7 +355,23 @@ impl Client {
     /// longer matches, `establish` returns a fail-closed
     /// [`Error::Attestation`] / [`Error::TrustUpgrades`] and this never
     /// swaps in a channel to an unverified enclave.
-    async fn reconnect(&self) -> Result<(), Error> {
+    async fn ensure_connected(&self) -> Result<(), Error> {
+        if !self.inner.config.auto_reconnect || !self.current_cmd_tx().await.is_closed() {
+            return Ok(());
+        }
+
+        // Establishing a session is expensive and security-sensitive. Once
+        // one clone starts reconnecting, all other clones wait here and then
+        // observe the sender it installed instead of opening parallel
+        // sessions and repeating attestation.
+        let _reconnect_guard = self.inner.reconnect_lock.lock().await;
+
+        // The first caller may have completed the reconnect while this caller
+        // waited for the single-flight lock.
+        if !self.current_cmd_tx().await.is_closed() {
+            return Ok(());
+        }
+
         let new_tx = self.inner.config.establish().await?;
         *self.inner.cmd_tx.lock().await = new_tx;
         info!("reconnected and re-verified attestation");
@@ -534,6 +552,7 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(ClientInner {
                 cmd_tx: Mutex::new(cmd_tx),
+                reconnect_lock: Mutex::new(()),
                 config,
             }),
         })
@@ -547,8 +566,8 @@ impl ConnectConfig {
     /// command sender.
     ///
     /// This is the single connection sequence shared by the initial
-    /// connect ([`ClientBuilder::build`]) and every reconnect
-    /// ([`Client::reconnect`]). Because both go through here, a reconnect
+    /// connect ([`ClientBuilder::build`]) and every reconnect preflight.
+    /// Because both go through here, a reconnect
     /// enforces the EXACT same attestation policy as the first connect:
     /// it fails closed (returns [`Error::Attestation`] /
     /// [`Error::TrustUpgrades`]) rather than attaching to an enclave
