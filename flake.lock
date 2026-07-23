@@ -3,11 +3,11 @@
     "builder-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1781017065,
-        "narHash": "sha256-YVgmsbW0DrMN3cUc+BZRJp7iscdVReIP7o5PtAv3IuI=",
+        "lastModified": 1783697223,
+        "narHash": "sha256-7lnyiIYNhO7jF+9FK87TMdiFH9WCkXh3/M+5oKM2Z/E=",
         "owner": "EnclaviaIO",
         "repo": "builder",
-        "rev": "2b551d80b5013f53716f714791e649350b8e9ea4",
+        "rev": "be630db4854eb6154a4c4cfaf2e20f2202a22f35",
         "type": "github"
       },
       "original": {
