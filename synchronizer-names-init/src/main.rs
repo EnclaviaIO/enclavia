@@ -66,9 +66,11 @@ use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Vsock CID of the host: `VMADDR_CID_HOST = 2`. Same on real Nitro and
-/// under QEMU's `vhost-device-vsock` bridge.
-const VSOCK_HOST_CID: u32 = 2;
+// The host vsock CID is detected at runtime via `enclavia_vsock::host_cid()`
+// (NOT hardcoded 2): the parent is CID 3 under real Nitro but CID 2 under
+// QEMU's vhost-device-vsock bridge. The old hardcoded 2 made this connect
+// time out on real Nitro, and since a failed identity fetch is fatal (the
+// init `set -e`-exits), it tore the enclave down seconds after boot.
 
 /// Port the host-side names responder listens on. Picked to sit just
 /// above the synchronizer's customer port (5010) and clear of the mesh
@@ -136,9 +138,10 @@ fn parse_argv() -> Result<PathBuf, String> {
 /// Connect to the host names responder and read the length-prefixed
 /// identity payload. Any failure is fatal (see module docs).
 async fn fetch_names() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let host_cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(VSOCK_HOST_CID, NAMES_HOST_PORT),
+        tokio_vsock::VsockStream::connect(host_cid, NAMES_HOST_PORT),
     )
     .await
     {
@@ -146,7 +149,7 @@ async fn fetch_names() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Syn
         Ok(Err(e)) => return Err(Box::new(e)),
         Err(_) => {
             return Err(format!(
-                "vsock {VSOCK_HOST_CID}:{NAMES_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
+                "vsock {host_cid}:{NAMES_HOST_PORT} connect timed out after {CONNECT_TIMEOUT:?}"
             )
             .into());
         }

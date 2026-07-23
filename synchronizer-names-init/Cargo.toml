@@ -17,6 +17,10 @@ description = "In-enclave init helper: fetches this node's MESH_SELF_NAME + MESH
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 tokio-vsock = { workspace = true }
+# Runtime host-vsock-CID detection (parent is CID 3 on real Nitro, 2 under
+# QEMU) so the identity fetch dials the right CID and a single EIF boots on
+# both transports.
+enclavia-vsock = { path = "../enclavia-vsock" }
 
 [[bin]]
 name = "synchronizer-names-init"

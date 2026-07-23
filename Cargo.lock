@@ -3804,6 +3804,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "enclavia-protocol",
+ "enclavia-vsock",
  "hex",
  "openraft",
  "p256",
@@ -3825,6 +3826,7 @@ dependencies = [
 name = "synchronizer-names-init"
 version = "0.1.0"
 dependencies = [
+ "enclavia-vsock",
  "tokio",
  "tokio-vsock",
 ]
