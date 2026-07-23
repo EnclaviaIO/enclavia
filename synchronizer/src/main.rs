@@ -74,12 +74,14 @@ const DEBUG_MODE: bool = true;
 #[cfg(all(feature = "enclave", not(feature = "qemu")))]
 const DEBUG_MODE: bool = false;
 
-/// Host CID the in-enclave node dials to reach `mesh-host`. Always 2 (the
-/// parent under real Nitro; the vhost-device-vsock bridge under QEMU debug),
-/// so the mesh transport is vsock in both binary variants, regardless of the
-/// `debug`/`enclave` split (which only governs the customer-facing listener).
-#[cfg(any(feature = "mesh", feature = "raft"))]
-const VSOCK_HOST_CID: u32 = 2;
+// Host CID the in-enclave node dials to reach `mesh-host` is detected at
+// runtime via `enclavia_vsock::host_cid()` (NOT a hardcoded 2): the parent
+// is CID 3 under real Nitro but CID 2 under QEMU's vhost-device-vsock bridge.
+// The old hardcoded `VSOCK_HOST_CID = 2` silently broke real Nitro (the node
+// dialed a non-existent CID 2, its names/mesh bootstrap timed out, and the
+// init `set -e`-exited, tearing the enclave down seconds after boot). The
+// detected value is threaded from `main` into `read_mesh_env` so a single
+// EIF boots on both transports.
 
 /// Minimum number of OTHER nodes a mesh-enabled build accepts in
 /// `MESH_PEERS`: two peers, i.e. the 3-node cluster the freshness oracle is
@@ -138,7 +140,7 @@ struct MeshEnv {
 /// fails there is NO env fallback (that would reopen the hole): the mesh
 /// config is refused with a loud error log (fatal in a `raft` build).
 #[cfg(any(feature = "mesh", feature = "raft"))]
-fn read_mesh_env() -> Option<MeshEnv> {
+fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
     use enclavia_protocol::attestation::extract_own_pcrs;
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::PcrKey;
@@ -193,7 +195,7 @@ fn read_mesh_env() -> Option<MeshEnv> {
     let config = MeshConfig::new(self_name.clone(), peers, self_digest);
     let identity = MeshIdentity::generate();
     let dialer = VsockMeshDialer {
-        cid: VSOCK_HOST_CID,
+        cid: host_cid,
         port: MESH_VSOCK_PORT,
     };
     let acceptor = match VsockMeshAcceptor::bind(SYNCHRONIZER_BOOTSTRAP_PORT) {
@@ -218,13 +220,13 @@ fn read_mesh_env() -> Option<MeshEnv> {
 /// Returns the running [`Mesh`](synchronizer::mesh::Mesh) so `main` keeps it
 /// alive; `None` when no peer set is configured.
 #[cfg(all(feature = "mesh", not(feature = "raft")))]
-fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
+fn start_mesh_from_env(host_cid: u32) -> Option<synchronizer::mesh::Mesh> {
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::mesh::Mesh;
     use synchronizer::mesh::attestation::NsmAttestor;
     use synchronizer::mesh::rpc::EchoHandler;
 
-    let env = read_mesh_env()?;
+    let env = read_mesh_env(host_cid)?;
     let attestor = NsmAttestor::new(&env.identity);
     info!(
         self_name = %env.self_name,
@@ -286,7 +288,7 @@ fn start_mesh_from_env() -> Option<synchronizer::mesh::Mesh> {
 /// config without quorum and the cluster halts (a fresh joiner is not admitted),
 /// the deliberate #209 availability trade and the #122 recovery boundary.
 #[cfg(feature = "raft")]
-async fn start_replicated_from_env() -> Option<(
+async fn start_replicated_from_env(host_cid: u32) -> Option<(
     Arc<synchronizer::mesh::Mesh>,
     synchronizer::raft::RaftHandle,
     synchronizer::raft::ReplicatedDispatch,
@@ -296,7 +298,7 @@ async fn start_replicated_from_env() -> Option<(
     use synchronizer::mesh::attestation::NsmAttestor;
     use synchronizer::raft::{RaftHandle, RaftRequestHandler, ReplicatedDispatch};
 
-    let env = read_mesh_env()?;
+    let env = read_mesh_env(host_cid)?;
     let attestor = NsmAttestor::new(&env.identity);
     // The deduped peer set (== Raft membership minus self), captured before the
     // config is moved into the mesh. The per-boot instance pubkey is captured
@@ -382,6 +384,14 @@ async fn main() {
         .with_ansi(false)
         .init();
 
+    // Detect the host vsock CID ONCE (parent is CID 3 on real Nitro, 2 under
+    // QEMU): the in-enclave init records it to /run/enclavia-host-cid, which
+    // `host_cid()` reads (with a reachability-probe fallback). Threaded into
+    // the mesh dialer so a single EIF boots on both transports. See the note
+    // by the removed hardcoded VSOCK_HOST_CID above.
+    #[cfg(any(feature = "mesh", feature = "raft"))]
+    let host_cid = enclavia_vsock::host_cid().await;
+
     // Build the request dispatcher. A raft build serves ONLY through the
     // replicated cluster; a missing/invalid mesh env is fatal, never a
     // single-node fallback (the env arrives over host-controlled channels, and
@@ -391,7 +401,7 @@ async fn main() {
     // aborts the dial / accept / openraft tasks).
     #[cfg(feature = "raft")]
     let (dispatch, _mesh, _raft): (Arc<dyn SessionDispatch>, _, _) =
-        match start_replicated_from_env().await {
+        match start_replicated_from_env(host_cid).await {
             Some((mesh, raft, replicated)) => {
                 info!("serving customer RPC through the replicated cluster");
                 (Arc::new(replicated), mesh, raft)
@@ -410,7 +420,7 @@ async fn main() {
     #[cfg(not(feature = "raft"))]
     let dispatch: Arc<dyn SessionDispatch> = Arc::new(Node::with_debug_mode(DEBUG_MODE));
     #[cfg(all(feature = "mesh", not(feature = "raft")))]
-    let _mesh = start_mesh_from_env();
+    let _mesh = start_mesh_from_env(host_cid);
 
     // The per-session server attestor (#208): every customer connection
     // is answered with this node's OWN NSM document bound to the

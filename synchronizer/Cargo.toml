@@ -29,6 +29,10 @@ tokio-vsock = { workspace = true, optional = true }
 # not need; the `node` feature turns `async-transport` back on for the
 # Noise responder helpers the listener uses.
 enclavia-protocol = { path = "../enclavia-protocol", optional = true, default-features = false }
+# Runtime host-vsock-CID detection (parent is CID 3 on real Nitro, 2 under
+# QEMU) so one EIF boots on both. Enabled by `mesh` (the only path that dials
+# the host over vsock); pulls in tokio-vsock, which `mesh` already carries.
+enclavia-vsock = { path = "../enclavia-vsock", optional = true }
 snow = { workspace = true, optional = true }
 # Verifies the OLD key's 64-byte raw r||s ECDSA P-256 control signature
 # over the transition-link payload, against the pubkey registered at
@@ -127,6 +131,7 @@ mesh = [
     "dep:hex",
     "dep:aws-nitro-enclaves-nsm-api",
     "dep:tokio-vsock",
+    "dep:enclavia-vsock",
 ]
 # Build the listener binary. Pick one of `debug` (UDS) or `enclave`
 # (vsock) — same pattern as the other in-enclave crates.
