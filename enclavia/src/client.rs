@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::message::{ClientMessage, ServerMessage, StreamHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::info;
 use url::Url;
 
@@ -21,9 +21,34 @@ use crate::ws::{self, Ws};
 /// client) and we bail rather than grow unboundedly.
 const MAX_UPGRADE_HEAD: usize = 64 * 1024;
 
-struct ClientInner {
-    cmd_tx: mpsc::Sender<OutboundCommand>,
+/// Everything needed to re-establish the attested channel from scratch.
+///
+/// Held behind an `Arc` so a reconnect re-runs the EXACT same connection
+/// sequence (WebSocket, Noise handshake, attestation request + verify
+/// against the originally-pinned expectations) as the first connect. The
+/// pinned PCRs, the debug-mode / cert-chain policy, and the
+/// `trust_upgrades` inputs all live here, so a reconnect can never relax
+/// what the first connect verified.
+struct ConnectConfig {
+    url: String,
     host: String,
+    pcrs: Pcrs,
+    debug_mode: bool,
+    extra_headers: Vec<(String, String)>,
+    trust_upgrades: Option<TrustUpgrades>,
+    auto_reconnect: bool,
+}
+
+struct ClientInner {
+    /// The current transport task's command sender. Swapped under the
+    /// lock when a reconnect stands up a fresh transport task, so all
+    /// `Client` clones pick up the new channel.
+    cmd_tx: Mutex<mpsc::Sender<OutboundCommand>>,
+    /// Serializes reconnect attempts across all `Client` clones. Callers
+    /// re-check `cmd_tx` after taking this lock so only one of them performs
+    /// the WebSocket, Noise, and attestation handshakes.
+    reconnect_lock: Mutex<()>,
+    config: ConnectConfig,
 }
 
 /// An encrypted HTTP client that communicates through an enclavia proxy.
@@ -46,6 +71,10 @@ impl Client {
     /// 2. Noise NN handshake
     /// 3. Attestation request and verification
     ///
+    /// The returned client auto-reconnects before new requests and streams by
+    /// default (re-verifying attestation against the same pinned PCRs); see
+    /// [`ClientBuilder::auto_reconnect`] to tune or disable it.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -54,7 +83,19 @@ impl Client {
     /// // `enclavia reproduce`, copy/paste friendly:
     /// let pcrs = enclavia::Pcrs::from_hex("6be2...", "4b4d...", "21b9...")?;
     /// let client = enclavia::Client::connect("wss://proxy.example.com", pcrs).await?;
-    /// let resp = client.get("/api/data").send().await?;
+    ///
+    /// // A request carries an arbitrary method, path, headers, and body.
+    /// let resp = client
+    ///     .post("/api/data")
+    ///     .header("Content-Type", "application/json")
+    ///     .body(br#"{"k":"v"}"#.to_vec())
+    ///     .send()
+    ///     .await?;
+    ///
+    /// // The response exposes status, headers, and body.
+    /// let _status: u16 = resp.status();
+    /// let _content_type: Option<&str> = resp.header("Content-Type");
+    /// let _body: &[u8] = resp.bytes();
     /// # Ok(())
     /// # }
     /// ```
@@ -154,8 +195,8 @@ impl Client {
                 None => {
                     if head_buf.len() >= MAX_UPGRADE_HEAD {
                         let _ = self
-                            .inner
-                            .cmd_tx
+                            .current_cmd_tx()
+                            .await
                             .try_send(OutboundCommand::StreamClose { id, half: StreamHalf::Both });
                         return Err(Error::HttpParse(format!(
                             "response head exceeded {MAX_UPGRADE_HEAD} bytes before \\r\\n\\r\\n"
@@ -178,8 +219,8 @@ impl Client {
             // here is incidental: its Drop fires a StreamClose{Both} too, but
             // we send one eagerly so the close races the head into the wire.
             let _ = self
-                .inner
-                .cmd_tx
+                .current_cmd_tx()
+                .await
                 .try_send(OutboundCommand::StreamClose { id, half: StreamHalf::Both });
             // Truncate the buffer to the head so callers only see what the
             // workload produced as its HTTP response, not any trailing body.
@@ -215,7 +256,15 @@ impl Client {
     /// receive buffer; if you don't have any prologue to ship, pass an empty
     /// `Vec<u8>` and the channel becomes a plain TCP-shaped pipe from the
     /// first byte.
+    ///
+    /// If auto-reconnect is enabled and the attested channel was already
+    /// dropped, this call establishes and re-attests a fresh channel before
+    /// opening the stream. An existing stream is never silently recreated:
+    /// its workload socket state cannot be recovered, so it still surfaces
+    /// the disconnect and the caller decides whether to open a replacement.
     pub async fn open_stream(&self, payload: Vec<u8>) -> Result<UpgradedStream, Error> {
+        self.ensure_connected().await?;
+
         let (id_tx, id_rx) = oneshot::channel();
         // 64 slots to match the server side's per-connection MAX_IN_FLIGHT
         // buffering. The transport task now blocks (backpressure) instead of
@@ -223,8 +272,8 @@ impl Client {
         // burst we absorb before the WebSocket read stalls.
         let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(64);
 
-        self.inner
-            .cmd_tx
+        let cmd_tx = self.current_cmd_tx().await;
+        cmd_tx
             .send(OutboundCommand::OpenStream {
                 payload,
                 id_tx,
@@ -235,30 +284,106 @@ impl Client {
 
         let id = id_rx.await.map_err(|_| Error::ConnectionClosed)??;
 
-        Ok(UpgradedStream::new(
-            id,
-            self.inner.cmd_tx.clone(),
-            stream_rx,
-            Vec::new(),
-        ))
+        Ok(UpgradedStream::new(id, cmd_tx, stream_rx, Vec::new()))
     }
 
     /// The host portion of the proxy URL (used for the HTTP Host header).
     pub(crate) fn host(&self) -> &str {
-        &self.inner.host
+        &self.inner.config.host
     }
 
-    /// Send a one-shot request to the background transport task.
-    pub(crate) async fn send_request(
-        &self,
-        payload: Vec<u8>,
-        response_tx: oneshot::Sender<Result<Vec<u8>, Error>>,
-    ) -> Result<(), Error> {
-        self.inner
-            .cmd_tx
-            .send(OutboundCommand::Request { payload, response_tx })
-            .await
-            .map_err(|_| Error::ConnectionClosed)
+    /// Clone the current transport task's command sender.
+    ///
+    /// Taken behind the lock so a concurrent reconnect that swaps the
+    /// sender is observed atomically.
+    async fn current_cmd_tx(&self) -> mpsc::Sender<OutboundCommand> {
+        self.inner.cmd_tx.lock().await.clone()
+    }
+
+    /// Send a one-shot request over the attested channel.
+    ///
+    /// If auto-reconnect is enabled (the default) and the channel is down
+    /// (from a prior drop), this transparently re-establishes it first,
+    /// re-running the FULL attestation handshake against the SAME pinned
+    /// expectations and failing closed if the enclave's measurement no
+    /// longer matches. The request itself is sent AT MOST ONCE: a request
+    /// whose channel drops while it is in flight is never silently
+    /// re-sent (it may already have reached the enclave). It surfaces as a
+    /// retryable [`Error::ConnectionClosed`] (see [`Error::is_retryable`]),
+    /// and the caller decides whether to retry. A retry runs on the
+    /// freshly re-established, re-verified channel, so the caller
+    /// re-implements neither Noise nor attestation, only the idempotency
+    /// decision for that one request.
+    ///
+    /// Attestation failures on reconnect are terminal, not retryable.
+    ///
+    /// A live stream ([`Client::open_stream`] / [`Client::upgrade`]) is NOT
+    /// auto-reconnected: its workload socket state cannot be transparently
+    /// rebuilt, so a dropped stream still surfaces as an error. A later call
+    /// to open a replacement stream does reconnect and re-attest first.
+    pub(crate) async fn send_request(&self, payload: Vec<u8>) -> Result<Vec<u8>, Error> {
+        // If reconnect is enabled and the channel is already down (a prior
+        // request's drop tore down the transport task), re-establish it
+        // BEFORE sending. `reconnect` re-attests and fails closed on a
+        // measurement mismatch. We only ever reconnect here, ahead of the
+        // single send below, so a request whose response was lost is never
+        // re-sent by the SDK; the caller re-drives that.
+        self.ensure_connected().await?;
+
+        let cmd_tx = self.current_cmd_tx().await;
+        let (response_tx, response_rx) = oneshot::channel();
+        let send_res = cmd_tx
+            .send(OutboundCommand::Request {
+                payload,
+                response_tx,
+            })
+            .await;
+
+        match send_res {
+            // Accepted by the transport task; await the response. A closed
+            // response channel means the task died mid-request: surface a
+            // retryable drop and do NOT re-send (the request may already
+            // have executed on the enclave).
+            Ok(()) => response_rx.await.unwrap_or(Err(Error::ConnectionClosed)),
+            // Transport task already gone: the request was not delivered.
+            // Still retryable; the caller's retry re-establishes the
+            // channel via the is_closed() check above before sending.
+            Err(_) => Err(Error::ConnectionClosed),
+        }
+    }
+
+    /// Ensure there is a live attested channel before starting a new
+    /// request or stream.
+    ///
+    /// Runs the identical connection sequence as the initial connect via
+    /// [`ConnectConfig::establish`], so the full attestation verification
+    /// (session-nonce binding, pinned-PCR equality, cert-chain / debug
+    /// policy, and the `trust_upgrades` descent check) runs again against
+    /// the SAME pinned expectations. If the enclave's attestation no
+    /// longer matches, `establish` returns a fail-closed
+    /// [`Error::Attestation`] / [`Error::TrustUpgrades`] and this never
+    /// swaps in a channel to an unverified enclave.
+    async fn ensure_connected(&self) -> Result<(), Error> {
+        if !self.inner.config.auto_reconnect || !self.current_cmd_tx().await.is_closed() {
+            return Ok(());
+        }
+
+        // Establishing a session is expensive and security-sensitive. Once
+        // one clone starts reconnecting, all other clones wait here and then
+        // observe the sender it installed instead of opening parallel
+        // sessions and repeating attestation.
+        let _reconnect_guard = self.inner.reconnect_lock.lock().await;
+
+        // The first caller may have completed the reconnect while this caller
+        // waited for the single-flight lock.
+        if !self.current_cmd_tx().await.is_closed() {
+            return Ok(());
+        }
+
+        let new_tx = self.inner.config.establish().await?;
+        *self.inner.cmd_tx.lock().await = new_tx;
+        info!("reconnected and re-verified attestation");
+        Ok(())
     }
 }
 
@@ -273,6 +398,7 @@ struct TrustUpgrades {
     enclave_id: Uuid,
 }
 
+
 /// Builder for configuring and establishing a [`Client`] connection.
 pub struct ClientBuilder {
     url: String,
@@ -280,6 +406,7 @@ pub struct ClientBuilder {
     debug_mode: bool,
     extra_headers: Vec<(String, String)>,
     trust_upgrades: Option<TrustUpgrades>,
+    auto_reconnect: bool,
 }
 
 impl ClientBuilder {
@@ -290,7 +417,40 @@ impl ClientBuilder {
             debug_mode: false,
             extra_headers: Vec::new(),
             trust_upgrades: None,
+            auto_reconnect: true,
         }
+    }
+
+    /// Enable or disable transparent reconnect before new requests and
+    /// streams. ON by default.
+    ///
+    /// When enabled, a request that finds the attested channel down (the
+    /// enclave restarted on a deploy/upgrade, or the channel dropped)
+    /// transparently re-establishes it first: re-open the WebSocket,
+    /// redo the Noise handshake, and RE-VERIFY the enclave's attestation
+    /// against the SAME pinned expectations (PCRs, debug-mode /
+    /// cert-chain policy, and `trust_upgrades` inputs) the initial
+    /// connect verified. If the enclave's attestation no longer matches
+    /// (upgraded to an image whose PCRs are not the pinned ones, with
+    /// `trust_upgrades` off or the new image not descending from the
+    /// pin), reconnect FAILS CLOSED with [`Error::Attestation`] /
+    /// [`Error::TrustUpgrades`]; it never attaches to an unverified
+    /// enclave.
+    ///
+    /// The request itself is never silently re-sent: a request whose
+    /// channel drops while it is in flight surfaces as a retryable
+    /// [`Error::ConnectionClosed`] (see [`Error::is_retryable`]) so the
+    /// caller decides whether to retry (idempotency stays the caller's
+    /// call); the retry runs on the re-established, re-verified channel.
+    /// Existing live streams are never recreated, but a subsequent
+    /// [`Client::open_stream`] or [`Client::upgrade`] call reconnects and
+    /// re-attests before opening its replacement stream.
+    ///
+    /// Pass `false` to restore the old behavior (a dropped channel
+    /// surfaces as an error and the caller owns recovery entirely).
+    pub fn auto_reconnect(mut self, enabled: bool) -> Self {
+        self.auto_reconnect = enabled;
+        self
     }
 
     /// Set the expected PCR values for attestation verification.
@@ -366,6 +526,12 @@ impl ClientBuilder {
 
     /// Build the client: connect, handshake, verify attestation, and start the
     /// background transport task.
+    ///
+    /// The verified connection parameters (pinned PCRs, debug-mode
+    /// policy, `trust_upgrades` inputs, reconnect policy) are retained on
+    /// the returned [`Client`] so a later transparent reconnect re-runs
+    /// this identical sequence, re-verifying attestation against the SAME
+    /// expectations. See [`ClientBuilder::auto_reconnect`].
     pub async fn build(self) -> Result<Client, Error> {
         let pcrs = self.pcrs.unwrap_or(Pcrs {
             pcr0: Vec::new(),
@@ -380,6 +546,44 @@ impl ClientBuilder {
             .ok_or_else(|| Error::InvalidUrl("Missing host".into()))?
             .to_string();
 
+        let config = ConnectConfig {
+            url: self.url,
+            host,
+            pcrs,
+            debug_mode: self.debug_mode,
+            extra_headers: self.extra_headers,
+            trust_upgrades: self.trust_upgrades,
+            auto_reconnect: self.auto_reconnect,
+        };
+
+        // The initial connect and every later reconnect share one code
+        // path, so attestation is verified identically each time.
+        let cmd_tx = config.establish().await?;
+
+        Ok(Client {
+            inner: Arc::new(ClientInner {
+                cmd_tx: Mutex::new(cmd_tx),
+                reconnect_lock: Mutex::new(()),
+                config,
+            }),
+        })
+    }
+}
+
+impl ConnectConfig {
+    /// Open the WebSocket, run the Noise handshake, request the
+    /// attestation document, VERIFY it against the pinned expectations,
+    /// and spawn the background transport task. Returns the new task's
+    /// command sender.
+    ///
+    /// This is the single connection sequence shared by the initial
+    /// connect ([`ClientBuilder::build`]) and every reconnect preflight.
+    /// Because both go through here, a reconnect
+    /// enforces the EXACT same attestation policy as the first connect:
+    /// it fails closed (returns [`Error::Attestation`] /
+    /// [`Error::TrustUpgrades`]) rather than attaching to an enclave
+    /// whose measurement no longer matches.
+    async fn establish(&self) -> Result<mpsc::Sender<OutboundCommand>, Error> {
         info!(url = %self.url, "Connecting to enclavia proxy");
 
         // 1. WebSocket connect. The backend-specific parts (TLS setup and
@@ -406,10 +610,14 @@ impl ClientBuilder {
             _ => return Err(Error::UnexpectedMessage),
         };
 
+        // The attestation verification below is the load-bearing security
+        // step, and it is identical on the first connect and on every
+        // reconnect: same pinned PCRs, same debug/cert-chain policy, same
+        // handshake-hash binding, same trust_upgrades descent check.
         match attestation::verify_against(
             &attestation_data,
             &handshake_hash,
-            &pcrs,
+            &self.pcrs,
             self.debug_mode,
         ) {
             Ok(()) => info!("Attestation verified (pinned PCRs match)"),
@@ -418,7 +626,10 @@ impl ClientBuilder {
                 // following upgrades: try to verify the running enclave
                 // as a descendant of the pinned version.
                 Some(tu) => {
-                    if pcrs.pcr0.is_empty() && pcrs.pcr1.is_empty() && pcrs.pcr2.is_empty() {
+                    if self.pcrs.pcr0.is_empty()
+                        && self.pcrs.pcr1.is_empty()
+                        && self.pcrs.pcr2.is_empty()
+                    {
                         return Err(Error::TrustUpgrades(
                             "trust_upgrades requires pinned PCRs (call .pcrs(..))".into(),
                         ));
@@ -426,13 +637,14 @@ impl ClientBuilder {
                     verify_via_upgrade_chain(
                         &attestation_data,
                         &handshake_hash,
-                        &pcrs,
+                        &self.pcrs,
                         self.debug_mode,
                         tu,
                     )
                     .await?;
                     info!("Attestation verified (descends from pinned PCRs via upgrade chain)");
                 }
+                // Fail closed: no matching pin, no upgrade path opted in.
                 None => return Err(Error::Attestation(pinned_err.to_string())),
             },
         }
@@ -442,9 +654,7 @@ impl ClientBuilder {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         ws::spawn_transport(transport::run_transport(ws, transport, cmd_rx));
 
-        Ok(Client {
-            inner: Arc::new(ClientInner { cmd_tx, host }),
-        })
+        Ok(cmd_tx)
     }
 }
 

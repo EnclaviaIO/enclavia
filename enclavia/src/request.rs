@@ -1,5 +1,3 @@
-use tokio::sync::oneshot;
-
 use crate::client::Client;
 use crate::error::Error;
 use crate::http::{self, Method};
@@ -65,12 +63,11 @@ impl RequestBuilder {
         let raw_request =
             http::serialize_request(self.method, &self.path, &self.headers, self.body.as_deref());
 
-        let (response_tx, response_rx) = oneshot::channel();
-        self.client.send_request(raw_request, response_tx).await?;
-
-        let raw_response = response_rx
-            .await
-            .map_err(|_| Error::ConnectionClosed)??;
+        // send_request re-establishes and RE-VERIFIES the attested channel
+        // if it is down, but never silently re-sends an in-flight request:
+        // a mid-flight drop returns a retryable `Error` (see its doc comment
+        // and `Error::is_retryable`). The caller owns the retry decision.
+        let raw_response = self.client.send_request(raw_request).await?;
 
         http::parse_response(&raw_response)
     }
