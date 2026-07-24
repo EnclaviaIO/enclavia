@@ -680,13 +680,10 @@ async fn meta_put(data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = meta_connect().await?;
     stream.write_all(&[META_PUT]).await?;
     stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
-    // Cap each vsock write at 32 KiB (single AF_VSOCK writes above that
-    // are silently lost guest-to-host). Metadata blobs are small today,
-    // but a grown blob must degrade to more writes, not a wedged
-    // connection.
-    for chunk in data.chunks(32 * 1024) {
-        stream.write_all(chunk).await?;
-    }
+    // Metadata blobs are small today, but a grown blob must degrade to
+    // more writes, not a silently wedged connection (the vsock per-write
+    // limit); see enclavia_protocol::write_all_vsock.
+    enclavia_protocol::write_all_vsock(&mut stream, data).await?;
     stream.flush().await?;
 
     let mut status = [0u8; 1];

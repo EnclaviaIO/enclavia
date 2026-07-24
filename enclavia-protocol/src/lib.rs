@@ -231,15 +231,10 @@ where
         .try_into()
         .map_err(|_| "chain link too large to encode as u32-prefixed frame")?;
 
-    // Write the 4-byte length header then the body in two separate calls.
-    // Each call is well under the ~32 KiB vsock single-write limit.
+    // Write the 4-byte length header, then the body segmented at the vsock
+    // per-write limit (see [`write_all_vsock`]).
     stream.write_all(&len.to_be_bytes()).await?;
-
-    // Chunk body writes at 32 KiB to stay within the vsock per-write limit.
-    const VSOCK_CHUNK: usize = 32 * 1024;
-    for chunk in link_bytes.chunks(VSOCK_CHUNK) {
-        stream.write_all(chunk).await?;
-    }
+    write_all_vsock(stream, &link_bytes).await?;
 
     stream.shutdown().await?;
 

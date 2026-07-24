@@ -12,6 +12,10 @@ cargo test --workspace
 
 Most crates have unit tests that run without an enclave. End-to-end tests that require a QEMU enclave or a real Nitro instance are exercised through the builder repo (https://github.com/EnclaviaIO/builder) and the hosted CI; you do not need to run them locally.
 
+## Code conventions
+
+- **Vsock writes are capped at 32 KiB.** A single write larger than 32 KiB on an AF_VSOCK stream is silently lost (guest-to-host: the receiver sees the bytes up to the previous write boundary and then nothing, with no error on either side). Any write whose buffer is not statically known to fit must go through `enclavia_protocol::write_all_vsock` (or an equivalent `chunks(32 * 1024)` loop, e.g. `copy_bidirectional_with_sizes(.., 32 * 1024, 32 * 1024)` for splices). Remember that serialized sizes can exceed payload sizes: CBOR encodes `Vec<u8>` as an integer array, roughly doubling it on the wire.
+
 ## Submitting changes
 
 1. Fork the repo and open a pull request against `main`.

@@ -152,11 +152,32 @@ where
     Ok((CborTransport::new(transport.0, stream), transport.1))
 }
 
-/// Maximum bytes per stream write in [`CborTransport::send`]. Single writes
-/// over ~32 KiB on AF_VSOCK are silently lost (guest-to-host), so every
-/// vsock-facing writer in this workspace stays at or under this size.
-#[cfg(feature = "async-transport")]
-const VSOCK_WRITE_CHUNK: usize = 32 * 1024;
+/// Maximum bytes per write on a vsock-backed stream. A single AF_VSOCK
+/// write larger than this is silently lost on the guest-to-host path (the
+/// length prefix of a framed protocol arrives, the body never does, and the
+/// connection wedges), so every vsock-facing writer must stay at or under
+/// this size. Use [`write_all_vsock`] instead of `write_all` for any buffer
+/// that is not statically known to fit.
+pub const VSOCK_WRITE_CHUNK: usize = 32 * 1024;
+
+/// `write_all`, segmented at [`VSOCK_WRITE_CHUNK`] per write so the buffer
+/// survives a vsock hop. Identical semantics on any other stream type; use
+/// this for every write whose bytes may cross AF_VSOCK and whose size is
+/// not statically bounded below the limit.
+///
+/// Gated on the `tokio` dependency alone (not the full `async-transport`
+/// feature) so consumers that skip the Noise transport machinery, like
+/// enclavia-crypto, can still use it.
+#[cfg(feature = "tokio")]
+pub async fn write_all_vsock<S>(stream: &mut S, bytes: &[u8]) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    for chunk in bytes.chunks(VSOCK_WRITE_CHUNK) {
+        tokio::io::AsyncWriteExt::write_all(stream, chunk).await?;
+    }
+    Ok(())
+}
 
 /// A wrapper around NoiseTransport that provides CBOR message sending/receiving
 /// with length-prefixed framing (4-byte big-endian length prefix + encrypted payload).
@@ -198,16 +219,12 @@ where
 
         let length_bytes = (encrypted_len as u32).to_be_bytes();
         tokio::io::AsyncWriteExt::write_all(&mut self.stream, &length_bytes).await?;
-        // Cap each write at 32 KiB: a single AF_VSOCK write larger than that
-        // is silently lost between the guest driver and the host (the
-        // repo-wide "cap vsock writes at 32 KiB" rule, see e.g. the chain
-        // module's VSOCK_CHUNK). A Noise frame can reach ~64 KiB ciphertext
-        // (CBOR encodes Vec<u8> payloads as integer arrays, roughly doubling
-        // a 16 KiB stream chunk), so writing it in one call wedged every
-        // stream whose per-message payload exceeded ~16 KiB.
-        for chunk in self.write_buffer[..encrypted_len].chunks(VSOCK_WRITE_CHUNK) {
-            tokio::io::AsyncWriteExt::write_all(&mut self.stream, chunk).await?;
-        }
+        // Segmented write: a Noise frame can reach ~64 KiB ciphertext (CBOR
+        // encodes Vec<u8> payloads as integer arrays, roughly doubling a
+        // 16 KiB stream chunk), and an unsegmented write_all of that wedged
+        // every stream whose per-message payload exceeded ~16 KiB. See
+        // [`write_all_vsock`].
+        write_all_vsock(&mut self.stream, &self.write_buffer[..encrypted_len]).await?;
         tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
 
         trace!("CBOR message sent successfully");
