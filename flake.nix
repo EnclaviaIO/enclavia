@@ -319,6 +319,9 @@
             # just works in this shell.
             pkgs.wasm-bindgen-cli
             pkgs.binaryen
+            # Runs the wasm npm package's smoke tests (enclavia-wasm/*.mjs);
+            # >= 22 for the global WebSocket the bindings use.
+            pkgs.nodejs_22
           ];
         } // wasmRingEnv);
 
