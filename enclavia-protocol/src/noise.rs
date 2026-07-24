@@ -152,6 +152,33 @@ where
     Ok((CborTransport::new(transport.0, stream), transport.1))
 }
 
+/// Maximum bytes per write on a vsock-backed stream. A single AF_VSOCK
+/// write larger than this is silently lost on the guest-to-host path (the
+/// length prefix of a framed protocol arrives, the body never does, and the
+/// connection wedges), so every vsock-facing writer must stay at or under
+/// this size. Use [`write_all_vsock`] instead of `write_all` for any buffer
+/// that is not statically known to fit.
+pub const VSOCK_WRITE_CHUNK: usize = 32 * 1024;
+
+/// `write_all`, segmented at [`VSOCK_WRITE_CHUNK`] per write so the buffer
+/// survives a vsock hop. Identical semantics on any other stream type; use
+/// this for every write whose bytes may cross AF_VSOCK and whose size is
+/// not statically bounded below the limit.
+///
+/// Gated on the `tokio` dependency alone (not the full `async-transport`
+/// feature) so consumers that skip the Noise transport machinery, like
+/// enclavia-crypto, can still use it.
+#[cfg(feature = "tokio")]
+pub async fn write_all_vsock<S>(stream: &mut S, bytes: &[u8]) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    for chunk in bytes.chunks(VSOCK_WRITE_CHUNK) {
+        tokio::io::AsyncWriteExt::write_all(stream, chunk).await?;
+    }
+    Ok(())
+}
+
 /// A wrapper around NoiseTransport that provides CBOR message sending/receiving
 /// with length-prefixed framing (4-byte big-endian length prefix + encrypted payload).
 #[cfg(feature = "async-transport")]
@@ -192,8 +219,12 @@ where
 
         let length_bytes = (encrypted_len as u32).to_be_bytes();
         tokio::io::AsyncWriteExt::write_all(&mut self.stream, &length_bytes).await?;
-        tokio::io::AsyncWriteExt::write_all(&mut self.stream, &self.write_buffer[..encrypted_len])
-            .await?;
+        // Segmented write: a Noise frame can reach ~64 KiB ciphertext (CBOR
+        // encodes Vec<u8> payloads as integer arrays, roughly doubling a
+        // 16 KiB stream chunk), and an unsegmented write_all of that wedged
+        // every stream whose per-message payload exceeded ~16 KiB. See
+        // [`write_all_vsock`].
+        write_all_vsock(&mut self.stream, &self.write_buffer[..encrypted_len]).await?;
         tokio::io::AsyncWriteExt::flush(&mut self.stream).await?;
 
         trace!("CBOR message sent successfully");
@@ -243,5 +274,89 @@ where
 
     pub fn transport_mut(&mut self) -> &mut NoiseTransport {
         &mut self.transport
+    }
+}
+
+#[cfg(all(test, feature = "async-transport"))]
+mod write_chunk_tests {
+    use super::*;
+
+    /// AsyncWrite sink that records the size of every poll_write call, so
+    /// the test can assert `CborTransport::send` never exceeds the vsock
+    /// single-write limit even for frames that encrypt to ~64 KiB.
+    struct RecordingSink {
+        writes: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.push(buf.len());
+            self.data.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncRead for RecordingSink {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn send_never_writes_more_than_vsock_chunk() {
+        // Hand-build a transport pair so we can drive `send` without a
+        // network: initiator/responder over an in-memory handshake.
+        let mut hs_i = NoiseHandshake::initiator().unwrap();
+        let mut hs_r = NoiseHandshake::responder().unwrap();
+        let mut buf_a = vec![0u8; 65535];
+        let mut buf_b = vec![0u8; 65535];
+        let len = hs_i.write_message(&[], &mut buf_a).unwrap();
+        hs_r.read_message(&buf_a[..len], &mut buf_b).unwrap();
+        let len = hs_r.write_message(&[], &mut buf_a).unwrap();
+        hs_i.read_message(&buf_a[..len], &mut buf_b).unwrap();
+        let transport = hs_i.into_transport_mode().unwrap();
+
+        let sink = RecordingSink { writes: Vec::new(), data: Vec::new() };
+        let mut cbor = CborTransport::new(transport, sink);
+
+        // A 30 KiB Vec<u8> payload CBOR-encodes to roughly double its size
+        // (integer-array encoding), so the frame comfortably exceeds one
+        // 32 KiB vsock write.
+        #[derive(Serialize)]
+        struct Big {
+            payload: Vec<u8>,
+        }
+        let msg = Big { payload: vec![0xABu8; 30 * 1024] };
+        cbor.send(&msg).await.unwrap();
+
+        let sink = &cbor.stream;
+        let total: usize = sink.writes.iter().sum();
+        assert!(total > VSOCK_WRITE_CHUNK + 4, "frame should exceed one chunk");
+        assert!(
+            sink.writes.iter().all(|w| *w <= VSOCK_WRITE_CHUNK),
+            "single write exceeded the vsock limit: {:?}",
+            sink.writes
+        );
     }
 }

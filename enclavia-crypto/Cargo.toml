@@ -51,8 +51,10 @@ tokio-vsock = { workspace = true }
 # `nix` feature = the /dev/nsm driver (nsm_init/process_request).
 aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 # `kms_recipient::decode` opens that envelope. default-features = false to
-# skip the async-transport (tokio/tracing) modules we don't use.
-enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+# skip the async-transport (tokio/tracing) modules we do not use; the bare
+# `tokio` feature is still needed for `write_all_vsock` (the segmented
+# vsock write helper used by meta_put).
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false, features = ["tokio"] }
 enclavia-vsock = { path = "../enclavia-vsock" }
 
 [lib]
