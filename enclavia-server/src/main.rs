@@ -486,6 +486,68 @@ async fn pull_upgrade_kms_creds() -> Result<BTreeMap<String, Vec<u8>>, String> {
     ciborium::de::from_reader(&bytes[..]).map_err(|e| format!("decoding creds CBOR: {e}"))
 }
 
+/// On real Nitro (host CID 3), pull a fresh `kms:Decrypt`-capable creds set
+/// from the on-demand relay the backend re-armed on the parent (vsock 5013)
+/// and inject it (plus the `KMS_AWS_REGION` bridge) into `command`'s env.
+///
+/// BOTH `prepare-upgrade` and `revoke-upgrade` re-derive the current LUKS
+/// passphrase via `kms:Decrypt` AFTER `init.sh` scrubbed the boot creds (the
+/// workload must never see them), so both need this. Under QEMU (host CID 2)
+/// the enclave talks to mock-kms and needs no creds, so this is a no-op. The
+/// creds live only in the subprocess env, never on disk.
+async fn inject_upgrade_kms_creds(
+    command: &mut tokio::process::Command,
+) -> Result<(), String> {
+    if enclavia_vsock::host_cid().await != 3 {
+        return Ok(());
+    }
+    let creds = pull_upgrade_kms_creds().await?;
+    let mut region: Option<String> = None;
+    for (k, v) in &creds {
+        let value = String::from_utf8_lossy(v);
+        if k == "AWS_REGION" {
+            region = Some(value.to_string());
+        }
+        command.env(k, value.as_ref());
+    }
+    // `enclavia-crypto` selects its real-KMS transport off KMS_AWS_REGION; the
+    // creds feed delivers the region under the standard name AWS_REGION.
+    if let Some(r) = region {
+        command.env("KMS_AWS_REGION", r);
+    }
+    Ok(())
+}
+
+/// Format a failed `enclavia-crypto` subprocess into a user-visible error.
+/// `enclavia-crypto` logs its fatal error via tracing to STDOUT (the
+/// subscriber default), so capturing only stderr would drop the cause and
+/// leave just the bare exit code. Surface the last non-empty line of either
+/// stream.
+fn format_enclavia_crypto_failure(subcommand: &str, output: &std::process::Output) -> String {
+    let last_line = |buf: &[u8]| -> String {
+        String::from_utf8_lossy(buf)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .next_back()
+            .unwrap_or("")
+            .to_string()
+    };
+    let detail: Vec<String> = [last_line(&output.stdout), last_line(&output.stderr)]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", detail.join(" | "))
+    };
+    format!(
+        "enclavia-crypto {subcommand} exited with {}{}",
+        output.status, suffix
+    )
+}
+
 /// Spawn `enclavia-crypto prepare-upgrade` and translate its exit status into
 /// a user-visible result. The new public key is base64-encoded for the CLI;
 /// the key id is passed through unchanged.
@@ -507,38 +569,10 @@ async fn run_enclavia_crypto_prepare_upgrade(
     ]);
 
     // The re-key re-derives the CURRENT LUKS passphrase via `kms:Decrypt`
-    // (`enclavia-crypto prepare-upgrade` step 2). On real Nitro that needs live
-    // AWS creds, but `init.sh` scrubs the boot creds before this server even
-    // starts (the workload must never see `kms:Decrypt`-capable creds). So pull
-    // a FRESH set from the on-demand relay the backend re-armed on the parent
-    // and inject them into the subprocess env ONLY. Host CID 3 == real Nitro;
-    // under QEMU (CID 2) the enclave talks to mock-kms and needs no creds.
-    if enclavia_vsock::host_cid().await == 3 {
-        match pull_upgrade_kms_creds().await {
-            Ok(creds) => {
-                let mut region: Option<String> = None;
-                for (k, v) in &creds {
-                    let value = String::from_utf8_lossy(v);
-                    if k == "AWS_REGION" {
-                        region = Some(value.to_string());
-                    }
-                    command.env(k, value.as_ref());
-                }
-                // `enclavia-crypto` selects its real-KMS transport off
-                // KMS_AWS_REGION; the creds feed delivers the region under the
-                // standard name AWS_REGION. Bridge it, mirroring init.sh's
-                // boot path (which only does so on the real-Nitro CID 3).
-                if let Some(r) = region {
-                    command.env("KMS_AWS_REGION", r);
-                }
-            }
-            Err(e) => {
-                return (
-                    false,
-                    format!("failed to pull fresh KMS creds for re-key: {e}"),
-                );
-            }
-        }
+    // (`enclavia-crypto prepare-upgrade` step 2), which needs fresh KMS creds
+    // on real Nitro (a no-op under QEMU).
+    if let Err(e) = inject_upgrade_kms_creds(&mut command).await {
+        return (false, format!("failed to pull fresh KMS creds for re-key: {e}"));
     }
 
     let output = match command.output().await {
@@ -549,42 +583,31 @@ async fn run_enclavia_crypto_prepare_upgrade(
     if output.status.success() {
         (true, "prepare-upgrade completed".into())
     } else {
-        // `enclavia-crypto` logs its fatal error via tracing to STDOUT (the
-        // subscriber default), so capturing only stderr would drop the cause
-        // and leave just the bare exit code. Surface the last non-empty line
-        // of either stream.
-        let last_line = |buf: &[u8]| -> String {
-            String::from_utf8_lossy(buf)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .next_back()
-                .unwrap_or("")
-                .to_string()
-        };
-        let detail: Vec<String> = [last_line(&output.stdout), last_line(&output.stderr)]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
-        let suffix = if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", detail.join(" | "))
-        };
         (
             false,
-            format!("enclavia-crypto exited with {}{}", output.status, suffix),
+            format_enclavia_crypto_failure("prepare-upgrade", &output),
         )
     }
 }
 
 /// Spawn `enclavia-crypto revoke-upgrade` and translate its exit status.
 async fn run_enclavia_crypto_revoke_upgrade(bin: &str) -> (bool, String) {
-    let output = match tokio::process::Command::new(bin)
-        .arg("revoke-upgrade")
-        .output()
-        .await
-    {
+    let mut command = tokio::process::Command::new(bin);
+    command.arg("revoke-upgrade");
+
+    // revoke-upgrade re-derives the current LUKS passphrase via `kms:Decrypt`
+    // to authenticate `cryptsetup luksKillSlot`, exactly like prepare-upgrade,
+    // so it needs the same fresh KMS creds injected (the boot creds were
+    // scrubbed). Without this, revoke-upgrade fails on real Nitro with a bare
+    // `kms:Decrypt` error while succeeding under QEMU's mock-kms.
+    if let Err(e) = inject_upgrade_kms_creds(&mut command).await {
+        return (
+            false,
+            format!("failed to pull fresh KMS creds for rollback: {e}"),
+        );
+    }
+
+    let output = match command.output().await {
         Ok(o) => o,
         Err(e) => return (false, format!("failed to spawn {bin}: {e}")),
     };
@@ -592,19 +615,9 @@ async fn run_enclavia_crypto_revoke_upgrade(bin: &str) -> (bool, String) {
     if output.status.success() {
         (true, "revoke-upgrade completed".into())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let trimmed = stderr.trim();
-        let suffix = if trimmed.is_empty() {
-            String::new()
-        } else {
-            format!(": {trimmed}")
-        };
         (
             false,
-            format!(
-                "enclavia-crypto revoke-upgrade exited with {}{}",
-                output.status, suffix
-            ),
+            format_enclavia_crypto_failure("revoke-upgrade", &output),
         )
     }
 }
