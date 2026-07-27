@@ -89,7 +89,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let resolver = Arc::new(UnboundClient::loopback());
+    let resolver = Arc::new(UnboundClient::with_addr(config.unbound_addr));
+    info!(unbound_addr = %config.unbound_addr, "Egress enforcement resolver address");
     // Only connections sourced from the trusted address (the isolated
     // unbound's resolver-netns veth address; defaults to the tun
     // address pre-netns-split, making the gate inert) may use the
