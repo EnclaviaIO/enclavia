@@ -592,14 +592,37 @@ async fn restart_required(client: &ApiClient, enclave_id: &str) -> bool {
     !stopped
 }
 
+fn ssh_tunnel_command(callback_port: u16) -> String {
+    format!(
+        "ssh -N -L 127.0.0.1:{callback_port}:127.0.0.1:{callback_port} user@remote-host"
+    )
+}
+
 async fn run_login(json: bool) -> Result<(), CliError> {
     let pending = auth::start_login().await?;
+    let callback_port = pending.callback_port;
     // The URL + prompts are interactive progress: stderr under `--json`,
     // stdout otherwise (unchanged human flow).
     note(json, "");
     note(json, "Open this URL in your browser to authorize this device:");
     note(json, "");
     note(json, format!("  {}", pending.approval_url));
+    note(json, "");
+    note(
+        json,
+        "Running Enclavia remotely (on a VPS)? On the browser machine, start this tunnel first:",
+    );
+    note(json, "");
+    note(
+        json,
+        format!("  {}", ssh_tunnel_command(callback_port)),
+    );
+    note(json, "");
+    note(
+        json,
+        "Replace user@remote-host with your usual SSH destination and keep it running,",
+    );
+    note(json, "then open the URL above.");
     note(json, "");
     note(json, "Waiting for approval...");
 

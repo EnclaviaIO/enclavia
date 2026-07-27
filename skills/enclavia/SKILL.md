@@ -30,11 +30,13 @@ refresh token; the CLI auto-refreshes on expiry and rewrites the file, so
 once it exists an agent keeps working with no further interaction.
 
 `enclavia auth login` is INTERACTIVE: it opens a browser (OAuth 2.1 +
-PKCE) and prints the approval URL to stderr. A headless agent CANNOT
-complete it. Have a human run `enclavia auth login` once on a machine with
-a browser to create the credentials file, then run the agent with that
-file present (copy it to the agent's `~/.config/enclavia/` if needed). If
-no credentials exist, commands fail with `{"kind":"not_logged_in"}`.
+PKCE) and prints the approval URL to stderr. A human must approve the
+login in a browser. When the browser and CLI run on different machines
+(for example, the CLI runs over SSH or on a VPS), run the printed
+`ssh -N -L ...` command on the browser machine, keep that tunnel open,
+and then approve the printed URL. Once the credentials file exists, an
+agent can keep using it without interaction. If no credentials exist,
+commands fail with `{"kind":"not_logged_in"}`.
 
 Set `ENCLAVIA_BACKEND_URL` (default `https://api.beta.enclavia.io`) to
 target a non-prod backend, e.g. `http://localhost:3000`. Note the

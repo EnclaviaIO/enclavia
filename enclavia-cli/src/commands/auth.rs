@@ -55,6 +55,9 @@ const LOGIN_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 /// `wait_for_token` themselves.
 pub struct PendingLogin {
     pub approval_url: String,
+    /// Ephemeral loopback port used by the OAuth callback. Remote users
+    /// can forward this port from their browser machine over SSH.
+    pub callback_port: u16,
     /// State + verifier + listener live on the pending struct so the
     /// caller can `.wait_for_token().await` once they've shown the URL to
     /// the user.
@@ -100,6 +103,7 @@ pub async fn start_login() -> Result<PendingLogin, CliError> {
 
     Ok(PendingLogin {
         approval_url,
+        callback_port: port,
         state_token,
         pkce_verifier,
         redirect_uri,
