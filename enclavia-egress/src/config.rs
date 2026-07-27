@@ -6,8 +6,10 @@
 //! a JSON file (default `/etc/enclavia/egress.json`, override with
 //! `EGRESS_CONFIG_PATH`) and exposed as [`AllowlistConfig`].
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+
+use crate::resolver::DEFAULT_UNBOUND_ADDR;
 
 /// Runtime configuration for the egress daemon.
 #[derive(Clone, Debug)]
@@ -40,6 +42,19 @@ pub struct Config {
     /// veth address once `unbound` is isolated, at which point the
     /// gate distinguishes resolver traffic from workload traffic.
     pub trusted_src: Ipv4Addr,
+    /// Address of the in-enclave `unbound` the daemon queries when it
+    /// enforces a hostname allowlist entry (resolve the host, check the
+    /// workload's connect IP against the answer).
+    ///
+    /// Defaults to loopback (`127.0.0.1:53`), which is correct while
+    /// `unbound` shares the daemon's network namespace. Once the builder
+    /// isolates `unbound` in its own resolver netns it no longer listens
+    /// on the daemon's loopback, so the builder sets `EGRESS_UNBOUND_ADDR`
+    /// to the resolver-netns address (e.g. `10.99.2.2:53`). Without this
+    /// override under a netns split, every hostname lookup fails and, per
+    /// the fail-closed policy, every hostname-allowlisted connection is
+    /// denied.
+    pub unbound_addr: SocketAddr,
 }
 
 impl Config {
@@ -68,6 +83,10 @@ impl Config {
         let trusted_src: Ipv4Addr = std::env::var("EGRESS_TRUSTED_SRC")
             .map(|s| s.parse().expect("invalid EGRESS_TRUSTED_SRC"))
             .unwrap_or(tun_local_ip);
+        let unbound_addr: SocketAddr = std::env::var("EGRESS_UNBOUND_ADDR")
+            .unwrap_or_else(|_| DEFAULT_UNBOUND_ADDR.into())
+            .parse()
+            .expect("invalid EGRESS_UNBOUND_ADDR");
 
         Self {
             tun_name,
@@ -77,6 +96,7 @@ impl Config {
             vsock_port,
             allowlist_path,
             trusted_src,
+            unbound_addr,
         }
     }
 }
