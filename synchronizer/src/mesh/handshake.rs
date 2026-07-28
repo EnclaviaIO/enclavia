@@ -122,7 +122,10 @@ pub enum MeshFrame {
     /// An id-correlated RPC envelope (request or response). Opaque to the
     /// handshake layer; decoded by [`super::rpc`].
     Rpc {
-        /// CBOR-encoded [`super::rpc::Envelope`].
+        /// CBOR-encoded [`super::rpc::Envelope`]. Byte-string encoded on the
+        /// wire (legacy integer-array frames still decode), see
+        /// [`super::cbor_bytes`].
+        #[serde(with = "super::cbor_bytes")]
         envelope: Vec<u8>,
     },
 }

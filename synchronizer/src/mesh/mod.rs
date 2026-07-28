@@ -48,6 +48,62 @@ pub mod identity;
 pub mod rpc;
 pub mod transport;
 
+/// serde adapter for the mesh's nested opaque byte payloads
+/// ([`handshake::MeshFrame::Rpc`]'s `envelope`, [`rpc::Envelope`]'s `body`).
+///
+/// Plain `Vec<u8>` is CBOR-encoded by ciborium as an ARRAY of integers
+/// (~1.6-2x the raw size per nesting layer, plus per-element encode/decode
+/// work); with two such layers wrapping every replication RPC the payload
+/// reached the Noise layer ~3x inflated, which both burned leader CPU and
+/// forced the tight `max_payload_entries` / `snapshot_max_chunk_size`
+/// ceilings in `raft::default_config`. This adapter emits a CBOR BYTE STRING
+/// instead (1x + 5 bytes header), and on decode accepts BOTH encodings so a
+/// mixed-version cluster keeps talking during a rolling restart: a new node
+/// decodes an old peer's array frames, while old nodes cannot decode the new
+/// byte-string frames, so a rollout must roll ALL nodes (one at a time is
+/// fine: the rolled node rejoins once a quorum of upgraded peers exists;
+/// see the rollout note in the PR).
+pub mod cbor_bytes {
+    use serde::{Deserializer, Serializer};
+
+    /// Serialize as a CBOR byte string.
+    pub fn serialize<S: Serializer>(v: &[u8], ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(v)
+    }
+
+    struct BytesOrSeq;
+
+    impl<'de> serde::de::Visitor<'de> for BytesOrSeq {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a byte string or a sequence of bytes")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+
+        // The legacy array-of-integers encoding.
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Deserialize from a byte string OR the legacy integer array.
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
+        de.deserialize_any(BytesOrSeq)
+    }
+}
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -536,4 +592,57 @@ async fn sleep_with_jitter(base: Duration) {
     use rand::Rng;
     let jitter_ms = rand::thread_rng().gen_range(0..=(base.as_millis() as u64 / 2 + 1));
     tokio::time::sleep(base + Duration::from_millis(jitter_ms)).await;
+}
+
+#[cfg(test)]
+mod cbor_bytes_tests {
+    use super::handshake::MeshFrame;
+
+    /// New frames carry the envelope as a CBOR byte string (major type 2),
+    /// not the legacy array of integers (major type 4).
+    #[test]
+    fn encodes_byte_string() {
+        let frame = MeshFrame::Rpc {
+            envelope: vec![0xAA; 300],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&frame, &mut buf).unwrap();
+        // The 300 raw bytes must appear verbatim (a byte string embeds them
+        // as-is; the integer-array encoding would emit 0x18 0xAA pairs).
+        assert!(
+            buf.windows(300).any(|w| w.iter().all(|b| *b == 0xAA)),
+            "envelope bytes are not embedded verbatim: still array-encoded?"
+        );
+        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
+
+    /// A legacy peer's array-of-integers encoding still decodes (rolling
+    /// restart compatibility).
+    #[test]
+    fn decodes_legacy_integer_array() {
+        // Hand-build the legacy encoding: {"frame": "Rpc", "envelope": [1,2,3]}
+        // exactly as a pre-byte-string node would emit it (plain Vec<u8>).
+        #[derive(serde::Serialize)]
+        #[serde(tag = "frame")]
+        enum LegacyFrame {
+            Rpc { envelope: Vec<u8> },
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &LegacyFrame::Rpc {
+                envelope: vec![1, 2, 3, 200, 255],
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![1, 2, 3, 200, 255]),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
 }
