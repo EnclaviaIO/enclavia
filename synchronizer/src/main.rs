@@ -377,9 +377,17 @@ async fn start_replicated_from_env(host_cid: u32) -> Option<(
 
 #[tokio::main]
 async fn main() {
+    // Default `openraft` to WARN, not INFO: stdout is the emulated serial
+    // console inside the guest, where a write is a vmexit storm on our single
+    // vCPU. openraft's snapshot path alone logs ~8 INFO lines per build,
+    // several of them multi-KiB (it debug-prints the full membership,
+    // pubkeys as decimal arrays), which measurably stalled the apply loop
+    // for tens of milliseconds per snapshot and showed up directly as the
+    // customer-visible Pin p99. An explicit RUST_LOG still overrides.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,openraft=warn".into()),
         )
         .with_ansi(false)
         .init();
