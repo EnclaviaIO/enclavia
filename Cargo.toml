@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "enclavia",
+    "enclavia-ffi",
     "enclavia-wasm",
     "enclavia-chain-init",
     "enclavia-cli",
@@ -16,6 +17,14 @@ members = [
     "synchronizer",
     "synchronizer-names-init",
 ]
+# `enclavia-dart/native` is the per-language UniFFI codegen wrapper (like
+# `bdk-dart/native` vs. `bdk-ffi`): it re-exports `enclavia-ffi` and pulls in
+# the `uniffi-dart` git crate purely to drive `uniffi-bindgen --language
+# dart`. Dart's Native Assets build hook invokes `cargo` directly inside that
+# directory, so it never needs to be part of this workspace's resolution —
+# keeping it out avoids the uniffi-dart git dependency landing in the
+# workspace `Cargo.lock` for every other crate's builds.
+exclude = ["enclavia-dart/native"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,19 @@
+# Rust
+# native/Cargo.lock IS tracked (not ignored): it pins the exact dependency
+# versions the published native library is compiled from, for reproducible
+# builds, same as bdk-dart's native/Cargo.lock.
+native/target/
+**/*.rs.bk
+
+# Flutter/Dart
+**/build/
+**/.dart_tool/
+**/.packages
+**/.pub-cache/
+**/.pub/
+pubspec.lock
+
+# Native libs built locally
+*.dylib
+*.so
+*.dll

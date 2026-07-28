@@ -1,0 +1,22 @@
+[package]
+name = "enclavia-ffi"
+description = "UniFFI bindings for the enclavia client SDK: attested Noise tunnel to an enclave, exported to Swift/Kotlin/Dart."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+enclavia = { path = "../enclavia" }
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+uniffi = { version = "=0.31.2", features = ["tokio"] }
+thiserror.workspace = true
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+once_cell = "1"
