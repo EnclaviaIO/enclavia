@@ -7,7 +7,7 @@
 [package]
 name = "enclavia_dart_ffi"
 description = "This is a simple wrapper crate which re-exports enclavia-ffi for publishing to pub.dev"
-version = "0.1.0"
+version = "0.2.0"
 homepage = "https://enclavia.io"
 repository = "https://github.com/EnclaviaIO/enclavia"
 edition = "2021"

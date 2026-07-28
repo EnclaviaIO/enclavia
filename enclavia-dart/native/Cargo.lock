@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ciborium",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enclavia",
  "enclavia-protocol",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "attestation-doc-validation",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia_dart_ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "camino",
  "enclavia-ffi",
