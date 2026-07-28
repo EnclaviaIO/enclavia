@@ -364,6 +364,7 @@ async fn run_scenario(seed: u64) {
                 old_key: key(old_idx),
                 new_key: key(new_idx),
                 new_control_pubkey: pubkey(pubkey_seed(new_idx)),
+                fido2_sign_count: None,
             };
             if let Some(v) = submit(&nodes, op).await {
                 // The successor adopts the old key's state; retire the old,

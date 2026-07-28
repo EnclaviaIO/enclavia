@@ -36,11 +36,11 @@
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
+use crate::custody::{ControlProofKind, check_fido2_sign_count, verify_control_proof};
 
 /// Kind of a chain entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,9 +78,9 @@ pub struct ChainLink {
     /// COSE_Sign1 attestation document. `user_data == sha256(payload)`.
     #[serde(with = "serde_bytes")]
     pub attestation: Vec<u8>,
-    /// 64-byte raw `r || s` ECDSA P-256 signature over `payload` under
-    /// the enclave's control private key. Required for upgrade /
-    /// revocation, absent on boot.
+    /// Legacy raw P-256 signature or versioned FIDO2 assertion over
+    /// `payload` under the enclave's control key. Required for upgrade
+    /// / revocation, absent on boot.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -133,9 +133,10 @@ pub struct ChainLinkJson {
     /// Base64 of the COSE_Sign1 NSM attestation document. `user_data`
     /// is bound to `sha256(payload_bytes)`.
     pub attestation: String,
-    /// Base64 of the raw 64-byte ECDSA P-256 r||s signature. Absent on
-    /// boot links (they're authenticated by the attestation alone),
-    /// required on upgrade/revocation links.
+    /// Base64 of the opaque control proof: either a legacy raw P-256
+    /// signature or a versioned FIDO2 assertion. Absent on boot links
+    /// (they're authenticated by the attestation alone), required on
+    /// upgrade/revocation links.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     /// Wall-clock time the backend appended this link. `None` on the
@@ -408,13 +409,22 @@ pub enum ChainValidationError {
     /// error class should map to 500.
     #[error("stored control_public_key does not decode as SEC1 P-256: {0}")]
     BadControlPubkey(String),
-    /// `signature` is not 64 bytes raw r||s.
-    #[error("signature is not 64 bytes raw r||s ECDSA P-256")]
+    /// `signature` is neither a legacy raw P-256 signature nor a
+    /// well-formed versioned FIDO2 assertion.
+    #[error("signature is not a supported control-key proof")]
     SignatureShape,
     /// `signature` does not verify against the enclave's control
     /// pubkey.
     #[error("signature does not verify under the enclave's control_public_key")]
     SignatureInvalid,
+    /// A FIDO2 proof followed an earlier proof from the same control
+    /// key without advancing its authenticated signature counter.
+    #[error("FIDO2 signature counter did not advance (previous {previous}, current {current})")]
+    SignatureCounterDidNotAdvance { previous: u32, current: u32 },
+    /// Once this chain has accepted a FIDO2 proof, returning to the raw
+    /// proof family would bypass its persisted signature-counter state.
+    #[error("control proof cannot downgrade from FIDO2 to raw P-256")]
+    SignatureCounterDowngrade,
     /// Upgrade / revocation submitted on a non-upgradable enclave.
     #[error("non-upgradable enclaves cannot record {0:?} links")]
     NonUpgradableSigned(ChainLinkKind),
@@ -545,12 +555,28 @@ fn validate_signed(
             "upgradable enclave is missing control_public_key in context".into(),
         )
     })?;
-    let verifying = VerifyingKey::from_sec1_bytes(pubkey_bytes)
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey_bytes)
         .map_err(|e| ChainValidationError::BadControlPubkey(e.to_string()))?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| ChainValidationError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| ChainValidationError::SignatureInvalid)?;
+    let verified = verify_control_proof(&verifying, &link.payload, sig_bytes).map_err(|e| {
+        if e.is_shape_error() {
+            ChainValidationError::SignatureShape
+        } else {
+            ChainValidationError::SignatureInvalid
+        }
+    })?;
+    if let Some(previous) = latest_fido2_sign_count(ctx.prior_chain, &verifying) {
+        match (verified.kind, verified.sign_count) {
+            (ControlProofKind::Fido2, Some(current)) => {
+                check_fido2_sign_count(previous, current).map_err(|_| {
+                    ChainValidationError::SignatureCounterDidNotAdvance { previous, current }
+                })?;
+            }
+            (ControlProofKind::P256Raw, None) => {
+                return Err(ChainValidationError::SignatureCounterDowngrade);
+            }
+            _ => unreachable!("verified proof kind and sign_count are inconsistent"),
+        }
+    }
 
     // Payload-shape sanity + per-kind cross-link checks.
     match link.kind {
@@ -610,6 +636,23 @@ fn validate_signed(
     }
     Ok(Outcome::Append {
         sequence: ctx.prior_chain.len() as u64,
+    })
+}
+
+/// Most recent authenticated FIDO2 counter already present in the
+/// chain. Stored links passed this verifier at ingest; re-verifying
+/// here also keeps a full-chain walk independent of database trust.
+/// This deliberately trades that trust minimization for an O(n) scan
+/// per signed append (and O(n²) work across an incremental full walk).
+fn latest_fido2_sign_count(
+    prior_chain: &[ChainLink],
+    verifying: &p256::ecdsa::VerifyingKey,
+) -> Option<u32> {
+    prior_chain.iter().rev().find_map(|prior| {
+        let signature = prior.signature.as_deref()?;
+        verify_control_proof(verifying, &prior.payload, signature)
+            .ok()?
+            .sign_count
     })
 }
 
@@ -957,8 +1000,10 @@ pub fn verify_pcr_descent(
 mod tests {
     use super::*;
     use crate::attestation::test_utils::FakeChainAttestation;
+    use crate::custody::{FIDO2_RP_ID, Fido2Assertion, fido2_client_data_hash};
     use chrono::Duration;
-    use p256::ecdsa::{SigningKey, signature::Signer};
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest as _, Sha256};
 
     fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
         PcrsHex {
@@ -1029,6 +1074,22 @@ mod tests {
             attestation,
             signature: Some(sig.to_bytes().to_vec()),
         }
+    }
+
+    fn fido2_proof(signing: &SigningKey, payload: &[u8], counter: u32) -> Vec<u8> {
+        let mut authenticator_data = Sha256::digest(FIDO2_RP_ID.as_bytes()).to_vec();
+        authenticator_data.push(0x01 | 0x04);
+        authenticator_data.extend_from_slice(&counter.to_be_bytes());
+        let credential_id = vec![0xD4; 32];
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&fido2_client_data_hash(payload, &credential_id));
+        let signature: Signature = signing.sign(&signed);
+        Fido2Assertion {
+            credential_id,
+            authenticator_data,
+            signature: signature.to_der().as_bytes().to_vec(),
+        }
+        .encode()
     }
 
     fn revocation_link(
@@ -1307,6 +1368,116 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome, Outcome::Append { sequence: 1 });
+    }
+
+    #[test]
+    fn upgrade_appends_with_fido2_proof() {
+        let pcrs = pcrs_hex_from_seed(0x29);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x29);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+
+        let mut link = upgrade_link(
+            id,
+            "sha256:v2",
+            0x29,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        link.signature = Some(fido2_proof(&sk, &link.payload, 7));
+        let outcome = validate_chain_link(
+            &link,
+            &ctx(
+                &pcrs,
+                "sha256:v1",
+                Some(&pk),
+                true,
+                std::slice::from_ref(&genesis),
+            ),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Append { sequence: 1 });
+    }
+
+    #[test]
+    fn fido2_counter_advances_across_signed_chain_links() {
+        let pcrs = pcrs_hex_from_seed(0x2a);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x2a);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+
+        let mut first = upgrade_link(
+            id,
+            "sha256:v2",
+            0x2a,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        first.id = Some(Uuid::new_v4());
+        first.sequence = Some(1);
+        first.signature = Some(fido2_proof(&sk, &first.payload, 7));
+        let prior = vec![genesis, first];
+
+        let mut repeated = upgrade_link(
+            id,
+            "sha256:v3",
+            0x2a,
+            &sk,
+            chrono::Utc::now() + Duration::days(8),
+        );
+        repeated.signature = Some(fido2_proof(&sk, &repeated.payload, 7));
+        let err = validate_chain_link(
+            &repeated,
+            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &prior),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ChainValidationError::SignatureCounterDidNotAdvance {
+                previous: 7,
+                current: 7,
+            }
+        ));
+
+        let mut advanced = repeated;
+        advanced.signature = Some(fido2_proof(&sk, &advanced.payload, 8));
+        assert_eq!(
+            validate_chain_link(
+                &advanced,
+                &ctx(&pcrs, "sha256:v1", Some(&pk), true, &prior),
+                chrono::Utc::now(),
+                true,
+            )
+            .unwrap(),
+            Outcome::Append { sequence: 2 }
+        );
+
+        let raw = upgrade_link(
+            id,
+            "sha256:v3",
+            0x2a,
+            &sk,
+            chrono::Utc::now() + Duration::days(8),
+        );
+        let err = validate_chain_link(
+            &raw,
+            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &prior),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ChainValidationError::SignatureCounterDowngrade
+        ));
     }
 
     #[test]
@@ -1721,7 +1892,14 @@ mod tests {
         let pinned = pcrs_hex_from_seed(v2).to_pcrs().unwrap();
 
         let tip = verify_pcr_descent(
-            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &pinned,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap();
         assert_eq!(tip, pinned);
@@ -1738,7 +1916,14 @@ mod tests {
         let stranger = pcrs_hex_from_seed(0x77).to_pcrs().unwrap();
 
         let err = verify_pcr_descent(
-            &stranger, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &stranger,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap_err();
         assert!(matches!(err, PcrDescentError::PinnedNotInLineage));
@@ -1756,7 +1941,14 @@ mod tests {
         let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
 
         let err = verify_pcr_descent(
-            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &pinned,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1851,7 +2043,10 @@ mod tests {
         };
         assert!(matches!(
             bad.into_chain_link(),
-            Err(ChainLinkDecodeError::Base64 { field: "payload", .. })
+            Err(ChainLinkDecodeError::Base64 {
+                field: "payload",
+                ..
+            })
         ));
 
         let neg = ChainLinkJson {

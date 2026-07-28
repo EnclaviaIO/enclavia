@@ -4,11 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
+use enclavia_protocol::custody::{
+    ControlProofKind, VerifiedControlProof, check_fido2_sign_count, verify_control_proof,
+};
 use enclavia_protocol::{
     CHAIN_LINK_ACK, ClientMessage, ControlCommand, RekeyParams, ServerMessage, StreamHalf,
     perform_cbor_handshake_as_responder,
 };
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use p256::ecdsa::VerifyingKey;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -181,17 +184,13 @@ async fn handle_control(
         }
     };
 
-    // Locked-in wire format (#47): 64-byte raw `r || s`, each 32 B
-    // big-endian zero-padded. DER signatures from PIV/OpenSSL must be
-    // re-encoded to this shape by the signer before being shipped.
-    let sig = match Signature::from_slice(signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "signature must be 64 bytes raw r||s".into()),
+    // Backward-compatible control proof: existing deployments use the
+    // locked-in 64-byte raw P-256 form, while CTAP2 signers carry a
+    // versioned FIDO2 assertion in the same opaque byte field.
+    let envelope_proof = match verify_control_proof(pubkey, payload, signature) {
+        Ok(verified) => verified,
+        Err(e) => return (false, format!("signature verification failed: {e}")),
     };
-
-    if pubkey.verify(payload, &sig).is_err() {
-        return (false, "signature verification failed".into());
-    }
 
     let cmd: ControlCommand = match ciborium::from_reader(payload) {
         Ok(c) => c,
@@ -212,6 +211,7 @@ async fn handle_control(
                 pubkey,
                 &chain_payload,
                 &payload_signature,
+                envelope_proof,
                 rekey.as_ref(),
                 crypto_bin,
                 min_upgrade_delay_secs,
@@ -231,11 +231,40 @@ async fn handle_control(
                 pubkey,
                 &chain_payload,
                 &payload_signature,
+                envelope_proof,
                 rollback,
                 crypto_bin,
             )
             .await
         }
+    }
+}
+
+/// Verify the inner chain-link proof and bind its FIDO2 counter to the
+/// envelope proof. The CLI signs the inner payload first and the
+/// envelope second, so supported counters must advance in that order.
+fn verify_inner_control_proof(
+    pubkey: &VerifyingKey,
+    chain_payload: &[u8],
+    payload_signature: &[u8],
+    envelope_proof: VerifiedControlProof,
+) -> Result<(), String> {
+    let inner_proof = verify_control_proof(pubkey, chain_payload, payload_signature)
+        .map_err(|e| format!("payload_signature verification failed: {e}"))?;
+
+    match (inner_proof.kind, envelope_proof.kind) {
+        (ControlProofKind::P256Raw, ControlProofKind::P256Raw) => Ok(()),
+        (ControlProofKind::Fido2, ControlProofKind::Fido2) => {
+            let inner_count = inner_proof
+                .sign_count
+                .expect("FIDO2 verification always returns a counter");
+            let envelope_count = envelope_proof
+                .sign_count
+                .expect("FIDO2 verification always returns a counter");
+            check_fido2_sign_count(inner_count, envelope_count)
+                .map_err(|e| format!("FIDO2 inner/envelope counter check failed: {e}"))
+        }
+        _ => Err("inner and envelope control proof formats differ".into()),
     }
 }
 
@@ -286,20 +315,16 @@ async fn run_prepare_upgrade(
     pubkey: &VerifyingKey,
     chain_payload: &[u8],
     payload_signature: &[u8],
+    envelope_proof: VerifiedControlProof,
     rekey: Option<&RekeyParams>,
     bin: &str,
     min_upgrade_delay_secs: u64,
 ) -> (bool, String) {
-    // Defence-in-depth: verify payload_signature against the control pubkey.
-    let sig = match Signature::from_slice(payload_signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
-    };
-    if pubkey.verify(chain_payload, &sig).is_err() {
-        return (
-            false,
-            "payload_signature does not verify under the control pubkey".into(),
-        );
+    // Defence-in-depth: verify the inner proof against the same control key.
+    if let Err(e) =
+        verify_inner_control_proof(pubkey, chain_payload, payload_signature, envelope_proof)
+    {
+        return (false, e);
     }
 
     // Validate the chain payload shape. Fail before touching storage.
@@ -388,18 +413,14 @@ async fn run_revoke_upgrade(
     pubkey: &VerifyingKey,
     chain_payload: &[u8],
     payload_signature: &[u8],
+    envelope_proof: VerifiedControlProof,
     rollback: bool,
     bin: &str,
 ) -> (bool, String) {
-    let sig = match Signature::from_slice(payload_signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
-    };
-    if pubkey.verify(chain_payload, &sig).is_err() {
-        return (
-            false,
-            "payload_signature does not verify under the control pubkey".into(),
-        );
+    if let Err(e) =
+        verify_inner_control_proof(pubkey, chain_payload, payload_signature, envelope_proof)
+    {
+        return (false, e);
     }
 
     if let Err(e) =
@@ -1238,6 +1259,7 @@ mod tests {
     //! chain-host. The nonce rotation and rejection paths don't need it.
     use super::*;
     use enclavia_protocol::ControlCommand;
+    use enclavia_protocol::custody::{FIDO2_RP_ID, Fido2Assertion, fido2_client_data_hash};
     use p256::ecdsa::{SigningKey, signature::Signer};
 
     pub(super) fn fixed_pair() -> (SigningKey, VerifyingKey) {
@@ -1261,6 +1283,22 @@ mod tests {
     fn sign_raw(sk: &SigningKey, msg: &[u8]) -> Vec<u8> {
         let sig: p256::ecdsa::Signature = sk.sign(msg);
         sig.to_bytes().to_vec()
+    }
+
+    fn sign_fido2(sk: &SigningKey, msg: &[u8], counter: u32, flags: u8) -> Vec<u8> {
+        let mut authenticator_data = Sha256::digest(FIDO2_RP_ID.as_bytes()).to_vec();
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&counter.to_be_bytes());
+        let credential_id = vec![0xC3; 32];
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&fido2_client_data_hash(msg, &credential_id));
+        let signature: p256::ecdsa::Signature = sk.sign(&signed);
+        Fido2Assertion {
+            credential_id,
+            authenticator_data,
+            signature: signature.to_der().as_bytes().to_vec(),
+        }
+        .encode()
     }
 
     fn cbor_encode<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -1381,6 +1419,80 @@ mod tests {
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("signature verification"), "msg = {msg}");
+    }
+
+    #[tokio::test]
+    async fn accepts_fido2_envelope_and_inner_proofs() {
+        let nonce_value = [0xF2; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let chain_payload = sample_upgrade_payload(0xF2);
+        let payload_signature = sign_fido2(&sk, &chain_payload, 1, 0x01 | 0x04);
+        let payload = cbor_encode(&ControlCommand::PrepareUpgrade {
+            payload: chain_payload,
+            payload_signature,
+            rekey: None,
+            nonce: nonce_value,
+        });
+        let envelope = sign_fido2(&sk, &payload, 2, 0x01 | 0x04);
+
+        // Unit tests have no NSM/chain-host, so the command ultimately
+        // fails there. Reaching that point proves both FIDO2 proofs
+        // passed the enclave-side verifier and command dispatch.
+        let (ok, msg) = handle_control(&payload, &envelope, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(
+            msg.contains("chain attestation") || msg.contains("chain-host"),
+            "msg = {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_fido2_inner_and_envelope_counter_reuse() {
+        let nonce_value = [0xF4; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let chain_payload = sample_upgrade_payload(0xF4);
+        let payload_signature = sign_fido2(&sk, &chain_payload, 9, 0x01 | 0x04);
+        let payload = cbor_encode(&ControlCommand::PrepareUpgrade {
+            payload: chain_payload,
+            payload_signature,
+            rekey: None,
+            nonce: nonce_value,
+        });
+        let envelope = sign_fido2(&sk, &payload, 9, 0x01 | 0x04);
+
+        let (ok, msg) = handle_control(&payload, &envelope, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("counter did not advance"), "msg = {msg}");
+    }
+
+    #[tokio::test]
+    async fn rejects_backup_eligible_fido2_proof() {
+        let nonce_value = [0xF5; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let chain_payload = sample_upgrade_payload(0xF5);
+        let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
+        let envelope = sign_fido2(&sk, &payload, 1, 0x01 | 0x04 | 0x08);
+
+        let (ok, msg) = handle_control(&payload, &envelope, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("backup-eligible"), "msg = {msg}");
+    }
+
+    #[tokio::test]
+    async fn rejects_fido2_proof_without_user_verification() {
+        let nonce_value = [0xF3; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let chain_payload = sample_upgrade_payload(0xF3);
+        let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
+        let envelope = sign_fido2(&sk, &payload, 1, 0x01);
+
+        let (ok, msg) = handle_control(&payload, &envelope, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("user verification"), "msg = {msg}");
     }
 
     #[tokio::test]
