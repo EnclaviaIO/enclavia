@@ -438,11 +438,12 @@ where
         &mut transport,
         &MeshFrame::Hello {
             from: config.self_name.clone(),
+            byte_wire: true,
         },
     )
     .await?;
-    let announced = match read_frame(&mut stream, &mut transport).await? {
-        Some(MeshFrame::Hello { from }) => from,
+    let (announced, peer_byte_wire) = match read_frame(&mut stream, &mut transport).await? {
+        Some(MeshFrame::Hello { from, byte_wire }) => (from, byte_wire),
         Some(_) => return Err("responder's first frame was not Hello".into()),
         None => return Err("responder closed before sending Hello".into()),
     };
@@ -453,10 +454,12 @@ where
         .into());
     }
 
-    // Stand up the RPC client over the established transport. Publish the live
-    // channel so `Mesh::call` can use it, then drive the connection until it
-    // ends.
-    let (channel, driver) = spawn_client(stream, transport);
+    // Stand up the RPC client over the established transport, emitting the
+    // compact byte-string payload encoding only if the peer announced it can
+    // decode it (a pre-adapter peer's Hello carries no flag -> legacy).
+    // Publish the live channel so `Mesh::call` can use it, then drive the
+    // connection until it ends.
+    let (channel, driver) = spawn_client(stream, transport, peer_byte_wire);
     *slot.lock().await = Some(channel);
     driver.await?;
     Ok(())
@@ -558,8 +561,8 @@ where
     // peer should never announce a name we do not know, but we refuse to
     // attribute traffic to an unconfigured name; self-name is never in the
     // peer set, which also rejects a reflected dial).
-    let from = match read_frame(&mut stream, &mut transport).await? {
-        Some(MeshFrame::Hello { from }) => from,
+    let (from, peer_byte_wire) = match read_frame(&mut stream, &mut transport).await? {
+        Some(MeshFrame::Hello { from, byte_wire }) => (from, byte_wire),
         Some(_) => return Err("inbound peer's first frame was not Hello".into()),
         None => return Ok(()),
     };
@@ -573,6 +576,7 @@ where
         &mut transport,
         &MeshFrame::Hello {
             from: config.self_name.clone(),
+            byte_wire: true,
         },
     )
     .await?;
@@ -593,7 +597,7 @@ where
         .lock()
         .await
         .insert(from.clone(), peer_id.mesh_pubkey);
-    serve(stream, transport, &peer, handler).await?;
+    serve(stream, transport, &peer, handler, peer_byte_wire).await?;
     debug!(peer = %from, "inbound peer closed");
     Ok(())
 }
@@ -629,6 +633,61 @@ mod cbor_bytes_tests {
         let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
         match decoded {
             MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
+
+    /// A PRE-ADAPTER decoder (the deployed cluster's current build) must
+    /// tolerate our new Hello's `byte_wire` field: serde ignores unknown
+    /// fields on internally-tagged enums by default, and the whole rolling
+    /// upgrade rests on that. Simulated here with an enum matching the old
+    /// wire shape exactly.
+    #[test]
+    fn old_decoder_ignores_byte_wire_field() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "frame")]
+        enum OldMeshFrame {
+            Hello { from: String },
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &MeshFrame::Hello {
+                from: "node-b".to_string(),
+                byte_wire: true,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded: OldMeshFrame = ciborium::from_reader(buf.as_slice())
+            .expect("old decoder must ignore the unknown byte_wire field");
+        match decoded {
+            OldMeshFrame::Hello { from } => assert_eq!(from, "node-b"),
+        }
+    }
+
+    /// And the reverse: an OLD peer's Hello (no `byte_wire` field) decodes on
+    /// a new node as `byte_wire: false`, so we emit legacy frames to it.
+    #[test]
+    fn old_hello_decodes_as_legacy_wire() {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "frame")]
+        enum OldMeshFrame {
+            Hello { from: String },
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &OldMeshFrame::Hello {
+                from: "node-c".to_string(),
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            MeshFrame::Hello { from, byte_wire } => {
+                assert_eq!(from, "node-c");
+                assert!(!byte_wire, "missing field must default to legacy wire");
+            }
             other => panic!("wrong frame: {other:?}"),
         }
     }

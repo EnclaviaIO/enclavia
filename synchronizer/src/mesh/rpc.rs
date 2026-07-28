@@ -88,6 +88,70 @@ pub enum Envelope {
     },
 }
 
+/// Emit-only mirror of [`Envelope`] with the body as a CBOR byte string (the
+/// negotiated compact framing, see [`MeshFrame::Hello`]'s `byte_wire`). Same
+/// `kind` tag values, so it decodes on the peer as an ordinary [`Envelope`]
+/// through the accept-both adapter.
+#[derive(Serialize)]
+#[serde(tag = "kind")]
+enum EnvelopeBytes<'a> {
+    /// Mirrors [`Envelope::Request`].
+    Request {
+        /// Correlation id.
+        id: u64,
+        /// Payload, emitted as a byte string.
+        #[serde(serialize_with = "super::cbor_bytes::serialize")]
+        body: &'a [u8],
+    },
+    /// Mirrors [`Envelope::Response`].
+    Response {
+        /// Correlation id.
+        id: u64,
+        /// Payload, emitted as a byte string.
+        #[serde(serialize_with = "super::cbor_bytes::serialize")]
+        body: &'a [u8],
+    },
+}
+
+/// CBOR-encode `env` for the wire, honouring the connection's negotiated
+/// payload encoding: byte strings when the peer announced `byte_wire`
+/// support, the legacy integer arrays otherwise.
+fn encode_envelope(env: &Envelope, byte_wire: bool) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    if byte_wire {
+        let mirror = match env {
+            Envelope::Request { id, body } => EnvelopeBytes::Request { id: *id, body },
+            Envelope::Response { id, body } => EnvelopeBytes::Response { id: *id, body },
+        };
+        ciborium::into_writer(&mirror, &mut buf).map_err(|e| format!("{e}"))?;
+    } else {
+        ciborium::into_writer(env, &mut buf).map_err(|e| format!("{e}"))?;
+    }
+    Ok(buf)
+}
+
+/// Write one RPC frame, honouring the negotiated payload encoding for the
+/// envelope layer (the inner body layer is handled by [`encode_envelope`]).
+async fn write_rpc_frame<S>(
+    stream: &mut S,
+    transport: &mut enclavia_protocol::NoiseTransport,
+    envelope: Vec<u8>,
+    byte_wire: bool,
+) -> Result<(), HandshakeError>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    use crate::mesh::handshake::{RpcFrameBytes, write_frame_ser};
+    if byte_wire {
+        write_frame_ser(stream, transport, &RpcFrameBytes::Rpc {
+            envelope: &envelope,
+        })
+        .await
+    } else {
+        write_frame(stream, transport, &MeshFrame::Rpc { envelope }).await
+    }
+}
+
 /// Errors surfaced by an RPC call on a [`ClientChannel`].
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -236,6 +300,7 @@ impl ClientChannel {
 pub fn spawn_client<S>(
     stream: S,
     mut transport: enclavia_protocol::NoiseTransport,
+    byte_wire: bool,
 ) -> (
     ClientChannel,
     impl std::future::Future<Output = Result<(), HandshakeError>>,
@@ -283,10 +348,9 @@ where
                 maybe_req = outbound_rx.recv() => {
                     match maybe_req {
                         Some(env) => {
-                            let mut buf = Vec::new();
-                            ciborium::into_writer(&env, &mut buf)
-                                .map_err(|e| HandshakeError::Cbor(format!("{e}")))?;
-                            write_frame(&mut write_half, &mut transport, &MeshFrame::Rpc { envelope: buf }).await?;
+                            let buf = encode_envelope(&env, byte_wire)
+                                .map_err(HandshakeError::Cbor)?;
+                            write_rpc_frame(&mut write_half, &mut transport, buf, byte_wire).await?;
                         }
                         // All ClientChannel clones dropped: shut down.
                         None => return Ok(()),
@@ -362,6 +426,7 @@ pub async fn serve<S, H>(
     mut transport: enclavia_protocol::NoiseTransport,
     peer: &PeerContext,
     handler: &H,
+    byte_wire: bool,
 ) -> Result<(), HandshakeError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -375,21 +440,15 @@ where
                 match env {
                     Envelope::Request { id, body } => {
                         let resp_body = handler.handle(peer, body).await;
-                        let mut buf = Vec::new();
-                        ciborium::into_writer(
+                        let buf = encode_envelope(
                             &Envelope::Response {
                                 id,
                                 body: resp_body,
                             },
-                            &mut buf,
+                            byte_wire,
                         )
-                        .map_err(|e| HandshakeError::Cbor(format!("{e}")))?;
-                        write_frame(
-                            &mut stream,
-                            &mut transport,
-                            &MeshFrame::Rpc { envelope: buf },
-                        )
-                        .await?;
+                        .map_err(HandshakeError::Cbor)?;
+                        write_rpc_frame(&mut stream, &mut transport, buf, byte_wire).await?;
                     }
                     // The server side never receives a Response: a peer that
                     // sends one on its dialed connection is misbehaving. Drop.
@@ -578,10 +637,10 @@ mod tests {
                 mesh_pubkey: [0u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN],
                 pcr_digest: crate::PcrKey([0u8; 32]),
             };
-            let _ = serve(server_stream, server_transport, &peer, &EchoHandler).await;
+            let _ = serve(server_stream, server_transport, &peer, &EchoHandler, true).await;
         });
 
-        let (channel, driver) = spawn_client(client_stream, client_transport);
+        let (channel, driver) = spawn_client(client_stream, client_transport, true);
         let driver = tokio::spawn(driver);
 
         // Many concurrent caller tasks, each doing a long run of sequential
