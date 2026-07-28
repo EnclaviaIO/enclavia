@@ -140,14 +140,22 @@ async fn handle_pin(
         return err(RpcError::Unauthorized);
     }
 
-    // Decide Register vs Pin from the leader's linearized view. A `None`
-    // (unregistered) means first-pin -> Register; a present key means re-pin ->
-    // Pin. Reading through `linearizable_get` keeps the decision honest on the
-    // leader (a stale follower would mis-decide, but only the leader gets here).
-    let is_registered = match raft.linearizable_get(&key).await {
-        Ok(state) => state.is_some(),
-        Err(_) => return err(RpcError::Unavailable),
-    };
+    // Decide Register vs Pin from the leader's LOCAL applied state. This used
+    // to be a `linearizable_get`, which costs a full ReadIndex quorum round on
+    // the mesh per Pin; that made the pre-check the most expensive part of the
+    // steady-state Pin path. The local read is safe because the decision is
+    // only a HINT: the authoritative check is the deterministic pure-core
+    // `apply` on the committed entry, and both stale directions are handled:
+    //
+    // * Local "unregistered" but actually registered (another session's
+    //   Register raced us): the committed `Register` is rejected
+    //   `AlreadyRegistered` and retried ONCE as a `Pin` below (pre-existing
+    //   path).
+    // * Local "registered" is always a committed fact (applied state is a
+    //   prefix of committed history), and a live key only leaves via that same
+    //   enclave's `Transition`; a Pin racing its own retirement surfaces the
+    //   core's rejection, exactly as it would have with the linearized read.
+    let is_registered = raft.state_machine().get(&key).await.is_some();
 
     let first_op = if is_registered {
         ReplicatedOp::Pin { key, commitment }

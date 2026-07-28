@@ -212,3 +212,10 @@ required-features = ["node"]
 name = "mesh_client"
 path = "examples/mesh_client.rs"
 required-features = ["node"]
+
+# Customer-RPC stress bench for the same QEMU harness: M concurrent
+# sessions x N Pin/Get ops with latency percentiles.
+[[example]]
+name = "pin_bench"
+path = "examples/pin_bench.rs"
+required-features = ["node"]

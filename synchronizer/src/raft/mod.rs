@@ -399,7 +399,21 @@ impl RaftHandle {
             heartbeat_interval: 150,
             election_timeout_min: 300,
             election_timeout_max: 600,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(100),
+            // 50000, not 100: every snapshot build stalls the cluster's write
+            // path for ~50-100ms (measured on the QEMU bench cluster; the
+            // stall survives quieted logging and disabled purge, so it is
+            // openraft's snapshot-completion machinery itself, not our
+            // storage callbacks, which all measure <7ms). At LogsSinceLast(100)
+            // that stall recurred every ~100 Pins and dominated the
+            // customer-visible p99 under load (bench: p99 47-65ms with the
+            // stall vs ~1ms without). At 50000 it is amortized to noise at
+            // any realistic pin rate, while memory stays bounded (a
+            // ReplicatedOp entry is a couple hundred bytes, so the retained
+            // tail is ~15 MiB worst case in a 768M guest) and a restarting
+            // node still hydrates exactly as before: by log replay when it
+            // merely fell behind, by snapshot once the log purges past what
+            // it is missing.
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(50000),
             max_in_snapshot_log_to_keep: 1000,
             // Bound every replication payload to the mesh's single-Noise-message
             // ceiling. A mesh RPC is ONE Noise message

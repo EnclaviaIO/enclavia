@@ -72,14 +72,18 @@ pub enum Envelope {
     Request {
         /// Per-connection correlation id.
         id: u64,
-        /// Opaque request payload.
+        /// Opaque request payload, carried as a CBOR byte string (see the
+        /// rationale on [`MeshFrame::Rpc`]'s `envelope`).
+        #[serde(with = "serde_bytes")]
         body: MeshPayload,
     },
     /// The response to the request with the matching `id`.
     Response {
         /// Correlation id echoed from the request.
         id: u64,
-        /// Opaque response payload.
+        /// Opaque response payload, carried as a CBOR byte string (see the
+        /// rationale on [`MeshFrame::Rpc`]'s `envelope`).
+        #[serde(with = "serde_bytes")]
         body: MeshPayload,
     },
 }

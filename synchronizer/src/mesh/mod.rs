@@ -537,3 +537,29 @@ async fn sleep_with_jitter(base: Duration) {
     let jitter_ms = rand::thread_rng().gen_range(0..=(base.as_millis() as u64 / 2 + 1));
     tokio::time::sleep(base + Duration::from_millis(jitter_ms)).await;
 }
+
+#[cfg(test)]
+mod wire_encoding_tests {
+    use super::handshake::MeshFrame;
+
+    /// The RPC envelope rides the wire as a CBOR byte string (major type 2),
+    /// embedding the raw bytes verbatim, not as an array of integers (which
+    /// would roughly double the size and cost per-element decode work).
+    #[test]
+    fn rpc_envelope_is_a_byte_string() {
+        let frame = MeshFrame::Rpc {
+            envelope: vec![0xAA; 300],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&frame, &mut buf).unwrap();
+        assert!(
+            buf.windows(300).any(|w| w.iter().all(|b| *b == 0xAA)),
+            "envelope bytes are not embedded verbatim: array-encoded?"
+        );
+        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
+}

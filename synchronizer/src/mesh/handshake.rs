@@ -122,7 +122,13 @@ pub enum MeshFrame {
     /// An id-correlated RPC envelope (request or response). Opaque to the
     /// handshake layer; decoded by [`super::rpc`].
     Rpc {
-        /// CBOR-encoded [`super::rpc::Envelope`].
+        /// CBOR-encoded [`super::rpc::Envelope`], carried as a CBOR byte
+        /// string (via `serde_bytes`; a plain `Vec<u8>` would be encoded as
+        /// an ARRAY of integers, ~2x the bytes and per-element encode/decode
+        /// work on every replication RPC). No cross-version wire concern:
+        /// the self-PCR mesh allowlist only ever admits peers running the
+        /// identical image, so both ends always agree on the encoding.
+        #[serde(with = "serde_bytes")]
         envelope: Vec<u8>,
     },
 }
