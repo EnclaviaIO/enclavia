@@ -1,0 +1,94 @@
+# Client-language binding checks: wasm + Dart. Split out of `ci.yml` so
+# they run in a separate parallel job rather than serialize behind the
+# main build+clippy+test+doctests loop (both need their own `cargo build`
+# passes anyway: the wasm step builds `enclavia-wasm-npm`, the Dart step
+# builds through Native Assets, neither reuses `ci.yml`'s `target/` in a
+# meaningful way).
+#
+# Same Nix-first shape as `ci.yml`: warm `nix develop` once, every
+# subsequent step runs inside it (or `nix develop .#dart` for the Dart
+# steps, which need `rustup` + the Dart SDK instead of the workspace's
+# usual Nix-provided Rust toolchain — see `flake.nix`'s `devShells.dart`).
+
+name: bindings
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm-and-dart:
+    name: wasm + dart bindings
+    runs-on: [self-hosted, nix]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Warm nix develop
+        run: nix develop --command true
+
+      # Wasm reconnect smoke test: run the EXACT publish artifact
+      # (`nix build .#enclavia-wasm-npm`) in Node against a local mock
+      # enclave that drops the channel after every answered request, so
+      # each fetch past the first exercises the SDK's transparent
+      # reconnect (full Noise + attestation re-verify) on the wasm build.
+      # The mock binds an ephemeral port and prints it (parallel jobs on
+      # one runner never collide); killed by recorded PID, no pkill (the
+      # runners have no procps).
+      - name: wasm reconnect smoke (nix-built npm artifact)
+        run: |
+          set -euo pipefail
+          nix build .#enclavia-wasm-npm -o result-wasm-npm
+          nix develop --command cargo build --example reconnect_mock_server -p enclavia
+          ./target/debug/examples/reconnect_mock_server > mock-server.log 2>&1 &
+          MOCK_PID=$!
+          trap 'kill "$MOCK_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            grep -q '^listening on ' mock-server.log && break
+            sleep 0.2
+          done
+          PORT=$(sed -n 's/^listening on //p' mock-server.log | head -n1)
+          [ -n "$PORT" ] || { echo "mock server never reported a port"; cat mock-server.log; exit 1; }
+          nix develop --command node enclavia-wasm/reconnect-smoke.mjs "$(pwd)/result-wasm-npm" "$PORT"
+          cat mock-server.log
+
+      # enclavia-dart bindings freshness: lib/enclavia_ffi.dart is checked
+      # into git (Dart's Native Assets only builds the native library, not
+      # the bindings themselves, so consumers must never need a Rust
+      # toolchain just to get usable Dart source). Regenerate and diff
+      # against the committed copy so a change to enclavia-ffi without a
+      # rerun of scripts/generate_bindings.sh fails CI instead of silently
+      # shipping stale bindings.
+      - name: enclavia-dart bindings freshness
+        run: |
+          set -euo pipefail
+          nix develop .#dart --command ./enclavia-dart/scripts/generate_bindings.sh
+          git diff --exit-code -- enclavia-dart/lib/enclavia_ffi.dart || {
+            echo "::error::enclavia-dart/lib/enclavia_ffi.dart is stale; run enclavia-dart/scripts/generate_bindings.sh and commit the result"
+            exit 1
+          }
+
+      # Dart reconnect smoke test: same harness and mock enclave as the
+      # wasm step above (a fresh instance; the wasm run already spent the
+      # first one's connections), run through enclavia-dart's
+      # Native-Assets-built native library instead of the wasm bindings.
+      - name: dart reconnect smoke (native library via Native Assets)
+        run: |
+          set -euo pipefail
+          nix develop --command cargo build --example reconnect_mock_server -p enclavia
+          ./target/debug/examples/reconnect_mock_server > mock-server-dart.log 2>&1 &
+          MOCK_PID=$!
+          trap 'kill "$MOCK_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            grep -q '^listening on ' mock-server-dart.log && break
+            sleep 0.2
+          done
+          PORT=$(sed -n 's/^listening on //p' mock-server-dart.log | head -n1)
+          [ -n "$PORT" ] || { echo "mock server never reported a port"; cat mock-server-dart.log; exit 1; }
+          nix develop .#dart --command bash -c 'cd enclavia-dart && dart run reconnect_smoke.dart "$1"' _ "$PORT"
+          cat mock-server-dart.log

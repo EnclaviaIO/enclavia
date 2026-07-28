@@ -325,6 +325,26 @@
           ];
         } // wasmRingEnv);
 
+        # `enclavia-dart` bindings: Dart SDK for `dart pub get` / `dart run`,
+        # which drives Native Assets (`hook/build.dart`), which in turn
+        # invokes `native_toolchain_rust`. That package unconditionally
+        # shells out to `rustup show active-toolchain` / `rustup toolchain
+        # install` against `native/rust-toolchain.toml` — it has no support
+        # for an ambient, non-rustup toolchain (like the Nix-provided one
+        # `devShells.default` uses), so this shell provides `rustup` itself
+        # rather than `rustToolchain`, exactly as a non-Nix contributor
+        # following upstream bdk-dart's own setup instructions would. Split
+        # out of `devShells.default` because the Dart SDK and a
+        # rustup-managed toolchain are a sizeable extra download most
+        # contributors (who never touch enclavia-dart) don't need.
+        devShells.dart = pkgs.mkShell {
+          buildInputs = [
+            pkgs.rustup
+            pkgs.pkg-config
+            pkgs.dart
+          ];
+        };
+
         packages = {
           nbd-client = nbdClient;
           enclavia-egress = enclaviaEgress;

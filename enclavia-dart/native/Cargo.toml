@@ -1,0 +1,36 @@
+# Standalone workspace root: Dart's Native Assets build hook runs `cargo`
+# straight out of this directory, so it must never attach itself to an
+# ancestor workspace (in this monorepo layout, `cargo build` here would
+# otherwise walk up and pick up the root `enclavia` workspace's Cargo.lock).
+[workspace]
+
+[package]
+name = "enclavia_dart_ffi"
+description = "This is a simple wrapper crate which re-exports enclavia-ffi for publishing to pub.dev"
+version = "0.1.0"
+homepage = "https://enclavia.io"
+repository = "https://github.com/EnclaviaIO/enclavia"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+name = "enclavia_dart_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+enclavia-ffi = { path = "../../enclavia-ffi" }
+uniffi = { version = "=0.31.2", features = ["cli"] }
+uniffi-dart = { git = "https://github.com/Uniffi-Dart/uniffi-dart", tag = "v0.2.1+v0.31.2" }
+camino = "1.2"
+
+# Reproducible builds: force a single codegen unit, same rationale as
+# bdk-dart/native/Cargo.toml (native_toolchain_rust doesn't reliably forward
+# CARGO_PROFILE_RELEASE_CODEGEN_UNITS / CARGO_ENCODED_RUSTFLAGS into the
+# native-assets build).
+[profile.release]
+codegen-units = 1

@@ -1,0 +1,28 @@
+name: enclavia_dart
+description: Dart bindings for the enclavia client SDK (attested Noise tunnel to an enclave).
+version: 0.1.0
+homepage: https://enclavia.io
+repository: https://github.com/EnclaviaIO/enclavia
+issue_tracker: https://github.com/EnclaviaIO/enclavia/issues
+license: MIT OR Apache-2.0
+
+environment:
+  sdk: "^3.10.0"
+
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  windows:
+
+dependencies:
+  ffi: ^2.1.4
+  hooks: ^1.0.0
+  native_toolchain_rust: ^1.0.0
+dev_dependencies:
+  code_assets: ^1.0.0
+  test: ^1.26.2
+
+hooks:
+  build: hook/build.dart
