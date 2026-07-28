@@ -377,18 +377,25 @@ async fn start_replicated_from_env(host_cid: u32) -> Option<(
 
 #[tokio::main]
 async fn main() {
-    // Default `openraft` to WARN, not INFO: stdout is the emulated serial
-    // console inside the guest, where a write is a vmexit storm on our single
-    // vCPU. openraft's snapshot path alone logs ~8 INFO lines per build,
-    // several of them multi-KiB (it debug-prints the full membership,
-    // pubkeys as decimal arrays), which measurably stalled the apply loop
-    // for tens of milliseconds per snapshot and showed up directly as the
-    // customer-visible Pin p99. An explicit RUST_LOG still overrides.
+    // Cap `openraft` at WARN, even when RUST_LOG is set (the enclave init
+    // exports RUST_LOG=info): stdout is the emulated serial console inside
+    // the guest, where a write is a vmexit storm. openraft's snapshot path
+    // alone logs ~8 INFO lines per build, several of them multi-KiB (it
+    // debug-prints the full membership, pubkeys as decimal arrays), and the
+    // burst measurably stalled the RaftCore loop, commit and all, for
+    // 50-90ms per snapshot, which surfaced directly as the customer-visible
+    // Pin p99. An operator who really wants openraft chatter can still say
+    // so explicitly (any RUST_LOG containing an `openraft` directive is
+    // honoured untouched).
+    let base_filter =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let filter = if base_filter.contains("openraft") {
+        base_filter
+    } else {
+        format!("{base_filter},openraft=warn")
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,openraft=warn".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_ansi(false)
         .init();
 

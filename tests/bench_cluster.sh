@@ -92,7 +92,7 @@ EOF
         -M "nitro-enclave,vsock=c,id=bench-${name}" \
         -chardev "socket,id=c,path=${vhost}" \
         -kernel "$EIF" \
-        -nographic -m "$MEMORY" -smp 1 --enable-kvm -cpu host \
+        -nographic -m "$MEMORY" -smp "${SMP:-1}" --enable-kvm -cpu host \
         </dev/null >"$d/serial.log" 2>&1 &
     echo "$!" >> "$d/pids"
     echo "  $name up (qemu pid $!)"
