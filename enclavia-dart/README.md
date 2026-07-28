@@ -94,6 +94,37 @@ build the native library or bindings yourself — only if you're modifying
    toolchain to install the package — only to build the native library,
    which Native Assets handles for them.
 
+### Publishing to pub.dev (maintainers)
+
+In-repo, `native/Cargo.toml` depends on `enclavia-ffi` by path so that
+`generate_bindings.sh`, CI's Dart smoke test, and local development all
+build against the working tree. A pub.dev archive only contains the
+`enclavia-dart/` directory, so that path cannot resolve for consumers:
+at publish time (and only then), point the dependency at the release
+tag instead.
+
+1. Merge the release version bump and push the `enclavia-vX.Y.Z` tag.
+2. In `native/Cargo.toml`, temporarily replace
+
+   ```toml
+   enclavia-ffi = { path = "../../enclavia-ffi" }
+   ```
+
+   with
+
+   ```toml
+   enclavia-ffi = { git = "https://github.com/EnclaviaIO/enclavia", tag = "enclavia-vX.Y.Z" }
+   ```
+
+   and run `cargo update --workspace` in `native/` to refresh its
+   `Cargo.lock`.
+3. Run `dart pub publish --dry-run` from `enclavia-dart/`. The "checked-in
+   files are modified in git" note refers to the two files above and is
+   expected; there must be no other issues beyond analyzer warnings inside
+   the generated `lib/enclavia_ffi.dart`.
+4. Run `dart pub publish`, then discard the local dependency flip
+   (`git checkout -- native/Cargo.toml native/Cargo.lock`).
+
 ## License
 
 The Rust crates and generated bindings are dual-licensed under MIT or
