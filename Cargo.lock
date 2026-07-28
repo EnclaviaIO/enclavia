@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-chain-init"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "chrono",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-egress"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "enclavia-protocol",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enclavia",
  "enclavia-protocol",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "attestation-doc-validation",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-secrets-init"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "enclavia-vsock",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-vsock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
  "tokio-vsock",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "enclavia-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enclavia",
  "hex",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "mock-kms"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "attestation-doc-validation",
  "base64 0.22.1",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "nbd-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
@@ -3970,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "synchronizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-nitro-enclaves-nsm-api",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "synchronizer-names-init"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enclavia-vsock",
  "tokio",

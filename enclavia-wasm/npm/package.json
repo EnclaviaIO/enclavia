@@ -1,6 +1,6 @@
 {
   "name": "@enclavia/client-wasm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Enclavia client SDK compiled to WebAssembly: attested Noise tunnel to an enclave from browsers and JS runtimes (Node >= 22, Deno). Same Rust security core as the native SDK.",
   "license": "(Apache-2.0 OR MIT)",
   "repository": "github:EnclaviaIO/enclavia",
