@@ -59,9 +59,12 @@ pub struct TrustUpgrades {
 
 #[derive(uniffi::Record, Clone, Default)]
 pub struct ConnectOptions {
-    /// Accept the beta/QEMU debug attestation (nonce binding + PCR
-    /// equality, no signature). Defaults to `false`, matching the native
-    /// SDK. Leave unset on production Nitro.
+    /// Accept a debug enclave's attestation (nonce binding + PCR
+    /// equality, no signature) instead of requiring the full
+    /// production Nitro cert-chain validation. Defaults to `false`,
+    /// matching the native SDK. Debug enclaves are offered independently
+    /// of environment (beta or stable), so set this whenever the target
+    /// is a debug enclave, not based on which deployment you're talking to.
     pub debug_mode: Option<bool>,
     pub trust_upgrades: Option<TrustUpgrades>,
 }

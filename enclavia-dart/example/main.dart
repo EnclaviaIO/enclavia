@@ -26,7 +26,7 @@ Future<void> main() async {
     stdout.writeln(
       'Set ENCLAVIA_URL (wss://<id>.enclaves.<env>.enclavia.io), '
       'ENCLAVIA_PCR0/1/2 (hex, from `enclavia enclave status`), and '
-      'optionally ENCLAVIA_DEBUG_MODE=1 for a QEMU/beta enclave.',
+      'optionally ENCLAVIA_DEBUG_MODE=1 for a debug enclave.',
     );
     return;
   }
