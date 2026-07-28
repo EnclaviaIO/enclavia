@@ -131,7 +131,7 @@ enum Command {
     },
     /// Manage local control keys for self-hosted custody. A
     /// self-hosted enclave's upgrade confirmations and revocations are
-    /// signed by a key YOU hold (today: a YubiKey PIV slot); the
+    /// signed by a hardware key YOU hold (FIDO2 or YubiKey PIV); the
     /// backend never sees the private half. Keys are recorded in the
     /// platform configuration directory and referenced by name at create
     /// time (`enclave create --control-key <name>`).
@@ -143,13 +143,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum KeyCmd {
-    /// Generate a new ECDSA P-256 control key. With --yubikey the key
-    /// is generated ON-DEVICE in a PIV slot and is never extractable;
-    /// signing later requires the device (PIN + touch). A
-    /// passphrase-protected keyfile backend will follow; --yubikey is
-    /// required for now.
+    /// Generate a new hardware-backed ECDSA P-256 control key.
     Generate {
-        /// Generate on a YubiKey (PIV, ECDSA/P256). Required for now.
+        /// Create a discoverable CTAP2/FIDO2 ES256 credential on a USB
+        /// security key. Resident-key, UV, credProtect, and credential
+        /// management support are checked before creation; CTAP1/U2F
+        /// fallback is never used.
+        #[arg(long)]
+        fido2: bool,
+        /// Generate on a YubiKey PIV slot (legacy vendor-specific path).
         #[arg(long)]
         yubikey: bool,
         /// Name the key is stored under in the local index.
@@ -177,17 +179,18 @@ enum KeyCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Recover the local index entry for a control key that already
-    /// exists on a YubiKey (e.g. after losing the machine that held the
-    /// local control-key index). Reads the PUBLIC key back off the device
-    /// and records it exactly as `generate` would have.
-    /// Nothing is generated and nothing is written to the device; no
-    /// PIN is needed.
+    /// Recover the local index entry for an existing hardware control
+    /// key. Nothing is generated and no private key leaves the device.
     Import {
-        /// Import from a YubiKey (PIV, ECDSA/P256). Required for now.
+        /// Recover a discoverable CTAP2/FIDO2 ES256 credential. Requires
+        /// user verification and credential-management support.
+        #[arg(long)]
+        fido2: bool,
+        /// Import from a YubiKey PIV slot (ECDSA/P256).
         #[arg(long)]
         yubikey: bool,
-        /// Name the key is stored under in the local index.
+        /// Name stored in the local index. For FIDO2 this must match the
+        /// name stored with the discoverable credential.
         #[arg(long, default_value = "default")]
         name: String,
         /// PIV slot holding the key (9a, 9c, 9d, 9e). 9c is where
@@ -206,7 +209,7 @@ enum KeyCmd {
 
 /// Clap mirror of the YubiKey touch policy (the lib takes plain strings
 /// so it stays clap-free, like `InstanceTypeArg`).
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TouchPolicyArg {
     Always,
     Cached,
@@ -224,7 +227,7 @@ impl TouchPolicyArg {
 }
 
 /// Clap mirror of the YubiKey PIN policy.
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PinPolicyArg {
     Once,
     Always,
@@ -1447,45 +1450,156 @@ fn print_upgrade_confirm(r: &upgrade::StagedUpgradeJson) {
 
 fn run_key(cmd: KeyCmd, json: bool) -> Result<(), CliError> {
     match cmd {
-        KeyCmd::Generate { yubikey, name, slot, touch_policy, pin_policy, serial, yes } => {
-            if !yubikey {
-                return Err(CliError::Other(
-                    "only the YubiKey backend is available today; pass --yubikey (a \
-                     passphrase-keyfile backend is planned)"
-                        .into(),
-                ));
+        KeyCmd::Generate {
+            fido2,
+            yubikey,
+            name,
+            slot,
+            touch_policy,
+            pin_policy,
+            serial,
+            yes,
+        } => match (fido2, yubikey) {
+            (true, true) => Err(CliError::Other(
+                "--fido2 and --yubikey are mutually exclusive".into(),
+            )),
+            (false, false) => Err(CliError::Other(
+                "select a hardware backend with --fido2 or --yubikey".into(),
+            )),
+            (true, false) => {
+                let mut piv_only = Vec::new();
+                if slot != "9c" {
+                    piv_only.push("--slot");
+                }
+                if touch_policy != TouchPolicyArg::Always {
+                    piv_only.push("--touch-policy");
+                }
+                if pin_policy != PinPolicyArg::Once {
+                    piv_only.push("--pin-policy");
+                }
+                if serial.is_some() {
+                    piv_only.push("--serial");
+                }
+                if yes {
+                    piv_only.push("--yes");
+                }
+                if !piv_only.is_empty() {
+                    let noun =
+                        if piv_only.len() == 1 { "option applies" } else { "options apply" };
+                    return Err(CliError::Other(format!(
+                        "{} {noun} only to --yubikey PIV generation",
+                        piv_only.join(", ")
+                    )));
+                }
+                let generated = key_cmds::generate_fido2(&key_cmds::Fido2GenerateArgs { name })?;
+                emit(json, &generated, || print_fido2_key_generated(&generated));
+                Ok(())
             }
-            let args = key_cmds::YubiKeyGenerateArgs {
-                name,
-                slot,
-                touch_policy: touch_policy.as_str().into(),
-                pin_policy: pin_policy.as_str().into(),
-                serial,
-                assume_yes: yes,
-            };
-            let generated = key_cmds::generate_yubikey(&args)?;
-            emit(json, &generated, || print_key_generated(&generated));
-            Ok(())
-        }
-        KeyCmd::Import { yubikey, name, slot, serial } => {
-            if !yubikey {
-                return Err(CliError::Other(
-                    "only the YubiKey backend is available today; pass --yubikey (a \
-                     passphrase-keyfile backend is planned)"
-                        .into(),
-                ));
+            (false, true) => {
+                let args = key_cmds::YubiKeyGenerateArgs {
+                    name,
+                    slot,
+                    touch_policy: touch_policy.as_str().into(),
+                    pin_policy: pin_policy.as_str().into(),
+                    serial,
+                    assume_yes: yes,
+                };
+                let generated = key_cmds::generate_yubikey(&args)?;
+                emit(json, &generated, || print_key_generated(&generated));
+                Ok(())
             }
-            let args = key_cmds::YubiKeyImportArgs { name, slot, serial };
-            let imported = key_cmds::import_yubikey(&args)?;
-            emit(json, &imported, || print_key_imported(&imported));
-            Ok(())
-        }
+        },
+        KeyCmd::Import {
+            fido2,
+            yubikey,
+            name,
+            slot,
+            serial,
+        } => match (fido2, yubikey) {
+            (true, true) => Err(CliError::Other(
+                "--fido2 and --yubikey are mutually exclusive".into(),
+            )),
+            (false, false) => Err(CliError::Other(
+                "select a hardware backend with --fido2 or --yubikey".into(),
+            )),
+            (true, false) => {
+                let mut piv_only = Vec::new();
+                if slot != "9c" {
+                    piv_only.push("--slot");
+                }
+                if serial.is_some() {
+                    piv_only.push("--serial");
+                }
+                if !piv_only.is_empty() {
+                    let noun = if piv_only.len() == 1 {
+                        "option applies"
+                    } else {
+                        "options apply"
+                    };
+                    return Err(CliError::Other(format!(
+                        "{} {noun} only to --yubikey PIV import",
+                        piv_only.join(", ")
+                    )));
+                }
+                let imported = key_cmds::import_fido2(&key_cmds::Fido2ImportArgs { name })?;
+                emit(json, &imported, || print_fido2_key_imported(&imported));
+                Ok(())
+            }
+            (false, true) => {
+                let args = key_cmds::YubiKeyImportArgs { name, slot, serial };
+                let imported = key_cmds::import_yubikey(&args)?;
+                emit(json, &imported, || print_key_imported(&imported));
+                Ok(())
+            }
+        },
         KeyCmd::List => {
             let rows = key_cmds::list()?;
             emit(json, &rows, || print_key_list(&rows));
             Ok(())
         }
     }
+}
+
+fn print_fido2_key_generated(k: &key_cmds::GeneratedFido2Key) {
+    println!(
+        "Created FIDO2 control key '{}' on the selected authenticator.",
+        k.name
+    );
+    println!("  Public key:  {}", k.public_key);
+    println!("  Fingerprint: {}", k.fingerprint);
+    println!("  AAGUID:      {}", k.aaguid);
+    println!();
+    println!("The private key was generated on-device and cannot be extracted.");
+    println!(
+        "Local metadata was saved to {}",
+        enclavia_cli::keys::index_path().display()
+    );
+    println!(
+        "If that index is lost, recover this discoverable credential with:\n  enclavia key \
+         import --fido2 --name {}",
+        k.name
+    );
+    println!("Use it when creating an enclave:");
+    println!("  enclavia enclave create --control-key {} ...", k.name);
+}
+
+fn print_fido2_key_imported(k: &key_cmds::ImportedFido2Key) {
+    println!(
+        "Imported discoverable FIDO2 control key '{}' from the selected authenticator.",
+        k.name
+    );
+    println!("  Public key:  {}", k.public_key);
+    println!("  Fingerprint: {}", k.fingerprint);
+    println!("  AAGUID:      {}", k.aaguid);
+    if let Some(existing) = &k.already_registered_as {
+        println!(
+            "  Note: the same public key is already registered locally as '{existing}'."
+        );
+    }
+    println!();
+    println!("The private key never left the authenticator; only public metadata was recovered.");
+    println!("Use it when creating an enclave:");
+    println!("  enclavia enclave create --control-key {} ...", k.name);
 }
 
 fn print_key_imported(k: &key_cmds::ImportedKey) {
@@ -1530,7 +1644,7 @@ fn print_key_generated(k: &key_cmds::GeneratedKey) {
 fn print_key_list(rows: &[key_cmds::KeyListEntry]) {
     if rows.is_empty() {
         println!(
-            "No control keys yet. Generate one with `enclavia key generate --yubikey --name <name>`."
+            "No control keys yet. Generate one with `enclavia key generate --fido2 --name <name>`."
         );
         return;
     }

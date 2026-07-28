@@ -227,7 +227,7 @@ pub fn import_yubikey(_args: &YubiKeyImportArgs) -> Result<ImportedKey, CliError
 /// [`import_yubikey`] so the collision behaviors are testable without
 /// hardware.
 #[cfg_attr(not(feature = "yubikey"), allow(dead_code))]
-pub(crate) fn register_imported(
+fn register_imported(
     index: &mut KeyIndex,
     name: &str,
     serial: u32,
@@ -285,6 +285,7 @@ mod tests {
                 assert_eq!(*serial, 42);
                 assert_eq!(slot, "9c");
             }
+            other => panic!("wrong backend: {other:?}"),
         }
     }
 

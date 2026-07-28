@@ -85,7 +85,7 @@ enclavia enclave destroy <id>
 | `--egress-config PATH` | Full egress policy as a JSON file instead of the flags above. |
 | `--upgradable` | Allow signed image upgrades post-create (bakes a control key). |
 | `--production` | Launch on real AWS Nitro hardware instead of a debug (QEMU) enclave. Requires a paid plan. |
-| `--control-key KEY_NAME` | Self-hosted custody: register a local (YubiKey-backed) control key; the backend can then never sign upgrades itself. Implies `--upgradable`. |
+| `--control-key KEY_NAME` | Self-hosted custody: register a local FIDO2 or YubiKey PIV control key; the backend can then never sign upgrades itself. Implies `--upgradable`. |
 | `--anti-rollback` | Synchronizer-backed storage anti-rollback (storage enclaves, entitled plans). |
 | `--min-upgrade-delay DURATION` | Measured minimum upgrade activation delay (e.g. `48h`, `7d`), enforced by the enclave itself. Immutable post-create. |
 
@@ -132,19 +132,48 @@ enclavia upgrade revoke <enclave-id> <upgrade-id>
 With managed custody the backend signs the confirmation for you. With
 `--control-key` (self-hosted custody) confirm and revoke run a two-phase
 prepare/sign/submit flow against your local key, so the signature happens on
-your machine (or your YubiKey) and the backend never holds the private key.
+your hardware authenticator and the backend never holds the private key.
 
 ### Control keys (self-hosted custody)
 
 ```sh
+enclavia key generate --fido2 [--name NAME]
 enclavia key generate --yubikey [--name NAME] [--slot 9c] [--touch-policy always] [--pin-policy once] [--serial N]
+enclavia key import --fido2 [--name NAME]
 enclavia key import --yubikey [--name NAME] [--slot 9c] [--serial N]
 enclavia key list
 ```
 
-Keys are generated on-device (the private key never leaves the hardware);
-the public half is recorded in `keys/index.json` inside the platform
-configuration directory.
+`--fido2` uses vendor-neutral USB HID CTAP2 with a discoverable ES256
+credential and requires both user presence and user verification (normally a
+touch plus the authenticator's FIDO2 PIN). Discoverable credentials,
+`credProtect=UserVerificationRequired`, and CTAP2 credential management are
+the supported profile; CTAP1/U2F and non-discoverable-credential fallbacks are
+disabled. Generation checks these capabilities before creating a credential,
+so an incompatible authenticator is rejected without changing its state.
+Backup-eligible credentials are rejected on every assertion, so synced
+iCloud/Google passkeys and other exportable credentials cannot authorize
+control commands. Authenticated signature counters are required to advance
+when the authenticator supports them.
+The local `keys/index.json` caches the credential ID and public key for exact
+selection during routine signing. If that file is lost, `key import --fido2
+--name NAME` uses PIN/UV-protected credential management to recover the public
+metadata from the authenticator. `NAME` must match the name supplied when the
+credential was generated.
+
+`--yubikey` keeps the existing vendor-specific PIV path for devices and
+deployments that already use it. PIV entries can be reconstructed with
+`key import --yubikey`.
+
+In both modes the key is generated on-device and its private half never
+leaves the hardware. The public key and device metadata are recorded in the
+local index.
+
+FIDO2 proofs are larger than the legacy 64-byte PIV signature. Deploy the
+matching `enclavia-server`, protocol validator, and synchronizer together,
+and ensure any external control-plane proxy treats `payload_signature` and
+`envelope_signature` as opaque, variable-length base64 rather than enforcing
+a 64-byte length.
 
 ### Auth
 

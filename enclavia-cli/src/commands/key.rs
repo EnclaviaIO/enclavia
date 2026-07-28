@@ -1,9 +1,10 @@
 //! `enclavia key` command orchestration.
 //!
 //! Local control-key management for self-hosted custody. `generate`
-//! creates the key (on a YubiKey, on-device) and records it in the
+//! creates a PIV key or FIDO2 credential on-device and records it in the
 //! platform configuration directory's key index; `import` recovers an
-//! existing YubiKey PIV entry; `list` renders the index.
+//! existing YubiKey PIV or discoverable FIDO2 entry; `list` renders the
+//! index.
 //! Presentation lives in the binary, as with every other command
 //! module.
 
@@ -12,8 +13,13 @@ use serde::Serialize;
 use crate::error::CliError;
 use crate::keys::{self, KeyBackend, KeyIndex};
 
+mod fido2;
 mod yubikey;
 
+pub use fido2::{
+    Fido2GenerateArgs, Fido2ImportArgs, GeneratedFido2Key, ImportedFido2Key, generate_fido2,
+    import_fido2,
+};
 pub use yubikey::{
     GeneratedKey, ImportedKey, YubiKeyGenerateArgs, YubiKeyImportArgs, generate_yubikey,
     import_yubikey,
@@ -27,6 +33,10 @@ pub struct KeyListEntry {
     pub backend: String,
     pub serial: Option<u32>,
     pub slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aaguid: Option<String>,
     pub public_key: String,
     pub fingerprint: String,
 }
@@ -44,14 +54,22 @@ pub(crate) fn rows_from_index(index: &KeyIndex) -> Result<Vec<KeyListEntry>, Cli
         .keys
         .iter()
         .map(|(name, entry)| {
-            let (serial, slot) = match &entry.backend {
-                KeyBackend::Yubikey { serial, slot } => (Some(*serial), Some(slot.clone())),
+            let (serial, slot, credential_id, aaguid) = match &entry.backend {
+                KeyBackend::Yubikey { serial, slot } => {
+                    (Some(*serial), Some(slot.clone()), None, None)
+                }
+                KeyBackend::Fido2 {
+                    credential_id,
+                    aaguid,
+                } => (None, None, Some(credential_id.clone()), aaguid.clone()),
             };
             Ok(KeyListEntry {
                 name: name.clone(),
                 backend: entry.backend.kind().into(),
                 serial,
                 slot,
+                credential_id,
+                aaguid,
                 public_key: entry.public_key.clone(),
                 fingerprint: entry.fingerprint()?,
             })
@@ -65,8 +83,8 @@ pub fn control_key_body_for(name: &str) -> Result<serde_json::Value, CliError> {
     let index = keys::load_index()?;
     let entry = index.keys.get(name).ok_or_else(|| {
         CliError::Other(format!(
-            "no key named {name:?} in {} (generate one with `enclavia key generate --yubikey \
-             --name {name}`)",
+            "no key named {name:?} in {} (generate one with `enclavia key generate --fido2 \
+             --name {name}` or `enclavia key generate --yubikey --name {name}`)",
             keys::index_path().display()
         ))
     })?;
@@ -98,18 +116,47 @@ mod tests {
             },
         }
     }
+    fn point(seed: u8) -> [u8; 65] {
+        let sk = p256::SecretKey::from_bytes(&[seed; 32].into()).unwrap();
+        sk.public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .unwrap()
+    }
     #[test]
     fn rows_project_index_entries() {
         let mut index = KeyIndex::default();
         index.insert_new("alpha", entry(3)).unwrap();
         index.insert_new("beta", entry(4)).unwrap();
+        index
+            .insert_new(
+                "gamma",
+                KeyEntry {
+                    public_key: base64::engine::general_purpose::STANDARD.encode(point(5)),
+                    backend: KeyBackend::Fido2 {
+                        credential_id: base64::engine::general_purpose::STANDARD.encode([0xAA; 32]),
+                        aaguid: Some("00112233-4455-6677-8899-aabbccddeeff".into()),
+                    },
+                },
+            )
+            .unwrap();
         let rows = rows_from_index(&index).unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].name, "alpha");
         assert_eq!(rows[0].backend, "yubikey");
         assert_eq!(rows[0].serial, Some(3));
         assert_eq!(rows[0].slot.as_deref(), Some("9c"));
         assert!(rows[0].fingerprint.starts_with("sha256:"));
         assert_eq!(rows[1].name, "beta");
+        assert_eq!(rows[2].name, "gamma");
+        assert_eq!(rows[2].backend, "fido2");
+        assert_eq!(rows[2].serial, None);
+        assert_eq!(rows[2].slot, None);
+        assert!(rows[2].credential_id.is_some());
+        assert_eq!(
+            rows[2].aaguid.as_deref(),
+            Some("00112233-4455-6677-8899-aabbccddeeff")
+        );
     }
 }

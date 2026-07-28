@@ -6,15 +6,16 @@
 //! [`index_path`] mapping a user-chosen name to a backend descriptor plus
 //! the public key. The platform-aware location comes from
 //! [`crate::config::config_dir`] (`~/.config/enclavia` on Linux,
-//! `~/Library/Application Support/enclavia` on macOS). The current
-//! hardware backend is a YubiKey PIV slot; the schema is a tagged enum
-//! so future backends slot in without a migration.
+//! `~/Library/Application Support/enclavia` on macOS). Hardware backends
+//! are a YubiKey PIV slot and a vendor-neutral FIDO2 credential; the
+//! schema is a tagged enum so future backends slot in without a
+//! migration.
 //!
-//! The index holds no secret material (a YubiKey key is not
-//! extractable), but the directory is still created 0700 and the file
-//! written 0600: the future keyfile backend stores its encrypted
-//! keyfile under the same directory, and the index itself reveals which
-//! enclaves the machine can control.
+//! The index holds no private key material (the cached FIDO2 credential
+//! ID is non-secret and PIV keys are not extractable), but the directory is
+//! still created 0700 and the file written 0600: a future keyfile
+//! backend may store its encrypted keyfile under the same directory, and
+//! the index itself reveals which enclaves the machine can control.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -81,6 +82,17 @@ pub enum KeyBackend {
         /// PIV slot in lowercase hex, e.g. `"9c"`.
         slot: String,
     },
+    /// A discoverable CTAP2/FIDO2 ES256 credential. The private key
+    /// remains on the authenticator; the credential ID is cached for
+    /// exact routine selection and can be recovered through credential
+    /// management if the local index is lost.
+    Fido2 {
+        /// Standard-base64 credential ID returned by `makeCredential`.
+        credential_id: String,
+        /// Authenticator model identifier, retained for diagnostics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aaguid: Option<String>,
+    },
 }
 
 impl KeyBackend {
@@ -88,6 +100,7 @@ impl KeyBackend {
     pub fn kind(&self) -> &'static str {
         match self {
             KeyBackend::Yubikey { .. } => "yubikey",
+            KeyBackend::Fido2 { .. } => "fido2",
         }
     }
 }
@@ -103,6 +116,23 @@ impl KeyEntry {
     /// Short fingerprint of the public key for display.
     pub fn fingerprint(&self) -> Result<String, CliError> {
         Ok(fingerprint(&self.public_key_bytes()?))
+    }
+
+    /// Decode and validate the credential ID for a FIDO2 entry.
+    pub fn fido2_credential_id(&self) -> Result<Option<Vec<u8>>, CliError> {
+        let KeyBackend::Fido2 { credential_id, .. } = &self.backend else {
+            return Ok(None);
+        };
+        let id = base64::engine::general_purpose::STANDARD
+            .decode(credential_id)
+            .map_err(|e| CliError::Other(format!("invalid base64 FIDO2 credential ID: {e}")))?;
+        if id.is_empty() || id.len() > 1023 {
+            return Err(CliError::Other(format!(
+                "FIDO2 credential ID must contain 1-1023 bytes, got {}",
+                id.len()
+            )));
+        }
+        Ok(Some(id))
     }
 }
 
@@ -302,6 +332,7 @@ mod tests {
                 assert_eq!(*serial, 12345678);
                 assert_eq!(slot, "9c");
             }
+            other => panic!("wrong backend: {other:?}"),
         }
     }
 
@@ -381,6 +412,22 @@ mod tests {
         assert_eq!(json["serial"], 12345678);
         assert_eq!(json["slot"], "9c");
         assert!(json["public_key"].is_string());
+    }
+
+    #[test]
+    fn fido2_entry_round_trips_and_decodes_credential_id() {
+        let id = vec![0xA5; 48];
+        let entry = KeyEntry {
+            public_key: base64::engine::general_purpose::STANDARD.encode(sample_pubkey()),
+            backend: KeyBackend::Fido2 {
+                credential_id: base64::engine::general_purpose::STANDARD.encode(&id),
+                aaguid: Some("00112233-4455-6677-8899-aabbccddeeff".into()),
+            },
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: KeyEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.backend.kind(), "fido2");
+        assert_eq!(back.fido2_credential_id().unwrap(), Some(id));
     }
 
     #[test]

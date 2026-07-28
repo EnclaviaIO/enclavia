@@ -149,7 +149,7 @@ impl ControlSigner for YubiKeySigner {
         self.public_key
     }
 
-    fn sign(&self, msg: &[u8]) -> Result<[u8; 64], CliError> {
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, CliError> {
         // PIV signs a caller-provided digest; the enclave verifies
         // with `VerifyingKey::verify(msg, sig)`, which SHA-256
         // hashes internally, so the digest we hand the device MUST
@@ -166,6 +166,7 @@ impl ControlSigner for YubiKeySigner {
         // PIV emits DER (and possibly high-S); re-encode to the
         // locked-in 64-byte raw low-S r||s wire format.
         der_signature_to_raw(&der)
+            .map(|raw| raw.to_vec())
             .map_err(|e| CliError::Other(format!("re-encoding YubiKey signature: {e}")))
     }
 }

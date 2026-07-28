@@ -287,8 +287,8 @@ pub fn control_key_mode(enclave: &serde_json::Value) -> ControlKeyMode {
 }
 
 /// Locate the enclave's control key in the local index and open a
-/// signer for it. Interactive: the YubiKey backend prompts for its PIN
-/// on stderr.
+/// signer for it. Interactive hardware backends prompt for PIN/user
+/// verification and touch on stderr.
 fn signer_for_enclave(
     enclave: &serde_json::Value,
 ) -> Result<Box<dyn crate::signer::ControlSigner>, CliError> {

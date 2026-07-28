@@ -53,7 +53,10 @@
           nativeBuildInputs = [ pkgs.pkg-config ];
           # pcsclite: the CLI's default `yubikey` feature (#48) links
           # libpcsclite (PIV over PC/SC) via the pcsc-sys crate.
-          buildInputs = [ pkgs.openssl pkgs.pcsclite ];
+          # systemd provides libudev on Linux for the default `fido2`
+          # feature's CTAP2 USB-HID device discovery.
+          buildInputs = [ pkgs.openssl pkgs.pcsclite ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd ];
         };
 
         cargoArtifacts = craneLib.buildDepsOnly rustCommonArgs;
@@ -313,6 +316,10 @@
             pkgs.openssl
             # For the CLI's default `yubikey` feature (#48).
             pkgs.pcsclite
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            # CTAP2 USB-HID enumeration (`authenticator` crate).
+            pkgs.systemd
+          ] ++ [
             # wasm client (enclavia-wasm): bindgen glue + wasm-opt. The clang
             # that compiles ring's C for wasm32 is injected via the CC_/CFLAGS_
             # env vars below, so `cargo build --target wasm32-unknown-unknown`

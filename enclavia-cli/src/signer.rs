@@ -2,18 +2,17 @@
 //!
 //! [`ControlSigner`] is the seam between the two-phase confirm/revoke
 //! flow and wherever the control private key actually lives. The
-//! contract mirrors what `enclavia-server` verifies: `sign(msg)` must
-//! return a 64-byte raw low-S `r || s` ECDSA P-256 signature such that
-//! `p256::ecdsa::VerifyingKey::verify(msg, sig)` accepts it.
-//! `VerifyingKey::verify` hashes the message with SHA-256 internally,
-//! so hardware backends that sign a caller-provided digest (PIV) must
-//! compute `SHA-256(msg)` themselves and sign that digest.
+//! contract mirrors what `enclavia-server` verifies: `sign(msg)` returns
+//! an opaque control proof. PIV produces the original 64-byte raw P-256
+//! signature; FIDO2 produces a versioned CTAP2 assertion.
 //!
 //! Backends:
 //! - [`YubiKeySigner`] (cargo feature `yubikey`, on by default): PIV
 //!   ECDSA/P256 on a YubiKey. The key is generated on-device and never
 //!   extractable; signing prompts for the PIN and (policy permitting) a
 //!   touch.
+//! - [`Fido2Signer`] (cargo feature `fido2`, on by default): CTAP2-only
+//!   ES256 credentials on vendor-neutral USB HID security keys.
 //! - A passphrase-protected keyfile backend is planned as a follow-up
 //!   and will implement the same trait.
 
@@ -37,11 +36,9 @@ pub trait ControlSigner: Send {
     /// as registered with the backend at enclave-create time.
     fn public_key(&self) -> [u8; 65];
 
-    /// Sign `msg`: raw low-S `r || s` over `SHA-256(msg)`, i.e. exactly
-    /// what `p256::ecdsa::VerifyingKey::verify(msg, sig)` accepts on
-    /// the enclave side. Interactive backends may prompt (PIN, touch)
-    /// on stderr.
-    fn sign(&self, msg: &[u8]) -> Result<[u8; 64], CliError>;
+    /// Produce an opaque proof over `msg`. Interactive backends may
+    /// prompt for a PIN, user verification, and touch on stderr.
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, CliError>;
 }
 
 /// Build a signer for a key-index entry. When the CLI is built without
@@ -67,13 +64,30 @@ pub fn signer_for_entry(name: &str, entry: &KeyEntry) -> Result<Box<dyn ControlS
                 )))
             }
         }
+        KeyBackend::Fido2 { .. } => {
+            #[cfg(feature = "fido2")]
+            {
+                let credential_id = entry.fido2_credential_id()?.ok_or_else(|| {
+                    CliError::Other(format!("key {name:?} has no FIDO2 credential ID"))
+                })?;
+                Ok(Box::new(Fido2Signer::new(credential_id, public_key)?))
+            }
+            #[cfg(not(feature = "fido2"))]
+            {
+                let _ = public_key;
+                Err(CliError::Other(format!(
+                    "key {name:?} is a FIDO2 key, but this enclavia build has no FIDO2 \
+                     support (rebuild enclavia-cli with the default `fido2` feature)"
+                )))
+            }
+        }
     }
 }
 
 /// Assemble and sign a `PrepareUpgrade` submission from a prepare
 /// response: inner signature over the chain payload, canonical CBOR
 /// command via the shared protocol encoder, envelope signature over the
-/// command bytes. Two `sign` calls (two YubiKey touches).
+/// command bytes. Hardware backends require two authorization gestures.
 pub fn sign_confirm_submission(
     signer: &dyn ControlSigner,
     prep: &ConfirmPrepareResponse,
@@ -83,7 +97,7 @@ pub fn sign_confirm_submission(
     let envelope = signer.sign(&command)?;
     Ok(ConfirmSubmitRequest {
         command,
-        envelope_signature: envelope.to_vec(),
+        envelope_signature: envelope,
     })
 }
 
@@ -98,7 +112,7 @@ pub fn sign_revoke_submission(
     let envelope = signer.sign(&command)?;
     Ok(ConfirmSubmitRequest {
         command,
-        envelope_signature: envelope.to_vec(),
+        envelope_signature: envelope,
     })
 }
 
@@ -108,6 +122,14 @@ mod yubikey;
 pub use yubikey::{
     GenerateParams, RecoveredKey, YubiKeySigner, generate_on_device, parse_slot,
     read_public_key_on_device,
+};
+
+#[cfg(feature = "fido2")]
+mod fido2;
+#[cfg(feature = "fido2")]
+pub use fido2::{
+    Fido2Signer, RecoveredFido2Credential, RegisteredFido2Credential, recover_fido2_credential,
+    register_fido2_credential,
 };
 
 #[cfg(test)]
@@ -139,10 +161,59 @@ mod tests {
                 .unwrap()
         }
 
-        fn sign(&self, msg: &[u8]) -> Result<[u8; 64], CliError> {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, CliError> {
             let sig: Signature = self.0.sign(msg);
             let sig = sig.normalize_s().unwrap_or(sig);
-            Ok(<[u8; 64]>::try_from(&sig.to_bytes()[..]).unwrap())
+            Ok(sig.to_bytes().to_vec())
+        }
+    }
+
+    /// Software CTAP2 assertion double for exercising variable-length
+    /// FIDO2 proofs through the same submission assembly.
+    struct InMemoryFido2Signer {
+        signing_key: SigningKey,
+        sign_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl InMemoryFido2Signer {
+        fn new(seed: u8) -> Self {
+            Self {
+                signing_key: SigningKey::from_bytes(&[seed; 32].into()).unwrap(),
+                sign_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl ControlSigner for InMemoryFido2Signer {
+        fn public_key(&self) -> [u8; 65] {
+            VerifyingKey::from(&self.signing_key)
+                .to_encoded_point(false)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        }
+
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, CliError> {
+            use enclavia_protocol::custody::{FIDO2_RP_ID, Fido2Assertion, fido2_client_data_hash};
+            use sha2::{Digest as _, Sha256};
+
+            let mut authenticator_data = Sha256::digest(FIDO2_RP_ID.as_bytes()).to_vec();
+            authenticator_data.push(0x01 | 0x04);
+            let sign_count = self
+                .sign_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
+            let mut signed = authenticator_data.clone();
+            let credential_id = vec![0xE5; 32];
+            signed.extend_from_slice(&fido2_client_data_hash(msg, &credential_id));
+            let signature: Signature = self.signing_key.sign(&signed);
+            Ok(Fido2Assertion {
+                credential_id,
+                authenticator_data,
+                signature: signature.to_der().as_bytes().to_vec(),
+            }
+            .encode())
         }
     }
 
@@ -155,13 +226,16 @@ mod tests {
         }
     }
 
-    /// Verify exactly as `enclavia-server::handle_control` does: parse
-    /// the 64 raw bytes with `Signature::from_slice`, then
-    /// `VerifyingKey::verify` (which hashes the message internally).
-    fn verify_like_enclave(pubkey: &[u8; 65], msg: &[u8], sig: &[u8]) {
+    /// Verify exactly as `enclavia-server::handle_control` does.
+    fn verify_like_enclave(pubkey: &[u8; 65], msg: &[u8], proof: &[u8]) {
+        use enclavia_protocol::custody::ControlProofKind;
+
         let vk = VerifyingKey::from_sec1_bytes(pubkey).unwrap();
-        let sig = Signature::from_slice(sig).unwrap();
-        vk.verify(msg, &sig).unwrap();
+        let verified = enclavia_protocol::custody::verify_control_proof(&vk, msg, proof).unwrap();
+        match verified.kind {
+            ControlProofKind::P256Raw => assert_eq!(verified.sign_count, None),
+            ControlProofKind::Fido2 => assert!(verified.sign_count.is_some()),
+        }
     }
 
     #[test]
@@ -194,6 +268,28 @@ mod tests {
                 let rk = rk.expect("rekey present");
                 assert_eq!(rk.new_public_key, rekey.new_public_key);
                 assert_eq!(rk.new_key_id, rekey.new_key_id);
+                verify_like_enclave(&signer.public_key(), &payload, &payload_signature);
+            }
+            other => panic!("wrong command variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fido2_confirm_submission_verifies_like_the_enclave() {
+        let signer = InMemoryFido2Signer::new(8);
+        let prep = prepare_fixture(None);
+        let req = sign_confirm_submission(&signer, &prep).unwrap();
+
+        assert!(req.envelope_signature.len() > 64);
+        verify_like_enclave(&signer.public_key(), &req.command, &req.envelope_signature);
+        let cmd: ControlCommand = ciborium::from_reader(req.command.as_slice()).unwrap();
+        match cmd {
+            ControlCommand::PrepareUpgrade {
+                payload,
+                payload_signature,
+                ..
+            } => {
+                assert!(payload_signature.len() > 64);
                 verify_like_enclave(&signer.public_key(), &payload, &payload_signature);
             }
             other => panic!("wrong command variant: {other:?}"),
