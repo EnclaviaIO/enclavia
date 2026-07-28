@@ -487,7 +487,16 @@ async fn main() {
                         )
                         .await
                         {
-                            warn!(error = %e, "connection error");
+                            // A plain I/O drop is a normal client disconnect
+                            // (sessions close when a customer enclave stops, and
+                            // a burst of teardown WARNs on the emulated serial
+                            // console measurably stalls live traffic); real
+                            // protocol violations keep the WARN.
+                            if matches!(e, synchronizer::listener::ConnError::Io(_)) {
+                                tracing::debug!(error = %e, "connection closed");
+                            } else {
+                                warn!(error = %e, "connection error");
+                            }
                         }
                     });
                 }
@@ -529,7 +538,16 @@ async fn main() {
                         )
                         .await
                         {
-                            warn!(error = %e, "connection error");
+                            // A plain I/O drop is a normal client disconnect
+                            // (sessions close when a customer enclave stops, and
+                            // a burst of teardown WARNs on the emulated serial
+                            // console measurably stalls live traffic); real
+                            // protocol violations keep the WARN.
+                            if matches!(e, synchronizer::listener::ConnError::Io(_)) {
+                                tracing::debug!(error = %e, "connection closed");
+                            } else {
+                                warn!(error = %e, "connection error");
+                            }
                         }
                     });
                 }
