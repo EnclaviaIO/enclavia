@@ -151,6 +151,13 @@ the public half is recorded in `~/.config/enclavia/keys/index.json`.
 enclavia auth login
 ```
 
+When the CLI runs over SSH or on a VPS, it prints an SSH local-forwarding
+command containing the randomly selected callback port. Run that command on
+the machine with your browser, replace `user@remote-host` with your usual SSH
+destination, and leave it running while you open and approve the authorization
+URL. The browser's loopback callback is then carried through SSH to the waiting
+CLI; no public VPS port is required.
+
 ## Configuration
 
 - `~/.config/enclavia/` holds credentials and the control-key index.
