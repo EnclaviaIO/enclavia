@@ -88,7 +88,10 @@ fn parse_args() -> Args {
         i += 2;
     }
     assert!(mode == "pin" || mode == "get", "bad --mode (pin|get)");
-    assert!(sessions >= 1 && sessions <= 150, "--sessions must be 1..=150 (u8 seed space)");
+    assert!(
+        (1..=150).contains(&sessions),
+        "--sessions must be 1..=150 (u8 seed space)"
+    );
     Args {
         proxy,
         server_pcrs: server_pcrs.expect("--server-pcrs <pcr.json> is required"),
@@ -350,7 +353,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-fn summarize(label: &str, micros: &mut Vec<u64>) {
+fn summarize(label: &str, micros: &mut [u64]) {
     micros.sort_unstable();
     let n = micros.len();
     if n == 0 {
