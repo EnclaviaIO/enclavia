@@ -24,8 +24,8 @@ default = []
 test-utils = []
 
 [dependencies]
-enclavia-protocol = { path = "../enclavia-protocol", version = "0.1.0" }
-enclavia-vsock = { path = "../enclavia-vsock", version = "0.1.0" }
+enclavia-protocol = { path = "../enclavia-protocol", version = "0.2.0" }
+enclavia-vsock = { path = "../enclavia-vsock", version = "0.2.0" }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-vsock = { workspace = true }
 tracing.workspace = true
