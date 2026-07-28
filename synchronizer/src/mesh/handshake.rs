@@ -118,43 +118,18 @@ pub enum MeshFrame {
     Hello {
         /// The sender's `self_name`.
         from: String,
-        /// Whether the sender can DECODE byte-string-encoded RPC payloads
-        /// (see [`super::cbor_bytes`]): the ~3x-smaller framing negotiation.
-        /// New nodes always announce `true`; a pre-adapter peer's Hello has
-        /// no such field and decodes as `false` (`serde(default)`), and a
-        /// pre-adapter peer DECODING our Hello ignores the unknown field. A
-        /// node emits byte-string payloads on a connection only when the
-        /// peer's Hello announced support, so a mixed-version cluster
-        /// (mid-rolling-restart) transparently stays on the legacy encoding.
-        #[serde(default)]
-        byte_wire: bool,
     },
     /// An id-correlated RPC envelope (request or response). Opaque to the
     /// handshake layer; decoded by [`super::rpc`].
     Rpc {
-        /// CBOR-encoded [`super::rpc::Envelope`]. Emitted in the legacy
-        /// integer-array encoding here (this variant is the non-negotiated
-        /// path); the byte-string emission lives in [`RpcFrameBytes`].
-        /// Decode accepts BOTH encodings, see [`super::cbor_bytes`].
-        #[serde(serialize_with = "super::cbor_bytes::serialize_legacy", deserialize_with = "super::cbor_bytes::deserialize")]
+        /// CBOR-encoded [`super::rpc::Envelope`], carried as a CBOR byte
+        /// string (via `serde_bytes`; a plain `Vec<u8>` would be encoded as
+        /// an ARRAY of integers, ~2x the bytes and per-element encode/decode
+        /// work on every replication RPC). No cross-version wire concern:
+        /// the self-PCR mesh allowlist only ever admits peers running the
+        /// identical image, so both ends always agree on the encoding.
+        #[serde(with = "serde_bytes")]
         envelope: Vec<u8>,
-    },
-}
-
-/// Emit-only mirror of [`MeshFrame::Rpc`] with the payload as a CBOR byte
-/// string (~3x smaller on the wire and far cheaper to encode/decode than the
-/// integer-array form). Written only on connections whose peer announced
-/// `byte_wire` support in its [`MeshFrame::Hello`]; decodes on the peer via
-/// the accept-both [`super::cbor_bytes`] adapter into an ordinary
-/// [`MeshFrame::Rpc`].
-#[derive(Serialize)]
-#[serde(tag = "frame")]
-pub enum RpcFrameBytes<'a> {
-    /// Mirrors [`MeshFrame::Rpc`]; same `frame` tag value.
-    Rpc {
-        /// CBOR-encoded [`super::rpc::Envelope`], emitted as a byte string.
-        #[serde(serialize_with = "super::cbor_bytes::serialize")]
-        envelope: &'a [u8],
     },
 }
 
@@ -346,21 +321,6 @@ pub async fn write_frame<S>(
 ) -> Result<(), HandshakeError>
 where
     S: AsyncWrite + Unpin,
-{
-    write_frame_ser(stream, transport, frame).await
-}
-
-/// [`write_frame`] generalized over the frame's Serialize impl, so the RPC
-/// layer can emit the negotiated byte-string mirror ([`RpcFrameBytes`])
-/// through the identical encrypt-and-chunk path.
-pub async fn write_frame_ser<S, F>(
-    stream: &mut S,
-    transport: &mut NoiseTransport,
-    frame: &F,
-) -> Result<(), HandshakeError>
-where
-    S: AsyncWrite + Unpin,
-    F: serde::Serialize,
 {
     let mut plaintext = Vec::new();
     ciborium::into_writer(frame, &mut plaintext)

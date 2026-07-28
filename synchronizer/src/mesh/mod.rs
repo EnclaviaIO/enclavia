@@ -48,74 +48,6 @@ pub mod identity;
 pub mod rpc;
 pub mod transport;
 
-/// serde adapter for the mesh's nested opaque byte payloads
-/// ([`handshake::MeshFrame::Rpc`]'s `envelope`, [`rpc::Envelope`]'s `body`).
-///
-/// Plain `Vec<u8>` is CBOR-encoded by ciborium as an ARRAY of integers
-/// (~1.6-2x the raw size per nesting layer, plus per-element encode/decode
-/// work); with two such layers wrapping every replication RPC the payload
-/// reached the Noise layer ~3x inflated, which both burned leader CPU and
-/// forced the tight `max_payload_entries` / `snapshot_max_chunk_size`
-/// ceilings in `raft::default_config`. This adapter emits a CBOR BYTE STRING
-/// instead (1x + 5 bytes header), and on decode accepts BOTH encodings so a
-/// mixed-version cluster keeps talking during a rolling restart: a new node
-/// decodes an old peer's array frames, while old nodes cannot decode the new
-/// byte-string frames, so a rollout must roll ALL nodes (one at a time is
-/// fine: the rolled node rejoins once a quorum of upgraded peers exists;
-/// see the rollout note in the PR).
-pub mod cbor_bytes {
-    use serde::{Deserializer, Serializer};
-
-    /// Serialize as a CBOR byte string.
-    pub fn serialize<S: Serializer>(v: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(v)
-    }
-
-    /// Serialize in the LEGACY integer-array encoding (what a plain `Vec<u8>`
-    /// field emits). Kept as the emit-side default until every deployed
-    /// cluster node runs an accept-both build: a byte-string frame is
-    /// undecodable by pre-adapter nodes, which would wedge a one-node-at-a-
-    /// time rolling restart (the rolled node's frames get rejected by its
-    /// still-old peers and it can never rejoin). Once the fleet is on
-    /// accept-both, a follow-up flips emission to [`serialize`].
-    pub fn serialize_legacy<S: Serializer>(v: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        use serde::Serialize;
-        v.serialize(ser)
-    }
-
-    struct BytesOrSeq;
-
-    impl<'de> serde::de::Visitor<'de> for BytesOrSeq {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a byte string or a sequence of bytes")
-        }
-
-        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
-            Ok(v.to_vec())
-        }
-
-        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
-            Ok(v)
-        }
-
-        // The legacy array-of-integers encoding.
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
-            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(b) = seq.next_element::<u8>()? {
-                out.push(b);
-            }
-            Ok(out)
-        }
-    }
-
-    /// Deserialize from a byte string OR the legacy integer array.
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
-        de.deserialize_any(BytesOrSeq)
-    }
-}
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -438,12 +370,11 @@ where
         &mut transport,
         &MeshFrame::Hello {
             from: config.self_name.clone(),
-            byte_wire: true,
         },
     )
     .await?;
-    let (announced, peer_byte_wire) = match read_frame(&mut stream, &mut transport).await? {
-        Some(MeshFrame::Hello { from, byte_wire }) => (from, byte_wire),
+    let announced = match read_frame(&mut stream, &mut transport).await? {
+        Some(MeshFrame::Hello { from }) => from,
         Some(_) => return Err("responder's first frame was not Hello".into()),
         None => return Err("responder closed before sending Hello".into()),
     };
@@ -454,12 +385,10 @@ where
         .into());
     }
 
-    // Stand up the RPC client over the established transport, emitting the
-    // compact byte-string payload encoding only if the peer announced it can
-    // decode it (a pre-adapter peer's Hello carries no flag -> legacy).
-    // Publish the live channel so `Mesh::call` can use it, then drive the
-    // connection until it ends.
-    let (channel, driver) = spawn_client(stream, transport, peer_byte_wire);
+    // Stand up the RPC client over the established transport. Publish the live
+    // channel so `Mesh::call` can use it, then drive the connection until it
+    // ends.
+    let (channel, driver) = spawn_client(stream, transport);
     *slot.lock().await = Some(channel);
     driver.await?;
     Ok(())
@@ -561,8 +490,8 @@ where
     // peer should never announce a name we do not know, but we refuse to
     // attribute traffic to an unconfigured name; self-name is never in the
     // peer set, which also rejects a reflected dial).
-    let (from, peer_byte_wire) = match read_frame(&mut stream, &mut transport).await? {
-        Some(MeshFrame::Hello { from, byte_wire }) => (from, byte_wire),
+    let from = match read_frame(&mut stream, &mut transport).await? {
+        Some(MeshFrame::Hello { from }) => from,
         Some(_) => return Err("inbound peer's first frame was not Hello".into()),
         None => return Ok(()),
     };
@@ -576,7 +505,6 @@ where
         &mut transport,
         &MeshFrame::Hello {
             from: config.self_name.clone(),
-            byte_wire: true,
         },
     )
     .await?;
@@ -597,7 +525,7 @@ where
         .lock()
         .await
         .insert(from.clone(), peer_id.mesh_pubkey);
-    serve(stream, transport, &peer, handler, peer_byte_wire).await?;
+    serve(stream, transport, &peer, handler).await?;
     debug!(peer = %from, "inbound peer closed");
     Ok(())
 }
@@ -611,137 +539,26 @@ async fn sleep_with_jitter(base: Duration) {
 }
 
 #[cfg(test)]
-mod cbor_bytes_tests {
+mod wire_encoding_tests {
     use super::handshake::MeshFrame;
 
-    /// Emission stays on the LEGACY integer-array encoding for now (rolling
-    /// compatibility with pre-adapter nodes, see `cbor_bytes::serialize_legacy`),
-    /// and legacy frames roundtrip through the accept-both deserializer.
+    /// The RPC envelope rides the wire as a CBOR byte string (major type 2),
+    /// embedding the raw bytes verbatim, not as an array of integers (which
+    /// would roughly double the size and cost per-element decode work).
     #[test]
-    fn emits_legacy_and_roundtrips() {
+    fn rpc_envelope_is_a_byte_string() {
         let frame = MeshFrame::Rpc {
             envelope: vec![0xAA; 300],
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&frame, &mut buf).unwrap();
-        // The legacy encoding writes each 0xAA byte as a 2-byte CBOR integer
-        // (0x18 0xAA), so the raw run must NOT appear verbatim.
         assert!(
-            !buf.windows(300).any(|w| w.iter().all(|b| *b == 0xAA)),
-            "emission switched to byte strings; pre-adapter peers cannot decode this"
+            buf.windows(300).any(|w| w.iter().all(|b| *b == 0xAA)),
+            "envelope bytes are not embedded verbatim: array-encoded?"
         );
         let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
         match decoded {
             MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
-            other => panic!("wrong frame: {other:?}"),
-        }
-    }
-
-    /// A PRE-ADAPTER decoder (the deployed cluster's current build) must
-    /// tolerate our new Hello's `byte_wire` field: serde ignores unknown
-    /// fields on internally-tagged enums by default, and the whole rolling
-    /// upgrade rests on that. Simulated here with an enum matching the old
-    /// wire shape exactly.
-    #[test]
-    fn old_decoder_ignores_byte_wire_field() {
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(tag = "frame")]
-        enum OldMeshFrame {
-            Hello { from: String },
-        }
-        let mut buf = Vec::new();
-        ciborium::into_writer(
-            &MeshFrame::Hello {
-                from: "node-b".to_string(),
-                byte_wire: true,
-            },
-            &mut buf,
-        )
-        .unwrap();
-        let decoded: OldMeshFrame = ciborium::from_reader(buf.as_slice())
-            .expect("old decoder must ignore the unknown byte_wire field");
-        match decoded {
-            OldMeshFrame::Hello { from } => assert_eq!(from, "node-b"),
-        }
-    }
-
-    /// And the reverse: an OLD peer's Hello (no `byte_wire` field) decodes on
-    /// a new node as `byte_wire: false`, so we emit legacy frames to it.
-    #[test]
-    fn old_hello_decodes_as_legacy_wire() {
-        #[derive(serde::Serialize)]
-        #[serde(tag = "frame")]
-        enum OldMeshFrame {
-            Hello { from: String },
-        }
-        let mut buf = Vec::new();
-        ciborium::into_writer(
-            &OldMeshFrame::Hello {
-                from: "node-c".to_string(),
-            },
-            &mut buf,
-        )
-        .unwrap();
-        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
-        match decoded {
-            MeshFrame::Hello { from, byte_wire } => {
-                assert_eq!(from, "node-c");
-                assert!(!byte_wire, "missing field must default to legacy wire");
-            }
-            other => panic!("wrong frame: {other:?}"),
-        }
-    }
-
-    /// The FUTURE emit format (a real CBOR byte string) already decodes, so
-    /// flipping emission later needs no decode-side change.
-    #[test]
-    fn decodes_future_byte_string() {
-        // Hand-build a byte-string-encoded frame via the adapter's serialize.
-        #[derive(serde::Serialize)]
-        #[serde(tag = "frame")]
-        enum FutureFrame {
-            Rpc {
-                #[serde(serialize_with = "crate::mesh::cbor_bytes::serialize")]
-                envelope: Vec<u8>,
-            },
-        }
-        let mut buf = Vec::new();
-        ciborium::into_writer(
-            &FutureFrame::Rpc {
-                envelope: vec![0xAA; 300],
-            },
-            &mut buf,
-        )
-        .unwrap();
-        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
-        match decoded {
-            MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
-            other => panic!("wrong frame: {other:?}"),
-        }
-    }
-
-    /// A legacy peer's array-of-integers encoding still decodes (rolling
-    /// restart compatibility).
-    #[test]
-    fn decodes_legacy_integer_array() {
-        // Hand-build the legacy encoding: {"frame": "Rpc", "envelope": [1,2,3]}
-        // exactly as a pre-byte-string node would emit it (plain Vec<u8>).
-        #[derive(serde::Serialize)]
-        #[serde(tag = "frame")]
-        enum LegacyFrame {
-            Rpc { envelope: Vec<u8> },
-        }
-        let mut buf = Vec::new();
-        ciborium::into_writer(
-            &LegacyFrame::Rpc {
-                envelope: vec![1, 2, 3, 200, 255],
-            },
-            &mut buf,
-        )
-        .unwrap();
-        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
-        match decoded {
-            MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![1, 2, 3, 200, 255]),
             other => panic!("wrong frame: {other:?}"),
         }
     }
