@@ -74,7 +74,7 @@ pub enum Envelope {
         id: u64,
         /// Opaque request payload. Byte-string encoded (legacy integer-array
         /// frames still decode), see [`super::cbor_bytes`].
-        #[serde(with = "super::cbor_bytes")]
+        #[serde(serialize_with = "super::cbor_bytes::serialize_legacy", deserialize_with = "super::cbor_bytes::deserialize")]
         body: MeshPayload,
     },
     /// The response to the request with the matching `id`.
@@ -83,7 +83,7 @@ pub enum Envelope {
         id: u64,
         /// Opaque response payload. Byte-string encoded (legacy integer-array
         /// frames still decode), see [`super::cbor_bytes`].
-        #[serde(with = "super::cbor_bytes")]
+        #[serde(serialize_with = "super::cbor_bytes::serialize_legacy", deserialize_with = "super::cbor_bytes::deserialize")]
         body: MeshPayload,
     },
 }

@@ -125,7 +125,7 @@ pub enum MeshFrame {
         /// CBOR-encoded [`super::rpc::Envelope`]. Byte-string encoded on the
         /// wire (legacy integer-array frames still decode), see
         /// [`super::cbor_bytes`].
-        #[serde(with = "super::cbor_bytes")]
+        #[serde(serialize_with = "super::cbor_bytes::serialize_legacy", deserialize_with = "super::cbor_bytes::deserialize")]
         envelope: Vec<u8>,
     },
 }

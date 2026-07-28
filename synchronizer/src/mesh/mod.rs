@@ -71,6 +71,18 @@ pub mod cbor_bytes {
         ser.serialize_bytes(v)
     }
 
+    /// Serialize in the LEGACY integer-array encoding (what a plain `Vec<u8>`
+    /// field emits). Kept as the emit-side default until every deployed
+    /// cluster node runs an accept-both build: a byte-string frame is
+    /// undecodable by pre-adapter nodes, which would wedge a one-node-at-a-
+    /// time rolling restart (the rolled node's frames get rejected by its
+    /// still-old peers and it can never rejoin). Once the fleet is on
+    /// accept-both, a follow-up flips emission to [`serialize`].
+    pub fn serialize_legacy<S: Serializer>(v: &[u8], ser: S) -> Result<S::Ok, S::Error> {
+        use serde::Serialize;
+        v.serialize(ser)
+    }
+
     struct BytesOrSeq;
 
     impl<'de> serde::de::Visitor<'de> for BytesOrSeq {
@@ -598,21 +610,50 @@ async fn sleep_with_jitter(base: Duration) {
 mod cbor_bytes_tests {
     use super::handshake::MeshFrame;
 
-    /// New frames carry the envelope as a CBOR byte string (major type 2),
-    /// not the legacy array of integers (major type 4).
+    /// Emission stays on the LEGACY integer-array encoding for now (rolling
+    /// compatibility with pre-adapter nodes, see `cbor_bytes::serialize_legacy`),
+    /// and legacy frames roundtrip through the accept-both deserializer.
     #[test]
-    fn encodes_byte_string() {
+    fn emits_legacy_and_roundtrips() {
         let frame = MeshFrame::Rpc {
             envelope: vec![0xAA; 300],
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&frame, &mut buf).unwrap();
-        // The 300 raw bytes must appear verbatim (a byte string embeds them
-        // as-is; the integer-array encoding would emit 0x18 0xAA pairs).
+        // The legacy encoding writes each 0xAA byte as a 2-byte CBOR integer
+        // (0x18 0xAA), so the raw run must NOT appear verbatim.
         assert!(
-            buf.windows(300).any(|w| w.iter().all(|b| *b == 0xAA)),
-            "envelope bytes are not embedded verbatim: still array-encoded?"
+            !buf.windows(300).any(|w| w.iter().all(|b| *b == 0xAA)),
+            "emission switched to byte strings; pre-adapter peers cannot decode this"
         );
+        let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
+
+    /// The FUTURE emit format (a real CBOR byte string) already decodes, so
+    /// flipping emission later needs no decode-side change.
+    #[test]
+    fn decodes_future_byte_string() {
+        // Hand-build a byte-string-encoded frame via the adapter's serialize.
+        #[derive(serde::Serialize)]
+        #[serde(tag = "frame")]
+        enum FutureFrame {
+            Rpc {
+                #[serde(serialize_with = "crate::mesh::cbor_bytes::serialize")]
+                envelope: Vec<u8>,
+            },
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &FutureFrame::Rpc {
+                envelope: vec![0xAA; 300],
+            },
+            &mut buf,
+        )
+        .unwrap();
         let decoded: MeshFrame = ciborium::from_reader(buf.as_slice()).unwrap();
         match decoded {
             MeshFrame::Rpc { envelope } => assert_eq!(envelope, vec![0xAA; 300]),
