@@ -26,7 +26,13 @@ use crate::error::CliError;
 use crate::keys::{KeyBackend, KeyEntry};
 
 /// A holder of the ECDSA P-256 control private key.
-pub trait ControlSigner {
+///
+/// `Send`-bound so `Box<dyn ControlSigner>` can be held across an
+/// `.await` point in an async, multi-threaded-executor caller (the MCP
+/// server's confirm/revoke tools). Every impl already satisfies this:
+/// `YubiKeySigner` wraps `pcsc::Card`, which is itself `unsafe impl
+/// Send`.
+pub trait ControlSigner: Send {
     /// The 65-byte uncompressed SEC1 public key (0x04 prefix), exactly
     /// as registered with the backend at enclave-create time.
     fn public_key(&self) -> [u8; 65];
