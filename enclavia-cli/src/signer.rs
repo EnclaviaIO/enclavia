@@ -112,9 +112,9 @@ mod yubikey_backend {
     //!
     //! 1. `enclavia key generate --yubikey --name hw-test`
     //!    prints a 65-byte base64 public key + fingerprint and adds an
-    //!    entry to `~/.config/enclavia/keys/index.json` with the
-    //!    device's serial and slot `9c`. `ykman piv info` shows a new
-    //!    ECCP256 key in slot 9c with touch policy ALWAYS.
+    //!    entry to the platform configuration directory's key index
+    //!    with the device's serial and slot `9c`. `ykman piv info`
+    //!    shows a new ECCP256 key in slot 9c with touch policy ALWAYS.
     //! 2. `enclavia key list` shows the entry; the fingerprint matches
     //!    step 1.
     //! 3. `enclavia enclave create --control-key hw-test --container-port 8080`
@@ -136,7 +136,7 @@ mod yubikey_backend {
     //!    the touches. The submit gets a 409 and the CLI re-prepares
     //!    and retries once, successfully.
     //! 8. Index recovery (simulated laptop loss): note the fingerprint
-    //!    from step 1, then `rm ~/.config/enclavia/keys/index.json`.
+    //!    and exact index path printed in step 1, then remove that index.
     //!    `enclavia key import --yubikey --name recovered` re-reads the
     //!    public key off the device WITHOUT prompting for the PIN and
     //!    prints the SAME fingerprint as step 1; `key list` shows the

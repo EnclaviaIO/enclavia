@@ -38,11 +38,22 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn enclavia_config_dir(config_home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        config_home.join("Library/Application Support/enclavia")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        config_home.join("enclavia")
+    }
+}
+
 /// Write a valid credentials file pointing at `backend_url`, so `ApiClient`
 /// authenticates against the stub instead of returning `NotLoggedIn`.
 fn write_credentials(config_home: &Path, backend_url: &str) {
-    // `config::config_dir()` is `$XDG_CONFIG_HOME/enclavia`.
-    let dir = config_home.join("enclavia");
+    // Mirror `dirs::config_dir()`: XDG on Linux, Application Support on macOS.
+    let dir = enclavia_config_dir(config_home);
     std::fs::create_dir_all(&dir).unwrap();
     let creds = serde_json::json!({
         "access_token": "test-access-token",

@@ -132,9 +132,9 @@ enum Command {
     /// Manage local control keys for self-hosted custody. A
     /// self-hosted enclave's upgrade confirmations and revocations are
     /// signed by a key YOU hold (today: a YubiKey PIV slot); the
-    /// backend never sees the private half. Keys are recorded in
-    /// `~/.config/enclavia/keys/index.json` and referenced by name at
-    /// create time (`enclave create --control-key <name>`).
+    /// backend never sees the private half. Keys are recorded in the
+    /// platform configuration directory and referenced by name at create
+    /// time (`enclave create --control-key <name>`).
     Key {
         #[command(subcommand)]
         cmd: KeyCmd,
@@ -178,9 +178,9 @@ enum KeyCmd {
         yes: bool,
     },
     /// Recover the local index entry for a control key that already
-    /// exists on a YubiKey (e.g. after losing the machine that held
-    /// ~/.config/enclavia/keys/index.json). Reads the PUBLIC key back
-    /// off the device and records it exactly as `generate` would have.
+    /// exists on a YubiKey (e.g. after losing the machine that held the
+    /// local control-key index). Reads the PUBLIC key back off the device
+    /// and records it exactly as `generate` would have.
     /// Nothing is generated and nothing is written to the device; no
     /// PIN is needed.
     Import {

@@ -33,7 +33,7 @@ registry repo (`<your-handle>/<enclave-uuid>`), and the first push triggers
 the measured EIF build.
 
 ```sh
-enclavia auth login                       # browser OAuth; token lands in ~/.config/enclavia/
+enclavia auth login                       # browser OAuth; token lands in the platform config dir
 enclavia deploy myapp:v1 --name api --container-port 8080
 #   -> create + push + build in one command; streams the build log and
 #      prints the endpoint + PCRs once the enclave is running
@@ -143,7 +143,8 @@ enclavia key list
 ```
 
 Keys are generated on-device (the private key never leaves the hardware);
-the public half is recorded in `~/.config/enclavia/keys/index.json`.
+the public half is recorded in `keys/index.json` inside the platform
+configuration directory.
 
 ### Auth
 
@@ -160,7 +161,10 @@ CLI; no public VPS port is required.
 
 ## Configuration
 
-- `~/.config/enclavia/` holds credentials and the control-key index.
+- The platform configuration directory holds credentials and the control-key
+  index: `${XDG_CONFIG_HOME:-$HOME/.config}/enclavia` (usually
+  `~/.config/enclavia`) on Linux and `~/Library/Application Support/enclavia`
+  on macOS.
 - `ENCLAVIA_BACKEND_URL` overrides the API endpoint (default
   `https://api.beta.enclavia.io`). Useful against a local dev backend.
 

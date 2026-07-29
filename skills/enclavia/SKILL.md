@@ -24,10 +24,13 @@ operations.
 
 ## Auth (do this first)
 
-The CLI reads credentials from `~/.config/enclavia/credentials.json`
-(honours `$XDG_CONFIG_HOME`). The file holds an OAuth access token plus a
-refresh token; the CLI auto-refreshes on expiry and rewrites the file, so
-once it exists an agent keeps working with no further interaction.
+The CLI reads credentials from its platform configuration directory:
+`${XDG_CONFIG_HOME:-$HOME/.config}/enclavia/credentials.json` (usually
+`~/.config/enclavia/credentials.json`) on Linux and
+`~/Library/Application Support/enclavia/credentials.json` on macOS. The file
+holds an OAuth access token plus a refresh token; the CLI auto-refreshes on
+expiry and rewrites the file, so once it exists an agent keeps working with no
+further interaction.
 
 `enclavia auth login` is INTERACTIVE: it opens a browser (OAuth 2.1 +
 PKCE) and prints the approval URL to stderr. A human must approve the

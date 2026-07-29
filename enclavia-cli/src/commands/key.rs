@@ -2,11 +2,10 @@
 //!
 //! Local control-key management for self-hosted custody. `generate`
 //! creates the key (on a YubiKey, on-device) and records it in the
-//! index at `~/.config/enclavia/keys/index.json`; `import` recovers an
-//! index entry for a key that already lives on a device (lost laptop:
-//! the index is gone but the YubiKey still holds the private key);
-//! `list` renders the index. Presentation lives in the binary, as with
-//! every other command module.
+//! platform configuration directory's key index; `import` recovers an
+//! existing YubiKey PIV entry; `list` renders the index.
+//! Presentation lives in the binary, as with every other command
+//! module.
 
 use base64::Engine as _;
 use serde::Serialize;

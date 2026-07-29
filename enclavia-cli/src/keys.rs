@@ -2,12 +2,13 @@
 //!
 //! Self-hosted enclaves are created against a control public key the
 //! user holds; the private half never reaches the backend. This module
-//! is the on-disk registry of those keys: a single JSON index at
-//! `~/.config/enclavia/keys/index.json` mapping a user-chosen name to a
-//! backend descriptor plus the public key. Today the only backend is a
-//! YubiKey PIV slot; the schema is a tagged enum so a future
-//! passphrase-keyfile backend (`{"type": "file", "path": ...}`) slots
-//! in without a migration.
+//! is the on-disk registry of those keys: a single JSON file at
+//! [`index_path`] mapping a user-chosen name to a backend descriptor plus
+//! the public key. The platform-aware location comes from
+//! [`crate::config::config_dir`] (`~/.config/enclavia` on Linux,
+//! `~/Library/Application Support/enclavia` on macOS). The current
+//! hardware backend is a YubiKey PIV slot; the schema is a tagged enum
+//! so future backends slot in without a migration.
 //!
 //! The index holds no secret material (a YubiKey key is not
 //! extractable), but the directory is still created 0700 and the file
