@@ -278,11 +278,15 @@ pub enum AllowlistLoadError {
     Json(PathBuf, serde_json::Error),
     #[error("unsupported allowlist schema version {0} (expected 1)")]
     UnsupportedVersion(u32),
-    #[error("UDP egress is not supported yet (entry `{host}:{port}/udp`); see https://github.com/EnclaviaIO/enclavia/issues/1")]
+    #[error(
+        "UDP egress is not supported yet (entry `{host}:{port}/udp`); see https://github.com/EnclaviaIO/enclavia/issues/1"
+    )]
     UdpNotSupported { host: String, port: String },
     #[error("invalid port `{0}` (expected 1..=65535 or \"*\" for any port)")]
     BadPort(String),
-    #[error("`dns: open` requires at least one IPv4 entry in `resolvers` (the in-enclave resolver has no upstream to forward to)")]
+    #[error(
+        "`dns: open` requires at least one IPv4 entry in `resolvers` (the in-enclave resolver has no upstream to forward to)"
+    )]
     DnsOpenWithoutResolvers,
 }
 
@@ -483,7 +487,11 @@ pub enum AllowlistFlagError {
     #[error("egress allow spec `{0}` uses an IPv6 host; IPv6 egress is always denied")]
     IpV6Host(String),
     #[error("egress allow spec `{spec}` has invalid hostname `{host}`: {reason}")]
-    InvalidHostname { spec: String, host: String, reason: &'static str },
+    InvalidHostname {
+        spec: String,
+        host: String,
+        reason: &'static str,
+    },
     #[error("resolver spec `{0}` must be an IPv4 address")]
     InvalidResolver(String),
     #[error("dns mode `{0}` is not recognised (expected `allowlist` or `open`)")]
@@ -520,18 +528,16 @@ pub fn parse_cli_entry(spec: &str) -> Result<RawEgressEntry, AllowlistFlagError>
     // no proto tail, so we leave the whole string alone and let the
     // host:port split below pick up `10.0.0.0/8` as the host.
     let (head, protocol) = match trimmed.rsplit_once('/') {
-        Some((head, tail)) if !tail.contains(':') => {
-            match tail.to_ascii_lowercase().as_str() {
-                "tcp" => (head, Protocol::Tcp),
-                "udp" => (head, Protocol::Udp),
-                _ => {
-                    return Err(AllowlistFlagError::UnsupportedProtocol(
-                        spec.to_string(),
-                        tail.to_string(),
-                    ));
-                }
+        Some((head, tail)) if !tail.contains(':') => match tail.to_ascii_lowercase().as_str() {
+            "tcp" => (head, Protocol::Tcp),
+            "udp" => (head, Protocol::Udp),
+            _ => {
+                return Err(AllowlistFlagError::UnsupportedProtocol(
+                    spec.to_string(),
+                    tail.to_string(),
+                ));
             }
-        }
+        },
         _ => (trimmed, Protocol::Tcp),
     };
 
@@ -638,9 +644,8 @@ pub fn assemble_from_cli(
 /// it for storage; on failure returns the same `AllowlistFlagError`
 /// the CLI path uses, so error messages stay consistent.
 pub fn validate_json(value: &serde_json::Value) -> Result<RawAllowlist, AllowlistFlagError> {
-    let raw: RawAllowlist = serde_json::from_value(value.clone()).map_err(|e| {
-        AllowlistFlagError::Validation(AllowlistLoadError::Json(PathBuf::new(), e))
-    })?;
+    let raw: RawAllowlist = serde_json::from_value(value.clone())
+        .map_err(|e| AllowlistFlagError::Validation(AllowlistLoadError::Json(PathBuf::new(), e)))?;
     AllowlistConfig::from_raw(raw.clone()).map_err(AllowlistFlagError::Validation)?;
     Ok(raw)
 }
@@ -750,8 +755,10 @@ mod tests {
             ]
         }"#;
         let cfg = AllowlistConfig::from_bytes(raw).expect("parse");
-        let on_443: Vec<_> =
-            cfg.tcp_hostnames_for_port(443).map(|h| h.host.as_str()).collect();
+        let on_443: Vec<_> = cfg
+            .tcp_hostnames_for_port(443)
+            .map(|h| h.host.as_str())
+            .collect();
         assert_eq!(on_443, vec!["a.example"]);
     }
 
@@ -969,11 +976,12 @@ mod tests {
 
     #[test]
     fn validate_json_rejects_unknown_version() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"version": 2, "egress": []}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"version": 2, "egress": []}"#).unwrap();
         assert!(matches!(
             validate_json(&v),
-            Err(AllowlistFlagError::Validation(AllowlistLoadError::UnsupportedVersion(2)))
+            Err(AllowlistFlagError::Validation(
+                AllowlistLoadError::UnsupportedVersion(2)
+            ))
         ));
     }
 
@@ -1126,7 +1134,8 @@ mod tests {
 
     #[test]
     fn port_zero_rejected() {
-        let raw = br#"{ "version": 1, "egress": [ {"host": "1.2.3.4", "port": 0, "protocol": "tcp"} ] }"#;
+        let raw =
+            br#"{ "version": 1, "egress": [ {"host": "1.2.3.4", "port": 0, "protocol": "tcp"} ] }"#;
         let err = AllowlistConfig::from_bytes(raw).expect_err("must reject");
         assert!(matches!(err, AllowlistLoadError::BadPort(ref p) if p == "0"));
     }
@@ -1140,7 +1149,10 @@ mod tests {
                 r#"{{ "version": 1, "egress": [ {{"host": "1.2.3.4", "port": {bad}, "protocol": "tcp"}} ] }}"#
             );
             let err = AllowlistConfig::from_bytes(raw.as_bytes()).expect_err("must reject");
-            assert!(matches!(err, AllowlistLoadError::BadPort(_)), "port {bad} should be rejected");
+            assert!(
+                matches!(err, AllowlistLoadError::BadPort(_)),
+                "port {bad} should be rejected"
+            );
         }
     }
 

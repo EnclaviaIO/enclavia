@@ -64,10 +64,12 @@ impl Pcrs {
     /// ```
     pub fn from_hex(pcr0: &str, pcr1: &str, pcr2: &str) -> Result<Self, AttestationError> {
         fn decode(idx: usize, s: &str) -> Result<Vec<u8>, AttestationError> {
-            let bytes =
-                hex::decode(s.trim()).map_err(|_| AttestationError::InvalidPcrHex(idx))?;
+            let bytes = hex::decode(s.trim()).map_err(|_| AttestationError::InvalidPcrHex(idx))?;
             if !matches!(bytes.len(), 32 | 48 | 64) {
-                return Err(AttestationError::InvalidPcrLength { idx, len: bytes.len() });
+                return Err(AttestationError::InvalidPcrLength {
+                    idx,
+                    len: bytes.len(),
+                });
             }
             Ok(bytes)
         }

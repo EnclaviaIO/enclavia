@@ -337,7 +337,10 @@ mod write_chunk_tests {
         hs_i.read_message(&buf_a[..len], &mut buf_b).unwrap();
         let transport = hs_i.into_transport_mode().unwrap();
 
-        let sink = RecordingSink { writes: Vec::new(), data: Vec::new() };
+        let sink = RecordingSink {
+            writes: Vec::new(),
+            data: Vec::new(),
+        };
         let mut cbor = CborTransport::new(transport, sink);
 
         // A 30 KiB Vec<u8> payload CBOR-encodes to roughly double its size
@@ -347,12 +350,17 @@ mod write_chunk_tests {
         struct Big {
             payload: Vec<u8>,
         }
-        let msg = Big { payload: vec![0xABu8; 30 * 1024] };
+        let msg = Big {
+            payload: vec![0xABu8; 30 * 1024],
+        };
         cbor.send(&msg).await.unwrap();
 
         let sink = &cbor.stream;
         let total: usize = sink.writes.iter().sum();
-        assert!(total > VSOCK_WRITE_CHUNK + 4, "frame should exceed one chunk");
+        assert!(
+            total > VSOCK_WRITE_CHUNK + 4,
+            "frame should exceed one chunk"
+        );
         assert!(
             sink.writes.iter().all(|w| *w <= VSOCK_WRITE_CHUNK),
             "single write exceeded the vsock limit: {:?}",

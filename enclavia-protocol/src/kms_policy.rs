@@ -65,11 +65,7 @@ const EQ_OPERATORS: [&str; 2] = ["StringEquals", "StringEqualsIgnoreCase"];
 
 /// Actions that could loosen or sidestep the attestation gate, forbidden
 /// for ANY principal (matched case-insensitively, exact).
-const FORBIDDEN_ACTIONS: [&str; 3] = [
-    "kms:putkeypolicy",
-    "kms:creategrant",
-    "kms:replicatekey",
-];
+const FORBIDDEN_ACTIONS: [&str; 3] = ["kms:putkeypolicy", "kms:creategrant", "kms:replicatekey"];
 
 /// Why a KMS key policy is unacceptable for an attestation-bound LUKS key.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -87,7 +83,9 @@ pub enum PolicyError {
     #[error("key policy grants wildcard action {0:?}; only explicit actions are allowed")]
     WildcardAction(String),
     /// A gate-loosening action was granted to some principal.
-    #[error("key policy grants gate-loosening action {0:?} (could change or bypass the decrypt gate)")]
+    #[error(
+        "key policy grants gate-loosening action {0:?} (could change or bypass the decrypt gate)"
+    )]
     ForbiddenAction(String),
     /// A statement allows `kms:Decrypt` without a complete PCR binding to
     /// this enclave.
@@ -145,9 +143,7 @@ pub fn verify_decrypt_policy(policy_json: &str, own: &Pcrs) -> Result<(), Policy
             if action.contains('*') {
                 return Err(PolicyError::WildcardAction(action.clone()));
             }
-            if FORBIDDEN_ACTIONS.contains(&action.as_str())
-                || action.starts_with("kms:reencrypt")
-            {
+            if FORBIDDEN_ACTIONS.contains(&action.as_str()) || action.starts_with("kms:reencrypt") {
                 return Err(PolicyError::ForbiddenAction(action.clone()));
             }
         }
@@ -205,7 +201,9 @@ fn collect_pcr_bindings(stmt: &Value) -> std::collections::BTreeMap<String, Stri
         if !EQ_OPERATORS.contains(&op.as_str()) {
             continue;
         }
-        let Some(kv_map) = kv.as_object() else { continue };
+        let Some(kv_map) = kv.as_object() else {
+            continue;
+        };
         for (key, val) in kv_map {
             let suffix = key
                 .strip_prefix("kms:RecipientAttestation:PCR")
@@ -501,7 +499,10 @@ mod tests {
             }]
         })
         .to_string();
-        assert_eq!(verify_decrypt_policy(&doc, &own()), Err(PolicyError::NotAction));
+        assert_eq!(
+            verify_decrypt_policy(&doc, &own()),
+            Err(PolicyError::NotAction)
+        );
     }
 
     #[test]

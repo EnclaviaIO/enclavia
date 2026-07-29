@@ -169,8 +169,8 @@ pub struct RevokePrepareResponse {
 /// Serde adapter: `Vec<u8>` as a standard-base64 (padded) JSON string,
 /// matching the chain endpoint's byte-field convention.
 mod base64_vec {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &Vec<u8>, ser: S) -> Result<S::Ok, S::Error> {
@@ -179,15 +179,17 @@ mod base64_vec {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(de)?;
-        STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
 /// Serde adapter: `[u8; 32]` as a standard-base64 (padded) JSON string.
 /// Rejects any decoded length other than exactly 32 bytes.
 mod base64_array32 {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], ser: S) -> Result<S::Ok, S::Error> {
@@ -196,9 +198,12 @@ mod base64_array32 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(de)?;
-        let v = STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)?;
-        v.try_into()
-            .map_err(|v: Vec<u8>| serde::de::Error::custom(format!("expected 32 bytes, got {}", v.len())))
+        let v = STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 32 bytes, got {}", v.len()))
+        })
     }
 }
 
@@ -397,8 +402,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: ConfirmPrepareResponse = serde_json::from_str(&json).unwrap();
 
-        let cli_cmd =
-            encode_prepare_upgrade(&back.payload, &payload_sig, back.rekey, back.nonce);
+        let cli_cmd = encode_prepare_upgrade(&back.payload, &payload_sig, back.rekey, back.nonce);
         assert_eq!(cli_cmd, backend_cmd);
     }
 

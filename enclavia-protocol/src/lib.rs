@@ -9,6 +9,8 @@ pub mod kms_policy;
 pub mod kms_recipient;
 #[cfg(feature = "async-transport")]
 pub mod mesh;
+#[cfg(feature = "async-transport")]
+pub mod monitor;
 mod noise;
 pub mod staging;
 
