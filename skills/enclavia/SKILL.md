@@ -59,12 +59,13 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
 - `enclavia enclave logs <id> --json`
   -> `{"build_log":<str|null>,"runtime_log":<str|null>}`. `build_log` is the EIF build output (always available once building); `runtime_log` is the guest serial console, captured only for debug/QEMU enclaves (null on production Nitro). `--json` emits the raw object verbatim (pipe into a log viewer); without it the two logs print as labeled sections. Good first stop when `status` shows `error` or a build/boot failure.
 
-- `enclavia enclave create [--instance-type small|medium|large] [--container-port N] [--storage-size-bytes N] [--name S] [--visibility private|public] [--production] [--upgradable] [--control-key NAME] [--anti-rollback] [--min-upgrade-delay DURATION] [--egress-allow HOST:PORT[/PROTO]]... [--egress-resolver IPV4]... [--egress-config PATH] --json`
+- `enclavia enclave create [--instance-type small|medium|large] [--container-port N] [--storage-size-bytes N] [--name S] [--visibility private|public] [--production] [--upgradable] [--control-key NAME] [--anti-rollback] [--min-upgrade-delay DURATION] [--egress-allow HOST:PORT[/PROTO]]... [--egress-resolver IPV4]... [--egress-dns allowlist|open] [--egress-config PATH] --json`
   -> created enclave object `{id,status,...}`. Status starts `waiting_for_image`; next step is `push`. All flags below are immutable post-create.
   - `--production`: real EC2 Nitro hardware instead of the default debug/QEMU enclave. Requires an entitled account (paid plan or a saved payment method); otherwise the create is rejected.
   - `--control-key NAME`: self-hosted control-key custody for upgrades (implies `--upgradable`).
   - `--anti-rollback`: request synchronizer-backed anti-rollback protection for persistent storage. Only takes effect on a storage enclave (`--storage-size-bytes`) whose plan entitles it; otherwise the backend silently ignores it, so check `synchronizer_enabled` in `enclave status --json` to confirm what you got.
   - `--min-upgrade-delay DURATION`: minimum delay between confirming an upgrade and it taking effect (e.g. `30m`, `48h`, `7d`). Requires `--upgradable`.
+  - `--egress-dns allowlist|open`: DNS resolution mode for the egress allowlist. `allowlist` (default) only resolves hostnames already present as `--egress-allow` entries; `open` lets the in-enclave resolver answer any hostname query, while connect-time enforcement against `--egress-allow` / `--egress-resolver` stays identical. Mutually exclusive with `--egress-config`; requires at least one `--egress-resolver`.
 
 - `enclavia enclave stop|start|restart|destroy <id> --json`
   -> `{"id":<id>,"status":"stopped"|"started"|"restart_requested"|"destroyed"}`.
