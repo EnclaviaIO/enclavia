@@ -106,6 +106,7 @@
             "-p enclavia-egress"
             "-p enclavia-secrets-init"
             "-p enclavia-chain-init"
+            "-p enclavia-monitor"
             "-p nbd-client"
           ];
         });
@@ -188,6 +189,14 @@
           // {
             pname = "enclavia-chain-init";
             cargoExtraArgs = "-p enclavia-chain-init";
+          }
+        );
+
+        enclaviaMonitor = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
+          // {
+            pname = "enclavia-monitor";
+            cargoExtraArgs = "-p enclavia-monitor";
           }
         );
 
@@ -353,6 +362,7 @@
           enclavia-server = enclaviaServer;
           enclavia-secrets-init = enclaviaSecretsInit;
           enclavia-chain-init = enclaviaChainInit;
+          enclavia-monitor = enclaviaMonitor;
           # Beta-tester install entry point. Must stay named `enclavia`
           # so `nix profile install ...#enclavia` matches the binary.
           enclavia = enclaviaCli;

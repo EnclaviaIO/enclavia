@@ -1721,7 +1721,14 @@ mod tests {
         let pinned = pcrs_hex_from_seed(v2).to_pcrs().unwrap();
 
         let tip = verify_pcr_descent(
-            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &pinned,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap();
         assert_eq!(tip, pinned);
@@ -1738,7 +1745,14 @@ mod tests {
         let stranger = pcrs_hex_from_seed(0x77).to_pcrs().unwrap();
 
         let err = verify_pcr_descent(
-            &stranger, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &stranger,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap_err();
         assert!(matches!(err, PcrDescentError::PinnedNotInLineage));
@@ -1756,7 +1770,14 @@ mod tests {
         let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
 
         let err = verify_pcr_descent(
-            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &pinned,
+            &links,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1851,7 +1872,10 @@ mod tests {
         };
         assert!(matches!(
             bad.into_chain_link(),
-            Err(ChainLinkDecodeError::Base64 { field: "payload", .. })
+            Err(ChainLinkDecodeError::Base64 {
+                field: "payload",
+                ..
+            })
         ));
 
         let neg = ChainLinkJson {

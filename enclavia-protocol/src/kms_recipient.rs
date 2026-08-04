@@ -77,8 +77,8 @@ pub fn encode(recipient: &RsaPublicKey, plaintext: &[u8]) -> Result<Vec<u8>, Rec
     }
 
     // AES-256-CBC encrypt the plaintext (PKCS#7 padding).
-    let encrypted_content = Aes256CbcEnc::new(&cek.into(), &iv.into())
-        .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+    let encrypted_content =
+        Aes256CbcEnc::new(&cek.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(plaintext);
 
     // RSA-OAEP-SHA256 wrap the CEK to the recipient's ephemeral key.
     let encrypted_key = recipient
@@ -161,7 +161,9 @@ fn ber_to_der(input: &[u8]) -> Result<Vec<u8>, RecipientError> {
 
 /// Transcode one TLV; returns (definite-length DER bytes, remaining input).
 fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
-    let id = *input.first().ok_or_else(|| ber_err("unexpected end of input"))?;
+    let id = *input
+        .first()
+        .ok_or_else(|| ber_err("unexpected end of input"))?;
     if id & 0x1f == 0x1f {
         return Err(ber_err("high-tag-number form unsupported"));
     }
@@ -222,9 +224,8 @@ fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
 
     let is_universal_octet = id == 0x24;
     let is_context = id & 0xc0 == 0x80; // context-specific class
-    let context_octet = is_context
-        && !children.is_empty()
-        && children.iter().all(|c| c.first() == Some(&0x04));
+    let context_octet =
+        is_context && !children.is_empty() && children.iter().all(|c| c.first() == Some(&0x04));
     if is_universal_octet || context_octet {
         let mut body = Vec::new();
         for child in &children {
@@ -282,7 +283,9 @@ fn emit_der(id: u8, content: &[u8]) -> Vec<u8> {
 /// Extract the value bytes of a transcoded primitive OCTET STRING TLV.
 fn octet_value(der: &[u8]) -> Result<Vec<u8>, RecipientError> {
     if der.first() != Some(&0x04) {
-        return Err(ber_err("constructed OCTET STRING child is not an OCTET STRING"));
+        return Err(ber_err(
+            "constructed OCTET STRING child is not an OCTET STRING",
+        ));
     }
     let (len, content) = read_len(&der[1..])?;
     let len = len.ok_or_else(|| ber_err("indefinite OCTET STRING child"))?;
@@ -351,11 +354,10 @@ pub fn decode(ephemeral: &RsaPrivateKey, cms_der: &[u8]) -> Result<Vec<u8>, Reci
         )));
     }
     // IV is the algorithm parameter (OCTET STRING).
-    let iv_any = eci
-        .content_enc_alg
-        .parameters
-        .as_ref()
-        .ok_or_else(|| RecipientError::Malformed("AES-CBC algorithm has no IV parameter".into()))?;
+    let iv_any =
+        eci.content_enc_alg.parameters.as_ref().ok_or_else(|| {
+            RecipientError::Malformed("AES-CBC algorithm has no IV parameter".into())
+        })?;
     let iv = iv_any
         .decode_as::<OctetString>()
         .map_err(|e| RecipientError::Der(e.to_string()))?;
@@ -428,7 +430,9 @@ mod tests {
         assert_eq!(ber_to_der(&ber_octet_def).unwrap(), want);
 
         // Nested indefinite SEQUENCE { SEQUENCE { INTEGER 1 } } -> definite.
-        let ber_nested = [0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let ber_nested = [
+            0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
         let der_nested = [0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01];
         assert_eq!(ber_to_der(&ber_nested).unwrap(), der_nested);
 
@@ -447,7 +451,9 @@ mod tests {
 
         // An EXPLICIT [0] wrapper (single SEQUENCE child, not an OCTET STRING)
         // must STAY constructed -- this is ContentInfo.content.
-        let ber_explicit = [0xA0, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let ber_explicit = [
+            0xA0, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
         let der_explicit = [0xA0, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01];
         assert_eq!(ber_to_der(&ber_explicit).unwrap(), der_explicit);
 

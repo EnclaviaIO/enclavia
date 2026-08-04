@@ -8,6 +8,7 @@ members = [
     "enclavia-cli",
     "enclavia-crypto",
     "enclavia-egress",
+    "enclavia-monitor",
     "enclavia-protocol",
     "enclavia-secrets-init",
     "enclavia-server",

@@ -1345,6 +1345,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclavia-monitor"
+version = "0.2.0"
+dependencies = [
+ "enclavia-protocol",
+ "enclavia-vsock",
+ "libc",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "enclavia-protocol"
 version = "0.2.0"
 dependencies = [

@@ -1,0 +1,31 @@
+# In-enclave crate: runs inside the VM (real Nitro or QEMU) and reaches
+# the host unconditionally via tokio-vsock. No debug/enclave feature
+# split. See "Transport conventions" in enclavia-crates/CLAUDE.md before
+# adding any transport-related feature here.
+
+[package]
+name = "enclavia-monitor"
+# In-enclave/dev binary, not part of the crates.io publish set (the SDK,
+# protocol, and CLI are). Flip deliberately if that ever changes.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-enclave monitor daemon: periodic workload-liveness + disk-usage telemetry over vsock (guest to host, port 5014) and a graceful flush-and-ack shutdown listener (host to guest, port 5015)."
+
+[dependencies]
+enclavia-protocol = { path = "../enclavia-protocol" }
+enclavia-vsock = { path = "../enclavia-vsock" }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio-vsock = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# statvfs (disk usage), syncfs/sync (shutdown flush), umount2
+# (best-effort unmount). Same raw-libc approach as enclavia-egress's
+# TUN plumbing; no need for the heavier nix/rustix wrappers.
+libc = { workspace = true }
+
+[[bin]]
+name = "enclavia-monitor"
+path = "src/main.rs"
