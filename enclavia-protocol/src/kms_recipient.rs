@@ -152,15 +152,29 @@ fn ber_err(m: impl std::fmt::Display) -> RecipientError {
 /// idempotent on input that is already strict DER. Fail-closed: any structural
 /// surprise returns an error (worst case recovery just fails, as it does now).
 fn ber_to_der(input: &[u8]) -> Result<Vec<u8>, RecipientError> {
-    let (out, rest) = transcode_tlv(input)?;
+    let (out, rest) = transcode_tlv(input, 0)?;
     if !rest.is_empty() {
         return Err(ber_err(format!("{} trailing bytes", rest.len())));
     }
     Ok(out)
 }
 
+/// Maximum ASN.1 nesting depth `transcode_tlv` will recurse through.
+///
+/// The input is the parent-proxied `CiphertextForRecipient` CMS and is
+/// transcoded (in `decode`) BEFORE any authenticity check, so a hostile
+/// parent can feed arbitrarily deep nesting (e.g. `30 80` repeated) to
+/// blow the enclave stack and abort the boot decrypt path. A real KMS
+/// EnvelopedData is only a handful of levels deep; this bound is far above
+/// any legitimate structure yet stops the unbounded-recursion DoS.
+const MAX_TLV_DEPTH: usize = 64;
+
 /// Transcode one TLV; returns (definite-length DER bytes, remaining input).
-fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
+/// `depth` is the current nesting level, bounded by [`MAX_TLV_DEPTH`].
+fn transcode_tlv(input: &[u8], depth: usize) -> Result<(Vec<u8>, &[u8]), RecipientError> {
+    if depth > MAX_TLV_DEPTH {
+        return Err(ber_err("ASN.1 nesting exceeds maximum depth"));
+    }
     let id = *input.first().ok_or_else(|| ber_err("unexpected end of input"))?;
     if id & 0x1f == 0x1f {
         return Err(ber_err("high-tag-number form unsupported"));
@@ -199,7 +213,7 @@ fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
             let mut region = &after_len[..len];
             after = &after_len[len..];
             while !region.is_empty() {
-                let (child, rest) = transcode_tlv(region)?;
+                let (child, rest) = transcode_tlv(region, depth + 1)?;
                 children.push(child);
                 region = rest;
             }
@@ -212,7 +226,7 @@ fn transcode_tlv(input: &[u8]) -> Result<(Vec<u8>, &[u8]), RecipientError> {
                     region = &region[2..];
                     break;
                 }
-                let (child, rest) = transcode_tlv(region)?;
+                let (child, rest) = transcode_tlv(region, depth + 1)?;
                 children.push(child);
                 region = rest;
             }
@@ -431,6 +445,29 @@ mod tests {
         let ber_nested = [0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
         let der_nested = [0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01];
         assert_eq!(ber_to_der(&ber_nested).unwrap(), der_nested);
+    }
+
+    #[test]
+    fn ber_to_der_rejects_deeply_nested_input() {
+        // A hostile parent proxies the CiphertextForRecipient CMS, which
+        // decode() transcodes BEFORE any authenticity check. Deeply nested
+        // indefinite-length constructed TLVs (`30 80` repeated) recurse
+        // transcode_tlv once per level; without a depth bound this overflows
+        // the enclave stack and aborts the boot decrypt path. Build a nest
+        // far deeper than MAX_TLV_DEPTH: `30 80` * N then `00 00` * N. It
+        // must return an error, not recurse unbounded (Ok on HEAD).
+        let n = 5000usize;
+        let mut deep = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            deep.extend_from_slice(&[0x30, 0x80]);
+        }
+        for _ in 0..n {
+            deep.extend_from_slice(&[0x00, 0x00]);
+        }
+        assert!(
+            ber_to_der(&deep).is_err(),
+            "deeply nested BER must be rejected, not recursed unbounded"
+        );
 
         // IMPLICIT-tagged, chunked OCTET STRING under a context-specific
         // constructed tag [0] (0xA0), indefinite, "ab"+"cd" -> a single

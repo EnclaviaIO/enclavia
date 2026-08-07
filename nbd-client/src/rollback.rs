@@ -135,14 +135,17 @@ pub const CHAIN_FETCH_MAX_FRAME: u32 = 256 * 1024;
 /// exactly as before this module existed.
 pub const ENV_SYNCHRONIZER_ENABLED: &str = "SYNCHRONIZER_ENABLED";
 
-/// Environment variable overriding the path of the enclave config file
-/// carrying the #47 `control_public_key` (defaults to
-/// [`DEFAULT_CONFIG_PATH`], the same file enclavia-server reads).
-pub const ENV_CONFIG_PATH: &str = "ENCLAVIA_CONFIG_PATH";
-
-/// Default path of the enclave config JSON (mirrors
-/// `enclavia-server::config::CONFIG_PATH`).
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/enclavia/config.json";
+/// Path of the enclave config JSON carrying the synchronizer trust
+/// anchors (mirrors `enclavia-server::config::CONFIG_PATH` and the
+/// hard-coded path `enclavia-chain-init` reads). This is a fixed,
+/// compiled-in constant on purpose: the file is part of the measured EIF
+/// rootfs, and its trust anchors (expected oracle PCRs, `debug_attestation`,
+/// the #47 control public key) MUST NOT be locatable via host-controlled
+/// input. Honouring an env-var override (as this module previously did via
+/// `ENCLAVIA_CONFIG_PATH`) would let the parent VM redirect the path to an
+/// unmeasured file of its choosing and substitute its own trust anchors, so
+/// there is deliberately no override.
+pub const CONFIG_PATH: &str = "/etc/enclavia/config.json";
 
 /// True when the operator opted this enclave into synchronizer pinning.
 pub fn synchronizer_enabled() -> bool {
@@ -1291,8 +1294,10 @@ pub struct SyncSession {
 /// including the oracle failing to prove its identity, is fatal
 /// (fail-stop, no retries).
 pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
-    let config_path = std::env::var(ENV_CONFIG_PATH).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
-    let trust = load_synchronizer_trust(Path::new(&config_path))?;
+    // Trust anchors come only from the measured config at the fixed
+    // CONFIG_PATH — never from a host-influenceable location (see the
+    // CONFIG_PATH doc comment). No env-var override.
+    let trust = load_synchronizer_trust(Path::new(CONFIG_PATH))?;
 
     let port = enclavia_protocol::mesh::SYNCHRONIZER_CUSTOMER_RELAY_PORT;
     info!(port, "connecting to the synchronizer relay over vsock");
