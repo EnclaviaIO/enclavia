@@ -373,7 +373,18 @@ impl RaftRequestHandler {
     /// follower already verified the session attestation and vouches for the
     /// carried facts (see [`crate::raft::forward`]); the leader still runs the
     /// full replicated handler, including the `Transition` chain-link check.
-    async fn serve_forwarded(&self, fwd: ForwardedClientRequest) -> ForwardedClientResponse {
+    ///
+    /// Because that vouching is only meaningful from a genuine cluster member,
+    /// the leader first checks that `peer` (the mutually-attested mesh channel
+    /// identity, not the payload) is a committed voter, and rejects the
+    /// forward otherwise. Without this a host-booted same-image clone that
+    /// passes attestation and announces a configured name could forward a
+    /// `Pin`/`Transition` and mutate committed anti-rollback state.
+    async fn serve_forwarded(
+        &self,
+        peer: &PeerContext,
+        fwd: ForwardedClientRequest,
+    ) -> ForwardedClientResponse {
         use crate::wire::{Response, RpcError};
         let Some((handle, debug_mode)) = self.serve.get() else {
             // Serve path not yet installed (bootstrap window): tell the
@@ -382,6 +393,26 @@ impl RaftRequestHandler {
                 error: RpcError::Unavailable,
             });
         };
+        // SECURITY: only a committed cluster VOTER may forward a client
+        // request. The forwarding contract (see the doc comment above) is that
+        // a follower vouches for session attestation it already verified; that
+        // vouching is only trustworthy if the forwarder is an actual member.
+        // A host-booted same-image clone can pass mutual attestation and
+        // announce a configured routing name, but it never went through
+        // Join/admit and so is NOT a committed voter, so it must not be able
+        // to forward a Pin/Transition that mutates committed state. The
+        // identity is the attested channel pubkey, NEVER the request payload
+        // (mirroring serve_join).
+        let peer_id = crate::raft::membership::instance_node_id(&peer.mesh_pubkey);
+        if !handle.is_committed_voter(peer_id).await {
+            tracing::warn!(
+                peer = %peer.name,
+                "rejecting forwarded client request from a non-member peer"
+            );
+            return ForwardedClientResponse(Response::Err {
+                error: RpcError::Unauthorized,
+            });
+        }
         let resp = crate::raft::serve::handle_on_leader(
             handle,
             fwd.session_key,
@@ -444,7 +475,7 @@ impl RequestHandler for RaftRequestHandler {
                 encode_or_empty(&reply)
             }
             MeshMessage::ForwardClient(fwd) => {
-                let reply = self.serve_forwarded(fwd).await;
+                let reply = self.serve_forwarded(peer, fwd).await;
                 encode_or_empty(&reply)
             }
             MeshMessage::Join(req) => {

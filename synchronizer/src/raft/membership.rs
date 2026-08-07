@@ -140,6 +140,23 @@ pub enum AdmissionError {
     /// recorded pubkey. Same class as [`AdmissionError::CorruptMembership`].
     #[error("committed voter {0} id does not match its recorded pubkey")]
     IdMismatch(RaftNodeId),
+    /// A committed voter occupies a slot name that is NOT in the configured
+    /// cluster shape. Such a voter is not counted by the per-slot
+    /// one-instance-per-slot check, so it would otherwise escape the
+    /// invariants entirely. Same class as [`AdmissionError::CorruptMembership`].
+    #[error("committed voter holds unconfigured slot {0:?}")]
+    UnconfiguredVoter(String),
+    /// The resulting voter set would exceed the number of configured slots.
+    /// A committed membership can never hold more voters than there are
+    /// configured slots; this is a hard runtime bound (defence in depth),
+    /// NOT a `debug_assert!` that vanishes in release builds.
+    #[error("resulting membership has {voters} voters but only {slots} slots are configured")]
+    OversizedMembership {
+        /// The size of the computed voter set.
+        voters: usize,
+        /// The number of configured slots.
+        slots: usize,
+    },
 }
 
 /// The leader-side outcome of a valid admission request: which node to add,
@@ -199,6 +216,15 @@ pub fn plan_admission(
     }
 
     // 2. Committed-state invariants (defence in depth).
+    // Every committed voter must occupy a CONFIGURED slot. A voter whose name
+    // is outside the configured set is never counted by the per-slot holder
+    // check below, so without this it would slip through every invariant here
+    // and be carried into `new_voter_ids` unchecked.
+    for member in voters.values() {
+        if !configured_names.contains(&member.name) {
+            return Err(AdmissionError::UnconfiguredVoter(member.name.clone()));
+        }
+    }
     for name in configured_names {
         let holders = voters.values().filter(|m| m.name == *name).count();
         if holders > 1 {
@@ -249,7 +275,17 @@ pub fn plan_admission(
     }
     new_voter_ids.insert(added_id);
 
-    debug_assert!(new_voter_ids.len() <= configured_names.len());
+    // Hard bound (NOT debug_assert!, which is compiled out in release): the
+    // committed voter set can never exceed the number of configured slots.
+    // The step-2 checks make this unreachable for well-formed input, so this
+    // is defence in depth against a future refactor or a corrupt state that
+    // slipped past them.
+    if new_voter_ids.len() > configured_names.len() {
+        return Err(AdmissionError::OversizedMembership {
+            voters: new_voter_ids.len(),
+            slots: configured_names.len(),
+        });
+    }
 
     Ok(AdmissionPlan {
         added_id,
@@ -297,6 +333,23 @@ mod tests {
     fn id_is_deterministic_per_pubkey() {
         assert_eq!(instance_node_id(&pk(1)), instance_node_id(&pk(1)));
         assert_ne!(instance_node_id(&pk(1)), instance_node_id(&pk(2)));
+    }
+
+    /// A committed voter whose slot name is NOT configured must be refused
+    /// up front. Previously the per-slot holder check only iterated the
+    /// configured names, so a foreign-name voter was never counted and slipped
+    /// through into `new_voter_ids` unchecked.
+    #[test]
+    fn voter_with_unconfigured_slot_name_is_refused() {
+        let configured = names(&CLUSTER);
+        // "rogue" is not one of az-a/az-b/az-c.
+        let v = voters(&[("az-a", 1), ("rogue", 9)]);
+        let candidate = pk(2); // wants az-b
+        let err = plan_admission(&configured, &v, "az-b", &candidate).unwrap_err();
+        assert!(
+            matches!(err, AdmissionError::UnconfiguredVoter(ref n) if n == "rogue"),
+            "expected UnconfiguredVoter(\"rogue\"), got {err:?}"
+        );
     }
 
     /// First fill of an empty slot: no eviction, candidate joins the voter

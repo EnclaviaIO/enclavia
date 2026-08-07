@@ -284,6 +284,13 @@ pub enum AllowlistLoadError {
     BadPort(String),
     #[error("`dns: open` requires at least one IPv4 entry in `resolvers` (the in-enclave resolver has no upstream to forward to)")]
     DnsOpenWithoutResolvers,
+    #[error("invalid hostname `{host}` in allowlist: {reason}")]
+    InvalidHostname {
+        /// The offending host string.
+        host: String,
+        /// Why it was rejected (from `validate_hostname`).
+        reason: &'static str,
+    },
 }
 
 impl AllowlistConfig {
@@ -382,6 +389,17 @@ impl AllowlistConfig {
                     );
                 }
                 Err(_) => {
+                    // Not an IP literal/CIDR, so treat it as a hostname — but
+                    // enforce the SAME hostname grammar the CLI path
+                    // (`parse_cli_entry`) applies. `from_raw` is the JSON /
+                    // backend path (`validate_json` routes through here), and
+                    // without this check it accepted hostnames the CLI
+                    // rejects, including strings with embedded control
+                    // characters (e.g. a newline), which would flow verbatim
+                    // into the in-enclave resolver config downstream.
+                    if let Err(reason) = validate_hostname(&host) {
+                        return Err(AllowlistLoadError::InvalidHostname { host, reason });
+                    }
                     hostnames.push(HostnameEntry {
                         host: host.to_ascii_lowercase(),
                         port,
@@ -965,6 +983,30 @@ mod tests {
         let raw = validate_json(&v).unwrap();
         assert_eq!(raw.egress.len(), 1);
         assert_eq!(raw.resolvers.len(), 1);
+    }
+
+    #[test]
+    fn from_raw_rejects_hostname_with_control_chars() {
+        // The JSON/backend path (from_bytes -> from_raw) must apply the same
+        // hostname grammar as the CLI path (parse_cli_entry ->
+        // validate_hostname). A newline embedded in the host previously
+        // slipped through the from_raw hostname arm unvalidated and would
+        // flow verbatim into the in-enclave resolver config downstream.
+        // JSON `\n` decodes to a real newline in the host string.
+        let doc = br#"{"version":1,"resolvers":["1.1.1.1"],"egress":[{"host":"evil.com\ninjected","port":443,"protocol":"tcp"}]}"#;
+        let err = AllowlistConfig::from_bytes(doc).unwrap_err();
+        assert!(
+            matches!(err, AllowlistLoadError::InvalidHostname { .. }),
+            "expected InvalidHostname, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_raw_still_accepts_well_formed_hostname() {
+        let doc = br#"{"version":1,"resolvers":["1.1.1.1"],"egress":[{"host":"api.example.com","port":443,"protocol":"tcp"}]}"#;
+        let cfg = AllowlistConfig::from_bytes(doc).expect("valid hostname accepted");
+        assert_eq!(cfg.hostnames.len(), 1);
+        assert_eq!(cfg.hostnames[0].host, "api.example.com");
     }
 
     #[test]
