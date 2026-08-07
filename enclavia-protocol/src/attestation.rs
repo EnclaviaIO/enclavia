@@ -10,9 +10,9 @@
 //!   synchronizer's call path: it does not pre-commit to a specific
 //!   identity; the document's verified PCRs *are* the identity, and the
 //!   caller hashes them into its own key. The doc must also carry the
-//!   enclave's raw 32-byte Ed25519 control pubkey in `user_data` — the
+//!   enclave's 65-byte SEC1 P-256 control pubkey in `user_data` — the
 //!   synchronizer registers it alongside the key and uses it to verify
-//!   `Transition` signatures later.
+//!   `Transition` control proofs later.
 //!
 //! Both check that the doc's nonce equals `base64(handshake_hash)`,
 //! binding the document to the live Noise session. In `debug_mode` the
@@ -214,8 +214,8 @@ pub struct AttestedIdentity {
     /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key extracted
     /// from the doc's `user_data` field. The synchronizer registers
     /// this alongside the [`Pcrs::digest`]-derived key on first
-    /// attestation, and uses it to verify raw r||s signatures on
-    /// subsequent `Transition` RPCs.
+    /// attestation, and uses it to verify raw P-256 signatures or FIDO2
+    /// assertions on subsequent `Transition` RPCs.
     pub control_pubkey: [u8; CONTROL_PUBKEY_LEN],
 }
 

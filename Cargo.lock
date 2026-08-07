@@ -298,6 +298,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "authenticator"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd6f57365675990f2db272a6560b28945df74cf3749c70aafd9b1c7829edebc"
+dependencies = [
+ "aes",
+ "base64 0.21.7",
+ "bitflags 1.3.2",
+ "cbc",
+ "cfg-if",
+ "core-foundation 0.9.4",
+ "devd-rs",
+ "hmac",
+ "libc",
+ "libudev",
+ "log",
+ "memoffset 0.8.0",
+ "p256",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "runloop",
+ "serde",
+ "serde_bytes",
+ "serde_cbor",
+ "serde_json",
+ "sha2",
+ "winapi",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,6 +1148,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "devd-rs"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9313f104b590510b46fc01c0a324fc76505c13871454d3c48490468d04c8d395"
+dependencies = [
+ "libc",
+ "nom",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1255,6 +1295,7 @@ dependencies = [
 name = "enclavia-cli"
 version = "0.2.0"
 dependencies = [
+ "authenticator",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -2322,6 +2363,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "libudev"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea626d3bdf40a1c5aee3bcd4f40826970cae8d80a8fec934c82a63840094dcfe"
+dependencies = [
+ "libc",
+ "libudev-sys",
+]
+
+[[package]]
+name = "libudev-sys"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c8469b4a23b962c1396b9b451dda50ef5b283e8dd309d69033475fa9b334324"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2383,6 +2444,15 @@ name = "memoffset"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5de893c32cde5f383baa4c04c5d6dbdd735cfd4a794b0debdb2bb1b421da5ff4"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
+name = "memoffset"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d61c719bcfbcf5d62b3a09efa6088de8c54bc0bfcd3ea7ae39fcc186108b8de1"
 dependencies = [
  "autocfg",
 ]
@@ -3366,6 +3436,12 @@ dependencies = [
  "libc",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "runloop"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d79b4b604167921892e84afbbaad9d5ad74e091bf6c511d9dbfb0593f09fabd"
 
 [[package]]
 name = "rust_decimal"
@@ -4945,6 +5021,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4952,6 +5044,12 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-core"

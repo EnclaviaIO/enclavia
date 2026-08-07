@@ -25,7 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 # ECDSA P-256 for verifying signed `ControlCommand`s from the backend
 # (#47). The pubkey is read from `enclavia-config.json` at startup as
-# 65-byte uncompressed SEC1; signatures are 64-byte raw r||s.
+# 65-byte uncompressed SEC1; proofs are raw P-256 or FIDO2/ES256.
 p256 = { workspace = true }
 rand.workspace = true
 base64.workspace = true

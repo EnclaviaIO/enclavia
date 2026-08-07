@@ -13,9 +13,9 @@
 //!   return typed results. Presentation lives in `bin/enclavia/main.rs`.
 //! - [`error`] — shared error type used by the lib surface.
 //! - [`keys`]: local control-key index for self-hosted custody.
-//! - [`signer`]: `ControlSigner` trait + backends (YubiKey behind the
-//!   default `yubikey` cargo feature; build with
-//!   `default-features = false` to drop the pcsclite link dependency).
+//! - [`signer`]: `ControlSigner` trait + hardware backends (vendor-neutral
+//!   CTAP2/FIDO2 and YubiKey PIV, both enabled by default; build with
+//!   `default-features = false` to drop their platform dependencies).
 
 pub mod api;
 pub mod commands;

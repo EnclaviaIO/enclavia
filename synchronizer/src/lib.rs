@@ -27,8 +27,9 @@
 //! in `AttestationDoc::user_data` is a 65-byte uncompressed SEC1 P-256
 //! verifying key (see [`enclavia_protocol::attestation::CONTROL_PUBKEY_LEN`]
 //! and `AttestedIdentity::control_pubkey`). Signatures over chain payloads
-//! are 64-byte raw `r || s` P-256. This module stores the 65-byte pubkey
-//! verbatim; verification of the raw r||s signature against it lives in
+//! are either legacy raw P-256 signatures or versioned FIDO2 assertions.
+//! This module stores the 65-byte pubkey verbatim; verification of the
+//! control proof against it lives in
 //! [`wire::verify_transition_link`] (a pure helper) and is wired into the
 //! node/listener layer, never into this pure core.
 //!
@@ -146,10 +147,18 @@ pub struct KeyState {
     /// the authorizing pubkey out from under a pending Transition.
     ///
     /// A transition link's `UpgradePayload` is signed under the OLD key's
-    /// control private key; the node verifies the 64-byte raw r||s P-256
-    /// signature against THIS frozen pubkey before applying the op.
+    /// control private key; the node verifies its raw P-256 signature or
+    /// FIDO2 assertion against THIS frozen pubkey before applying the op.
     #[cfg_attr(feature = "serde", serde(with = "control_pubkey_serde"))]
     pub control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+    /// Most recently accepted FIDO2 signature counter for this frozen
+    /// control key. `None` until a FIDO2 transition proof is observed,
+    /// and reset when a transition rotates the control public key.
+    ///
+    /// A value of zero is meaningful: CTAP2 permits authenticators
+    /// without counter support, for which zero-to-zero is accepted.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fido2_sign_count: Option<u32>,
 }
 
 /// serde adapter for the 65-byte `control_pubkey` field. `serde`'s
@@ -252,6 +261,9 @@ pub struct StateMachine {
     /// `(old_key, new_key)` pairs for which the caller has verified an
     /// upgrade chain link authorizing the transition. Append-only.
     transition_authorizations: BTreeSet<(PcrKey, PcrKey)>,
+    /// Authenticated FIDO2 counter carried by each verified transition
+    /// authorization. `None` records a legacy raw-P256 proof.
+    transition_fido2_sign_counts: BTreeMap<(PcrKey, PcrKey), Option<u32>>,
     retired: BTreeSet<PcrKey>,
 }
 
@@ -288,7 +300,33 @@ impl StateMachine {
     /// sha256(payload)`, and the payload's `from_pcrs`/`to_pcrs` hash to
     /// `old_key`/`new_key`. Repeat calls are idempotent.
     pub fn observe_transition(&mut self, old_key: PcrKey, new_key: PcrKey) {
+        self.observe_transition_with_fido2_sign_count(old_key, new_key, None);
+    }
+
+    /// Record a verified transition together with its authenticated
+    /// FIDO2 signature counter. The counter becomes the successor
+    /// state's baseline when the transition preserves the same control
+    /// public key.
+    pub fn observe_transition_with_fido2_sign_count(
+        &mut self,
+        old_key: PcrKey,
+        new_key: PcrKey,
+        fido2_sign_count: Option<u32>,
+    ) {
         self.transition_authorizations.insert((old_key, new_key));
+        self.transition_fido2_sign_counts
+            .entry((old_key, new_key))
+            .and_modify(|stored| {
+                // A failed apply may be retried with a freshly signed
+                // link for the same pair. Retain the strongest/latest
+                // authenticated baseline and never replace FIDO2 state
+                // with a raw-proof `None`: `Option` ordering makes every
+                // `Some(count)` greater than `None`.
+                if fido2_sign_count > *stored {
+                    *stored = fido2_sign_count;
+                }
+            })
+            .or_insert(fido2_sign_count);
     }
 
     /// Apply `op` to the state machine.
@@ -323,6 +361,7 @@ impl StateMachine {
             commitment,
             version: Version(0),
             control_pubkey,
+            fido2_sign_count: None,
         };
         self.state.insert(key, entry);
         Ok(entry)
@@ -367,10 +406,21 @@ impl StateMachine {
             return Err(ValidationError::NoTransitionAuthorization);
         }
         let mut carried = self.state.remove(&old_key).expect("checked above");
+        let old_control_pubkey = carried.control_pubkey;
         // Rotate the registered pubkey to `new_key`'s, future
         // Transition requests from `new_key` will be verified against
         // it, not against the old key's pubkey.
         carried.control_pubkey = new_pubkey;
+        carried.fido2_sign_count = if new_pubkey == old_control_pubkey {
+            self.transition_fido2_sign_counts
+                .get(&(old_key, new_key))
+                .copied()
+                .flatten()
+        } else {
+            // A signature counter belongs to the credential behind the
+            // old public key and is not a baseline for a rotated key.
+            None
+        };
         self.retired.insert(old_key);
         self.state.insert(new_key, carried);
         Ok(carried)
@@ -417,6 +467,7 @@ impl StateMachine {
                 .map(|(k, pk)| (*k, ControlPubkeyBytes(*pk)))
                 .collect(),
             transition_authorizations: self.transition_authorizations.clone(),
+            transition_fido2_sign_counts: self.transition_fido2_sign_counts.clone(),
             retired: self.retired.clone(),
         }
     }
@@ -433,6 +484,7 @@ impl StateMachine {
             .map(|(k, pk)| (k, pk.0))
             .collect();
         self.transition_authorizations = snapshot.transition_authorizations;
+        self.transition_fido2_sign_counts = snapshot.transition_fido2_sign_counts;
         self.retired = snapshot.retired;
     }
 }
@@ -451,6 +503,8 @@ pub struct StateMachineSnapshot {
     state: BTreeMap<PcrKey, KeyState>,
     attested: BTreeMap<PcrKey, ControlPubkeyBytes>,
     transition_authorizations: BTreeSet<(PcrKey, PcrKey)>,
+    #[serde(default)]
+    transition_fido2_sign_counts: BTreeMap<(PcrKey, PcrKey), Option<u32>>,
     retired: BTreeSet<PcrKey>,
 }
 
@@ -892,6 +946,47 @@ mod tests {
         assert_ne!(post.control_pubkey, pre.control_pubkey);
     }
 
+    #[test]
+    fn transition_persists_fido2_counter_only_for_the_same_control_key() {
+        let mut same_key = StateMachine::new();
+        same_key.observe_attestation(k(1), pk(1));
+        same_key.observe_attestation(k(2), pk(1));
+        same_key
+            .apply(Op::Register {
+                key: k(1),
+                commitment: c(0xaa),
+            })
+            .unwrap();
+        same_key.observe_transition_with_fido2_sign_count(k(1), k(2), Some(8));
+        same_key.observe_transition_with_fido2_sign_count(k(1), k(2), Some(9));
+        same_key.observe_transition(k(1), k(2));
+        let state = same_key
+            .apply(Op::Transition {
+                old_key: k(1),
+                new_key: k(2),
+            })
+            .unwrap();
+        assert_eq!(state.fido2_sign_count, Some(9));
+
+        let mut rotated_key = StateMachine::new();
+        rotated_key.observe_attestation(k(1), pk(1));
+        rotated_key.observe_attestation(k(2), pk(2));
+        rotated_key
+            .apply(Op::Register {
+                key: k(1),
+                commitment: c(0xaa),
+            })
+            .unwrap();
+        rotated_key.observe_transition_with_fido2_sign_count(k(1), k(2), Some(9));
+        let state = rotated_key
+            .apply(Op::Transition {
+                old_key: k(1),
+                new_key: k(2),
+            })
+            .unwrap();
+        assert_eq!(state.fido2_sign_count, None);
+    }
+
     /// `KeyState.control_pubkey` is frozen at Register time, a later
     /// re-attestation of the same `PcrKey` with a different pubkey
     /// does NOT rotate the registered authorizer. This is what makes
@@ -1072,5 +1167,34 @@ mod tests {
             "post-restore Transition diverged from the original"
         );
         assert_eq!(b.get(&k(4)).unwrap().control_pubkey, pk(4));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_preserves_pending_fido2_counter_baseline() {
+        let mut sm = StateMachine::new();
+        sm.observe_attestation(k(1), pk(1));
+        // The successor retains the same control credential.
+        sm.observe_attestation(k(2), pk(1));
+        sm.apply(Op::Register {
+            key: k(1),
+            commitment: c(0xaa),
+        })
+        .unwrap();
+        sm.observe_transition_with_fido2_sign_count(k(1), k(2), Some(23));
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&sm.snapshot(), &mut bytes).unwrap();
+        let snapshot: StateMachineSnapshot = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let mut restored = StateMachine::new();
+        restored.restore_from_snapshot(snapshot);
+
+        let state = restored
+            .apply(Op::Transition {
+                old_key: k(1),
+                new_key: k(2),
+            })
+            .unwrap();
+        assert_eq!(state.fido2_sign_count, Some(23));
     }
 }
