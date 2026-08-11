@@ -253,6 +253,7 @@ mod tests {
             Request::Get { key: k(1) },
             Request::Pin {
                 key: k(2),
+                expected_version: crate::Version(0),
                 commitment: Commitment([0xab; 32]),
             },
         ] {

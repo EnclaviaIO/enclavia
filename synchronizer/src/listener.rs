@@ -541,6 +541,7 @@ mod tests {
             key_old,
             Request::Pin {
                 key: key_old,
+                expected_version: crate::Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -663,6 +664,7 @@ mod tests {
             &Frame::Rpc {
                 request: Request::Pin {
                     key,
+                    expected_version: crate::Version(0),
                     commitment: c(0xaa),
                 },
             },

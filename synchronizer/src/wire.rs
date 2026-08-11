@@ -167,6 +167,18 @@ pub enum Request {
     Pin {
         /// PCR set whose commitment is being updated.
         key: PcrKey,
+        /// Compare-and-swap guard, checked only when the pin maps to
+        /// [`crate::Op::Pin`] (ignored for a first-time `Register`, which
+        /// is inherently a CAS on non-existence): the pin applies only
+        /// when the key's current version equals this. The client learns
+        /// the version from the boot `Get` and every `PinOk`. Two live
+        /// writers for one key (a host-booted clone pair sharing the
+        /// image's PCRs) can then never both keep pinning: the loser's
+        /// first divergent pin fails with [`RpcError::VersionConflict`]
+        /// instead of silently last-write-winning, which is what stops a
+        /// forked volume's acknowledged writes from being rolled back
+        /// undetected.
+        expected_version: Version,
         /// New commitment to associate with `key`.
         commitment: Commitment,
     },
@@ -270,6 +282,15 @@ pub enum RpcError {
     #[error("operation rejected")]
     OperationRejected,
 
+    /// A `Pin` named an `expected_version` that is no longer current
+    /// (compare-and-swap failure): another writer pinned first. The
+    /// caller should `Get` to disambiguate a retry of its own lost-write
+    /// (current commitment equals the one it tried to pin — benign) from
+    /// a genuine fork (a different commitment — fatal). Never a liveness
+    /// error: do not blindly retry.
+    #[error("pin version conflict")]
+    VersionConflict,
+
     /// The server is currently unable to commit writes (e.g. quorum lost).
     /// Reads may still succeed; clients should back off and retry.
     #[error("synchronizer cluster unavailable")]
@@ -298,6 +319,10 @@ impl From<ValidationError> for RpcError {
             // by knowing which RPC it was handling; here we default to
             // NotFound and let the server override for transitions.
             ValidationError::KeyNotCurrent => RpcError::NotFound,
+
+            // A CAS failure has its own wire variant so the client can
+            // run the Get-disambiguation (own lost write vs genuine fork).
+            ValidationError::StalePin { .. } => RpcError::VersionConflict,
 
             ValidationError::AlreadyRegistered => RpcError::OperationRejected,
             ValidationError::KeyRetired => RpcError::OperationRejected,
@@ -759,6 +784,7 @@ mod tests {
     fn request_pin_roundtrip() {
         roundtrip(&Request::Pin {
             key: k(7),
+            expected_version: Version(3),
             commitment: c(0xab),
         });
     }
@@ -802,6 +828,7 @@ mod tests {
             RpcError::NotFound,
             RpcError::TransitionRejected,
             RpcError::OperationRejected,
+            RpcError::VersionConflict,
             RpcError::Unavailable,
         ] {
             roundtrip(&Response::Err { error: code });
@@ -821,6 +848,13 @@ mod tests {
             ),
             (ValidationError::KeyRetired, RpcError::OperationRejected),
             (ValidationError::KeyNotCurrent, RpcError::NotFound),
+            (
+                ValidationError::StalePin {
+                    expected: Version(0),
+                    current: Version(1),
+                },
+                RpcError::VersionConflict,
+            ),
             (
                 ValidationError::NewKeyAlreadyExists,
                 RpcError::TransitionRejected,

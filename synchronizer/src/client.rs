@@ -241,15 +241,30 @@ where
     /// `Version(0)` means this Pin REGISTERED the key (first pin for an
     /// unseen key); `Version(n+1)` bumped an existing pin.
     ///
+    /// `expected_version` is the compare-and-swap guard: for a re-pin it
+    /// must equal the key's current version (learned from the boot `Get`
+    /// and every `PinOk`), or the pin fails with
+    /// [`RpcError::VersionConflict`]. It is ignored when the pin maps to
+    /// a first-time Register (which is inherently a CAS on
+    /// non-existence); pass `Version(0)` there by convention.
+    ///
     /// In the replicated deployment the response only arrives after the
     /// entry is replicated to every voter, so awaiting this is the
     /// durable ack.
     pub async fn pin(
         &mut self,
         key: PcrKey,
+        expected_version: Version,
         commitment: Commitment,
     ) -> Result<Version, ClientError> {
-        match self.rpc(Request::Pin { key, commitment }).await? {
+        match self
+            .rpc(Request::Pin {
+                key,
+                expected_version,
+                commitment,
+            })
+            .await?
+        {
             Response::PinOk { version } => Ok(version),
             Response::Err { error } => Err(ClientError::Rpc(error)),
             _ => Err(ClientError::UnexpectedResponse("expected PinOk")),

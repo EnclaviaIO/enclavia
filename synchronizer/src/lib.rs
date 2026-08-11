@@ -102,6 +102,14 @@ pub enum Op {
     Pin {
         /// Currently-registered key whose commitment is being updated.
         key: PcrKey,
+        /// Compare-and-swap guard: the pin only applies when the key's
+        /// current version equals this. Two live writers for one key (a
+        /// host-booted clone pair sharing the image's PCRs) otherwise
+        /// fork the volume silently: both boot against the same pin,
+        /// both keep pinning divergent state, and the host later picks a
+        /// winner — a rollback of the losing fork's acknowledged writes.
+        /// With the CAS the loser's first divergent pin is rejected.
+        expected_version: Version,
         /// New commitment; bumps the per-key version by one.
         commitment: Commitment,
     },
@@ -203,6 +211,18 @@ pub enum ValidationError {
     /// registered (never registered, or already retired).
     #[error("PCR key is not currently registered")]
     KeyNotCurrent,
+    /// `Pin` named an `expected_version` that does not match the key's
+    /// current version: a compare-and-swap failure, i.e. another writer
+    /// pinned first (a forked clone, or a retry of a pin whose first
+    /// attempt actually committed). Carries the current version so the
+    /// caller can disambiguate a fork from its own lost write.
+    #[error("pin version conflict: expected {expected:?}, current is {current:?}")]
+    StalePin {
+        /// The version the caller believed current.
+        expected: Version,
+        /// The key's actual current version.
+        current: Version,
+    },
     /// `Transition` named a `new_key` that is already registered.
     #[error("transition target key is already registered")]
     NewKeyAlreadyExists,
@@ -299,7 +319,11 @@ impl StateMachine {
     pub fn apply(&mut self, op: Op) -> Result<KeyState, ValidationError> {
         match op {
             Op::Register { key, commitment } => self.apply_register(key, commitment),
-            Op::Pin { key, commitment } => self.apply_pin(key, commitment),
+            Op::Pin {
+                key,
+                expected_version,
+                commitment,
+            } => self.apply_pin(key, expected_version, commitment),
             Op::Transition { old_key, new_key } => self.apply_transition(old_key, new_key),
         }
     }
@@ -331,12 +355,19 @@ impl StateMachine {
     fn apply_pin(
         &mut self,
         key: PcrKey,
+        expected_version: Version,
         commitment: Commitment,
     ) -> Result<KeyState, ValidationError> {
         let entry = self
             .state
             .get_mut(&key)
             .ok_or(ValidationError::KeyNotCurrent)?;
+        if entry.version != expected_version {
+            return Err(ValidationError::StalePin {
+                expected: expected_version,
+                current: entry.version,
+            });
+        }
         entry.commitment = commitment;
         entry.version = Version(entry.version.0 + 1);
         Ok(*entry)
@@ -604,6 +635,7 @@ mod tests {
         .unwrap();
         sm.apply(Op::Pin {
             key: k(1),
+            expected_version: Version(0),
             commitment: c(0xbb),
         })
         .unwrap();
@@ -719,6 +751,7 @@ mod tests {
         let err = sm
             .apply(Op::Pin {
                 key: k(1),
+                expected_version: Version(0),
                 commitment: c(0xaa),
             })
             .unwrap_err();
@@ -737,6 +770,7 @@ mod tests {
         let s1 = sm
             .apply(Op::Pin {
                 key: k(1),
+                expected_version: Version(0),
                 commitment: c(0xbb),
             })
             .unwrap();
@@ -745,11 +779,61 @@ mod tests {
         let s2 = sm
             .apply(Op::Pin {
                 key: k(1),
+                expected_version: Version(1),
                 commitment: c(0xcc),
             })
             .unwrap();
         assert_eq!(s2.version, Version(2));
         assert_eq!(s2.commitment, c(0xcc));
+    }
+
+    /// The compare-and-swap guard: a pin naming a stale expected_version
+    /// is rejected, and the error carries the current version. This is
+    /// what stops a host-booted clone pair (same image, same PCR key)
+    /// from forking the volume: both boot against the same pin, and the
+    /// loser's first divergent pin fails instead of silently
+    /// last-write-winning.
+    #[test]
+    fn pin_with_stale_expected_version_is_rejected() {
+        let mut sm = StateMachine::new();
+        sm.observe_attestation(k(1), pk(1));
+        sm.apply(Op::Register {
+            key: k(1),
+            commitment: c(0xaa),
+        })
+        .unwrap();
+        sm.apply(Op::Pin {
+            key: k(1),
+            expected_version: Version(0),
+            commitment: c(0xbb),
+        })
+        .unwrap();
+        // A second writer that believes the version is still 0 (a fork
+        // that booted before the first writer's pin) is rejected.
+        let err = sm
+            .apply(Op::Pin {
+                key: k(1),
+                expected_version: Version(0),
+                commitment: c(0xcc),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::StalePin {
+                expected: Version(0),
+                current: Version(1),
+            }
+        );
+        // The rejected pin changed nothing.
+        assert_eq!(sm.get(&k(1)).unwrap().commitment, c(0xbb));
+        assert_eq!(sm.get(&k(1)).unwrap().version, Version(1));
+        // And the honest writer continues unaffected.
+        sm.apply(Op::Pin {
+            key: k(1),
+            expected_version: Version(1),
+            commitment: c(0xcc),
+        })
+        .unwrap();
     }
 
     /// Spec invariant: `RetirementIsFinal`, once a key is retired by a
@@ -798,6 +882,7 @@ mod tests {
         let err = sm
             .apply(Op::Pin {
                 key: k(1),
+                expected_version: Version(0),
                 commitment: c(0xff),
             })
             .unwrap_err();
@@ -846,6 +931,7 @@ mod tests {
         for i in 0u8..16 {
             sm.apply(Op::Pin {
                 key: k(1),
+                expected_version: prev,
                 commitment: c(i),
             })
             .unwrap();
@@ -867,11 +953,13 @@ mod tests {
         .unwrap();
         sm.apply(Op::Pin {
             key: k(1),
+            expected_version: Version(0),
             commitment: c(0xbb),
         })
         .unwrap();
         sm.apply(Op::Pin {
             key: k(1),
+            expected_version: Version(1),
             commitment: c(0xcc),
         })
         .unwrap();
@@ -942,6 +1030,7 @@ mod tests {
             },
             Op::Pin {
                 key: k(1),
+                expected_version: Version(0),
                 commitment: c(0xab),
             },
             Op::Register {
@@ -950,6 +1039,7 @@ mod tests {
             },
             Op::Pin {
                 key: k(2),
+                expected_version: Version(0),
                 commitment: c(0xbc),
             },
             Op::Transition {
@@ -958,6 +1048,7 @@ mod tests {
             },
             Op::Pin {
                 key: k(3),
+                expected_version: Version(1),
                 commitment: c(0xcc),
             },
         ];
@@ -1019,6 +1110,7 @@ mod tests {
         .unwrap();
         sm.apply(Op::Pin {
             key: k(1),
+            expected_version: Version(0),
             commitment: c(0xbb),
         })
         .unwrap();
