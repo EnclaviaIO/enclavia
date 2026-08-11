@@ -97,6 +97,20 @@ fn read_host_cid_file() -> Option<u32> {
     parse_host_cid(&raw)
 }
 
+/// The init-recorded host CID ([`HOST_CID_PATH`]), or `None` when the file
+/// is absent/invalid (and only the legacy probe remains).
+///
+/// Unlike [`host_cid`], this NEVER consults the reachability probe: the
+/// probe is a dev convenience for running binaries outside a patched-init
+/// EIF and is explicitly unreliable on real Nitro (a parent that stops
+/// answering the probe port is indistinguishable from QEMU). Callers making
+/// a SECURITY decision on the Nitro-vs-QEMU distinction (e.g. whether the
+/// plaintext mock-KMS transport is acceptable) must use this function and
+/// treat `None` as "not provably QEMU", never as "QEMU".
+pub fn init_recorded_host_cid() -> Option<u32> {
+    read_host_cid_file()
+}
+
 /// Parse the host CID file contents: a single ASCII-decimal CID, optionally
 /// surrounded by whitespace, that must be one of the two known CIDs.
 fn parse_host_cid(raw: &str) -> Option<u32> {

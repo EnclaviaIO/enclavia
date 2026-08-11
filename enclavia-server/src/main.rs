@@ -94,6 +94,32 @@ fn fresh_nonce() -> [u8; 32] {
     buf
 }
 
+/// A payload-free one-line summary of a [`ClientMessage`], safe to log at any
+/// level: variant name plus ids/lengths, never body bytes (those are the
+/// decrypted customer traffic, and the tracing output lands on the
+/// host-readable enclave console).
+fn client_message_summary(msg: &ClientMessage) -> String {
+    match msg {
+        ClientMessage::RequestAttestation => "RequestAttestation".to_string(),
+        ClientMessage::Data { id, payload } => {
+            format!("Data id={id} payload_len={}", payload.len())
+        }
+        ClientMessage::Control { payload, signature } => format!(
+            "Control payload_len={} signature_len={}",
+            payload.len(),
+            signature.len()
+        ),
+        ClientMessage::GetControlNonce => "GetControlNonce".to_string(),
+        ClientMessage::OpenStream { id, payload } => {
+            format!("OpenStream id={id} payload_len={}", payload.len())
+        }
+        ClientMessage::StreamData { id, payload } => {
+            format!("StreamData id={id} payload_len={}", payload.len())
+        }
+        ClientMessage::StreamClose { id, half } => format!("StreamClose id={id} half={half:?}"),
+    }
+}
+
 /// Connect to the host-side `chain-host` daemon (vsock CID 2 port 5005),
 /// write the chain link, and wait for the ACK.
 ///
@@ -341,10 +367,18 @@ async fn run_prepare_upgrade(
         }
     }
 
-    // Storage re-key (only for storage enclaves).
+    // Storage re-key (only for storage enclaves). The signed payload's
+    // `to_pcrs` is forwarded so `enclavia-crypto` can verify the NEW KMS
+    // key's policy gates Decrypt to exactly the enclave version being
+    // upgraded to (see the binary's `--expected-pcr*` args).
     if let Some(rk) = rekey {
-        let (ok, msg) =
-            run_enclavia_crypto_prepare_upgrade(&rk.new_public_key, &rk.new_key_id, bin).await;
+        let (ok, msg) = run_enclavia_crypto_prepare_upgrade(
+            &rk.new_public_key,
+            &rk.new_key_id,
+            &payload.to_pcrs,
+            bin,
+        )
+        .await;
         if !ok {
             // Do NOT emit a chain link if the LUKS step failed.
             return (false, format!("storage re-key failed: {msg}"));
@@ -486,6 +520,43 @@ async fn pull_upgrade_kms_creds() -> Result<BTreeMap<String, Vec<u8>>, String> {
     ciborium::de::from_reader(&bytes[..]).map_err(|e| format!("decoding creds CBOR: {e}"))
 }
 
+/// Env keys we forward from the host-pulled creds map into the
+/// `enclavia-crypto` subprocess. ANY other key is rejected outright: the
+/// map is host-controlled, and the subprocess honours security-critical
+/// env knobs (`LUKS_CURRENT_KEY_FILE`, `NBD_DEVICE`, `CRYPTSETUP_BIN`,
+/// `KMS_VSOCK_PORT`, ...), so forwarding arbitrary keys would let the
+/// parent redirect the plaintext LUKS passphrase to a host-visible sink
+/// (e.g. `LUKS_CURRENT_KEY_FILE=/dev/nbd0` or `/dev/console`).
+const ALLOWED_CREDS_ENV: [&str; 4] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+];
+
+/// Filter the host-supplied creds map down to [`ALLOWED_CREDS_ENV`],
+/// fail-closed: any unexpected key (or a value that is not clean UTF-8 /
+/// contains NUL, which would make `Command::env` panic) rejects the whole
+/// pull. Pure so the policy is unit-testable.
+fn filter_creds_env(creds: &BTreeMap<String, Vec<u8>>) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::with_capacity(creds.len());
+    for (k, v) in creds {
+        if !ALLOWED_CREDS_ENV.contains(&k.as_str()) {
+            return Err(format!(
+                "creds map carries unexpected key {k:?}; refusing to inject any of it \
+                 (only {ALLOWED_CREDS_ENV:?} are ever forwarded to enclavia-crypto)"
+            ));
+        }
+        let value = String::from_utf8(v.clone())
+            .map_err(|_| format!("creds value for {k} is not valid UTF-8"))?;
+        if value.contains('\0') {
+            return Err(format!("creds value for {k} contains a NUL byte"));
+        }
+        out.push((k.clone(), value));
+    }
+    Ok(out)
+}
+
 /// On real Nitro (host CID 3), pull a fresh `kms:Decrypt`-capable creds set
 /// from the on-demand relay the backend re-armed on the parent (vsock 5013)
 /// and inject it (plus the `KMS_AWS_REGION` bridge) into `command`'s env.
@@ -495,6 +566,12 @@ async fn pull_upgrade_kms_creds() -> Result<BTreeMap<String, Vec<u8>>, String> {
 /// workload must never see them), so both need this. Under QEMU (host CID 2)
 /// the enclave talks to mock-kms and needs no creds, so this is a no-op. The
 /// creds live only in the subprocess env, never on disk.
+///
+/// SECURITY: the map is host-controlled, so it passes through
+/// [`filter_creds_env`] (strict allowlist) before touching the subprocess
+/// env, and a missing `AWS_REGION` is fatal here — silently proceeding
+/// would leave `KMS_AWS_REGION` unset and drop `enclavia-crypto` to its
+/// plaintext mock-KMS transport on a production enclave.
 async fn inject_upgrade_kms_creds(
     command: &mut tokio::process::Command,
 ) -> Result<(), String> {
@@ -502,18 +579,28 @@ async fn inject_upgrade_kms_creds(
         return Ok(());
     }
     let creds = pull_upgrade_kms_creds().await?;
+    let env = filter_creds_env(&creds)?;
     let mut region: Option<String> = None;
-    for (k, v) in &creds {
-        let value = String::from_utf8_lossy(v);
+    for (k, v) in &env {
         if k == "AWS_REGION" {
-            region = Some(value.to_string());
+            region = Some(v.clone());
         }
-        command.env(k, value.as_ref());
+        command.env(k, v);
     }
     // `enclavia-crypto` selects its real-KMS transport off KMS_AWS_REGION; the
-    // creds feed delivers the region under the standard name AWS_REGION.
-    if let Some(r) = region {
-        command.env("KMS_AWS_REGION", r);
+    // creds feed delivers the region under the standard name AWS_REGION. On
+    // real Nitro an absent region is an error, never a silent mock fallback.
+    match region {
+        Some(r) if !r.trim().is_empty() => {
+            command.env("KMS_AWS_REGION", r);
+        }
+        _ => {
+            return Err(
+                "creds map has no AWS_REGION on real Nitro; refusing to run enclavia-crypto \
+                 without it (it would select the plaintext mock-KMS transport)"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -550,10 +637,16 @@ fn format_enclavia_crypto_failure(subcommand: &str, output: &std::process::Outpu
 
 /// Spawn `enclavia-crypto prepare-upgrade` and translate its exit status into
 /// a user-visible result. The new public key is base64-encoded for the CLI;
-/// the key id is passed through unchanged.
+/// the key id is passed through unchanged. `to_pcrs` (from the signed
+/// `UpgradePayload`) is forwarded so the binary can require the NEW KMS key's
+/// policy to gate `kms:Decrypt` to exactly those measurements before it seals
+/// anything under the key (the upgrade-time counterpart of the boot-time
+/// policy check; without it a compromised control key could seal the fresh
+/// passphrase to an attacker-held key with no attestation gate at all).
 async fn run_enclavia_crypto_prepare_upgrade(
     new_public_key: &[u8],
     new_key_id: &str,
+    to_pcrs: &enclavia_protocol::chain::PcrsHex,
     bin: &str,
 ) -> (bool, String) {
     use base64::Engine as _;
@@ -566,6 +659,12 @@ async fn run_enclavia_crypto_prepare_upgrade(
         &pubkey_b64,
         "--new-key-id",
         new_key_id,
+        "--expected-pcr0",
+        &to_pcrs.pcr0,
+        "--expected-pcr1",
+        &to_pcrs.pcr1,
+        "--expected-pcr2",
+        &to_pcrs.pcr2,
     ]);
 
     // The re-key re-derives the CURRENT LUKS passphrase via `kms:Decrypt`
@@ -883,7 +982,11 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                     }
                 };
 
-                trace!(?msg, "Received message from client");
+                // NEVER log the message body: Data/OpenStream/StreamData
+                // carry the decrypted customer traffic (HTTP requests with
+                // credentials), and this log goes to the enclave console,
+                // which the host can read. Variant + ids + lengths only.
+                trace!(summary = %client_message_summary(&msg), "Received message from client");
 
                 // Channel gating (#47 hardening). Control messages are
                 // only accepted on the host-only control listener: a
@@ -1118,9 +1221,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_pubkey = server_config.control_public_key.map(Arc::new);
     let min_upgrade_delay_secs = server_config.min_upgrade_delay_secs;
     let nonce: ControlNonce = Arc::new(Mutex::new(fresh_nonce()));
-    let crypto_bin = Arc::new(
-        std::env::var("ENCLAVIA_CRYPTO_BIN").unwrap_or_else(|_| "/bin/enclavia-crypto".into()),
-    );
+    // The re-key binary path is a fixed, compiled-in constant: it receives
+    // the freshly injected KMS creds and drives the LUKS re-key, so it must
+    // come from the measured rootfs and never from a host-influenceable
+    // env var (same trust-anchor contract as /etc/enclavia/config.json).
+    let crypto_bin = Arc::new("/bin/enclavia-crypto".to_string());
 
     info!(
         container = %container_addr,
@@ -1993,5 +2098,101 @@ mod workload_dial_grace_tests {
             "non-refused errors must not be retried, took {:?}",
             start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod host_input_hardening_tests {
+    //! Regression tests for the host-controlled-input hardening: the creds
+    //! env allowlist and the payload-free client-message logging.
+    use super::*;
+
+    fn creds(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn filter_creds_env_accepts_the_aws_set() {
+        let out = filter_creds_env(&creds(&[
+            ("AWS_ACCESS_KEY_ID", b"AKIA..."),
+            ("AWS_SECRET_ACCESS_KEY", b"secret"),
+            ("AWS_SESSION_TOKEN", b"token"),
+            ("AWS_REGION", b"eu-central-1"),
+        ]))
+        .expect("the four AWS keys pass");
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().any(|(k, _)| k == "AWS_REGION"));
+    }
+
+    #[test]
+    fn filter_creds_env_rejects_unexpected_keys() {
+        // The exfiltration class this closes: a host-injected env knob that
+        // redirects the plaintext LUKS passphrase to a host-visible sink.
+        for bad in [
+            "LUKS_CURRENT_KEY_FILE",
+            "LUKS_NEW_KEY_FILE",
+            "NBD_DEVICE",
+            "CRYPTSETUP_BIN",
+            "KMS_VSOCK_PORT",
+            "META_VSOCK_PORT",
+            "UPGRADE_ROLLBACK_STASH",
+            "RUST_LOG",
+        ] {
+            let err = filter_creds_env(&creds(&[
+                ("AWS_REGION", b"eu-central-1"),
+                (bad, b"/dev/nbd0"),
+            ]))
+            .expect_err("unexpected key must reject the whole pull");
+            assert!(err.contains(bad), "error should name the key: {err}");
+        }
+    }
+
+    #[test]
+    fn filter_creds_env_rejects_nul_and_non_utf8_values() {
+        // NUL in a value would make `Command::env` panic (control-task DoS).
+        let err = filter_creds_env(&creds(&[("AWS_REGION", b"eu\0central")]))
+            .expect_err("NUL value rejected");
+        assert!(err.contains("NUL"), "{err}");
+        let err = filter_creds_env(&creds(&[("AWS_REGION", &[0xff, 0xfe])]))
+            .expect_err("non-UTF-8 value rejected");
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn client_message_summary_never_contains_payload_bytes() {
+        let secret = b"Authorization: Bearer hunter2";
+        for msg in [
+            ClientMessage::Data {
+                id: 7,
+                payload: secret.to_vec(),
+            },
+            ClientMessage::OpenStream {
+                id: 8,
+                payload: secret.to_vec(),
+            },
+            ClientMessage::StreamData {
+                id: 9,
+                payload: secret.to_vec(),
+            },
+            ClientMessage::Control {
+                payload: secret.to_vec(),
+                signature: vec![0u8; 64],
+            },
+        ] {
+            let summary = client_message_summary(&msg);
+            assert!(
+                !summary.contains("hunter2") && !summary.contains("Bearer"),
+                "summary leaks payload: {summary}"
+            );
+        }
+        // And it still carries the useful debugging context.
+        let s = client_message_summary(&ClientMessage::Data {
+            id: 42,
+            payload: vec![0u8; 100],
+        });
+        assert!(s.contains("42") && s.contains("100"), "{s}");
     }
 }
