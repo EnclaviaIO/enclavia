@@ -33,9 +33,26 @@
 //! described the chain as carrying no signature. We include one on
 //! upgrade / revocation as defence-in-depth: a forged link injected by
 //! a tampered host-side daemon would carry no valid signature.
+//!
+//! ## Identity and clock trust
+//!
+//! Every payload carries an `enclave_id`, and the validator enforces it
+//! against the expected id threaded through [`ChainContext`] (the URL
+//! path id on backend ingest; the caller-pinned id on SDK walks).
+//! Without that binding a link attested by one enclave would transplant
+//! onto any other enclave sharing the same PCRs (i.e. booting the same
+//! EIF), letting one enclave's chain stand in for another's.
+//!
+//! `BootPayload.booted_at` is the ENCLAVE's self-reported wall clock,
+//! which the host can influence. The walker's refusal to accept a
+//! promotion boot that predates its explaining upgrade's `valid_from`
+//! (see [`ChainValidationError::UpgradeNotYetActive`]) is therefore an
+//! auditability / defence-in-depth gate, not the load-bearing
+//! activation enforcement: the real timelock lives enclave-side in the
+//! min-upgrade-delay check that gates `PrepareUpgrade` processing.
 
 use base64::Engine as _;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -147,7 +164,9 @@ pub struct ChainLinkJson {
 /// Payload shape for a [`ChainLinkKind::Boot`] link.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootPayload {
-    /// Enclave identifier. Must match the URL path on ingest.
+    /// Enclave identifier. Must equal the expected id in the
+    /// validator's context (the URL path id on ingest, the
+    /// caller-pinned id on SDK walks); enforced by [`validate_boot`].
     pub enclave_id: Uuid,
     /// Manifest digest of the Docker image this boot is bound to.
     pub image_digest: String,
@@ -296,6 +315,12 @@ impl PcrsHex {
 ///   enclave) are also accepted.
 /// - `upgradable`: defaults to `false` when absent.
 ///
+/// The enclave id is deliberately NOT read from this row: callers pass
+/// the id they asked about (the SDK's pinned id, the CLI's resolved
+/// id — both also name the URL this row was fetched from) straight to
+/// [`validate_chain`] / [`verify_pcr_descent`], so a backend serving a
+/// transplanted row cannot redirect the identity check.
+///
 /// These values are corroborating, not load-bearing, in the
 /// `trust_upgrades` trust model (a wrong value can only make a genuine
 /// chain fail to verify); see [`verify_pcr_descent`].
@@ -340,6 +365,12 @@ where
 /// `GET /enclaves/{id}/upgrade-chain`, passing successively longer
 /// prefixes as `prior_chain`.
 pub struct ChainContext<'a> {
+    /// The enclave this chain is expected to belong to. Every payload's
+    /// `enclave_id` must equal it; a link attested by a DIFFERENT
+    /// enclave that happens to share the same PCRs (same EIF) is
+    /// rejected as transplanted. Backend: the URL path id. SDK: the
+    /// caller-pinned enclave id.
+    pub enclave_id: &'a Uuid,
     /// PCR0/1/2 recorded for this enclave at build time. Every link's
     /// attestation document must carry these PCRs.
     pub enclave_pcrs: &'a PcrsHex,
@@ -367,9 +398,13 @@ pub enum Outcome {
         /// genesis boot is 0; subsequent links increment by 1.
         sequence: u64,
     },
-    /// The link is a duplicate of an already-active boot (same
-    /// `image_digest` as the chain's most recent boot). Caller should
-    /// NOT insert it; the existing matching link is still authoritative.
+    /// The link is a duplicate of an already-active entry: a boot with
+    /// the same `image_digest` as the chain's most recent boot, or a
+    /// signed (upgrade / revocation) link whose exact payload bytes
+    /// already appear on the chain (a replayed copy — the payload's
+    /// random nonce makes legitimate duplicates impossible). Caller
+    /// should NOT insert it; the existing matching link is still
+    /// authoritative.
     Dedup,
 }
 
@@ -386,8 +421,10 @@ pub enum ChainValidationError {
     /// CBOR-decode of `payload` failed against the kind's struct.
     #[error("{kind:?} payload not CBOR-decodable: {msg}")]
     PayloadDecode { kind: ChainLinkKind, msg: String },
-    /// `payload.enclave_id` does not match the validator's context.
-    #[error("payload enclave_id does not match the URL")]
+    /// `payload.enclave_id` does not match the expected enclave id in
+    /// the validator's context. The link was attested by (or forged
+    /// for) a different enclave that happens to share this one's PCRs.
+    #[error("payload enclave_id does not match the expected enclave id")]
     EnclaveIdMismatch,
     /// Boot link claims PCRs that disagree with what the backend
     /// recorded post-build.
@@ -438,6 +475,25 @@ pub enum ChainValidationError {
     /// upgrade.
     #[error("upgrade has already been revoked")]
     AlreadyRevoked,
+    /// Walker-level rule: a signed (upgrade / revocation) link whose
+    /// payload is byte-identical to an earlier signed link's payload.
+    /// Ingest dedups such replays ([`Outcome::Dedup`]), so a chain a
+    /// backend SERVES must never contain the same signed payload twice;
+    /// one that does is carrying a resurrected copy of a (possibly
+    /// revoked) link under a fresh row id. Distinct from
+    /// [`ChainValidationError::AlreadyRevoked`], which is about a FRESH
+    /// revocation payload re-targeting an already-revoked upgrade.
+    #[error("{0:?} link duplicates the payload bytes of an earlier chain link")]
+    DuplicatePayload(ChainLinkKind),
+    /// Walker-level rule: a promotion boot whose self-reported
+    /// `booted_at` predates the explaining upgrade's `valid_from`
+    /// (minus the clock-skew tolerance). The timelock that was supposed
+    /// to leave a pre-activation revoke window had not elapsed when the
+    /// new image claims to have booted. See the module-level "Identity
+    /// and clock trust" note for why this is defence-in-depth on top of
+    /// the enclave-side min-upgrade-delay check.
+    #[error("promotion boot predates the explaining upgrade's valid_from (minus clock skew)")]
+    UpgradeNotYetActive,
     /// A stored chain entry's payload no longer CBOR-decodes (DB-side
     /// drift). Maps to 500.
     #[error("stored {0:?} payload corrupt: {1}")]
@@ -486,6 +542,11 @@ fn validate_boot(
             msg: e.to_string(),
         }
     })?;
+    // Identity before anything else: a boot attested by a different
+    // enclave (same EIF, same PCRs) must not land on this chain.
+    if parsed.enclave_id != *ctx.enclave_id {
+        return Err(ChainValidationError::EnclaveIdMismatch);
+    }
     if parsed.pcrs != *ctx.enclave_pcrs {
         return Err(ChainValidationError::PcrMismatch);
     }
@@ -552,16 +613,33 @@ fn validate_signed(
         .verify(&link.payload, &sig)
         .map_err(|_| ChainValidationError::SignatureInvalid)?;
 
-    // Payload-shape sanity + per-kind cross-link checks.
+    // Payload-shape sanity, the enclave_id binding, replay dedup, and
+    // per-kind cross-link checks.
     match link.kind {
         ChainLinkKind::Upgrade => {
-            let _: UpgradePayload =
+            let parsed: UpgradePayload =
                 ciborium::from_reader(link.payload.as_slice()).map_err(|e| {
                     ChainValidationError::PayloadDecode {
                         kind: ChainLinkKind::Upgrade,
                         msg: e.to_string(),
                     }
                 })?;
+            if parsed.enclave_id != *ctx.enclave_id {
+                return Err(ChainValidationError::EnclaveIdMismatch);
+            }
+            // Replayed-upgrade guard: a byte-identical payload already
+            // on the chain is a captured re-submission (e.g. of a
+            // since-revoked upgrade). Payload bytes are canonical — the
+            // signature covers them and the attestation binds
+            // sha256(payload) — and the payload's random nonce makes
+            // legitimate duplicates impossible, so a second copy can
+            // only be a replay. Dedup instead of appending: appending
+            // would assign a fresh row id the prior revocation (keyed
+            // to the original's id) does not cover, resurrecting the
+            // revoked transition.
+            if signed_payload_seen(link, ctx.prior_chain) {
+                return Ok(Outcome::Dedup);
+            }
         }
         ChainLinkKind::Revocation => {
             let revoke: RevocationPayload = ciborium::from_reader(link.payload.as_slice())
@@ -569,6 +647,17 @@ fn validate_signed(
                     kind: ChainLinkKind::Revocation,
                     msg: e.to_string(),
                 })?;
+            if revoke.enclave_id != *ctx.enclave_id {
+                return Err(ChainValidationError::EnclaveIdMismatch);
+            }
+            // Same replay guard as for upgrades. Runs BEFORE the
+            // double-revoke scan: a byte-identical re-submission dedups,
+            // while a FRESH revocation payload targeting an
+            // already-revoked upgrade still fails `AlreadyRevoked`
+            // below.
+            if signed_payload_seen(link, ctx.prior_chain) {
+                return Ok(Outcome::Dedup);
+            }
             // Target lookup, kind check, activation check, double-revoke.
             let target = ctx
                 .prior_chain
@@ -613,9 +702,31 @@ fn validate_signed(
     })
 }
 
+/// True when an already-chained link has the same kind and
+/// byte-identical payload as `link`. Shared by the ingest path (replay
+/// dedup in [`validate_signed`]) and the walker (where a duplicate is a
+/// hard [`ChainValidationError::DuplicatePayload`], since a served
+/// chain should never have passed one through ingest).
+fn signed_payload_seen(link: &ChainLink, prior: &[ChainLink]) -> bool {
+    prior
+        .iter()
+        .any(|l| l.kind == link.kind && l.payload == link.payload)
+}
+
 // ---------------------------------------------------------------------------
 // Full-chain walker
 // ---------------------------------------------------------------------------
+
+/// Clock-skew tolerance applied when judging a promotion boot's
+/// `booted_at` against the explaining upgrade's `valid_from`. Mirrors
+/// `CLOCK_SKEW_TOLERANCE_SECS` in `enclavia-server` (which uses the same
+/// 60s slack on the enclave-side min-upgrade-delay check): the enclave's
+/// clock is host-influenced, so a small allowance keeps a genuinely
+/// valid history from failing on second-level disagreement while still
+/// rejecting promotions claimed long before activation. NOTE: the two
+/// constants are coupled by convention only — if the server value ever
+/// changes, change this one to match.
+const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
 
 /// One stored chain link plus its server-assigned ingest time: the
 /// input unit for [`validate_chain`].
@@ -679,14 +790,36 @@ pub struct ChainWalk {
 ///   PCR check. A transition no signed upgrade link explains is
 ///   exactly what this rejects.
 ///
+/// Two walker-only rules have no per-link counterpart at ingest (they
+/// relate a link to the rebuilt history, not to a fixed context):
+///
+/// - A signed link whose payload byte-duplicates an earlier signed
+///   link's payload fails with
+///   [`ChainValidationError::DuplicatePayload`]: ingest dedups such
+///   replays, so a served chain containing one is a backend attempt to
+///   resurrect a (possibly revoked) link under a fresh row id.
+/// - A promotion boot whose `booted_at` predates the explaining
+///   upgrade's `valid_from` (minus a clock-skew tolerance) fails with
+///   [`ChainValidationError::UpgradeNotYetActive`], so the recorded
+///   history cannot claim an activation inside what was supposed to be
+///   the pre-activation revoke window. `booted_at` is the enclave's
+///   self-reported (host-influenced) clock, so this is defence-in-depth
+///   only; see the module-level "Identity and clock trust" note.
+///
 /// Callers MUST check [`ChainWalk::tip_matches_row`] in addition to
 /// the per-link outcomes: it ties the walk's final state to the row,
 /// proving the chain accounts for what is currently running.
 ///
+/// `enclave_id` is the enclave the caller asked about (SDK: the pinned
+/// id; CLI: the resolved id; both also name the URL the row and chain
+/// were fetched from). Every link's payload must carry it.
+///
 /// `now` is the fallback reference instant for links with no
 /// `recorded_at` (e.g. not-yet-ingested candidates).
+#[allow(clippy::too_many_arguments)]
 pub fn validate_chain(
     links: &[RecordedLink],
+    enclave_id: &Uuid,
     row_pcrs: &PcrsHex,
     row_image_digest: &str,
     control_public_key: Option<&[u8]>,
@@ -705,6 +838,22 @@ pub fn validate_chain(
     for recorded in links {
         let link = &recorded.link;
         let reference = recorded.recorded_at.unwrap_or(now);
+
+        // Resurrected-replay guard: a served chain must never contain
+        // the same signed payload twice (ingest dedups replays), so a
+        // duplicate here means the backend is feeding us a copy of a
+        // (possibly revoked) link under a fresh row id. Fail the link;
+        // `verify_pcr_descent` rejects the whole chain on any per-link
+        // error, so this is fail-closed.
+        if matches!(
+            link.kind,
+            ChainLinkKind::Upgrade | ChainLinkKind::Revocation
+        ) && signed_payload_seen(link, &prior)
+        {
+            outcomes.push(Err(ChainValidationError::DuplicatePayload(link.kind)));
+            prior.push(link.clone());
+            continue;
+        }
 
         // Reconstruct the row state this link saw at ingest. `promotes`
         // marks the contexts that advance the in-force state when the
@@ -732,6 +881,23 @@ pub fn validate_chain(
                         {
                             // Promotion boot: ingest saw the row
                             // already promoted to the upgrade target.
+                            // The boot must not PREDATE the upgrade's
+                            // `valid_from` (minus skew slack): the
+                            // timelock exists to leave a pre-activation
+                            // revoke window, and a history that shows
+                            // the new image running inside that window
+                            // is one where the window never existed.
+                            // `booted_at` is the enclave's self-reported
+                            // (host-influenced) clock, so this is
+                            // auditability / defence-in-depth; real
+                            // activation enforcement is enclave-side.
+                            if p.booted_at
+                                < target.valid_from - Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS)
+                            {
+                                outcomes.push(Err(ChainValidationError::UpgradeNotYetActive));
+                                prior.push(link.clone());
+                                continue;
+                            }
                             (target.to_pcrs, target.image_digest, true)
                         } else {
                             // No signed upgrade explains these PCRs;
@@ -751,6 +917,7 @@ pub fn validate_chain(
         };
 
         let ctx = ChainContext {
+            enclave_id,
             enclave_pcrs: &ctx_pcrs,
             enclave_image_digest: &ctx_digest,
             control_public_key,
@@ -783,6 +950,17 @@ pub fn validate_chain(
 /// Most recent prior unrevoked upgrade link whose `to_pcrs` and target
 /// image digest match the boot being explained. `None` when no signed
 /// upgrade accounts for a boot with these measurements.
+///
+/// An upgrade whose payload byte-duplicates an EARLIER upgrade link's
+/// payload never explains a boot: the walker rejects such a duplicate
+/// with [`ChainValidationError::DuplicatePayload`] (ingest dedups
+/// replays, so a served chain containing one is already a backend
+/// integrity failure), but `prior` also holds links that FAILED
+/// validation, and the revoked-id filter alone would let the resurrected
+/// copy (fresh row id the revocation doesn't cover) explain a promotion
+/// boot in the display path. Skipping duplicates here keeps the reported
+/// walk honest even though `verify_pcr_descent` already fails closed on
+/// the duplicate's error.
 fn promotion_target(
     prior: &[ChainLink],
     boot_pcrs: &PcrsHex,
@@ -794,13 +972,26 @@ fn promotion_target(
         .filter_map(|l| ciborium::from_reader::<RevocationPayload, _>(l.payload.as_slice()).ok())
         .map(|p| p.revokes)
         .collect();
-    prior
-        .iter()
-        .rev()
-        .filter(|l| l.kind == ChainLinkKind::Upgrade)
-        .filter(|l| l.id.is_none_or(|id| !revoked.contains(&id)))
-        .filter_map(|l| ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()).ok())
-        .find(|p| p.to_pcrs == *boot_pcrs && p.image_digest == boot_image_digest)
+    for (i, l) in prior.iter().enumerate().rev() {
+        if l.kind != ChainLinkKind::Upgrade {
+            continue;
+        }
+        if l.id.is_some_and(|id| revoked.contains(&id)) {
+            continue;
+        }
+        // A byte-duplicated upgrade payload is a resurrected replay
+        // (possibly of a revoked upgrade); it never explains a boot.
+        if signed_payload_seen(l, &prior[..i]) {
+            continue;
+        }
+        let Ok(p) = ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()) else {
+            continue;
+        };
+        if p.to_pcrs == *boot_pcrs && p.image_digest == boot_image_digest {
+            return Some(p);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -850,15 +1041,17 @@ pub enum PcrDescentError {
 /// to extend trust to the new image by proving the new image is a
 /// descendant of the pinned one.
 ///
-/// The caller passes the pinned PCRs plus the enclave's public chain
-/// (from `GET /enclaves/{id}/upgrade-chain`) and the validator context
-/// (`row_*`, `control_public_key`, `upgradable`) from
-/// `GET /enclaves/{id}`. On success it returns the chain's TIP PCRs; the
-/// caller MUST then verify the LIVE attestation against exactly those
-/// PCRs (e.g. [`crate::attestation::verify_against`]) to bind the
-/// verified descendant version to the running Noise session. This
-/// function does not see the live attestation and so cannot make that
-/// binding itself.
+/// The caller passes the pinned PCRs, the id of the enclave it believes
+/// it is talking to (`enclave_id` — every link's payload must carry it,
+/// so a chain transplanted from a same-EIF enclave fails), plus the
+/// enclave's public chain (from `GET /enclaves/{id}/upgrade-chain`) and
+/// the validator context (`row_*`, `control_public_key`, `upgradable`)
+/// from `GET /enclaves/{id}`. On success it returns the chain's TIP
+/// PCRs; the caller MUST then verify the LIVE attestation against
+/// exactly those PCRs (e.g. [`crate::attestation::verify_against`]) to
+/// bind the verified descendant version to the running Noise session.
+/// This function does not see the live attestation and so cannot make
+/// that binding itself.
 ///
 /// ## Trust model
 ///
@@ -886,13 +1079,15 @@ pub enum PcrDescentError {
 /// `debug_mode` must be the SDK's own mode: in production mode a chain
 /// of debug (non-CA-signed) links fails attestation and is rejected, so
 /// a production client never extends trust through unverifiable history.
-// One arg over the lint's threshold: this mirrors `validate_chain`'s
-// context (which sits exactly at the limit) plus the pinned anchor.
-// Bundling them into a struct would just move the same fields around.
+// Two args over the lint's threshold: this mirrors `validate_chain`'s
+// context (itself one over, from the expected enclave id) plus the
+// pinned anchor. Bundling them into a struct would just move the same
+// fields around.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_pcr_descent(
     pinned: &Pcrs,
     links: &[RecordedLink],
+    enclave_id: &Uuid,
     control_public_key: Option<&[u8]>,
     row_pcrs: &PcrsHex,
     row_image_digest: &str,
@@ -906,6 +1101,7 @@ pub fn verify_pcr_descent(
         ..
     } = validate_chain(
         links,
+        enclave_id,
         row_pcrs,
         row_image_digest,
         control_public_key,
@@ -980,11 +1176,22 @@ mod tests {
     }
 
     fn boot_link(enclave_id: Uuid, image_digest: &str, pcr_seed: u8) -> ChainLink {
+        boot_link_at(enclave_id, image_digest, pcr_seed, chrono::Utc::now())
+    }
+
+    /// [`boot_link`] with an explicit `booted_at`, for tests that
+    /// exercise the walker's `valid_from`-vs-`booted_at` rule.
+    fn boot_link_at(
+        enclave_id: Uuid,
+        image_digest: &str,
+        pcr_seed: u8,
+        booted_at: DateTime<Utc>,
+    ) -> ChainLink {
         let payload = BootPayload {
             enclave_id,
             image_digest: image_digest.into(),
             pcrs: pcrs_hex_from_seed(pcr_seed),
-            booted_at: chrono::Utc::now(),
+            booted_at,
             nonce: vec![0x42; 32],
         };
         let mut payload_bytes = Vec::new();
@@ -1058,6 +1265,7 @@ mod tests {
     }
 
     fn ctx<'a>(
+        enclave_id: &'a Uuid,
         pcrs: &'a PcrsHex,
         digest: &'a str,
         pubkey: Option<&'a [u8]>,
@@ -1065,6 +1273,7 @@ mod tests {
         chain: &'a [ChainLink],
     ) -> ChainContext<'a> {
         ChainContext {
+            enclave_id,
             enclave_pcrs: pcrs,
             enclave_image_digest: digest,
             control_public_key: pubkey,
@@ -1080,7 +1289,7 @@ mod tests {
         let link = boot_link(id, "sha256:aaa", 0x10);
         let outcome = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:aaa", None, false, &[]),
+            &ctx(&id, &pcrs, "sha256:aaa", None, false, &[]),
             chrono::Utc::now(),
             true,
         )
@@ -1095,7 +1304,7 @@ mod tests {
         let link = boot_link(id, "sha256:aaa", 0x99);
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:aaa", None, false, &[]),
+            &ctx(&id, &pcrs, "sha256:aaa", None, false, &[]),
             chrono::Utc::now(),
             true,
         )
@@ -1110,7 +1319,7 @@ mod tests {
         let link = boot_link(id, "sha256:DIFFERENT", 0x12);
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:aaa", None, false, &[]),
+            &ctx(&id, &pcrs, "sha256:aaa", None, false, &[]),
             chrono::Utc::now(),
             true,
         )
@@ -1126,6 +1335,7 @@ mod tests {
         let outcome = validate_chain_link(
             &first,
             &ctx(
+                &id,
                 &pcrs,
                 "sha256:bbb",
                 None,
@@ -1162,7 +1372,7 @@ mod tests {
         let reboot = boot_link(id, "sha256:v1", 0x14);
         let outcome = validate_chain_link(
             &reboot,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &chain),
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
             chrono::Utc::now(),
             true,
         )
@@ -1182,6 +1392,7 @@ mod tests {
         let err = validate_chain_link(
             &reboot,
             &ctx(
+                &id,
                 &pcrs,
                 "sha256:new",
                 None,
@@ -1209,7 +1420,7 @@ mod tests {
         );
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", None, false, &[]),
+            &ctx(&id, &pcrs, "sha256:v1", None, false, &[]),
             chrono::Utc::now(),
             true,
         )
@@ -1242,6 +1453,7 @@ mod tests {
         let err = validate_chain_link(
             &link,
             &ctx(
+                &id,
                 &pcrs,
                 "sha256:v1",
                 Some(&pk),
@@ -1269,7 +1481,7 @@ mod tests {
         );
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &[]),
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &[]),
             chrono::Utc::now(),
             true,
         )
@@ -1296,6 +1508,7 @@ mod tests {
         let outcome = validate_chain_link(
             &link,
             &ctx(
+                &id,
                 &pcrs,
                 "sha256:v1",
                 Some(&pk),
@@ -1331,7 +1544,7 @@ mod tests {
         let link = revocation_link(id, upgrade.id.unwrap(), 0x1a, &sk);
         let outcome = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &chain),
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
             chrono::Utc::now(),
             true,
         )
@@ -1352,7 +1565,7 @@ mod tests {
         let link = revocation_link(id, Uuid::new_v4(), 0x1b, &sk);
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &chain),
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
             chrono::Utc::now(),
             true,
         )
@@ -1382,7 +1595,7 @@ mod tests {
         let link = revocation_link(id, upgrade.id.unwrap(), 0x1c, &sk);
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &chain),
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
             chrono::Utc::now(),
             true,
         )
@@ -1415,12 +1628,187 @@ mod tests {
         let link = revocation_link(id, upgrade.id.unwrap(), 0x1d, &sk);
         let err = validate_chain_link(
             &link,
-            &ctx(&pcrs, "sha256:v1", Some(&pk), true, &chain),
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
             chrono::Utc::now(),
             true,
         )
         .unwrap_err();
         assert!(matches!(err, ChainValidationError::AlreadyRevoked));
+    }
+
+    // -----------------------------------------------------------------------
+    // enclave_id binding (transplant resistance)
+    // -----------------------------------------------------------------------
+
+    /// A boot payload carrying a DIFFERENT enclave id (a transplant
+    /// from another enclave booting the same EIF, hence the same PCRs)
+    /// must fail even though PCRs and image digest match.
+    #[test]
+    fn boot_rejects_enclave_id_mismatch() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let link = boot_link(other, "sha256:aaa", 0x1e);
+        let err = validate_chain_link(
+            &link,
+            &ctx(&id, &pcrs, "sha256:aaa", None, false, &[]),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainValidationError::EnclaveIdMismatch));
+    }
+
+    /// Same transplant for an upgrade link: valid signature, valid
+    /// attestation, wrong enclave id.
+    #[test]
+    fn upgrade_rejects_enclave_id_mismatch() {
+        let pcrs = pcrs_hex_from_seed(0x1f);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x1f);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+
+        let link = upgrade_link(
+            other,
+            "sha256:v2",
+            0x1f,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        let err = validate_chain_link(
+            &link,
+            &ctx(
+                &id,
+                &pcrs,
+                "sha256:v1",
+                Some(&pk),
+                true,
+                std::slice::from_ref(&genesis),
+            ),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainValidationError::EnclaveIdMismatch));
+    }
+
+    /// And for a revocation link.
+    #[test]
+    fn revocation_rejects_enclave_id_mismatch() {
+        let pcrs = pcrs_hex_from_seed(0x24);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x24);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x24,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let chain = vec![genesis, upgrade.clone()];
+
+        let link = revocation_link(other, upgrade.id.unwrap(), 0x24, &sk);
+        let err = validate_chain_link(
+            &link,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainValidationError::EnclaveIdMismatch));
+    }
+
+    // -----------------------------------------------------------------------
+    // Signed-link replay dedup (ingest path)
+    // -----------------------------------------------------------------------
+
+    /// THE revoked-upgrade replay: a captured, valid upgrade link is
+    /// re-submitted AFTER being revoked. The payload bytes (and thus
+    /// the signature and attestation binding) are identical to the
+    /// original's; ingest must dedup rather than append a copy the old
+    /// revocation doesn't cover.
+    #[test]
+    fn upgrade_replay_after_revocation_dedups() {
+        let pcrs = pcrs_hex_from_seed(0x25);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x25);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x25,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x25, &sk);
+        revoke.id = Some(Uuid::new_v4());
+        revoke.sequence = Some(2);
+        let chain = vec![genesis, upgrade.clone(), revoke];
+
+        // The replay is the captured link resubmitted: same payload,
+        // attestation, and signature bytes; no backend-assigned fields.
+        let mut replay = upgrade;
+        replay.id = None;
+        replay.sequence = None;
+        let outcome = validate_chain_link(
+            &replay,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Dedup);
+    }
+
+    /// A byte-identical revocation replay dedups too — DISTINCT from a
+    /// fresh revocation payload re-targeting the same upgrade, which
+    /// still fails `AlreadyRevoked` (see `revocation_rejects_double_revoke`).
+    #[test]
+    fn revocation_replay_dedups() {
+        let pcrs = pcrs_hex_from_seed(0x26);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x26);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x26,
+            &sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x26, &sk);
+        revoke.id = Some(Uuid::new_v4());
+        revoke.sequence = Some(2);
+        let chain = vec![genesis, upgrade, revoke.clone()];
+
+        let mut replay = revoke;
+        replay.id = None;
+        replay.sequence = None;
+        let outcome = validate_chain_link(
+            &replay,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Dedup);
     }
 
     // -----------------------------------------------------------------------
@@ -1504,7 +1892,16 @@ mod tests {
             recorded(promo, now - Duration::minutes(9)),
         ];
         let row_pcrs = pcrs_hex_from_seed(0x30);
-        let walk = validate_chain(&links, &row_pcrs, "sha256:v2", Some(&pk), true, now, true);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &row_pcrs,
+            "sha256:v2",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
 
         for (i, outcome) in walk.outcomes.iter().enumerate() {
             assert!(
@@ -1539,6 +1936,7 @@ mod tests {
         let row_pcrs = pcrs_hex_from_seed(0x31);
         let walk = validate_chain(
             &links,
+            &id,
             &row_pcrs,
             "sha256:v2",
             Some(&[4u8; 65]),
@@ -1587,7 +1985,16 @@ mod tests {
             recorded(rogue, now - Duration::minutes(5)),
         ];
         let row_pcrs = pcrs_hex_from_seed(0x22);
-        let walk = validate_chain(&links, &row_pcrs, "sha256:v1", Some(&pk), true, now, true);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &row_pcrs,
+            "sha256:v1",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
 
         assert!(walk.outcomes[0].is_ok());
         assert!(walk.outcomes[1].is_ok());
@@ -1626,7 +2033,16 @@ mod tests {
             recorded(revoke, now - Duration::minutes(90)),
         ];
         let row_pcrs = pcrs_hex_from_seed(0x23);
-        let walk = validate_chain(&links, &row_pcrs, "sha256:v1", Some(&pk), true, now, true);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &row_pcrs,
+            "sha256:v1",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
 
         assert!(
             walk.outcomes.iter().all(Result::is_ok),
@@ -1646,6 +2062,7 @@ mod tests {
             .collect();
         let walk_now = validate_chain(
             &unstamped,
+            &id,
             &row_pcrs,
             "sha256:v1",
             Some(&pk),
@@ -1659,13 +2076,238 @@ mod tests {
         ));
     }
 
+    /// A served chain containing the same signed upgrade payload twice
+    /// is carrying a resurrected copy: ingest would have deduped the
+    /// replay, so its presence means the backend is feeding us a link
+    /// the prior revocation no longer covers. The duplicate must fail
+    /// per-link validation (and thus the whole descent check).
+    #[test]
+    fn walk_rejects_resurrected_upgrade_payload() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x40);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        // Confirmed for a week out, then revoked inside the window.
+        let mut upgrade =
+            transition_upgrade_link(id, "sha256:v2", 0x40, 0x50, &sk, now + Duration::days(7));
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x40, &sk);
+        revoke.id = Some(Uuid::new_v4());
+        revoke.sequence = Some(2);
+        // The replayed copy: identical payload/attestation/signature,
+        // freshly assigned row fields (as ingest would have assigned on
+        // the vulnerable path).
+        let mut replay = upgrade.clone();
+        replay.id = Some(Uuid::new_v4());
+        replay.sequence = Some(3);
+        // A boot of the resurrected target, after valid_from.
+        let mut promo = boot_link_at(
+            id,
+            "sha256:v2",
+            0x50,
+            now + Duration::days(7) + Duration::minutes(5),
+        );
+        promo.id = Some(Uuid::new_v4());
+        promo.sequence = Some(4);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(2)),
+            recorded(upgrade, now - Duration::minutes(30)),
+            recorded(revoke, now - Duration::minutes(20)),
+            recorded(replay, now - Duration::minutes(15)),
+            recorded(promo, now + Duration::days(7) + Duration::minutes(6)),
+        ];
+        let row_pcrs = pcrs_hex_from_seed(0x50);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &row_pcrs,
+            "sha256:v2",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
+
+        assert!(walk.outcomes[0].is_ok());
+        assert!(walk.outcomes[1].is_ok());
+        assert!(walk.outcomes[2].is_ok());
+        assert!(
+            matches!(
+                walk.outcomes[3],
+                Err(ChainValidationError::DuplicatePayload(
+                    ChainLinkKind::Upgrade
+                ))
+            ),
+            "{:?}",
+            walk.outcomes[3]
+        );
+        // The resurrected copy must NOT explain the promotion boot either:
+        // `prior` includes failed links, and the revoked-id filter alone
+        // would let the fresh-row-id copy through `promotion_target`. With
+        // no legitimate upgrade explaining the v2 boot, the boot itself
+        // fails and the walk no longer claims to account for the row.
+        assert!(
+            walk.outcomes[4].is_err(),
+            "promotion boot explained by a resurrected upgrade: {:?}",
+            walk.outcomes[4]
+        );
+        assert!(
+            !walk.tip_matches_row,
+            "a chain whose only explanation is a resurrected revoked upgrade must not match the row"
+        );
+
+        // Fail-closed end to end: the descent check rejects the whole
+        // chain at the resurrected link, so a `trust_upgrades` client
+        // never extends trust through it.
+        let pinned = pcrs_hex_from_seed(0x40).to_pcrs().unwrap();
+        let err = verify_pcr_descent(
+            &pinned,
+            &links,
+            &id,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PcrDescentError::LinkInvalid {
+                    position: 3,
+                    source: ChainValidationError::DuplicatePayload(ChainLinkKind::Upgrade)
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A promotion boot that claims to have happened BEFORE the
+    /// explaining upgrade's `valid_from` (minus clock skew) must fail:
+    /// the timelock's pre-activation revoke window never existed for
+    /// this transition.
+    #[test]
+    fn walk_rejects_pre_activation_promotion() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x60);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        // Active a week from now — the revoke window is still open.
+        let mut upgrade =
+            transition_upgrade_link(id, "sha256:v2", 0x60, 0x70, &sk, now + Duration::days(7));
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        // ...yet the new image claims to have booted already.
+        let mut promo = boot_link_at(id, "sha256:v2", 0x70, now);
+        promo.id = Some(Uuid::new_v4());
+        promo.sequence = Some(2);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(2)),
+            recorded(upgrade, now - Duration::minutes(30)),
+            recorded(promo, now - Duration::minutes(5)),
+        ];
+        // The row already shows the promoted state (the cutover sweep
+        // promotes it before the new enclave boots).
+        let row_pcrs = pcrs_hex_from_seed(0x70);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &row_pcrs,
+            "sha256:v2",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
+
+        assert!(walk.outcomes[0].is_ok());
+        assert!(walk.outcomes[1].is_ok());
+        assert!(
+            matches!(
+                walk.outcomes[2],
+                Err(ChainValidationError::UpgradeNotYetActive)
+            ),
+            "{:?}",
+            walk.outcomes[2]
+        );
+        // The rejected boot must NOT advance the in-force tip.
+        assert_eq!(walk.final_pcrs, Some(pcrs_hex_from_seed(0x60)));
+        assert!(!walk.tip_matches_row);
+    }
+
+    /// The skew tolerance keeps a boot that happened seconds before
+    /// `valid_from` (host/enclave clock disagreement) valid: only a
+    /// boot EARLIER than `valid_from - 60s` is rejected.
+    #[test]
+    fn walk_accepts_promotion_within_clock_skew() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let mut genesis = boot_link(id, "sha256:v1", 0x61);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        // valid_from is 30s in the future; the boot's self-reported
+        // clock says "now" — inside the 60s tolerance.
+        let mut upgrade = transition_upgrade_link(
+            id,
+            "sha256:v2",
+            0x61,
+            0x71,
+            &sk,
+            now + Duration::seconds(30),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        let mut promo = boot_link_at(id, "sha256:v2", 0x71, now);
+        promo.id = Some(Uuid::new_v4());
+        promo.sequence = Some(2);
+
+        let links = vec![
+            recorded(genesis, now - Duration::hours(2)),
+            recorded(upgrade, now - Duration::minutes(30)),
+            recorded(promo, now - Duration::minutes(5)),
+        ];
+        let row_pcrs = pcrs_hex_from_seed(0x71);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &row_pcrs,
+            "sha256:v2",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
+
+        assert!(
+            walk.outcomes.iter().all(Result::is_ok),
+            "{:?}",
+            walk.outcomes
+        );
+        assert!(walk.tip_matches_row);
+        assert_eq!(walk.final_pcrs, Some(row_pcrs));
+    }
+
     // -----------------------------------------------------------------------
     // verify_pcr_descent (SDK trust_upgrades)
     // -----------------------------------------------------------------------
 
     /// boot(v1) -> upgrade(v1->v2) -> boot(v2) walked AFTER promotion.
-    /// Returns the links plus the v1/v2 seeds and the control pubkey.
-    fn two_version_chain(now: DateTime<Utc>) -> (Vec<RecordedLink>, Vec<u8>, u8, u8) {
+    /// Returns the links, the enclave id, the control pubkey, and the
+    /// v1/v2 seeds.
+    fn two_version_chain(now: DateTime<Utc>) -> (Vec<RecordedLink>, Uuid, Vec<u8>, u8, u8) {
         let (sk, pk) = keypair();
         let id = Uuid::new_v4();
         let (v1, v2) = (0x20u8, 0x30u8);
@@ -1686,19 +2328,20 @@ mod tests {
             recorded(upgrade, now - Duration::minutes(11)),
             recorded(promo, now - Duration::minutes(9)),
         ];
-        (links, pk, v1, v2)
+        (links, id, pk, v1, v2)
     }
 
     #[test]
     fn descent_pinned_genesis_returns_tip() {
         let now = chrono::Utc::now();
-        let (links, pk, v1, v2) = two_version_chain(now);
+        let (links, id, pk, v1, v2) = two_version_chain(now);
         let row_pcrs = pcrs_hex_from_seed(v2);
         let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
 
         let tip = verify_pcr_descent(
             &pinned,
             &links,
+            &id,
             Some(&pk),
             &row_pcrs,
             "sha256:v2",
@@ -1716,12 +2359,20 @@ mod tests {
         // Pinning the CURRENT (post-upgrade) version is also "in lineage":
         // the tip itself is an in-force boot state.
         let now = chrono::Utc::now();
-        let (links, pk, _v1, v2) = two_version_chain(now);
+        let (links, id, pk, _v1, v2) = two_version_chain(now);
         let row_pcrs = pcrs_hex_from_seed(v2);
         let pinned = pcrs_hex_from_seed(v2).to_pcrs().unwrap();
 
         let tip = verify_pcr_descent(
-            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &pinned,
+            &links,
+            &id,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap();
         assert_eq!(tip, pinned);
@@ -1733,12 +2384,20 @@ mod tests {
         // genesis nor any promotion: this could be a real chain for a
         // different enclave. Must not extend trust.
         let now = chrono::Utc::now();
-        let (links, pk, _v1, v2) = two_version_chain(now);
+        let (links, id, pk, _v1, v2) = two_version_chain(now);
         let row_pcrs = pcrs_hex_from_seed(v2);
         let stranger = pcrs_hex_from_seed(0x77).to_pcrs().unwrap();
 
         let err = verify_pcr_descent(
-            &stranger, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &stranger,
+            &links,
+            &id,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap_err();
         assert!(matches!(err, PcrDescentError::PinnedNotInLineage));
@@ -1750,13 +2409,21 @@ mod tests {
         // (user_data == sha256(payload)) breaks, so the link fails and
         // the whole chain is rejected even though the pin matches genesis.
         let now = chrono::Utc::now();
-        let (mut links, pk, v1, v2) = two_version_chain(now);
+        let (mut links, id, pk, v1, v2) = two_version_chain(now);
         links[1].link.payload[0] ^= 0xff;
         let row_pcrs = pcrs_hex_from_seed(v2);
         let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
 
         let err = verify_pcr_descent(
-            &pinned, &links, Some(&pk), &row_pcrs, "sha256:v2", true, now, true,
+            &pinned,
+            &links,
+            &id,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1791,6 +2458,7 @@ mod tests {
         let err = verify_pcr_descent(
             &pinned,
             &links,
+            &id,
             Some(&pk),
             &pcrs_hex_from_seed(v1),
             "sha256:v1",
@@ -1805,13 +2473,52 @@ mod tests {
         ));
     }
 
+    /// A fully-valid chain walked against the WRONG expected enclave id
+    /// (a transplant onto a same-EIF enclave, which shares the PCRs)
+    /// fails at the genesis link: every payload binds the originating
+    /// enclave's id.
+    #[test]
+    fn descent_rejects_transplanted_chain() {
+        let now = chrono::Utc::now();
+        let (links, id, pk, v1, v2) = two_version_chain(now);
+        let row_pcrs = pcrs_hex_from_seed(v2);
+        let pinned = pcrs_hex_from_seed(v1).to_pcrs().unwrap();
+        let other = Uuid::new_v4();
+        assert_ne!(other, id);
+
+        let err = verify_pcr_descent(
+            &pinned,
+            &links,
+            &other,
+            Some(&pk),
+            &row_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PcrDescentError::LinkInvalid {
+                    position: 0,
+                    source: ChainValidationError::EnclaveIdMismatch
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn descent_empty_chain_has_no_genesis() {
         let now = chrono::Utc::now();
+        let id = Uuid::new_v4();
         let pinned = pcrs_hex_from_seed(0x20).to_pcrs().unwrap();
         let err = verify_pcr_descent(
             &pinned,
             &[],
+            &id,
             None,
             &pcrs_hex_from_seed(0x20),
             "sha256:v1",
@@ -1851,7 +2558,10 @@ mod tests {
         };
         assert!(matches!(
             bad.into_chain_link(),
-            Err(ChainLinkDecodeError::Base64 { field: "payload", .. })
+            Err(ChainLinkDecodeError::Base64 {
+                field: "payload",
+                ..
+            })
         ));
 
         let neg = ChainLinkJson {

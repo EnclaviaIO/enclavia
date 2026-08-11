@@ -669,9 +669,10 @@ impl ConnectConfig {
 ///    / PCRs and the chain links are corroborated below, never taken on
 ///    faith.
 /// 2. [`enclavia_protocol::chain::verify_pcr_descent`] validates every
-///    link's Nitro attestation (load-bearing) and proves the pinned PCRs
-///    appear as an in-force state on the chain, returning the chain's
-///    verified TIP measurements.
+///    link's Nitro attestation (load-bearing), checks every payload
+///    binds the pinned enclave id, and proves the pinned PCRs appear as
+///    an in-force state on the chain, returning the chain's verified
+///    TIP measurements.
 /// 3. Re-verify the LIVE attestation against exactly that tip. This is
 ///    the step that binds the verified descendant version to THIS Noise
 ///    session: without it the chain could belong to a different live
@@ -727,10 +728,15 @@ async fn verify_via_upgrade_chain(
     }
 
     // Walk the chain rooted at the pinned PCRs; on success this is the
-    // measured version the live enclave must be running.
+    // measured version the live enclave must be running. The expected
+    // enclave id is the caller-pinned one (NOT anything off the
+    // untrusted row), so every link's payload must bind this enclave:
+    // a chain transplanted from a same-EIF enclave (same PCRs) fails
+    // the genesis link.
     let tip = enclavia_protocol::chain::verify_pcr_descent(
         pinned,
         &links,
+        &tu.enclave_id,
         row.control_public_key.as_deref(),
         &row.pcrs,
         &row.image_digest,
