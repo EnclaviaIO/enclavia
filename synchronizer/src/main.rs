@@ -87,9 +87,10 @@ const DEBUG_MODE: bool = false;
 /// `MESH_PEERS`: two peers, i.e. the 3-node cluster the freshness oracle is
 /// designed around (quorum survives one loss). Fewer peers would let a
 /// host-served identity quietly shrink the cluster below its durability
-/// floor, so the env reader rejects it.
+/// floor, so the env reader rejects it. Derived from the lib's
+/// `MIN_CLUSTER_NODES` so the bootstrap gate in `raft::join` never drifts.
 #[cfg(any(feature = "mesh", feature = "raft"))]
-const MIN_MESH_PEERS: usize = 2;
+const MIN_MESH_PEERS: usize = synchronizer::MIN_CLUSTER_NODES - 1;
 
 /// The pieces read from the mesh environment, shared by the single-node
 /// (echo-handler) and replicated (raft-handler) wiring paths.
@@ -162,6 +163,10 @@ fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    // Fast-path rejection of an obviously-undersized raw list. NOT the
+    // load-bearing check: the raw count can be padded with the self name or
+    // duplicates, so the real minimum is re-enforced on the deduped,
+    // self-dropped `config.peers` below (see the SECURITY comment there).
     if peers.len() < MIN_MESH_PEERS {
         error!(
             got = peers.len(),
@@ -193,6 +198,26 @@ fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
     info!("derived self-PCR digest from /dev/nsm for the mesh allowlist");
 
     let config = MeshConfig::new(self_name.clone(), peers, self_digest);
+    // SECURITY: enforce the cluster minimum AGAIN on the DEDUPED, self-dropped
+    // peer set — this is the load-bearing check, not the raw-count one above.
+    // The mesh env is host-served over an unmeasured channel, and
+    // `MeshConfig::new` drops the self name and de-duplicates, so a hostile
+    // env like MESH_SELF_NAME=az-a, MESH_PEERS="az-a,az-a" passes the raw
+    // count (2 entries) yet yields ZERO real peers. With zero peers the
+    // discovery bootstrap's "every peer reported NoCluster" gate is vacuous
+    // (0 == 0) and `is_smallest_name()` is true, so the node would initialize
+    // a SINGLE-VOTER Raft cluster: the 3-node freshness oracle silently
+    // collapses to one in-memory-only node whose restart wipes all pinned
+    // state. Refuse instead (fatal in a `raft` build, per the module docs).
+    if config.peers.len() < MIN_MESH_PEERS {
+        error!(
+            got = config.peers.len(),
+            required = MIN_MESH_PEERS,
+            "MESH_PEERS shrank below the cluster minimum after dropping the self name and \
+             duplicates (host-supplied env padding?); refusing the mesh config"
+        );
+        return None;
+    }
     let identity = MeshIdentity::generate();
     let dialer = VsockMeshDialer {
         cid: host_cid,

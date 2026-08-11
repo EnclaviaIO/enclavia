@@ -68,16 +68,26 @@
 
 use std::time::Duration;
 
+use std::collections::BTreeMap;
 use tracing::{error, info, warn};
 
 use crate::mesh::Mesh;
 use crate::raft::network::{JoinReply, JoinRequest, MeshMessage};
-use crate::raft::{MemberRecord, RaftHandle, instance_node_id};
+use crate::raft::{MemberRecord, RaftHandle, RaftNodeId, instance_node_id};
 
 /// Backoff between Join retries while waiting to be admitted (or to observe the
 /// cluster another way). Bounded per-attempt; the overall loop retries
 /// indefinitely (joins may retry forever, per the brief).
 pub const JOIN_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// The minimum membership a FRESH `initialize` may carry: the designed
+/// 3-node shape (this node plus the two peers `MIN_MESH_PEERS` in the
+/// binary requires). Defence in depth against an undersized configured
+/// set slipping past the env reader: a 1- or 2-voter `initialize` would
+/// silently collapse the freshness oracle (a 1-voter cluster commits on
+/// itself alone, and its restart wipes every pinned state, the exact
+/// rollback the cluster exists to prevent). See [`do_initialize`].
+const MIN_INITIAL_CLUSTER_MEMBERS: usize = crate::MIN_CLUSTER_NODES;
 
 /// Drive the boot discovery + join state machine to completion: return once
 /// this node is a committed voter (admitted via Join, or included in the fresh
@@ -217,11 +227,47 @@ async fn try_initialize_fresh(raft: &RaftHandle, mesh: &Mesh, self_name: &str) -
 
 /// Initialize the cluster from `records` (keyed by their derived ids) and log
 /// the outcome. Returns `true` on success or benign already-initialized.
+///
+/// REFUSES to initialize when the records dedup to fewer than
+/// [`MIN_INITIAL_CLUSTER_MEMBERS`] distinct instance ids (loud error, `false`
+/// so the caller retries). The count is taken AFTER keying by
+/// [`instance_node_id`]: the host routes peer names, so several configured
+/// names can resolve to one node (attestation cannot distinguish same-image
+/// instances), and a pre-dedup count would pass 3 records that are really 2
+/// voters. Defence in depth: the production env reader already refuses a
+/// peer set below the 3-node minimum, but that check lives in the binary and
+/// ran against host-supplied env vars; this is the last stop before an
+/// irreversible `initialize`. A smaller fresh cluster is never legitimate:
+/// a 1-voter cluster commits on itself alone and its restart wipes all
+/// pinned state (no persistence, #122), which is the rollback hazard the
+/// 3-node oracle exists to prevent. Retrying (rather than initializing
+/// anyway) is the fail-closed behaviour: the node simply never forms a
+/// cluster until the configuration is fixed.
 async fn do_initialize(raft: &RaftHandle, self_name: &str, records: Vec<MemberRecord>) -> bool {
-    let members = records
+    let members: BTreeMap<RaftNodeId, MemberRecord> = records
         .into_iter()
         .map(|r| (instance_node_id(&r.pubkey), r))
         .collect();
+    // The size gate runs on the DEDUPED, id-keyed map, not the record list:
+    // two records carrying the SAME instance pubkey collapse to one voter
+    // (the host routes peer names, so az-b and az-c can both resolve to one
+    // node — attestation cannot distinguish same-image instances). A pre-
+    // dedup count would pass 3 records that are really 2 voters, silently
+    // collapsing the freshness oracle below its designed shape — the same
+    // pre-dedup mistake the env reader's post-dedup `MIN_MESH_PEERS` check
+    // was hardened against.
+    if members.len() < MIN_INITIAL_CLUSTER_MEMBERS {
+        error!(
+            node = %self_name,
+            distinct = members.len(),
+            required = MIN_INITIAL_CLUSTER_MEMBERS,
+            "refusing to initialize a fresh cluster below the designed 3-node shape \
+             (after de-duplicating instance ids — duplicate peer pubkeys mean the host \
+             routed several names to one node); will retry (never collapse the \
+             freshness oracle to fewer voters)"
+        );
+        return false;
+    }
     match raft.initialize_cluster(members).await {
         Ok(()) => {
             info!(node = %self_name, "initialized a fresh cluster (discovery window elapsed with no live peer cluster)");
@@ -303,5 +349,151 @@ pub async fn watch_for_eviction(raft: RaftHandle) {
             // Metrics sender dropped (Raft already shutting down): nothing to do.
             return;
         }
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod tests {
+    use super::*;
+    use crate::CONTROL_PUBKEY_LEN;
+    use crate::mesh::attestation::FakeAttestor;
+    use crate::mesh::config::MeshConfig;
+    use crate::mesh::identity::MeshIdentity;
+    use crate::mesh::transport::{MeshHostStub, UdsMeshAcceptor};
+    use crate::raft::RaftRequestHandler;
+    use std::sync::Arc;
+
+    /// A cheap, distinct 65-byte SEC1-shaped pubkey for records OTHER than
+    /// this node's own (whose real per-boot key comes from its `MeshIdentity`).
+    /// `do_initialize` only hashes the bytes via [`instance_node_id`], so
+    /// distinctness is all the gate needs.
+    fn pk(b: u8) -> [u8; CONTROL_PUBKEY_LEN] {
+        let mut out = [b.wrapping_add(0x80); CONTROL_PUBKEY_LEN];
+        out[0] = 0x04;
+        out
+    }
+
+    /// Stand up a lone node's mesh + Raft handle over the in-process test
+    /// transport (same scaffold as the multi-node integration harnesses in
+    /// tests/), with its peers configured but NEVER reachable (nothing
+    /// registers their routes). The initialize-size gate must hold before any
+    /// peer is contacted, which is exactly what these tests drive.
+    async fn lone_handle(
+        name: &str,
+        peers: &[&str],
+        dir: &std::path::Path,
+    ) -> (RaftHandle, Arc<Mesh>) {
+        const IMAGE_SEED: u8 = 0x42;
+        let host = MeshHostStub::new();
+        let sock = dir.join(format!("{name}.sock"));
+        let acceptor = UdsMeshAcceptor::bind(&sock).unwrap();
+        host.register(name, &sock);
+        let identity = MeshIdentity::generate();
+        let self_pubkey = identity.pubkey();
+        let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
+        let peer_names: Vec<String> = peers.iter().map(|s| s.to_string()).collect();
+        let config = MeshConfig::new(
+            name.to_string(),
+            peer_names.clone(),
+            FakeAttestor::pcr_digest(IMAGE_SEED),
+        );
+        let handler = RaftRequestHandler::deferred();
+        let mesh = Arc::new(Mesh::start(
+            config,
+            host.dialer_for(name),
+            acceptor,
+            attestor,
+            identity,
+            handler.clone(),
+            true,
+        ));
+        let raft = RaftHandle::new(Arc::clone(&mesh), name, self_pubkey, &peer_names, handler)
+            .await
+            .unwrap();
+        (raft, mesh)
+    }
+
+    /// Regression test for the undersized-cluster hole: a fresh `initialize`
+    /// carrying fewer than the designed 3 members (here: just this node, the
+    /// MESH_PEERS="az-a,az-a" self-padding scenario the env reader now also
+    /// rejects) must be REFUSED, and no cluster may form. A 1-voter cluster
+    /// would commit on itself alone and lose every pinned state on restart.
+    #[tokio::test]
+    async fn initialize_refuses_an_undersized_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raft, _mesh) = lone_handle("node-a", &["node-b", "node-c"], dir.path()).await;
+        let records = vec![raft.self_record().clone()];
+        assert!(
+            !do_initialize(&raft, "node-a", records).await,
+            "a 1-record initialize must be refused"
+        );
+        assert!(
+            !raft.cluster_is_initialized().await,
+            "no cluster may form from the refused initialize"
+        );
+        raft.shutdown().await;
+    }
+
+    /// The designed shape still initializes: self plus both peers, exactly
+    /// what [`try_initialize_fresh`] builds from the channel-attested pubkeys
+    /// on a genuine first provision.
+    #[tokio::test]
+    async fn initialize_accepts_the_three_node_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raft, _mesh) = lone_handle("node-a", &["node-b", "node-c"], dir.path()).await;
+        let records = vec![
+            raft.self_record().clone(),
+            MemberRecord {
+                name: "node-b".to_string(),
+                pubkey: pk(2),
+            },
+            MemberRecord {
+                name: "node-c".to_string(),
+                pubkey: pk(3),
+            },
+        ];
+        assert!(
+            do_initialize(&raft, "node-a", records).await,
+            "the designed 3-node initialize must be accepted"
+        );
+        assert!(
+            raft.cluster_is_initialized().await,
+            "the fresh cluster is initialized after the accepted initialize"
+        );
+        assert!(
+            raft.self_is_committed_voter().await,
+            "the initializing node is a committed voter of the fresh cluster"
+        );
+        raft.shutdown().await;
+    }
+
+    /// Regression for the pre-dedup count: three records that are really TWO
+    /// instances (the host routed two peer names to one node, so both carry
+    /// the same attested pubkey) must be REFUSED — the id-keyed map
+    /// collapses them to 2 voters, below the designed 3-node shape.
+    #[tokio::test]
+    async fn initialize_refuses_duplicate_instance_pubkeys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raft, _mesh) = lone_handle("node-a", &["node-b", "node-c"], dir.path()).await;
+        let records = vec![
+            raft.self_record().clone(),
+            MemberRecord {
+                name: "node-b".to_string(),
+                pubkey: pk(2),
+            },
+            MemberRecord {
+                name: "node-c".to_string(),
+                pubkey: pk(2), // same instance as "node-b": host-routed names
+            },
+        ];
+        assert!(
+            !do_initialize(&raft, "node-a", records).await,
+            "records that dedup below the 3-node minimum must be refused"
+        );
+        assert!(
+            !raft.cluster_is_initialized().await,
+            "no cluster may form from the refused initialize"
+        );
+        raft.shutdown().await;
     }
 }

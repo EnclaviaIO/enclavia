@@ -39,9 +39,19 @@ use crate::wire::{Request, Response, RpcError};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 
 /// A bounded number of retries when no leader is currently known (election in
-/// progress). Each retry waits [`FORWARD_RETRY_DELAY`] before re-checking the
-/// leader hint, so a brief election does not surface as a client error.
-pub(crate) const FORWARD_MAX_RETRIES: usize = 20;
+/// progress) or the forward target rejects as not-yet-a-voter. Each retry
+/// waits [`FORWARD_RETRY_DELAY`] before re-checking the leader hint, so a
+/// brief election does not surface as a client error.
+///
+/// 60 * 50ms = 3s total: comfortably longer than the cluster's election
+/// timeout (300-600ms), and long enough to ride out a restarted node's
+/// LEARNER window — a restarted node is admitted as a learner first and only
+/// becomes a committed voter once the membership change commits, and the
+/// leader's non-voter gate (`RaftRequestHandler::serve_forwarded`) answers
+/// `Unavailable` until then. The customer (nbd-client) treats `Unavailable`
+/// at boot as fatal, so the budget must cover a realistic join, not just a
+/// re-election.
+pub(crate) const FORWARD_MAX_RETRIES: usize = 60;
 
 /// Delay between leader-hint re-checks while forwarding. 20 * 50ms = 1s total,
 /// comfortably longer than the cluster's election timeout (300-600ms) so a
