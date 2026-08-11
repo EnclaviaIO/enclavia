@@ -37,8 +37,21 @@ pub const NBD_SET_FLAGS: libc::c_ulong = 0xab0a;
 
 // Transmission flags we might receive
 pub const NBD_FLAG_HAS_FLAGS: u16 = 1 << 0;
+pub const NBD_FLAG_READ_ONLY: u16 = 1 << 1;
 pub const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
+pub const NBD_FLAG_SEND_FUA: u16 = 1 << 3;
 pub const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
+pub const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
+
+/// The only transmission flags we pass through to the kernel via
+/// NBD_SET_FLAGS. `SEND_TRIM` and `SEND_WRITE_ZEROES` are deliberately
+/// excluded: those commands modify/erase storage WITHOUT a payload, so
+/// they bypass the superblock pin gate's write classification. Clearing
+/// the flags means the kernel never issues them. `READ_ONLY` passes
+/// through honestly (a read-only export fails the mount, never a silent
+/// rollback), as do FLUSH/FUA (no content semantics).
+pub const NBD_FLAGS_PASSTHROUGH: u16 =
+    NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA;
 
 // Transmission-phase magic numbers (kernel ↔ server framing).
 pub const NBD_REQUEST_MAGIC: u32 = 0x25609513;
@@ -50,6 +63,7 @@ pub const NBD_CMD_WRITE: u16 = 1;
 pub const NBD_CMD_DISC: u16 = 2;
 pub const NBD_CMD_FLUSH: u16 = 3;
 pub const NBD_CMD_TRIM: u16 = 4;
+pub const NBD_CMD_WRITE_ZEROES: u16 = 6;
 
 /// Result of the NBD negotiation: the export parameters.
 pub struct ExportInfo {

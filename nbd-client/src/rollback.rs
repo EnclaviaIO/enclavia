@@ -65,7 +65,7 @@
 //! byte-for-byte as before (no synchronizer connection, no gating), so
 //! enclaves without storage rollback protection keep booting as today.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -304,6 +304,180 @@ pub fn get_outcome(
 }
 
 // ---------------------------------------------------------------------------
+// Runtime region verification (closes the boot-verify TOCTOU)
+// ---------------------------------------------------------------------------
+
+/// What a region-covering READ must match at reply time.
+#[derive(Clone, Copy, Debug)]
+struct ReadWatch {
+    /// Byte offset of the region within the read payload.
+    payload_offset: usize,
+    /// The watch seq of the newest pinned commitment when the read was
+    /// issued: content at least this fresh is acceptable, anything older
+    /// is rollback evidence.
+    accept_from_seq: u64,
+}
+
+#[derive(Default)]
+struct RegionWatchInner {
+    /// (seq, commitment) in pin order, newest last. Seq 0 is the
+    /// boot-verified commitment; each gated write takes the next seq.
+    history: VecDeque<(u64, [u8; 32])>,
+    /// (seq, commitment) of gated writes whose pins are still in flight,
+    /// keyed by the NBD write handle.
+    pending: HashMap<u64, (u64, [u8; 32])>,
+    /// Region-covering reads in flight, keyed by the NBD read handle.
+    reads: HashMap<u64, ReadWatch>,
+    next_seq: u64,
+}
+
+/// Shared runtime view of the superblock region's acceptable contents.
+///
+/// The boot-time verify checks the device ONCE, before the kernel attaches,
+/// via a single pre-attach read the host can trivially recognize (fixed
+/// handle, fixed offset, fixed length) — and then serve a different,
+/// rolled-back device for all subsequent traffic. This watch closes that
+/// TOCTOU by verifying EVERY read reply that fully covers the region, at a
+/// point the host cannot distinguish from btrfs's own superblock reads:
+///
+/// * the boot seeds `history` with the verified commitment;
+/// * every gated (superblock) write registers its new commitment in
+///   `pending` at gate time, and the pin actor moves it to `history` on
+///   the durable PinOk;
+/// * a read that fully covers the region records, at ISSUE time, the seq
+///   of the newest pinned commitment (`accept_from_seq`); at REPLY time
+///   its region bytes are hashed and must equal SOME known commitment
+///   with seq >= `accept_from_seq` — content at least as fresh as when
+///   the read was issued.
+///
+/// A legitimately concurrent read/write pair can yield either the pre- or
+/// post-write content (both accepted, since a pending write's commitment
+/// is known from its payload), so honest out-of-order NBD replies never
+/// false-positive. Anything OLDER than the read's issue-time state is
+/// rollback evidence and fatal. Reads can therefore never be answered
+/// with state older than the moment they were issued — the guarantee the
+/// single recognizable pre-attach read could not provide. (Reads that
+/// only PARTIALLY cover the region are not verified: the full region is
+/// never visible in one payload. btrfs reads the superblock as one 4 KiB
+/// block, so the mount-time read — the critical one — is always covered.)
+pub struct RegionWatch {
+    inner: Mutex<RegionWatchInner>,
+}
+
+impl RegionWatch {
+    /// Seed the watch with the boot-verified region commitment (seq 0).
+    pub fn new(boot_commitment: [u8; 32]) -> Self {
+        let mut inner = RegionWatchInner::default();
+        inner.history.push_back((0, boot_commitment));
+        inner.next_seq = 1;
+        Self {
+            inner: Mutex::new(inner),
+        }
+    }
+
+    /// Issue-side (request proxy): register a read that fully covers the
+    /// region. `payload_offset` locates the region inside the read payload.
+    pub fn watch_read(&self, handle: u64, payload_offset: usize) {
+        let mut i = self.inner.lock().unwrap();
+        let accept_from = i.history.back().map(|(s, _)| *s).unwrap_or(0);
+        i.reads.insert(
+            handle,
+            ReadWatch {
+                payload_offset,
+                accept_from_seq: accept_from,
+            },
+        );
+    }
+
+    /// Gate-side (request proxy): register a gated write's new commitment,
+    /// in pin order (the pin actor drains jobs FIFO, so seqs assigned here
+    /// match the order commitments land in `history`).
+    pub fn begin_pending(&self, handle: u64, commitment: [u8; 32]) {
+        let mut i = self.inner.lock().unwrap();
+        let seq = i.next_seq;
+        i.next_seq += 1;
+        i.pending.insert(handle, (seq, commitment));
+    }
+
+    /// PinOk (pin actor): move the write's commitment from pending to
+    /// history, then prune history entries too old to ever be an
+    /// acceptable answer again: with reads in flight, the floor is the
+    /// oldest in-flight read's `accept_from_seq` (its issue-time state);
+    /// with none, the floor is the newest entry (older content can only
+    /// ever be served to a read issued before it was superseded, and no
+    /// such read exists). Keeps the per-read scan bounded instead of
+    /// growing with every commit.
+    pub fn commit(&self, handle: u64) {
+        let mut i = self.inner.lock().unwrap();
+        let Some((seq, c)) = i.pending.remove(&handle) else {
+            warn!(
+                handle,
+                "pin completed for a handle with no pending watch entry (bookkeeping bug?)"
+            );
+            return;
+        };
+        i.history.push_back((seq, c));
+        let floor = i
+            .reads
+            .values()
+            .map(|w| w.accept_from_seq)
+            .min()
+            .unwrap_or(seq);
+        while i.history.len() > 1 {
+            if i.history[0].0 >= floor {
+                break;
+            }
+            i.history.pop_front();
+        }
+    }
+
+    /// Reply-side: the payload offset recorded for `handle`, if this read
+    /// covers the region (and must be verified after extraction).
+    pub fn read_payload_offset(&self, handle: u64) -> Option<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .reads
+            .get(&handle)
+            .map(|w| w.payload_offset)
+    }
+
+    /// Reply-side: verify a read reply's captured region bytes against
+    /// "content at least as fresh as when the read was issued". Unwatched
+    /// handles pass through. A mismatch is rollback evidence; the returned
+    /// string is the fatal reason.
+    pub fn verify_read(&self, handle: u64, region: &[u8]) -> Result<(), String> {
+        let mut i = self.inner.lock().unwrap();
+        let Some(w) = i.reads.remove(&handle) else {
+            return Ok(());
+        };
+        let hash = commitment_of_region(region);
+        let fresh = i
+            .history
+            .iter()
+            .any(|(s, c)| *s >= w.accept_from_seq && *c == hash)
+            || i.pending
+                .values()
+                .any(|(s, c)| *s >= w.accept_from_seq && *c == hash);
+        if fresh {
+            Ok(())
+        } else {
+            Err(format!(
+                "superblock region read (handle {handle}) does not match any pinned state at \
+                 least as fresh as its issue time: the host is serving stale device content \
+                 (rollback); refusing to serve"
+            ))
+        }
+    }
+
+    /// A read ended without verification (host error reply): drop the
+    /// watch entry so it cannot linger.
+    pub fn drop_read(&self, handle: u64) {
+        self.inner.lock().unwrap().reads.remove(&handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Streaming extraction (request path)
 // ---------------------------------------------------------------------------
 
@@ -314,16 +488,26 @@ pub fn get_outcome(
 /// Used on superblock writes: the payload is forwarded to the host
 /// unmodified and the region's new content is captured for hashing,
 /// without ever buffering the whole payload.
-pub async fn forward_bytes_extract<R, W>(
+///
+/// `on_window_complete` fires the instant the extraction window is fully
+/// captured, BEFORE the chunk carrying its last bytes is written to `dst`.
+/// The host learns the region's new content only from what we forward, so
+/// anything the callback registers (the pending pin commitment) is
+/// registered before the host can possibly act on the new content — this
+/// ordering is what lets a read racing the write accept the new content
+/// without a false-positive rollback verdict.
+pub async fn forward_bytes_extract<R, W, F>(
     src: &mut R,
     dst: &mut W,
     n: u64,
     extract_off: usize,
     extract_len: usize,
+    on_window_complete: F,
 ) -> Result<Vec<u8>, FatalError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+    F: FnOnce(&[u8]),
 {
     if (extract_off as u64).saturating_add(extract_len as u64) > n {
         return Err("extraction window exceeds payload length".into());
@@ -332,6 +516,7 @@ where
     let mut buf = [0u8; 32 * 1024];
     let mut pos: u64 = 0;
     let mut remaining = n;
+    let mut callback = Some(on_window_complete);
     while remaining > 0 {
         let take = std::cmp::min(remaining as usize, buf.len());
         src.read_exact(&mut buf[..take]).await?;
@@ -345,10 +530,19 @@ where
             let len = (hi - lo) as usize;
             out[dst_start..dst_start + len].copy_from_slice(&buf[src_start..src_start + len]);
         }
-
-        dst.write_all(&buf[..take]).await?;
         pos += take as u64;
         remaining -= take as u64;
+
+        // Fire the callback the moment the window closes, before this
+        // chunk reaches `dst` (see the doc comment for the ordering
+        // argument).
+        if pos >= (extract_off + extract_len) as u64 {
+            if let Some(cb) = callback.take() {
+                cb(&out);
+            }
+        }
+
+        dst.write_all(&buf[..take]).await?;
     }
     Ok(out)
 }
@@ -455,6 +649,10 @@ pub struct SyncHooks {
     pub gate: Arc<PinGate>,
     /// Queue feeding the pin actor.
     pub pin_tx: mpsc::Sender<PinJob>,
+    /// Runtime region watch: superblock-covering reads are verified
+    /// against pinned history, gated writes register their new
+    /// commitment here before the PinJob is queued.
+    pub watch: Arc<RegionWatch>,
 }
 
 /// Issues one Pin RPC. Abstracted from the network client so the actor's
@@ -601,6 +799,7 @@ where
 pub async fn pin_actor<P>(
     mut pinner: P,
     gate: Arc<PinGate>,
+    watch: Arc<RegionWatch>,
     mut rx: mpsc::Receiver<PinJob>,
     nudge: mpsc::UnboundedSender<()>,
 ) -> Result<(), FatalError>
@@ -610,6 +809,7 @@ where
     while let Some(job) = rx.recv().await {
         match pinner.pin(job.commitment).await {
             Ok(()) => {
+                watch.commit(job.handle);
                 gate.finish_ok(job.handle);
                 let _ = nudge.send(());
             }
@@ -650,11 +850,19 @@ where
 /// actor nudges; everything else keeps flowing meanwhile, so unrelated
 /// requests are never stalled. A failed or host-errored gated write is
 /// fatal (fail-stop).
+///
+/// Additionally, every read reply that fully covers the superblock region
+/// is captured en route and verified against the pinned history
+/// ([`RegionWatch`]): the host cannot tell these verifications apart from
+/// btrfs's own superblock reads, so it cannot serve a rolled-back device
+/// after the (recognizable) pre-attach boot read — the boot-TOCTOU this
+/// pump exists to close. A mismatch is fatal.
 pub async fn gated_reply_proxy<R, W>(
     mut from_host: R,
     mut to_kernel: W,
     inflight: Arc<Mutex<HashMap<u64, u32>>>,
     gate: Arc<PinGate>,
+    watch: Arc<RegionWatch>,
     mut nudge_rx: mpsc::UnboundedReceiver<()>,
 ) -> Result<(), FatalError>
 where
@@ -704,15 +912,43 @@ where
         let read_len = inflight.lock().unwrap().remove(&handle);
 
         if let Some(len) = read_len {
-            // Read replies are never gated (only writes are). Forward
-            // header + payload (payload only on success).
-            to_kernel.write_all(&header).await?;
-            if error == 0 {
-                crate::forward_bytes(&mut from_host, &mut to_kernel, len as u64).await?;
-            } else {
-                warn!(error, handle, "NBD read reply errored");
+            // Read replies are never gated (only writes are), but a read
+            // that fully covers the superblock region IS verified before
+            // any of its bytes reach the kernel: buffer the (small) reply,
+            // check the region against the pinned history, and only then
+            // forward. Unwatched reads stream through as before. The
+            // payload length comes from the kernel-issued request (bounded
+            // by the kernel's own request-size caps), never the host.
+            match watch.read_payload_offset(handle) {
+                Some(payload_offset) => {
+                    if error != 0 {
+                        watch.drop_read(handle);
+                        to_kernel.write_all(&header).await?;
+                        to_kernel.flush().await?;
+                        warn!(error, handle, "NBD read reply errored");
+                        continue;
+                    }
+                    let mut payload = vec![0u8; len as usize];
+                    from_host.read_exact(&mut payload).await?;
+                    let region = &payload[payload_offset..payload_offset + SB_REGION_LEN];
+                    watch
+                        .verify_read(handle, region)
+                        .map_err(|e| format!("fatal: {e}"))?;
+                    debug!(handle, "superblock region read verified against pinned history");
+                    to_kernel.write_all(&header).await?;
+                    to_kernel.write_all(&payload).await?;
+                    to_kernel.flush().await?;
+                }
+                None => {
+                    to_kernel.write_all(&header).await?;
+                    if error == 0 {
+                        crate::forward_bytes(&mut from_host, &mut to_kernel, len as u64).await?;
+                    } else {
+                        warn!(error, handle, "NBD read reply errored");
+                    }
+                    to_kernel.flush().await?;
+                }
             }
-            to_kernel.flush().await?;
             continue;
         }
 
@@ -895,9 +1131,18 @@ pub async fn fetch_latest_upgrade_link() -> Option<ChainLink> {
 /// handles). ASCII "SYNCBOOT".
 const BOOT_READ_HANDLE: u64 = 0x53594e43_424f4f54;
 
-/// Read the pinned superblock region directly off the host NBD stream
-/// (transmission phase, before the kernel is wired up).
-pub async fn nbd_read_region<S>(stream: &mut S, device_offset: u64) -> Result<Vec<u8>, FatalError>
+/// NBD handle for the boot-time LUKS2 header reads (ASCII "SYNCHDR!"),
+/// same pre-attach window as [`BOOT_READ_HANDLE`].
+const BOOT_HDR_READ_HANDLE: u64 = 0x53594e43_48445221;
+
+/// Read `len` bytes at `offset` directly off the host NBD stream
+/// (transmission phase, before the kernel is wired up), using `handle`.
+async fn nbd_read_range<S>(
+    stream: &mut S,
+    handle: u64,
+    offset: u64,
+    len: u32,
+) -> Result<Vec<u8>, FatalError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -905,9 +1150,9 @@ where
     header[0..4].copy_from_slice(&nbd::NBD_REQUEST_MAGIC.to_be_bytes());
     // bytes 4..6: command flags (zero); 6..8: type.
     header[6..8].copy_from_slice(&nbd::NBD_CMD_READ.to_be_bytes());
-    header[8..16].copy_from_slice(&BOOT_READ_HANDLE.to_be_bytes());
-    header[16..24].copy_from_slice(&device_offset.to_be_bytes());
-    header[24..28].copy_from_slice(&(SB_REGION_LEN as u32).to_be_bytes());
+    header[8..16].copy_from_slice(&handle.to_be_bytes());
+    header[16..24].copy_from_slice(&offset.to_be_bytes());
+    header[24..28].copy_from_slice(&len.to_be_bytes());
     stream.write_all(&header).await?;
     stream.flush().await?;
 
@@ -918,16 +1163,31 @@ where
         return Err(format!("boot verify: bad NBD reply magic {magic:#x}").into());
     }
     let error = u32::from_be_bytes(reply[4..8].try_into().unwrap());
-    let handle = u64::from_be_bytes(reply[8..16].try_into().unwrap());
-    if handle != BOOT_READ_HANDLE {
-        return Err(format!("boot verify: NBD reply for unexpected handle {handle:#x}").into());
+    let got_handle = u64::from_be_bytes(reply[8..16].try_into().unwrap());
+    if got_handle != handle {
+        return Err(format!("boot verify: NBD reply for unexpected handle {got_handle:#x}").into());
     }
     if error != 0 {
-        return Err(format!("boot verify: NBD read of superblock region failed ({error})").into());
+        return Err(format!("boot verify: NBD read at offset {offset} failed ({error})").into());
     }
-    let mut region = vec![0u8; SB_REGION_LEN];
-    stream.read_exact(&mut region).await?;
-    Ok(region)
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Read the pinned superblock region directly off the host NBD stream
+/// (transmission phase, before the kernel is wired up).
+pub async fn nbd_read_region<S>(stream: &mut S, device_offset: u64) -> Result<Vec<u8>, FatalError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    nbd_read_range(
+        stream,
+        BOOT_READ_HANDLE,
+        device_offset,
+        SB_REGION_LEN as u32,
+    )
+    .await
 }
 
 /// The RPCs boot verification issues on the authenticated session.
@@ -1116,6 +1376,137 @@ where
                 .into(),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// LUKS2 data-offset cross-check (the watched region must be the REAL one)
+// ---------------------------------------------------------------------------
+
+/// LUKS2 fixed binary-header length; the JSON metadata area follows it.
+const LUKS2_BINARY_HEADER_LEN: u64 = 4096;
+/// LUKS2 magic at offset 0 ("LUKS" + 0xBA 0xBE).
+const LUKS2_MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe];
+/// Cap on the LUKS2 `hdr_size` we will read/parse (bounds a hostile
+/// header's claimed size; real headers are 16 KiB).
+const LUKS2_MAX_HDR_SIZE: u64 = 1 << 20;
+
+/// Parse the data offset (bytes) of the first crypt segment out of a full
+/// LUKS2 header (`[0, hdr_size)`). Returns `Ok(None)` when the blob does
+/// not start with the LUKS2 magic (a fresh, never-formatted device).
+/// Pure so it is unit-testable.
+///
+/// The JSON metadata area is zero-padded to `hdr_size` on disk (cryptsetup
+/// pads with NULs), so the JSON string ends at the first NUL byte. Raw NUL
+/// is impossible inside JSON, so truncating there is exactly what
+/// cryptsetup itself does.
+pub fn parse_luks2_data_offset(header: &[u8]) -> Result<Option<u64>, String> {
+    if header.len() < LUKS2_BINARY_HEADER_LEN as usize || header[0..6] != LUKS2_MAGIC {
+        return Ok(None);
+    }
+    let version = u16::from_be_bytes(header[6..8].try_into().unwrap());
+    if version != 2 {
+        return Err(format!("LUKS header version {version} is not 2"));
+    }
+    let hdr_size = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    if !(LUKS2_BINARY_HEADER_LEN..=LUKS2_MAX_HDR_SIZE).contains(&hdr_size) {
+        return Err(format!("LUKS2 hdr_size {hdr_size} out of sane range"));
+    }
+    if (header.len() as u64) < hdr_size {
+        return Err(format!(
+            "LUKS2 header truncated: have {} bytes, hdr_size is {hdr_size}",
+            header.len()
+        ));
+    }
+    let json_area = &header[LUKS2_BINARY_HEADER_LEN as usize..hdr_size as usize];
+    let json_end = json_area.iter().position(|b| *b == 0).unwrap_or(json_area.len());
+    let json: serde_json::Value = serde_json::from_slice(&json_area[..json_end])
+        .map_err(|e| format!("LUKS2 JSON metadata does not parse: {e}"))?;
+    let segments = json
+        .get("segments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "LUKS2 header has no `segments` object".to_string())?;
+    // The crypt data segment is the one whose `type` is "crypt" (LUKS2
+    // also lists no other segment types in practice).
+    for (_id, seg) in segments {
+        if seg.get("type").and_then(serde_json::Value::as_str) == Some("crypt") {
+            let offset = seg
+                .get("offset")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "LUKS2 crypt segment has no `offset`".to_string())?;
+            return offset
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|e| format!("LUKS2 segment offset {offset:?} is not a number: {e}"));
+        }
+    }
+    Err("LUKS2 header has no crypt segment".to_string())
+}
+
+/// Boot-time cross-check of the configured LUKS data offset against the
+/// device's actual LUKS2 header. The watched superblock window is
+/// `[data_offset + 64 KiB, +4 KiB)`; if `data_offset` is wrong, the watch
+/// covers the wrong 4 KiB and anti-rollback is silently absent while
+/// appearing enabled — so a disagreement is FATAL, never a warning.
+///
+/// A device with no LUKS2 header (a fresh, never-formatted volume) passes:
+/// the first format happens inside this enclave with builder-controlled
+/// parameters, and the resulting header is then checked by this same call
+/// on every subsequent boot.
+///
+/// LIMITS (documented, see the module-level residual note): this check
+/// reads the header over the same recognizable pre-attach channel the
+/// region watch exists to distrust, so a host that serves the EXPECTED
+/// header to these boot reads and a DIFFERENT header (different crypt
+/// segment offset) to cryptsetup's runtime `luksOpen` reads can desync
+/// the watched window — on every boot, not only the first. A zeroed
+/// primary header plus a valid secondary (which cryptsetup falls back to)
+/// is one concrete variant. The check therefore fully closes the
+/// *accidental* config/device mismatch (a real hazard) but is only
+/// defence-in-depth against the host; the load-bearing close is
+/// builder-side: pin the offset (or a digest of the whole LUKS2 header,
+/// which also covers keyslot tampering) in the measured enclave config.
+pub async fn verify_luks_data_offset<S>(stream: &mut S, expected: u64) -> Result<(), FatalError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let binary = nbd_read_range(
+        stream,
+        BOOT_HDR_READ_HANDLE,
+        0,
+        LUKS2_BINARY_HEADER_LEN as u32,
+    )
+    .await?;
+    if binary[0..6] != LUKS2_MAGIC {
+        info!("boot verify: no LUKS2 header on device (fresh volume); offset check deferred to the first formatted boot");
+        return Ok(());
+    }
+    let hdr_size = u64::from_be_bytes(binary[8..16].try_into().unwrap());
+    if !(LUKS2_BINARY_HEADER_LEN..=LUKS2_MAX_HDR_SIZE).contains(&hdr_size) {
+        return Err(format!("boot verify: LUKS2 hdr_size {hdr_size} out of sane range").into());
+    }
+    let mut header = binary;
+    if hdr_size > LUKS2_BINARY_HEADER_LEN {
+        let json = nbd_read_range(
+            stream,
+            BOOT_HDR_READ_HANDLE,
+            LUKS2_BINARY_HEADER_LEN,
+            (hdr_size - LUKS2_BINARY_HEADER_LEN) as u32,
+        )
+        .await?;
+        header.extend_from_slice(&json);
+    }
+    let actual = parse_luks2_data_offset(&header)?
+        .ok_or("boot verify: device lost its LUKS2 header mid-read")?;
+    if actual != expected {
+        return Err(format!(
+            "boot verify: LUKS2 header data offset {actual} does not match the configured \
+             LUKS_DATA_OFFSET {expected}: the anti-rollback watch would cover the wrong \
+             superblock region (silent rollback hole); refusing to serve"
+        )
+        .into());
+    }
+    info!(data_offset = expected, "boot verify: LUKS2 data offset matches the configured watch");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,14 +1737,21 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
 }
 
 /// Full boot sequence for the anti-rollback wiring: connect +
-/// authenticate, read the device's current superblock region off the
-/// host stream, and run the decision table. Returns the live session
-/// (handed to the pin actor) only if the device may be served.
-pub async fn boot<H>(host: &mut H, data_offset: u64) -> Result<SyncSession, FatalError>
+/// authenticate, cross-check the configured LUKS data offset against the
+/// device's LUKS2 header, read the device's current superblock region off
+/// the host stream, and run the decision table. Returns the live session
+/// plus the boot-verified region commitment (the seed for the runtime
+/// [`RegionWatch`]) only if the device may be served.
+pub async fn boot<H>(host: &mut H, data_offset: u64) -> Result<(SyncSession, [u8; 32]), FatalError>
 where
     H: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = connect_and_authenticate().await?;
+    // The watched region is derived from the configured data offset; prove
+    // it matches the device's actual LUKS2 header before trusting any
+    // classification derived from it (a wrong offset silently unwatches the
+    // real superblock).
+    verify_luks_data_offset(host, data_offset).await?;
     let region = nbd_read_region(host, data_offset + SB_PRIMARY_FS_OFFSET).await?;
     // The chain-host fetch future is lazy: it dials only if the verify
     // path reaches the transition branch (#46). The Transition itself
@@ -1366,7 +1764,10 @@ where
         fetch_latest_upgrade_link(),
     )
     .await?;
-    Ok(session)
+    // In every serve branch (Serve / RegisterThenServe / a successful
+    // Transition re-verify) the pinned commitment equals the hash of the
+    // region we just read, so that hash is the watch's seed.
+    Ok((session, commitment_of_region(&region)))
 }
 
 /// Turn a [`SyncSession`] into the production [`Pinner`] for the actor,
@@ -1940,7 +2341,7 @@ mod tests {
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
         let mut src = Cursor::new(payload.clone());
         let mut dst = Vec::new();
-        let region = forward_bytes_extract(&mut src, &mut dst, 8192, 1024, 4096)
+        let region = forward_bytes_extract(&mut src, &mut dst, 8192, 1024, 4096, |_| {})
             .await
             .unwrap();
         assert_eq!(dst, payload, "payload must be forwarded unmodified");
@@ -1955,7 +2356,7 @@ mod tests {
         let off = 32 * 1024 - 2048;
         let mut src = Cursor::new(payload.clone());
         let mut dst = Vec::new();
-        let region = forward_bytes_extract(&mut src, &mut dst, payload.len() as u64, off, 4096)
+        let region = forward_bytes_extract(&mut src, &mut dst, payload.len() as u64, off, 4096, |_| {})
             .await
             .unwrap();
         assert_eq!(dst, payload);
@@ -1968,10 +2369,82 @@ mod tests {
         let mut src = Cursor::new(payload);
         let mut dst = Vec::new();
         assert!(
-            forward_bytes_extract(&mut src, &mut dst, 1024, 512, 4096)
+            forward_bytes_extract(&mut src, &mut dst, 1024, 512, 4096, |_| {})
                 .await
                 .is_err()
         );
+    }
+
+    /// The ordering contract the region watch relies on: the window
+    /// callback fires the moment the window closes, BEFORE the chunk
+    /// carrying its last bytes is written to `dst` — so anything the
+    /// callback registers is registered before the host sees the content.
+    #[tokio::test]
+    async fn window_callback_fires_before_the_window_bytes_are_forwarded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A writer that reports how many bytes it has accepted so far.
+        struct CountWriter {
+            buf: Vec<u8>,
+            count: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncWrite for CountWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.buf.extend_from_slice(buf);
+                self.count.store(self.buf.len(), Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        // 96 KiB payload; window [32 KiB, 36 KiB) closes inside the second
+        // 32 KiB chunk. At callback time only the first chunk (32 KiB) may
+        // have been written to dst.
+        let payload: Vec<u8> = (0..(96 * 1024u32)).map(|i| (i % 239) as u8).collect();
+        let off = 32 * 1024;
+        let mut src = Cursor::new(payload.clone());
+        let written = Arc::new(AtomicUsize::new(0));
+        let mut dst = CountWriter {
+            buf: Vec::new(),
+            count: written.clone(),
+        };
+        let dst_len_at_callback = std::cell::Cell::new(usize::MAX);
+        let region_at_callback = std::cell::RefCell::new(Vec::new());
+        let region = forward_bytes_extract(
+            &mut src,
+            &mut dst,
+            payload.len() as u64,
+            off,
+            4096,
+            |region| {
+                dst_len_at_callback.set(written.load(Ordering::SeqCst));
+                region_at_callback.replace(region.to_vec());
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dst_len_at_callback.get(),
+            32 * 1024,
+            "the callback must fire before the window's chunk is forwarded"
+        );
+        assert_eq!(region_at_callback.into_inner(), region);
+        assert_eq!(dst.buf, payload);
     }
 
     // --- PinGate ----------------------------------------------------------
@@ -1996,7 +2469,7 @@ mod tests {
 
     // --- gated reply pump ---------------------------------------------
 
-    fn reply_header(error: u32, handle: u64) -> [u8; 16] {
+    pub(crate) fn reply_header(error: u32, handle: u64) -> [u8; 16] {
         let mut h = [0u8; 16];
         h[0..4].copy_from_slice(&nbd::NBD_SIMPLE_REPLY_MAGIC.to_be_bytes());
         h[4..8].copy_from_slice(&error.to_be_bytes());
@@ -2004,26 +2477,35 @@ mod tests {
         h
     }
 
-    struct PumpHarness {
-        host: tokio::io::DuplexStream,
-        kernel: tokio::io::DuplexStream,
-        inflight: Arc<Mutex<HashMap<u64, u32>>>,
-        gate: Arc<PinGate>,
-        nudge_tx: mpsc::UnboundedSender<()>,
-        task: tokio::task::JoinHandle<Result<(), FatalError>>,
+    pub(crate) struct PumpHarness {
+        pub(crate) host: tokio::io::DuplexStream,
+        pub(crate) kernel: tokio::io::DuplexStream,
+        pub(crate) inflight: Arc<Mutex<HashMap<u64, u32>>>,
+        #[allow(dead_code)]
+        pub(crate) gate: Arc<PinGate>,
+        pub(crate) watch: Arc<RegionWatch>,
+        #[allow(dead_code)]
+        pub(crate) nudge_tx: mpsc::UnboundedSender<()>,
+        pub(crate) task: tokio::task::JoinHandle<Result<(), FatalError>>,
     }
 
     fn spawn_pump() -> PumpHarness {
+        spawn_pump_with_watch(RegionWatch::new([0xbb; 32]))
+    }
+
+    pub(crate) fn spawn_pump_with_watch(watch: RegionWatch) -> PumpHarness {
         let (host, host_side) = duplex(256 * 1024);
         let (kernel_side, kernel) = duplex(256 * 1024);
         let inflight = Arc::new(Mutex::new(HashMap::new()));
         let gate = Arc::new(PinGate::new());
+        let watch = Arc::new(watch);
         let (nudge_tx, nudge_rx) = unbounded_channel();
         let task = tokio::spawn(gated_reply_proxy(
             host_side,
             kernel_side,
             inflight.clone(),
             gate.clone(),
+            watch.clone(),
             nudge_rx,
         ));
         PumpHarness {
@@ -2031,6 +2513,7 @@ mod tests {
             kernel,
             inflight,
             gate,
+            watch,
             nudge_tx,
             task,
         }
@@ -2223,7 +2706,13 @@ mod tests {
             results: [Ok(())].into_iter().collect(),
             seen: Vec::new(),
         };
-        let actor = tokio::spawn(pin_actor(pinner, gate.clone(), pin_rx, nudge_tx));
+        let actor = tokio::spawn(pin_actor(
+            pinner,
+            gate.clone(),
+            Arc::new(RegionWatch::new([0x00; 32])),
+            pin_rx,
+            nudge_tx,
+        ));
 
         pin_tx
             .send(PinJob {
@@ -2253,7 +2742,13 @@ mod tests {
             results: [Err("no quorum".to_string())].into_iter().collect(),
             seen: Vec::new(),
         };
-        let actor = tokio::spawn(pin_actor(pinner, gate.clone(), pin_rx, nudge_tx));
+        let actor = tokio::spawn(pin_actor(
+            pinner,
+            gate.clone(),
+            Arc::new(RegionWatch::new([0x00; 32])),
+            pin_rx,
+            nudge_tx,
+        ));
 
         pin_tx
             .send(PinJob {
@@ -2598,5 +3093,252 @@ mod reconnect_tests {
             "x"
         )));
         assert!(!pin_error_is_retryable(&ClientError::Crypto("x".into())));
+    }
+}
+
+#[cfg(test)]
+mod region_watch_tests {
+    use super::tests::{reply_header, spawn_pump_with_watch};
+    use super::*;
+    use tokio::time::timeout;
+
+    fn region(b: u8) -> Vec<u8> {
+        vec![b; SB_REGION_LEN]
+    }
+
+    // --- RegionWatch freshness semantics --------------------------------
+
+    #[test]
+    fn boot_commitment_is_accepted() {
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        w.watch_read(7, 0);
+        assert_eq!(w.read_payload_offset(7), Some(0));
+        w.verify_read(7, &region(0xaa)).unwrap();
+    }
+
+    #[test]
+    fn rolled_back_content_is_rejected() {
+        // The boot-TOCTOU scenario: the watch was seeded with the CURRENT
+        // superblock, but the host serves an old snapshot's region to a
+        // later read (e.g. the mount-time superblock read). Fatal.
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        w.watch_read(7, 0);
+        let err = w.verify_read(7, &region(0x11)).unwrap_err();
+        assert!(err.contains("rollback"), "{err}");
+    }
+
+    #[test]
+    fn content_never_pinned_is_rejected() {
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        w.watch_read(7, 0);
+        assert!(w.verify_read(7, &region(0xee)).is_err());
+    }
+
+    #[test]
+    fn pending_write_content_is_accepted() {
+        // A read racing a gated write can legitimately observe the new
+        // content before the pin completes.
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        w.begin_pending(9, commitment_of_region(&region(0xbb)));
+        w.watch_read(7, 0);
+        w.verify_read(7, &region(0xbb)).unwrap();
+        // And the pre-write content is still acceptable for this read.
+        w.watch_read(8, 0);
+        w.verify_read(8, &region(0xaa)).unwrap();
+    }
+
+    #[test]
+    fn committed_write_becomes_the_fresh_floor() {
+        // After the pin lands, a NEW read answered with the pre-pin
+        // content is stale (rollback of one commit) and must fail.
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        w.begin_pending(9, commitment_of_region(&region(0xbb)));
+        w.commit(9);
+        w.watch_read(7, 0);
+        assert!(w.verify_read(7, &region(0xaa)).is_err());
+        w.watch_read(8, 0);
+        w.verify_read(8, &region(0xbb)).unwrap();
+    }
+
+    #[test]
+    fn read_issued_before_a_write_still_accepts_the_old_content() {
+        // Out-of-order honesty: the read was issued while 0xaa was
+        // current, so a delayed reply with 0xaa is fine even after a
+        // newer pin landed.
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        w.watch_read(7, 0); // issued now, accept_from = seq of 0xaa
+        w.begin_pending(9, commitment_of_region(&region(0xbb)));
+        w.commit(9);
+        w.verify_read(7, &region(0xaa)).unwrap();
+        // ...and the newer content is fine for it too.
+        w.watch_read(8, 0);
+        w.verify_read(8, &region(0xbb)).unwrap();
+    }
+
+    #[test]
+    fn unwatched_handles_pass_and_drop_works() {
+        let w = RegionWatch::new(commitment_of_region(&region(0xaa)));
+        // No watch_read: anything goes (not our business).
+        w.verify_read(99, &region(0x00)).unwrap();
+        w.watch_read(7, 0);
+        w.drop_read(7);
+        assert_eq!(w.read_payload_offset(7), None);
+        w.verify_read(7, &region(0x00)).unwrap();
+    }
+
+    // --- reply-pump integration ------------------------------------------
+
+    /// A region-covering read whose payload matches the pinned history
+    /// streams through untouched.
+    #[tokio::test]
+    async fn pump_passes_a_verified_region_read() {
+        let content = region(0x5a);
+        let mut h = spawn_pump_with_watch(RegionWatch::new(commitment_of_region(&content)));
+        h.watch.watch_read(9, 0);
+        h.inflight.lock().unwrap().insert(9, SB_REGION_LEN as u32);
+
+        h.host.write_all(&reply_header(0, 9)).await.unwrap();
+        h.host.write_all(&content).await.unwrap();
+        h.host.flush().await.unwrap();
+
+        let mut hdr = [0u8; 16];
+        timeout(Duration::from_secs(2), h.kernel.read_exact(&mut hdr))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hdr, reply_header(0, 9));
+        let mut payload = vec![0u8; SB_REGION_LEN];
+        timeout(Duration::from_secs(2), h.kernel.read_exact(&mut payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload, content);
+
+        drop(h.host);
+        h.task.await.unwrap().unwrap();
+    }
+
+    /// The boot-TOCTOU regression test: the host answered the pre-attach
+    /// boot read with the current superblock (verify passed), then serves
+    /// a rolled-back region to the mount-time read through the proxy.
+    /// The pump must fail-stop.
+    #[tokio::test]
+    async fn pump_fail_stops_a_rolled_back_region_read() {
+        let mut h = spawn_pump_with_watch(RegionWatch::new(commitment_of_region(&region(0x5a))));
+        h.watch.watch_read(9, 0);
+        h.inflight.lock().unwrap().insert(9, SB_REGION_LEN as u32);
+
+        h.host.write_all(&reply_header(0, 9)).await.unwrap();
+        h.host.write_all(&region(0x11)).await.unwrap(); // rolled-back content
+        h.host.flush().await.unwrap();
+
+        let result = timeout(Duration::from_secs(2), h.task).await.unwrap();
+        let err = result.unwrap().unwrap_err();
+        assert!(err.to_string().contains("rollback"), "{err}");
+    }
+
+    /// A read racing a gated write: the reply carrying the just-written
+    /// content is accepted while the pin is still in flight.
+    #[tokio::test]
+    async fn pump_accepts_pending_write_content_for_a_racing_read() {
+        let new_content = region(0x77);
+        let mut h = spawn_pump_with_watch(RegionWatch::new(commitment_of_region(&region(0x5a))));
+        h.watch.begin_pending(42, commitment_of_region(&new_content));
+        h.watch.watch_read(9, 0);
+        h.inflight.lock().unwrap().insert(9, SB_REGION_LEN as u32);
+
+        h.host.write_all(&reply_header(0, 9)).await.unwrap();
+        h.host.write_all(&new_content).await.unwrap();
+        h.host.flush().await.unwrap();
+
+        let mut payload = vec![0u8; SB_REGION_LEN + 16];
+        timeout(Duration::from_secs(2), h.kernel.read_exact(&mut payload))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(h.host);
+        h.task.await.unwrap().unwrap();
+    }
+
+    // --- LUKS2 header parsing --------------------------------------------
+
+    /// Build a minimal LUKS2 header: 4 KiB binary header + JSON metadata.
+    /// If `pad_to` is given, the JSON area is zero-padded so hdr_size
+    /// reaches it — exactly what cryptsetup writes on disk (the default
+    /// 16 KiB metadata area).
+    fn luks2_header_padded(offset: u64, pad_to: Option<usize>) -> Vec<u8> {
+        let json = format!(
+            r#"{{"segments":{{"0":{{"type":"crypt","offset":"{offset}","size":"dynamic","iv_tweak":"0"}}}},"digests":{{}}}}"#
+        );
+        let hdr_size = pad_to
+            .unwrap_or(LUKS2_BINARY_HEADER_LEN as usize + json.len())
+            .max(LUKS2_BINARY_HEADER_LEN as usize + json.len());
+        let mut h = vec![0u8; hdr_size];
+        h[0..6].copy_from_slice(&LUKS2_MAGIC);
+        h[6..8].copy_from_slice(&2u16.to_be_bytes());
+        h[8..16].copy_from_slice(&(hdr_size as u64).to_be_bytes());
+        h[LUKS2_BINARY_HEADER_LEN as usize..LUKS2_BINARY_HEADER_LEN as usize + json.len()]
+            .copy_from_slice(json.as_bytes());
+        h
+    }
+
+    fn luks2_header(offset: u64) -> Vec<u8> {
+        luks2_header_padded(offset, None)
+    }
+
+    #[test]
+    fn parses_the_crypt_segment_offset() {
+        let h = luks2_header(16 * 1024 * 1024);
+        assert_eq!(
+            parse_luks2_data_offset(&h).unwrap(),
+            Some(16 * 1024 * 1024)
+        );
+        let h = luks2_header(8 * 1024 * 1024);
+        assert_eq!(
+            parse_luks2_data_offset(&h).unwrap(),
+            Some(8 * 1024 * 1024)
+        );
+    }
+
+    /// Regression: real cryptsetup headers zero-pad the JSON area to
+    /// hdr_size (16 KiB by default); parsing must stop at the first NUL,
+    /// or every existing formatted volume fails the boot check.
+    #[test]
+    fn parses_a_zero_padded_cryptsetup_header() {
+        let h = luks2_header_padded(16 * 1024 * 1024, Some(16384));
+        assert_eq!(h.len(), 16384);
+        assert_eq!(
+            parse_luks2_data_offset(&h).unwrap(),
+            Some(16 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn no_magic_is_none_not_an_error() {
+        // A fresh (never-formatted) device: blank or garbage, never fatal.
+        assert_eq!(parse_luks2_data_offset(&vec![0u8; 4096]).unwrap(), None);
+        assert_eq!(parse_luks2_data_offset(&[1, 2, 3]).unwrap(), None);
+    }
+
+    #[test]
+    fn truncated_or_malformed_header_is_an_error() {
+        let mut h = luks2_header(16 * 1024 * 1024);
+        h.truncate(4100); // JSON cut short
+        assert!(parse_luks2_data_offset(&h).is_err());
+        let mut h = luks2_header(16 * 1024 * 1024);
+        h[7] = 3; // version 3
+        assert!(parse_luks2_data_offset(&h).is_err());
+    }
+
+    #[test]
+    fn missing_crypt_segment_is_an_error() {
+        let json = r#"{"segments":{"0":{"type":"other","offset":"16777216"}}}"#;
+        let hdr_size = LUKS2_BINARY_HEADER_LEN as usize + json.len();
+        let mut h = vec![0u8; hdr_size];
+        h[0..6].copy_from_slice(&LUKS2_MAGIC);
+        h[6..8].copy_from_slice(&2u16.to_be_bytes());
+        h[8..16].copy_from_slice(&(hdr_size as u64).to_be_bytes());
+        h[LUKS2_BINARY_HEADER_LEN as usize..].copy_from_slice(json.as_bytes());
+        assert!(parse_luks2_data_offset(&h).is_err());
     }
 }
