@@ -33,9 +33,12 @@
 //! 1. **No `NotAction`.** An `Allow` + `NotAction` grants everything
 //!    *except* the listed actions, which is too broad to reason about and
 //!    would include `kms:Decrypt`/`kms:PutKeyPolicy`. Rejected outright.
-//! 2. **No wildcard actions.** Any action containing `*` (e.g. `kms:*`,
-//!    `kms:Decrypt*`) is rejected: the legitimate policy uses explicit
-//!    actions only, and a wildcard is impossible to bound.
+//! 2. **No wildcard actions.** Any action containing a glob wildcard,
+//!    either `*` (e.g. `kms:*`, `kms:Decrypt*`) or `?` (e.g. `kms:Decryp?`,
+//!    which AWS expands to `kms:Decrypt`), is rejected: the legitimate
+//!    policy uses explicit actions only, and a wildcard is impossible to
+//!    bound. Rejecting `?` as well as `*` is load-bearing — a `?` pattern
+//!    would otherwise pass the exact `kms:decrypt` gate below unmatched.
 //! 3. **No gate-loosening actions for anyone.** `kms:PutKeyPolicy` (rewrite
 //!    the policy), `kms:CreateGrant` (delegate decrypt to an un-attested
 //!    principal), `kms:ReplicateKey` (clone the key elsewhere), and any
@@ -142,7 +145,14 @@ pub fn verify_decrypt_policy(policy_json: &str, own: &Pcrs) -> Result<(), Policy
         let actions = normalize_actions(stmt.get("Action"));
 
         for action in &actions {
-            if action.contains('*') {
+            // IAM policy actions honour BOTH glob wildcards: `*` (any run of
+            // characters) and `?` (exactly one character). We reject either,
+            // because a wildcard action cannot be soundly matched against our
+            // forbidden-action list or the exact `kms:decrypt` gate below: a
+            // pattern like `kms:decryp?` expands to `kms:Decrypt` at AWS yet
+            // is neither the literal `"kms:decrypt"` string nor a listed
+            // forbidden action, so it would otherwise slip past ungated.
+            if action.contains('*') || action.contains('?') {
                 return Err(PolicyError::WildcardAction(action.clone()));
             }
             if FORBIDDEN_ACTIONS.contains(&action.as_str())
@@ -333,6 +343,31 @@ mod tests {
         assert_eq!(
             verify_decrypt_policy(&doc, &own),
             Err(PolicyError::WildcardAction("kms:*".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_question_mark_wildcard_decrypt() {
+        // AWS IAM honours `?` (single-character) as well as `*` in an
+        // Action. `kms:Decryp?` expands to `kms:Decrypt` at evaluation time,
+        // but it is neither the literal `"kms:decrypt"` the PCR-binding gate
+        // matches nor a listed forbidden action. Without an explicit `?`
+        // check it would slip through as an ungated decrypt grant. This must
+        // be rejected as a wildcard action (fails on HEAD before the fix).
+        let own = own();
+        let doc = serde_json::json!({
+            "Statement": [{
+                "Sid": "SneakyDecrypt",
+                "Effect": "Allow",
+                "Principal": { "AWS": "arn:aws:iam::111122223333:root" },
+                "Action": "kms:Decryp?",
+                "Resource": "*"
+            }]
+        })
+        .to_string();
+        assert_eq!(
+            verify_decrypt_policy(&doc, &own),
+            Err(PolicyError::WildcardAction("kms:decryp?".into()))
         );
     }
 

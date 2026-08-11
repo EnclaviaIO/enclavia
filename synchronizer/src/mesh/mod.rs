@@ -348,17 +348,6 @@ where
     .await?;
     info!(peer = %peer, digest = ?peer_id.pcr_digest, "outbound peer attested, channel up");
 
-    // Record the peer's attested instance pubkey under the name we dialed (the
-    // mutual Hello below confirms the responder IS that name). The #209
-    // bootstrap reads this to build a peer's MemberRecord after a successful
-    // Join, so it must be available on the OUTBOUND path too, not only the
-    // accept side. The pubkey comes from the attestation handshake, never a
-    // payload.
-    observed
-        .lock()
-        .await
-        .insert(peer.to_string(), peer_id.mesh_pubkey);
-
     // Mutual Hello: send ours first (so the acceptor can attribute our
     // stream), then read the responder's and confirm the relay spliced us to
     // the peer we asked for. All nodes have identical PCRs, so attestation
@@ -384,6 +373,21 @@ where
         )
         .into());
     }
+
+    // Only now that the mutual Hello has CONFIRMED the responder is the name we
+    // dialed do we record its attested instance pubkey under that name. The
+    // #209 bootstrap reads this to build a peer's MemberRecord after a
+    // successful Join, so it must be available on the OUTBOUND path too, not
+    // only the accept side. Recording it BEFORE the Hello check let a
+    // misrouting/reflecting relay poison the map with a different (same-image,
+    // so indistinguishable by attestation) node's pubkey under this name; the
+    // mismatch return above does not roll back, so the write must happen only
+    // on the confirmed path. The pubkey comes from the attestation handshake,
+    // never a payload.
+    observed
+        .lock()
+        .await
+        .insert(peer.to_string(), peer_id.mesh_pubkey);
 
     // Stand up the RPC client over the established transport. Publish the live
     // channel so `Mesh::call` can use it, then drive the connection until it
