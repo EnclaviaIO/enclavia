@@ -288,7 +288,11 @@ where
     //    throughout.
     let (session_key, control_pubkey) = match read_frame(&mut stream, &mut transport).await? {
         Some(Frame::Authenticate { nsm_doc }) => {
-            let identity = attestation::verify_and_extract(&nsm_doc, &handshake_hash, debug_mode)
+            let identity = attestation::verify_and_extract(
+                &nsm_doc,
+                &handshake_hash,
+                attestation::VerificationMode::from_debug_flag(debug_mode),
+            )
                 .map_err(|e| ConnError::Attestation(e.to_string()))?;
             let key = PcrKey(identity.pcrs.digest());
             (key, identity.control_pubkey)
