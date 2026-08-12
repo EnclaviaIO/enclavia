@@ -138,6 +138,19 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| -> Box<dyn std::error::Error> { e })?,
         )
     } else {
+        // Loud on purpose (enclavia#99): with the wiring off there is NO
+        // freshness protection for the persistent volume, and an operator
+        // reading the enclave console must be able to tell. On production
+        // images this branch means the MEASURED config chose no rollback
+        // protection (the EIF init exports SYNCHRONIZER_ENABLED=1 only when
+        // `synchronizer.enabled` is stamped true), so the same fact is
+        // visible in the attested PCRs.
+        warn!(
+            "SYNCHRONIZER anti-rollback wiring is DISABLED ({} unset): the persistent volume \
+             has NO freshness protection -- a malicious storage host can serve a rolled-back \
+             copy undetected. Build the image with --synchronizer-enabled to arm it.",
+            rollback::ENV_SYNCHRONIZER_ENABLED
+        );
         None
     };
 

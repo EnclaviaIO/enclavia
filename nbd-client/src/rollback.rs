@@ -63,7 +63,17 @@
 //! The wiring activates only when [`ENV_SYNCHRONIZER_ENABLED`] is set to
 //! `1` or `true` in the environment. Without it, nbd-client behaves
 //! byte-for-byte as before (no synchronizer connection, no gating), so
-//! enclaves without storage rollback protection keep booting as today.
+//! enclaves without storage rollback protection keep booting as today —
+//! and log a prominent warning saying so (enclavia#99).
+//!
+//! On production images the variable is not host-controlled: the
+//! measured EIF init exports it exactly when the builder-stamped config
+//! (`synchronizer.enabled`, set via the builder's
+//! `--synchronizer-enabled`) says so, which makes the on/off choice part
+//! of PCR0/1/2 and therefore visible in the attestation the customer
+//! verifies. An unrecognized value (anything other than `1`/`true` /
+//! `0`/`false`/empty/unset) is fail-stop rather than silently "off":
+//! see [`synchronizer_enabled`].
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -148,10 +158,33 @@ pub const ENV_SYNCHRONIZER_ENABLED: &str = "SYNCHRONIZER_ENABLED";
 pub const CONFIG_PATH: &str = "/etc/enclavia/config.json";
 
 /// True when the operator opted this enclave into synchronizer pinning.
+///
+/// Fail-stops (panics, which aborts the boot before the device is ever
+/// served) on a value it does not recognize: the flag arms the
+/// anti-rollback wiring, and a typo'd `SYNCHRONIZER_ENABLED=yes` that
+/// silently mapped to "off" would boot an unprotected enclave that the
+/// operator believes is protected (enclavia#99). Absent, `0`, `false`,
+/// and empty remain "off": on production images the variable is
+/// exported by the measured EIF init exactly when the builder-stamped
+/// config says `synchronizer.enabled == true`, so absence is the
+/// measured "this enclave has no rollback protection" choice, not a
+/// host-droppable toggle.
 pub fn synchronizer_enabled() -> bool {
-    match std::env::var(ENV_SYNCHRONIZER_ENABLED) {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
+    parse_synchronizer_flag(std::env::var(ENV_SYNCHRONIZER_ENABLED).ok().as_deref())
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Pure parser behind [`synchronizer_enabled`], split out for tests.
+pub fn parse_synchronizer_flag(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Ok(true),
+        Some(v) if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") => Ok(false),
+        Some(v) => Err(format!(
+            "unrecognized {ENV_SYNCHRONIZER_ENABLED}={v:?}: use 1/true to arm the anti-rollback \
+             wiring or 0/false/unset to disable it; refusing to guess for a value that decides \
+             whether the volume is rollback-protected"
+        )),
     }
 }
 
@@ -1807,6 +1840,37 @@ mod tests {
 
     const DATA_OFFSET: u64 = 16 * 1024 * 1024; // LUKS2 default (16 MiB)
     const REGION_START: u64 = DATA_OFFSET + SB_PRIMARY_FS_OFFSET;
+
+    // --- SYNCHRONIZER_ENABLED parsing (enclavia#99) --------------------
+
+    /// `1`/`true` arm the wiring; unset, empty, `0`, `false` leave it
+    /// off (the measured "no rollback protection" choice).
+    #[test]
+    fn synchronizer_flag_recognized_values() {
+        for (v, expect) in [
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("False"), false),
+        ] {
+            assert_eq!(parse_synchronizer_flag(v).unwrap(), expect, "value {v:?}");
+        }
+    }
+
+    /// Anything else is fail-stop, never silently "off": a typo like
+    /// `yes` must not boot an unprotected enclave the operator believes
+    /// is protected.
+    #[test]
+    fn synchronizer_flag_unrecognized_is_an_error() {
+        for v in ["yes", "on", "enabled", "ture", "2"] {
+            let err = parse_synchronizer_flag(Some(v)).unwrap_err();
+            assert!(err.contains("unrecognized"), "value {v:?}: {err}");
+        }
+    }
 
     // --- primary_sb_overlap -------------------------------------------
 
