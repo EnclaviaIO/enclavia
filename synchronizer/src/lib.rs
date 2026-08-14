@@ -70,6 +70,13 @@ use serde::{Deserialize, Serialize};
 /// assertion in [`wire`].
 pub const CONTROL_PUBKEY_LEN: usize = 65;
 
+/// The designed cluster size for the freshness oracle: 3 nodes, so a Raft
+/// quorum survives the loss of one. Both the binary's mesh-env reader
+/// (`MIN_MESH_PEERS` = this minus one) and the Raft bootstrap
+/// (`raft::join`'s minimum initial-membership gate) derive from this, so
+/// the two never drift apart.
+pub const MIN_CLUSTER_NODES: usize = 3;
+
 /// SHA-256 hash of `PCR0 || PCR1 || PCR2` from a Nitro attestation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

@@ -6,6 +6,18 @@
 # directly with monzo's `nitroLib.buildEif`, using nitro-util's prebuilt
 # kernel/nsm.ko blobs and the builder's patched init for QEMU debug.
 #
+# This file is parameterized over `synchronizerPkg`, and flake.nix
+# instantiates it TWICE (the security boundary lives entirely in which
+# binary is baked in; everything else is byte-identical):
+#
+# * `synchronizer-eif` carries the QEMU/dev binary (skip-cert-chain
+#   attestation): for the local QEMU harness ONLY.
+# * `synchronizer-eif-nitro` carries the production binary (`enclave`
+#   feature, full AWS Nitro CA chain verification): the ONLY image a real
+#   Nitro deployment may run. The two images measure different PCR0/1/2,
+#   so customer configs' `synchronizer.expected_pcrs` must pin the nitro
+#   build's measurements.
+#
 # Patched init (QEMU debug): the stock Nitro init heartbeats to CID 3
 # (the real Nitro parent), but under QEMU `vhost-device-vsock` only
 # handles CID 2, so we reuse the builder's `init-patched` (heartbeat to
@@ -23,6 +35,10 @@
   synchronizerPkg,
   namesInitPkg,
   builderSrc,
+  # Derivation/image name. The two instantiations differ only in the baked-in
+  # synchronizer binary, so the name is the one thing keeping their store
+  # paths human-distinguishable.
+  eifName ? "synchronizer-enclave",
 }:
 
 let
@@ -70,7 +86,7 @@ let
   '';
 in
 nitroLib.buildEif {
-  name = "synchronizer-enclave";
+  name = eifName;
   kernel = blobs.kernel;
   kernelConfig = blobs.kernelConfig;
   # nitro-util's blob kernel is the AWS-provided one, which predates the

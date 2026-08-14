@@ -120,9 +120,33 @@
           pname = "enclavia-synchronizer-musl";
           cargoExtraArgs = pkgs.lib.concatStringsSep " " [
             "-p synchronizer"
-            "-p synchronizer-names-init"
             "--features synchronizer/qemu,synchronizer/raft"
           ];
+        });
+
+        # Deps-only build for the PRODUCTION (real Nitro) synchronizer
+        # binary. crane's deps-only artifact is feature-sensitive, and the
+        # nitro build differs from the qemu one above exactly in the
+        # attestation feature (`enclave` alone = full AWS CA chain; `qemu`
+        # layers skip-cert-chain on top), so it needs its own artifacts:
+        # sharing the qemu artifacts would let a skip-chain dependency
+        # fingerprint leak into the production build graph.
+        cargoArtifactsMuslSyncNitro = craneLibMusl.buildDepsOnly (muslCommonArgs // {
+          pname = "enclavia-synchronizer-nitro-musl";
+          cargoExtraArgs = pkgs.lib.concatStringsSep " " [
+            "-p synchronizer"
+            "--features synchronizer/enclave,synchronizer/raft"
+          ];
+        });
+
+        # synchronizer-names-init gets a feature-NEUTRAL artifacts build
+        # (it does not depend on the synchronizer crate, let alone its
+        # attestation features), so ONE artifact serves both EIFs without
+        # dragging a qemu-feature fingerprint into the production build
+        # graph.
+        cargoArtifactsMuslNamesInit = craneLibMusl.buildDepsOnly (muslCommonArgs // {
+          pname = "synchronizer-names-init-musl";
+          cargoExtraArgs = "-p synchronizer-names-init";
         });
 
         individualMuslCrateArgs = muslCommonArgs // {
@@ -133,6 +157,10 @@
 
         individualMuslSyncCrateArgs = individualMuslCrateArgs // {
           cargoArtifacts = cargoArtifactsMuslSync;
+        };
+
+        individualMuslSyncNitroCrateArgs = individualMuslCrateArgs // {
+          cargoArtifacts = cargoArtifactsMuslSyncNitro;
         };
 
         nbdClient = craneLibMusl.buildPackage (
@@ -202,12 +230,17 @@
           }
         );
 
-        # In-enclave synchronizer node binary, built in the `qemu`
-        # variant: vsock customer listener + vsock mesh transport (same
-        # as `enclave`) but skip-cert-chain attestation, which is what
-        # QEMU's self-signing NSM emits. `raft` turns on the replicated
-        # cluster path (mesh + openraft). One identical binary runs on
-        # all three nodes; identity is injected at runtime (see
+        # In-enclave synchronizer node binary, QEMU/dev variant
+        # (`--features qemu,raft`): vsock customer listener + vsock mesh
+        # transport (same as `enclave`) but SKIP-CERT-CHAIN attestation
+        # (`DEBUG_MODE = true` in main.rs), which is what QEMU's
+        # self-signing NSM emits. DEV/TEST ONLY: this build accepts
+        # attestation documents without verifying the AWS Nitro CA chain or
+        # the COSE signature, so on real Nitro a malicious host could join
+        # the Raft mesh with arbitrary forged documents. Never ship it to
+        # production; use `synchronizerNitro` below. `raft` turns on the
+        # replicated cluster path (mesh + openraft). One identical binary
+        # runs on all three nodes; identity is injected at runtime (see
         # synchronizer-names-init), never baked in, so PCRs stay equal.
         synchronizer = craneLibMusl.buildPackage (
           individualMuslSyncCrateArgs
@@ -217,12 +250,35 @@
           }
         );
 
+        # PRODUCTION synchronizer node binary (`--features enclave,raft`,
+        # NO `qemu`): `DEBUG_MODE = false`, so attestation verification runs
+        # the FULL AWS Nitro CA chain + COSE signature check
+        # (enclavia-protocol's `parse_and_validate` production path). This is
+        # the only binary a real Nitro deployment may run: anything less lets
+        # a host join the mesh with a forged document and vote Byzantine
+        # anti-rollback state. Same runtime-identity story as the qemu build
+        # (nothing per-node baked in), so all three production nodes also
+        # share one PCR set — but a DIFFERENT one from the qemu build (the
+        # measured payload differs), which is why customer configs'
+        # `synchronizer.expected_pcrs` must pin THIS build's measurements.
+        synchronizerNitro = craneLibMusl.buildPackage (
+          individualMuslSyncNitroCrateArgs
+          // {
+            pname = "enclavia-synchronizer-nitro";
+            cargoExtraArgs = "-p synchronizer --features enclave,raft";
+          }
+        );
+
         # In-enclave runtime identity fetcher (vsock 5011 -> host names
         # responder). Keeps MESH_SELF_NAME / MESH_PEERS out of the
         # measured image and cmdline so the three nodes share one PCR set.
+        # Built from the feature-neutral artifacts (it has no synchronizer
+        # feature surface), so the same binary serves the dev and
+        # production EIFs.
         synchronizerNamesInit = craneLibMusl.buildPackage (
-          individualMuslSyncCrateArgs
+          individualMuslCrateArgs
           // {
+            cargoArtifacts = cargoArtifactsMuslNamesInit;
             pname = "synchronizer-names-init";
             cargoExtraArgs = "-p synchronizer-names-init";
           }
@@ -294,12 +350,35 @@
         # QEMU debug. See nix/synchronizer-eif.nix for the rationale.
         nitroLib = nitro-util.lib.${system};
 
-        # One EIF for both QEMU and real Nitro: the patched init heartbeats
-        # both CIDs (3 + 2), so there is no longer a QEMU-vs-Nitro build
-        # variant. (`synchronizer-eif-nitro` is kept below as an alias.)
+        # Two REAL, distinct EIFs, one per synchronizer binary variant
+        # above. The patched init heartbeats both CIDs (3 + 2), so each EIF
+        # BOOTS on either transport — but they are not interchangeable, and
+        # the difference is the whole security boundary:
+        #
+        # * `synchronizer-eif` (qemu binary): DEV/TEST ONLY. Attestation
+        #   verification skips the AWS Nitro CA chain / COSE signature so it
+        #   can run under QEMU's self-signing NSM. On real Nitro it would
+        #   accept forged attestation documents, letting a malicious host
+        #   join the Raft mesh and fabricate committed anti-rollback state.
+        # * `synchronizer-eif-nitro` (enclave binary): PRODUCTION. Full AWS
+        #   Nitro CA chain verification; this is the only EIF a real
+        #   deployment may run.
+        #
+        # The two images measure DIFFERENTLY (different binaries -> different
+        # PCR0/1/2), so customer configs' `synchronizer.expected_pcrs` must
+        # pin the NITRO build's measurements; pinning the dev build's PCRs
+        # would re-open the forged-attestation hole above.
         synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix {
           inherit pkgs nitroLib;
           synchronizerPkg = synchronizer;
+          namesInitPkg = synchronizerNamesInit;
+          builderSrc = builder-src;
+        };
+
+        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix {
+          inherit pkgs nitroLib;
+          eifName = "synchronizer-enclave-nitro";
+          synchronizerPkg = synchronizerNitro;
           namesInitPkg = synchronizerNamesInit;
           builderSrc = builder-src;
         };
@@ -364,14 +443,19 @@
           # `nix build .#enclavia-wasm-npm && npm publish result/`.
           enclavia-wasm-npm = enclaviaWasmNpm;
 
-          # Synchronizer node binary (qemu variant) + its runtime
-          # identity fetcher, plus the dedicated EIF that wraps them.
+          # Synchronizer node binaries + their runtime identity fetcher,
+          # plus the dedicated EIFs that wrap them. `synchronizer` /
+          # `synchronizer-eif` are the QEMU/dev variants (skip-cert-chain
+          # attestation; never for production). `synchronizer-nitro` /
+          # `synchronizer-eif-nitro` are the PRODUCTION real-Nitro variants
+          # (full AWS CA chain): the production mesh only admits peers
+          # running this image, and customer configs' expected PCRs must
+          # pin ITS measurements.
           synchronizer = synchronizer;
+          synchronizer-nitro = synchronizerNitro;
           synchronizer-names-init = synchronizerNamesInit;
           synchronizer-eif = synchronizerEif;
-          # Deprecated alias: the EIF is now CID-agnostic (one build for QEMU
-          # and Nitro), so this is identical to `synchronizer-eif`.
-          synchronizer-eif-nitro = synchronizerEif;
+          synchronizer-eif-nitro = synchronizerEifNitro;
         };
 
         # `nix run` shorthand and `nix profile install` default.

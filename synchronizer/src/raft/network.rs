@@ -403,14 +403,29 @@ impl RaftRequestHandler {
         // to forward a Pin/Transition that mutates committed state. The
         // identity is the attested channel pubkey, NEVER the request payload
         // (mirroring serve_join).
+        //
+        // The rejection is `Unavailable`, NOT `Unauthorized`, because the same
+        // gate briefly rejects a LEGITIMATE node: a restarted node is admitted
+        // as a learner first and is not a committed voter until the membership
+        // change commits, so its forwards land here during that window. The
+        // rejection must therefore be retryable end-to-end:
+        // `route_client_request` retries `Unavailable` (re-resolving the
+        // leader and re-forwarding), while `Unauthorized` is FATAL at the
+        // nbd-client (its `get_outcome` only survives `NotFound`, and
+        // `pin_error_is_retryable` only retries Io/ConnectionClosed) and would
+        // wedge every customer of a genuinely restarted node. Fail-closed is
+        // preserved: a clone is never SERVED, its forwarder just keeps
+        // retrying (and the learner window closes as soon as admission
+        // commits).
         let peer_id = crate::raft::membership::instance_node_id(&peer.mesh_pubkey);
         if !handle.is_committed_voter(peer_id).await {
             tracing::warn!(
                 peer = %peer.name,
-                "rejecting forwarded client request from a non-member peer"
+                "rejecting forwarded client request from a non-voter peer (retryable: \
+                 a restarted node is a learner until its admission commits)"
             );
             return ForwardedClientResponse(Response::Err {
-                error: RpcError::Unauthorized,
+                error: RpcError::Unavailable,
             });
         }
         let resp = crate::raft::serve::handle_on_leader(
@@ -517,3 +532,111 @@ impl std::fmt::Display for CborErr {
     }
 }
 impl std::error::Error for CborErr {}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod tests {
+    use super::*;
+    use crate::CONTROL_PUBKEY_LEN;
+    use crate::PcrKey;
+    use crate::mesh::attestation::FakeAttestor;
+    use crate::mesh::config::MeshConfig;
+    use crate::mesh::identity::MeshIdentity;
+    use crate::mesh::transport::{MeshHostStub, UdsMeshAcceptor};
+    use crate::raft::membership::instance_node_id;
+    use crate::wire::{Request, Response, RpcError};
+
+    /// A cheap, distinct 65-byte SEC1-shaped pubkey. The voter gate only
+    /// hashes the bytes via [`instance_node_id`], so distinctness is all the
+    /// test needs.
+    fn pk(b: u8) -> [u8; CONTROL_PUBKEY_LEN] {
+        let mut out = [b.wrapping_add(0x80); CONTROL_PUBKEY_LEN];
+        out[0] = 0x04;
+        out
+    }
+
+    /// Regression test for the fatal-non-voter-rejection bug: a forwarded
+    /// client request from a peer that is NOT a committed voter (a host-booted
+    /// clone, or a legitimately restarted node still in its learner window)
+    /// must be rejected with `Unavailable`, which `route_client_request`
+    /// retries — NEVER `Unauthorized`, which is fatal at the nbd-client and
+    /// would wedge every customer of a genuinely restarted node.
+    #[tokio::test]
+    async fn forwarded_request_from_a_non_voter_is_rejected_as_retryable() {
+        const IMAGE_SEED: u8 = 0x42;
+        let dir = tempfile::tempdir().unwrap();
+        let host = MeshHostStub::new();
+        let sock = dir.path().join("node-a.sock");
+        let acceptor = UdsMeshAcceptor::bind(&sock).unwrap();
+        host.register("node-a", &sock);
+        let identity = MeshIdentity::generate();
+        let self_pubkey = identity.pubkey();
+        let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
+        let peers = vec!["node-b".to_string(), "node-c".to_string()];
+        let config = MeshConfig::new(
+            "node-a".to_string(),
+            peers.clone(),
+            FakeAttestor::pcr_digest(IMAGE_SEED),
+        );
+        let handler = RaftRequestHandler::deferred();
+        let mesh = Arc::new(Mesh::start(
+            config,
+            host.dialer_for("node-a"),
+            acceptor,
+            attestor,
+            identity,
+            handler.clone(),
+            true,
+        ));
+        let raft = RaftHandle::new(mesh, "node-a", self_pubkey, &peers, handler.clone())
+            .await
+            .unwrap();
+        raft.enable_serving(&handler, true);
+
+        // Initialize the designed 3-node membership so this node IS a
+        // committed voter: the non-voter gate must fire on a live cluster,
+        // not in the bootstrap window (which answers every forward with
+        // Unavailable because the serve path is not what rejects it).
+        let members = [
+            raft.self_record().clone(),
+            MemberRecord {
+                name: "node-b".to_string(),
+                pubkey: pk(2),
+            },
+            MemberRecord {
+                name: "node-c".to_string(),
+                pubkey: pk(3),
+            },
+        ]
+        .into_iter()
+        .map(|r| (instance_node_id(&r.pubkey), r))
+        .collect();
+        raft.initialize_cluster(members).await.unwrap();
+        assert!(raft.self_is_committed_voter().await);
+
+        // A forward from a channel identity that is NOT a committed voter
+        // (announces a configured name, but its pubkey was never admitted):
+        // rejected, retryably.
+        let peer = PeerContext {
+            name: "node-b".to_string(),
+            mesh_pubkey: pk(9),
+            pcr_digest: PcrKey([0x42; 32]),
+        };
+        let fwd = ForwardedClientRequest {
+            session_key: PcrKey([0x01; 32]),
+            control_pubkey: pk(5),
+            request: Request::Get {
+                key: PcrKey([0x02; 32]),
+            },
+        };
+        let resp = handler.serve_forwarded(&peer, fwd).await;
+        assert_eq!(
+            resp,
+            ForwardedClientResponse(Response::Err {
+                error: RpcError::Unavailable,
+            }),
+            "a non-voter's forward must be rejected with retryable Unavailable, \
+             never fatal Unauthorized"
+        );
+        raft.shutdown().await;
+    }
+}
