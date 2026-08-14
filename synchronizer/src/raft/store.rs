@@ -254,6 +254,7 @@ impl StateMachineStore {
                 old_key,
                 new_key,
                 new_control_pubkey,
+                fido2_sign_count,
             } => {
                 // The new key's attestation was observed by the leader from the
                 // submitting session; record it so the pure core's
@@ -261,7 +262,7 @@ impl StateMachineStore {
                 // already present from its earlier Register entry. Then record
                 // the (verified) transition authorization and apply.
                 sm.observe_attestation(*new_key, *new_control_pubkey);
-                sm.observe_transition(*old_key, *new_key);
+                sm.observe_transition_with_fido2_sign_count(*old_key, *new_key, *fido2_sign_count);
                 sm.apply(Op::Transition {
                     old_key: *old_key,
                     new_key: *new_key,
@@ -348,6 +349,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     commitment: crate::Commitment([0u8; 32]),
                     version: crate::Version(0),
                     control_pubkey: [0u8; crate::CONTROL_PUBKEY_LEN],
+                    fido2_sign_count: None,
                 })),
                 EntryPayload::Normal(op) => results.push(StateMachineStore::apply_one(sm, op)),
                 EntryPayload::Membership(mem) => {
@@ -357,6 +359,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                         commitment: crate::Commitment([0u8; 32]),
                         version: crate::Version(0),
                         control_pubkey: [0u8; crate::CONTROL_PUBKEY_LEN],
+                        fido2_sign_count: None,
                     }));
                 }
             }

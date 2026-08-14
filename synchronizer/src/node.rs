@@ -42,7 +42,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::wire::{
-    ChainLink, Request, Response, RpcError, decode_transition_link, verify_transition_link,
+    ChainLink, Request, Response, RpcError, decode_transition_link,
+    verify_transition_link_with_fido2_sign_count,
 };
 use crate::{CONTROL_PUBKEY_LEN, Op, PcrKey, StateMachine, ValidationError};
 
@@ -198,8 +199,8 @@ impl Node {
         // retired by a prior Transition) we report the wire-level
         // transition rejection rather than NotFound; a Transition isn't a
         // query.
-        let old_control_pubkey = match inner.get(&decoded.old_key) {
-            Some(state) => state.control_pubkey,
+        let (old_control_pubkey, previous_fido2_sign_count) = match inner.get(&decoded.old_key) {
+            Some(state) => (state.control_pubkey, state.fido2_sign_count),
             None => return err(RpcError::TransitionRejected),
         };
 
@@ -211,11 +212,12 @@ impl Node {
         // the OLD enclave's PCRs (from_pcrs). Both keys are re-derived
         // from the signed payload, never from an untrusted wire field.
         // Any failure folds to a single TransitionRejected.
-        let verified = match verify_transition_link(
+        let verified = match verify_transition_link_with_fido2_sign_count(
             &link,
             decoded,
             session_key,
             &old_control_pubkey,
+            previous_fido2_sign_count,
             self.debug_mode,
         ) {
             Ok(v) => v,
@@ -226,7 +228,11 @@ impl Node {
         // the pure state machine, which still enforces the remaining
         // structural checks (new_key attested, not retired, not already
         // registered, etc.).
-        inner.observe_transition(verified.old_key, verified.new_key);
+        inner.observe_transition_with_fido2_sign_count(
+            verified.old_key,
+            verified.new_key,
+            verified.fido2_sign_count,
+        );
         match inner.apply(Op::Transition {
             old_key: verified.old_key,
             new_key: verified.new_key,
@@ -341,6 +347,29 @@ mod tests {
             attestation,
             signature: Some(sig.to_bytes().to_vec()),
         }
+    }
+
+    fn use_fido2_signature(link: &mut ChainLink, signing: &SigningKey, sign_count: u32) {
+        use enclavia_protocol::custody::{
+            FIDO2_RP_ID, Fido2Assertion, fido2_client_data_hash,
+        };
+        use sha2::{Digest as _, Sha256};
+
+        let mut authenticator_data = Sha256::digest(FIDO2_RP_ID.as_bytes()).to_vec();
+        authenticator_data.push(0x01 | 0x04);
+        authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
+        let credential_id = vec![0x73; 32];
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&fido2_client_data_hash(&link.payload, &credential_id));
+        let signature: Signature = signing.sign(&signed);
+        link.signature = Some(
+            Fido2Assertion {
+                credential_id,
+                authenticator_data,
+                signature: signature.to_der().as_bytes().to_vec(),
+            }
+            .encode(),
+        );
     }
 
     /// Register an OLD key (attest + Pin) so it is live with a frozen
@@ -551,15 +580,15 @@ mod tests {
         let key_new = key_from_seed(0x21);
         node.observe_attestation(key_new, dummy_pubkey(0x21)).await;
         let mut link = upgrade_link(0x11, 0x21, &sk);
-        link.signature = Some(vec![0xde, 0xad]); // not 64 bytes
+        link.signature = Some(vec![0xde, 0xad]); // neither supported proof format
         let resp = node
             .handle_request(key_new, Request::Transition { link })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
 
-    /// A 64-byte signature that doesn't verify against old_key's frozen
-    /// control pubkey is rejected.
+    /// A well-shaped legacy signature that doesn't verify against
+    /// old_key's frozen control pubkey is rejected.
     #[tokio::test]
     async fn transition_with_invalid_signature_is_rejected() {
         let node = debug_node();
@@ -669,6 +698,50 @@ mod tests {
             .handle_request(key_old, Request::Get { key: key_old })
             .await;
         assert_eq!(resp, err(RpcError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn transition_enforces_fido2_counter_across_same_key_successors() {
+        let node = debug_node();
+        let (sk, control_pubkey) = keypair(0x18);
+        let key_old = register_old(&node, 0x18, control_pubkey).await;
+        let key_middle = key_from_seed(0x28);
+        let key_new = key_from_seed(0x38);
+        node.observe_attestation(key_middle, control_pubkey).await;
+        node.observe_attestation(key_new, control_pubkey).await;
+
+        let mut first = upgrade_link(0x18, 0x28, &sk);
+        use_fido2_signature(&mut first, &sk, 7);
+        assert_eq!(
+            node.handle_request(key_middle, Request::Transition { link: first })
+                .await,
+            Response::TransitionOk {
+                version: Version(0)
+            }
+        );
+
+        let mut repeated = upgrade_link(0x28, 0x38, &sk);
+        use_fido2_signature(&mut repeated, &sk, 7);
+        assert_eq!(
+            node.handle_request(key_new, Request::Transition { link: repeated })
+                .await,
+            err(RpcError::TransitionRejected)
+        );
+
+        let mut advanced = upgrade_link(0x28, 0x38, &sk);
+        use_fido2_signature(&mut advanced, &sk, 8);
+        assert_eq!(
+            node.handle_request(key_new, Request::Transition { link: advanced })
+                .await,
+            Response::TransitionOk {
+                version: Version(0)
+            }
+        );
+        assert_eq!(
+            node.handle_request(key_old, Request::Get { key: key_old })
+                .await,
+            err(RpcError::NotFound)
+        );
     }
 
     /// "Control pubkey substitution": after old_key registers with pk_real,

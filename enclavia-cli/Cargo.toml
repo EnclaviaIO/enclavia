@@ -60,12 +60,16 @@ p256 = { workspace = true }
 # default-features = false to avoid linking pcsclite into server-side
 # binaries.
 yubikey = { version = "0.8", optional = true }
-# Hidden-input PIN prompt for the YubiKey signing path.
+# Vendor-neutral CTAP2 client for USB HID FIDO2 security keys. The
+# `crypto_rust` backend avoids pulling NSS/OpenSSL into this path.
+authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"], optional = true }
+# Hidden-input PIN prompt for hardware signing paths.
 rpassword = { version = "7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
-default = ["yubikey"]
+default = ["yubikey", "fido2"]
 yubikey = ["dep:yubikey", "dep:rpassword"]
+fido2 = ["dep:authenticator", "dep:rpassword"]

@@ -3,9 +3,9 @@
 //! `ApiClient::new()` defaults to using the on-disk credentials (the
 //! original CLI behaviour) and transparently refreshes the access token
 //! on a 401. `ApiClient::with_token()` takes an explicit bearer —
-//! used by the MCP server, which is multi-tenant and never touches
-//! `~/.config/enclavia`. The MCP path explicitly does NOT participate in
-//! refresh-token rotation; that's the caller's job.
+//! used by the MCP server, which is multi-tenant and never touches the
+//! platform configuration directory. The MCP path explicitly does NOT
+//! participate in refresh-token rotation; that's the caller's job.
 
 use std::sync::Mutex;
 

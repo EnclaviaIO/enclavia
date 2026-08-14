@@ -31,9 +31,9 @@ pub enum ClientMessage {
     Data { id: u64, payload: Vec<u8> },
 
     /// Authenticated management command. `payload` is a CBOR-encoded
-    /// `ControlCommand`; `signature` is a P-256 ECDSA raw r||s 64-byte
-    /// signature over `payload` produced with the enclave's control private
-    /// key. The server verifies the signature against the control public key
+    /// `ControlCommand`; `signature` is either the original P-256 ECDSA
+    /// raw r||s signature or a versioned FIDO2 assertion over `payload`.
+    /// The server verifies the proof against the control public key
     /// baked into the EIF and the embedded nonce against its current
     /// single-use nonce.
     Control {
@@ -161,11 +161,11 @@ pub enum ControlCommand {
         /// CBOR-encoded [`chain::UpgradePayload`]. Becomes the `payload` field
         /// of the chain link verbatim; the enclave must not re-encode it.
         payload: Vec<u8>,
-        /// 64-byte raw r||s ECDSA P-256 signature over `payload` under the
-        /// enclave's control private key. Becomes the `signature` field of
-        /// the chain link. The enclave MAY also verify this against its own
-        /// control public key as defence-in-depth (same key signs both the
-        /// envelope and the chain payload).
+        /// Legacy raw P-256 signature or versioned FIDO2 assertion over
+        /// `payload` under the enclave's control key. Becomes the
+        /// `signature` field of the chain link. The enclave also verifies
+        /// this against its own control public key as defence-in-depth
+        /// (same key authorizes both envelope and chain payload).
         payload_signature: Vec<u8>,
         /// Storage re-key parameters. `None` for stateless enclaves.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,8 +183,8 @@ pub enum ControlCommand {
         /// CBOR-encoded [`chain::RevocationPayload`]. Becomes the `payload`
         /// field of the chain link verbatim.
         payload: Vec<u8>,
-        /// 64-byte raw r||s ECDSA P-256 signature over `payload`. Becomes the
-        /// chain link signature.
+        /// Legacy raw P-256 signature or versioned FIDO2 assertion over
+        /// `payload`. Becomes the chain-link proof.
         payload_signature: Vec<u8>,
         /// When `true`, the enclave runs `enclavia-crypto revoke-upgrade` to
         /// kill the LUKS keyslot added at prepare time and restore the key

@@ -30,9 +30,10 @@
 //! * [`ReplicatedOp::Transition`]: the new key must be attested for the pure
 //!   core's `Transition` to pass (`NewKeyNotAttested`), and the leader observed
 //!   the new key's attestation from the submitting session, so the entry
-//!   carries `new_control_pubkey`. A follower replays
+//!   carries `new_control_pubkey` plus the authenticated FIDO2 signature
+//!   counter (when present). A follower replays
 //!   `observe_attestation(new_key, new_control_pubkey)` then
-//!   `observe_transition(old_key, new_key)` then
+//!   the verified transition observation then
 //!   `apply(Op::Transition { old_key, new_key })`. (The old key was attested by
 //!   an earlier `Register`/`Pin` entry, already replicated, so its observation
 //!   is already present on every replica.)
@@ -204,6 +205,10 @@ pub enum ReplicatedOp {
         /// observed it from the submitting (new-enclave) session.
         #[serde(with = "control_pubkey_bytes")]
         new_control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+        /// Authenticated FIDO2 signature counter from the transition
+        /// proof. `None` for a legacy raw-P256 proof.
+        #[serde(default)]
+        fido2_sign_count: Option<u32>,
     },
 }
 
@@ -989,6 +994,7 @@ mod tests {
                 old_key: k(3),
                 new_key: k(4),
                 new_control_pubkey: pk(4),
+                fido2_sign_count: Some(17),
             },
         ] {
             let mut buf = Vec::new();

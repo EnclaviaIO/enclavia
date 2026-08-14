@@ -34,8 +34,8 @@ enclavia-protocol = { path = "../enclavia-protocol", optional = true, default-fe
 # the host over vsock); pulls in tokio-vsock, which `mesh` already carries.
 enclavia-vsock = { path = "../enclavia-vsock", optional = true }
 snow = { workspace = true, optional = true }
-# Verifies the OLD key's 64-byte raw r||s ECDSA P-256 control signature
-# over the transition-link payload, against the pubkey registered at
+# Verifies the OLD key's raw P-256 or FIDO2/ES256 control proof over the
+# transition-link payload, against the pubkey registered at
 # first attestation. Pulled in by the `wire` feature alongside the
 # verifier; the pure state machine (no features) stays crypto-free.
 p256 = { workspace = true, optional = true }

@@ -54,7 +54,10 @@
 //! Linearizable reads are unaffected: they still need only a fresh quorum.
 
 use crate::raft::{RaftHandle, RaftHandleError, ReplicatedOp};
-use crate::wire::{Request, Response, RpcError, decode_transition_link, verify_transition_link};
+use crate::wire::{
+    Request, Response, RpcError, decode_transition_link,
+    verify_transition_link_with_fido2_sign_count,
+};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
 
 /// Run one client [`Request`] from a session authenticated as `session_key`
@@ -210,11 +213,12 @@ async fn handle_pin(
 /// 3. `verify_transition_link` against that frozen pubkey + the session key
 ///    (the NEW enclave submits, so `new_key == session_key`).
 /// 4. Submit `ReplicatedOp::Transition { old_key, new_key, new_control_pubkey:
-///    control_pubkey }`, where `control_pubkey` is the submitting (new-enclave)
-///    session's announced key. The verifier requires `new_key == session_key`,
-///    so the session's `control_pubkey` IS the new key's attested pubkey;
-///    followers record it before applying so the pure core's `NewKeyNotAttested`
-///    check passes.
+///    control_pubkey, fido2_sign_count }`, where `control_pubkey` is the
+///    submitting (new-enclave) session's announced key. The verifier requires
+///    `new_key == session_key`, so the session's `control_pubkey` IS the new
+///    key's attested pubkey; followers record it and the authenticated counter
+///    before applying so the pure core's `NewKeyNotAttested` check passes and
+///    every replica retains the same counter baseline.
 ///
 /// The `old_key` lookup reads the leader-local state machine directly rather
 /// than through `linearizable_get`: a Transition is a write, and `client_write`
@@ -240,18 +244,20 @@ async fn handle_transition(
     // Look up the control pubkey frozen for the DERIVED old_key in the
     // replicated state. The old enclave must already be registered: only a live
     // key can be transitioned away from.
-    let old_control_pubkey = match raft.state_machine().get(&decoded.old_key).await {
-        Some(state) => state.control_pubkey,
-        None => return err(RpcError::TransitionRejected),
-    };
+    let (old_control_pubkey, previous_fido2_sign_count) =
+        match raft.state_machine().get(&decoded.old_key).await {
+            Some(state) => (state.control_pubkey, state.fido2_sign_count),
+            None => return err(RpcError::TransitionRejected),
+        };
 
     // Phase two: cryptographically verify the link against old_key's frozen
     // pubkey and the submitting session key.
-    let verified = match verify_transition_link(
+    let verified = match verify_transition_link_with_fido2_sign_count(
         &link,
         decoded,
         session_key,
         &old_control_pubkey,
+        previous_fido2_sign_count,
         debug_mode,
     ) {
         Ok(v) => v,
@@ -268,6 +274,7 @@ async fn handle_transition(
             old_key: verified.old_key,
             new_key: verified.new_key,
             new_control_pubkey: control_pubkey,
+            fido2_sign_count: verified.fido2_sign_count,
         })
         .await
     {

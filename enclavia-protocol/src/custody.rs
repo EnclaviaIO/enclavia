@@ -2,7 +2,8 @@
 //!
 //! In self-hosted custody the backend never holds the control private
 //! key: the CLI signs upgrade confirmations and revocations with a key
-//! it keeps locally (passphrase-protected keyfile or YubiKey PIV). Both
+//! it keeps locally (FIDO2 hardware token, YubiKey PIV, or a future
+//! passphrase-protected keyfile). Both
 //! sides must agree on the exact bytes the envelope signature covers,
 //! which are the CBOR encoding of the [`ControlCommand`] the enclave
 //! decodes. These helpers are that single encoding path: the backend's
@@ -12,12 +13,321 @@
 //! The module also carries the signing-request DTOs exchanged over the
 //! two-phase confirm/revoke HTTP endpoints (`.../confirm/prepare` and
 //! `.../confirm/submit`, plus the revoke pair), shared verbatim by the
-//! CLI and the backend, and the DER to raw `r || s` re-encoding helper
-//! for signatures produced by PIV hardware or OpenSSL.
+//! CLI and the backend. Control proofs are either the original raw
+//! P-256 signature (PIV/managed custody) or a versioned FIDO2 assertion
+//! produced by a CTAP2 authenticator.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{ControlCommand, RekeyParams};
+
+/// RP ID used for Enclavia control-key credentials.
+///
+/// This is deliberately protocol-wide and not supplied by the host or
+/// backend: the authenticator binds every credential and assertion to
+/// its SHA-256 hash, and the in-enclave verifier checks that hash.
+pub const FIDO2_RP_ID: &str = "control.enclavia.io";
+
+/// Web origin supplied to CTAP client implementations which model the
+/// browser-side WebAuthn checks. Direct CTAP2 uses [`FIDO2_RP_ID`] for
+/// the cryptographic RP binding.
+pub const FIDO2_ORIGIN: &str = "https://control.enclavia.io";
+
+/// Domain separator for the 32-byte CTAP2 `clientDataHash`.
+const FIDO2_CLIENT_DATA_CONTEXT: &[u8] = b"enclavia-control-fido2-v1\0";
+
+/// Prefix distinguishing a FIDO2 proof from the legacy 64-byte raw
+/// ECDSA signature. The remainder is CBOR-encoded [`Fido2Assertion`].
+const FIDO2_PROOF_PREFIX: &[u8] = b"enclavia-fido2-proof-v1\0";
+
+/// Maximum accepted size of a versioned FIDO2 control proof.
+///
+/// A normal proof is only a few hundred bytes. Keeping a generous 4 KiB
+/// ceiling bounds allocation and CBOR work before signature
+/// verification on attacker-reachable enclave paths.
+pub const MAX_FIDO2_PROOF_SIZE: usize = 4 * 1024;
+
+/// CTAP2 assertion carried in either a control-command envelope
+/// signature or an inner upgrade-chain payload signature.
+///
+/// The credential ID is included so callers can identify which
+/// hardware credential produced the proof. Verification is ultimately
+/// bound to the control public key baked into the enclave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fido2Assertion {
+    /// Credential selected by the CTAP2 `getAssertion` operation.
+    #[serde(with = "serde_bytes")]
+    pub credential_id: Vec<u8>,
+    /// Exact WebAuthn authenticator data (`rpIdHash || flags ||
+    /// signCount || extensions`).
+    #[serde(with = "serde_bytes")]
+    pub authenticator_data: Vec<u8>,
+    /// ASN.1 DER-encoded ES256 assertion signature.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl Fido2Assertion {
+    /// Encode this assertion into the versioned opaque proof format
+    /// carried by the existing `Vec<u8>` signature fields.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = FIDO2_PROOF_PREFIX.to_vec();
+        ciborium::into_writer(self, &mut out)
+            .expect("CBOR encoding a Fido2Assertion into a Vec cannot fail");
+        out
+    }
+
+    /// Decode a versioned FIDO2 proof, rejecting unknown formats and
+    /// trailing data.
+    pub fn decode(proof: &[u8]) -> Result<Self, ControlProofError> {
+        if proof.len() > MAX_FIDO2_PROOF_SIZE {
+            return Err(ControlProofError::Fido2ProofTooLarge {
+                actual: proof.len(),
+                max: MAX_FIDO2_PROOF_SIZE,
+            });
+        }
+        let body = proof
+            .strip_prefix(FIDO2_PROOF_PREFIX)
+            .ok_or(ControlProofError::UnsupportedFormat)?;
+        let mut cursor = std::io::Cursor::new(body);
+        let assertion: Self = ciborium::from_reader(&mut cursor)
+            .map_err(|e| ControlProofError::MalformedFido2(e.to_string()))?;
+        if cursor.position() != body.len() as u64 {
+            return Err(ControlProofError::Fido2TrailingData);
+        }
+        Ok(assertion)
+    }
+}
+
+/// Proof family accepted by the shared control-key verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlProofKind {
+    /// Original 64-byte low-S P-256 `r || s` signature.
+    P256Raw,
+    /// CTAP2/WebAuthn ES256 assertion.
+    Fido2,
+}
+
+/// Metadata returned after successful proof verification.
+#[must_use = "FIDO2 verification metadata carries an authenticated signature counter"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedControlProof {
+    pub kind: ControlProofKind,
+    /// Authenticated FIDO2 signature counter. `None` for legacy raw
+    /// signatures.
+    ///
+    /// This verifier authenticates the counter but cannot establish
+    /// freshness without prior state. Call [`check_fido2_sign_count`]
+    /// when a previous counter is available. FIDO2 authenticators that
+    /// do not implement counters are allowed to return zero.
+    pub sign_count: Option<u32>,
+}
+
+/// A FIDO2 signature counter failed the WebAuthn monotonicity check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Fido2SignCountError {
+    #[error(
+        "FIDO2 signature counter did not advance (previous {previous}, current {current}); \
+         the credential may have been cloned or reset"
+    )]
+    DidNotAdvance { previous: u32, current: u32 },
+}
+
+/// Check a newly authenticated FIDO2 signature counter against the
+/// previously accepted value.
+///
+/// A pair of zero counters is accepted because CTAP2 permits
+/// authenticators without counter support. If either value is nonzero,
+/// the new value must be strictly greater than the previous value.
+pub fn check_fido2_sign_count(previous: u32, current: u32) -> Result<(), Fido2SignCountError> {
+    if previous == 0 && current == 0 {
+        return Ok(());
+    }
+    if current <= previous {
+        return Err(Fido2SignCountError::DidNotAdvance { previous, current });
+    }
+    Ok(())
+}
+
+/// A malformed or invalid control-key proof.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlProofError {
+    #[error(
+        "unsupported proof format (expected 64 bytes raw P-256 or a versioned FIDO2 assertion)"
+    )]
+    UnsupportedFormat,
+    #[error("invalid raw P-256 signature encoding")]
+    InvalidRawSignature,
+    #[error("raw P-256 signature verification failed")]
+    InvalidRawSignatureValue,
+    #[error("malformed FIDO2 proof: {0}")]
+    MalformedFido2(String),
+    #[error("FIDO2 proof is {actual} bytes; maximum accepted size is {max} bytes")]
+    Fido2ProofTooLarge { actual: usize, max: usize },
+    #[error("FIDO2 proof contains trailing data")]
+    Fido2TrailingData,
+    #[error("FIDO2 credential ID is empty or exceeds 1023 bytes")]
+    InvalidCredentialId,
+    #[error("FIDO2 authenticator data is shorter than 37 bytes")]
+    AuthenticatorDataTooShort,
+    #[error("FIDO2 assertion is scoped to a different RP ID")]
+    RpIdHashMismatch,
+    #[error("FIDO2 assertion does not prove user presence")]
+    UserPresenceRequired,
+    #[error("FIDO2 assertion does not prove user verification")]
+    UserVerificationRequired,
+    #[error("FIDO2 assertion contains attested credential data")]
+    UnexpectedAttestedCredentialData,
+    #[error("FIDO2 assertion contains extension data or trailing authenticator bytes")]
+    UnexpectedAuthenticatorData,
+    #[error("FIDO2 assertion sets reserved authenticator-data flags")]
+    ReservedAuthenticatorFlags,
+    #[error("FIDO2 assertion has an invalid backup-state flag combination")]
+    InvalidBackupFlags,
+    #[error(
+        "backup-eligible FIDO2 credentials are not accepted; use a hardware-bound credential \
+         that cannot be synced or exported"
+    )]
+    BackupEligibleCredential,
+    #[error("FIDO2 assertion signature is not DER-encoded ES256")]
+    InvalidFido2Signature,
+    #[error("FIDO2 assertion signature verification failed")]
+    InvalidFido2SignatureValue,
+}
+
+impl ControlProofError {
+    /// Whether the error describes bytes that cannot represent a proof,
+    /// rather than a well-shaped proof which failed verification.
+    pub fn is_shape_error(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedFormat
+                | Self::InvalidRawSignature
+                | Self::MalformedFido2(_)
+                | Self::Fido2ProofTooLarge { .. }
+                | Self::Fido2TrailingData
+                | Self::InvalidCredentialId
+                | Self::AuthenticatorDataTooShort
+                | Self::UnexpectedAttestedCredentialData
+                | Self::UnexpectedAuthenticatorData
+                | Self::ReservedAuthenticatorFlags
+                | Self::InvalidBackupFlags
+                | Self::InvalidFido2Signature
+        )
+    }
+}
+
+/// Compute the exact 32 bytes passed as CTAP2 `clientDataHash`.
+///
+/// Enclavia is a native client rather than a browser. Domain-separating
+/// the hash prevents an assertion requested by another CTAP2 protocol
+/// from authorizing an Enclavia control message with the same bytes. The
+/// length-prefixed credential ID makes that otherwise-opaque proof field
+/// part of what the authenticator signs.
+pub fn fido2_client_data_hash(message: &[u8], credential_id: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(FIDO2_CLIENT_DATA_CONTEXT);
+    hasher.update((credential_id.len() as u32).to_be_bytes());
+    hasher.update(credential_id);
+    hasher.update(message);
+    hasher.finalize().into()
+}
+
+/// Verify either a legacy raw P-256 signature or a CTAP2-only FIDO2
+/// assertion against the enclave's registered control public key.
+///
+/// FIDO2 verification requires the fixed RP ID, UP and UV flags, a
+/// hardware-bound (not backup-eligible) credential, a structurally
+/// valid extension-free authenticator-data record, and an ES256
+/// signature over `authenticatorData || clientDataHash`. Proofs are
+/// size-limited before CBOR decoding.
+///
+/// The returned signature counter is authenticated here but must be
+/// compared with prior state by the caller; see
+/// [`check_fido2_sign_count`].
+pub fn verify_control_proof(
+    verifying_key: &p256::ecdsa::VerifyingKey,
+    message: &[u8],
+    proof: &[u8],
+) -> Result<VerifiedControlProof, ControlProofError> {
+    use p256::ecdsa::signature::Verifier as _;
+
+    if proof.len() == 64 {
+        let signature = p256::ecdsa::Signature::from_slice(proof)
+            .map_err(|_| ControlProofError::InvalidRawSignature)?;
+        verifying_key
+            .verify(message, &signature)
+            .map_err(|_| ControlProofError::InvalidRawSignatureValue)?;
+        return Ok(VerifiedControlProof {
+            kind: ControlProofKind::P256Raw,
+            sign_count: None,
+        });
+    }
+
+    let assertion = Fido2Assertion::decode(proof)?;
+    if assertion.credential_id.is_empty() || assertion.credential_id.len() > 1023 {
+        return Err(ControlProofError::InvalidCredentialId);
+    }
+    if assertion.authenticator_data.len() < 37 {
+        return Err(ControlProofError::AuthenticatorDataTooShort);
+    }
+
+    let expected_rp_id_hash: [u8; 32] = Sha256::digest(FIDO2_RP_ID.as_bytes()).into();
+    if assertion.authenticator_data[..32] != expected_rp_id_hash {
+        return Err(ControlProofError::RpIdHashMismatch);
+    }
+
+    let flags = assertion.authenticator_data[32];
+    const USER_PRESENT: u8 = 0x01;
+    const USER_VERIFIED: u8 = 0x04;
+    const BACKUP_ELIGIBLE: u8 = 0x08;
+    const BACKUP_STATE: u8 = 0x10;
+    const ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
+    const EXTENSION_DATA: u8 = 0x80;
+    const RESERVED_FLAGS: u8 = 0x02 | 0x20;
+    if flags & USER_PRESENT == 0 {
+        return Err(ControlProofError::UserPresenceRequired);
+    }
+    if flags & USER_VERIFIED == 0 {
+        return Err(ControlProofError::UserVerificationRequired);
+    }
+    if flags & ATTESTED_CREDENTIAL_DATA != 0 {
+        return Err(ControlProofError::UnexpectedAttestedCredentialData);
+    }
+    if flags & EXTENSION_DATA != 0 || assertion.authenticator_data.len() != 37 {
+        return Err(ControlProofError::UnexpectedAuthenticatorData);
+    }
+    if flags & RESERVED_FLAGS != 0 {
+        return Err(ControlProofError::ReservedAuthenticatorFlags);
+    }
+    if flags & BACKUP_STATE != 0 && flags & BACKUP_ELIGIBLE == 0 {
+        return Err(ControlProofError::InvalidBackupFlags);
+    }
+    if flags & BACKUP_ELIGIBLE != 0 {
+        return Err(ControlProofError::BackupEligibleCredential);
+    }
+
+    let sign_count = u32::from_be_bytes(
+        assertion.authenticator_data[33..37]
+            .try_into()
+            .expect("length checked above"),
+    );
+    let signature = p256::ecdsa::Signature::from_der(&assertion.signature)
+        .map_err(|_| ControlProofError::InvalidFido2Signature)?;
+    let client_data_hash = fido2_client_data_hash(message, &assertion.credential_id);
+    let mut signed = Vec::with_capacity(assertion.authenticator_data.len() + 32);
+    signed.extend_from_slice(&assertion.authenticator_data);
+    signed.extend_from_slice(&client_data_hash);
+    verifying_key
+        .verify(&signed, &signature)
+        .map_err(|_| ControlProofError::InvalidFido2SignatureValue)?;
+
+    Ok(VerifiedControlProof {
+        kind: ControlProofKind::Fido2,
+        sign_count: Some(sign_count),
+    })
+}
 
 /// CBOR-encode a [`ControlCommand::PrepareUpgrade`].
 ///
@@ -28,12 +338,11 @@ use crate::{ControlCommand, RekeyParams};
 /// verification.
 ///
 /// `payload` is the CBOR-encoded [`crate::chain::UpgradePayload`] and
-/// `payload_signature` the 64-byte raw `r || s` inner signature over
-/// it (see [`der_signature_to_raw`] for hardware signers that emit
-/// DER).
+/// `payload_signature` is either the legacy 64-byte raw `r || s`
+/// signature or a versioned FIDO2 assertion over it.
 pub fn encode_prepare_upgrade(
     payload: &[u8],
-    payload_signature: &[u8; 64],
+    payload_signature: &[u8],
     rekey: Option<RekeyParams>,
     nonce: [u8; 32],
 ) -> Vec<u8> {
@@ -51,7 +360,7 @@ pub fn encode_prepare_upgrade(
 /// CBOR-encoded [`crate::chain::RevocationPayload`].
 pub fn encode_revoke_upgrade(
     payload: &[u8],
-    payload_signature: &[u8; 64],
+    payload_signature: &[u8],
     rollback: bool,
     nonce: [u8; 32],
 ) -> Vec<u8> {
@@ -140,7 +449,8 @@ pub struct ConfirmSubmitRequest {
     /// [`encode_prepare_upgrade`] / [`encode_revoke_upgrade`], base64.
     #[serde(with = "base64_vec")]
     pub command: Vec<u8>,
-    /// 64-byte raw `r || s` P-256 signature over `command`, base64.
+    /// Legacy raw P-256 signature or versioned FIDO2 assertion over
+    /// `command`, base64.
     #[serde(with = "base64_vec")]
     pub envelope_signature: Vec<u8>,
 }
@@ -169,8 +479,8 @@ pub struct RevokePrepareResponse {
 /// Serde adapter: `Vec<u8>` as a standard-base64 (padded) JSON string,
 /// matching the chain endpoint's byte-field convention.
 mod base64_vec {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &Vec<u8>, ser: S) -> Result<S::Ok, S::Error> {
@@ -179,15 +489,17 @@ mod base64_vec {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(de)?;
-        STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
 /// Serde adapter: `[u8; 32]` as a standard-base64 (padded) JSON string.
 /// Rejects any decoded length other than exactly 32 bytes.
 mod base64_array32 {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], ser: S) -> Result<S::Ok, S::Error> {
@@ -196,9 +508,12 @@ mod base64_array32 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(de)?;
-        let v = STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)?;
-        v.try_into()
-            .map_err(|v: Vec<u8>| serde::de::Error::custom(format!("expected 32 bytes, got {}", v.len())))
+        let v = STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 32 bytes, got {}", v.len()))
+        })
     }
 }
 
@@ -353,6 +668,165 @@ mod tests {
         assert!(der_signature_to_raw(&[]).is_err());
     }
 
+    fn fido2_proof(sk: &SigningKey, msg: &[u8], flags: u8) -> Vec<u8> {
+        let mut authenticator_data = Sha256::digest(FIDO2_RP_ID.as_bytes()).to_vec();
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&42u32.to_be_bytes());
+
+        let credential_id = vec![0xA5; 32];
+        let client_data_hash = fido2_client_data_hash(msg, &credential_id);
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&client_data_hash);
+        let signature: Signature = sk.sign(&signed);
+        Fido2Assertion {
+            credential_id,
+            authenticator_data,
+            signature: signature.to_der().as_bytes().to_vec(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn fido2_control_proof_verifies_with_up_and_uv() {
+        let sk = SigningKey::from_bytes(&[17u8; 32].into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let msg = b"fido2 control proof";
+        let proof = fido2_proof(&sk, msg, 0x01 | 0x04);
+
+        let verified = verify_control_proof(&vk, msg, &proof).unwrap();
+        assert_eq!(verified.kind, ControlProofKind::Fido2);
+        assert_eq!(verified.sign_count, Some(42));
+
+        let decoded = Fido2Assertion::decode(&proof).unwrap();
+        assert_eq!(decoded.credential_id, vec![0xA5; 32]);
+    }
+
+    #[test]
+    fn fido2_control_proof_rejects_tampering_and_missing_uv() {
+        let sk = SigningKey::from_bytes(&[18u8; 32].into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let msg = b"fido2 protected bytes";
+
+        let proof = fido2_proof(&sk, msg, 0x01 | 0x04);
+        assert!(matches!(
+            verify_control_proof(&vk, b"different bytes", &proof),
+            Err(ControlProofError::InvalidFido2SignatureValue)
+        ));
+
+        let mut wrong_credential = Fido2Assertion::decode(&proof).unwrap();
+        wrong_credential.credential_id[0] ^= 0x01;
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &wrong_credential.encode()),
+            Err(ControlProofError::InvalidFido2SignatureValue)
+        ));
+
+        let no_uv = fido2_proof(&sk, msg, 0x01);
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &no_uv),
+            Err(ControlProofError::UserVerificationRequired)
+        ));
+
+        let no_up = fido2_proof(&sk, msg, 0x04);
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &no_up),
+            Err(ControlProofError::UserPresenceRequired)
+        ));
+    }
+
+    #[test]
+    fn fido2_control_proof_rejects_wrong_rp_and_trailing_data() {
+        let sk = SigningKey::from_bytes(&[19u8; 32].into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let msg = b"rp-bound proof";
+        let proof = fido2_proof(&sk, msg, 0x01 | 0x04);
+
+        let mut wrong_rp = Fido2Assertion::decode(&proof).unwrap();
+        wrong_rp.authenticator_data[0] ^= 0x01;
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &wrong_rp.encode()),
+            Err(ControlProofError::RpIdHashMismatch)
+        ));
+
+        let mut extra_authenticator_data = Fido2Assertion::decode(&proof).unwrap();
+        extra_authenticator_data.authenticator_data.push(0);
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &extra_authenticator_data.encode()),
+            Err(ControlProofError::UnexpectedAuthenticatorData)
+        ));
+
+        let mut trailing = proof;
+        trailing.push(0);
+        assert!(matches!(
+            Fido2Assertion::decode(&trailing),
+            Err(ControlProofError::Fido2TrailingData)
+        ));
+    }
+
+    #[test]
+    fn fido2_control_proof_rejects_backup_eligible_credentials() {
+        let sk = SigningKey::from_bytes(&[21u8; 32].into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let msg = b"hardware-bound credential required";
+
+        let backup_eligible = fido2_proof(&sk, msg, 0x01 | 0x04 | 0x08);
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &backup_eligible),
+            Err(ControlProofError::BackupEligibleCredential)
+        ));
+
+        let invalid_backup_state = fido2_proof(&sk, msg, 0x01 | 0x04 | 0x10);
+        assert!(matches!(
+            verify_control_proof(&vk, msg, &invalid_backup_state),
+            Err(ControlProofError::InvalidBackupFlags)
+        ));
+    }
+
+    #[test]
+    fn fido2_proof_size_is_bounded_before_decoding() {
+        let oversized = vec![0u8; MAX_FIDO2_PROOF_SIZE + 1];
+        assert!(matches!(
+            Fido2Assertion::decode(&oversized),
+            Err(ControlProofError::Fido2ProofTooLarge {
+                actual,
+                max: MAX_FIDO2_PROOF_SIZE,
+            }) if actual == MAX_FIDO2_PROOF_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn fido2_signature_counter_must_advance_when_supported() {
+        assert_eq!(check_fido2_sign_count(0, 0), Ok(()));
+        assert_eq!(check_fido2_sign_count(0, 1), Ok(()));
+        assert_eq!(check_fido2_sign_count(41, 42), Ok(()));
+        assert_eq!(
+            check_fido2_sign_count(42, 42),
+            Err(Fido2SignCountError::DidNotAdvance {
+                previous: 42,
+                current: 42,
+            })
+        );
+        assert_eq!(
+            check_fido2_sign_count(42, 0),
+            Err(Fido2SignCountError::DidNotAdvance {
+                previous: 42,
+                current: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn shared_verifier_preserves_legacy_raw_signatures() {
+        let sk = SigningKey::from_bytes(&[20u8; 32].into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let msg = b"legacy control proof";
+        let signature: Signature = sk.sign(msg);
+        let raw = signature.normalize_s().unwrap_or(signature).to_bytes();
+
+        let verified = verify_control_proof(&vk, msg, &raw).unwrap();
+        assert_eq!(verified.kind, ControlProofKind::P256Raw);
+        assert_eq!(verified.sign_count, None);
+    }
+
     #[test]
     fn confirm_prepare_response_serde_round_trip() {
         let resp = ConfirmPrepareResponse {
@@ -397,8 +871,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: ConfirmPrepareResponse = serde_json::from_str(&json).unwrap();
 
-        let cli_cmd =
-            encode_prepare_upgrade(&back.payload, &payload_sig, back.rekey, back.nonce);
+        let cli_cmd = encode_prepare_upgrade(&back.payload, &payload_sig, back.rekey, back.nonce);
         assert_eq!(cli_cmd, backend_cmd);
     }
 

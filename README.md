@@ -39,7 +39,7 @@ Shared / client-side crates (build for any target):
 - `enclavia-protocol`: Wire types and Noise+CBOR responder helpers. Shared between the in-enclave server, the host-side router, and the SDK. Includes attestation verification, the upgrade-chain and custody helpers, and the mesh/egress hand-off frames.
 - `enclavia`: Client SDK. Opens a Noise tunnel through the router's WebSocket, verifies the enclave's attestation against your pinned PCRs, and exposes the channel as an `http`-compatible client. Compiles for native targets and `wasm32-unknown-unknown`.
 - `enclavia-wasm`: wasm-bindgen bindings over the SDK for browsers and JS runtimes (Node >= 22, Deno): `connect(url, pcrs, opts)`, `fetch(...)`, and raw `openStream(...)` byte pipes. Same attestation verification as native.
-- `enclavia-cli`: The `enclavia` binary: auth, enclave lifecycle, image push, secrets, signed upgrades (managed or self-hosted YubiKey custody), `reproduce`, and a global `--json` mode. Also exposes a library face (`enclavia_cli::{api, commands, config}`); see [`enclavia-cli/README.md`](enclavia-cli/README.md).
+- `enclavia-cli`: The `enclavia` binary: auth, enclave lifecycle, image push, secrets, signed upgrades (managed or self-hosted FIDO2/YubiKey custody), `reproduce`, and a global `--json` mode. Also exposes a library face (`enclavia_cli::{api, commands, config}`); see [`enclavia-cli/README.md`](enclavia-cli/README.md).
 - `enclavia-vsock`: Small shared vsock plumbing used by the in-enclave crates.
 
 Dev tools:

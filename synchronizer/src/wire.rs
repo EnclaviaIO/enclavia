@@ -181,8 +181,8 @@ pub enum Request {
     /// `link` is a #47 upgrade [`ChainLink`] (kind
     /// [`ChainLinkKind::Upgrade`]) the new enclave read out of its own
     /// chain. Its CBOR-decoded [`UpgradePayload`] names `from_pcrs ->
-    /// to_pcrs`; the link's `signature` is the OLD enclave's 64-byte raw
-    /// r||s ECDSA P-256 control signature over the payload, and its
+    /// to_pcrs`; the link's `signature` is the OLD enclave's raw P-256
+    /// signature or FIDO2 assertion over the payload, and its
     /// `attestation` is the OLD enclave's NSM document bound to
     /// `sha256(payload)` (so its PCRs equal `from_pcrs`). The synchronizer
     /// derives `old_key`/`new_key` from the payload, verifies the link via
@@ -426,8 +426,9 @@ pub enum TransitionLinkError {
     /// The link carried no `signature` (upgrade links must).
     #[error("transition link is missing the control-key signature")]
     MissingSignature,
-    /// `signature` is not 64 bytes raw r||s ECDSA P-256.
-    #[error("transition link signature is not 64 bytes raw r||s P-256")]
+    /// `signature` is neither a legacy raw P-256 signature nor a
+    /// well-formed versioned FIDO2 assertion.
+    #[error("transition link carries a malformed control-key proof")]
     SignatureShape,
     /// The frozen control pubkey for the derived `old_key` did not decode
     /// as uncompressed SEC1 P-256. Indicates the stored pubkey is corrupt;
@@ -439,6 +440,19 @@ pub enum TransitionLinkError {
     /// the derived `old_key`.
     #[error("transition link signature does not verify under old_key's frozen control pubkey")]
     SignatureInvalid,
+    /// A FIDO2 transition proof did not advance the counter stored with
+    /// the current key state.
+    #[error("FIDO2 transition counter did not advance (previous {previous}, current {current})")]
+    SignatureCounterDidNotAdvance {
+        /// Last counter persisted for this control key.
+        previous: u32,
+        /// Counter authenticated by the submitted transition proof.
+        current: u32,
+    },
+    /// A key with an established FIDO2 counter presented a raw P-256
+    /// proof, which would bypass clone detection.
+    #[error("transition control proof cannot downgrade from FIDO2 to raw P-256")]
+    SignatureCounterDowngrade,
     /// The link's `payload` did not CBOR-decode as an [`UpgradePayload`].
     #[error("transition link payload is not a decodable UpgradePayload: {0}")]
     PayloadDecode(String),
@@ -490,8 +504,10 @@ pub struct DecodedTransition {
 /// Successful output of [`verify_transition_link`]: the `(old_key,
 /// new_key)` pair the verified link authorizes.
 ///
-/// The node records this via [`crate::StateMachine::observe_transition`]
-/// and then applies [`crate::Op::Transition`] with the same pair.
+/// The node records this via
+/// [`crate::StateMachine::observe_transition_with_fido2_sign_count`] and
+/// then applies [`crate::Op::Transition`] with the same pair.
+#[must_use = "the authenticated FIDO2 counter must be persisted with transition state"]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedTransition {
     /// `sha256(payload.from_pcrs)`, the retiring (OLD) enclave's key.
@@ -499,6 +515,9 @@ pub struct VerifiedTransition {
     /// `sha256(payload.to_pcrs)`, the successor key adopted by the
     /// transition. Equals the submitting session's bound key.
     pub new_key: PcrKey,
+    /// Authenticated FIDO2 signature counter, or `None` for a legacy
+    /// raw-P256 transition proof.
+    pub fido2_sign_count: Option<u32>,
 }
 
 /// Derive a [`PcrKey`] from a chain payload's hex-PCR triple, matching
@@ -526,8 +545,8 @@ fn pcr_key_from_hex(
 /// Returns the derived `(old_key, new_key)`. The payload is decoded here
 /// before its signature is verified, which is safe: the node uses the
 /// derived `old_key` only to *look up* a frozen pubkey, and
-/// [`verify_transition_link`] then verifies the 64-byte signature over the
-/// exact payload bytes against that pubkey. A payload that lies about
+/// [`verify_transition_link`] then verifies the control proof over the exact
+/// payload bytes against that pubkey. A payload that lies about
 /// `from_pcrs` would have to carry a signature valid under some OTHER key's
 /// frozen pubkey, which it cannot.
 pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, TransitionLinkError> {
@@ -563,15 +582,17 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 /// 2. **Not a self-transition.** `decoded.new_key != decoded.old_key`
 ///    (`from_pcrs != to_pcrs`). The state machine also rejects this, but a
 ///    self-transition link is never legitimate.
-/// 3. **Control signature.** The link's 64-byte raw r||s ECDSA P-256
-///    `signature` must verify over the payload bytes against
+/// 3. **Control proof.** The link's legacy raw P-256 signature or
+///    versioned FIDO2 assertion must verify over the payload bytes against
 ///    `old_control_pubkey`, the 65-byte SEC1 P-256 key the synchronizer
 ///    froze for `decoded.old_key` at its Register time
 ///    (`AttestedIdentity::control_pubkey`). This proves the retiring
 ///    enclave authorized this exact `from -> to` pair; control-pubkey
 ///    substitution is defeated because the pubkey is frozen, and the
 ///    decode-before-verify ordering is safe because the signature covers
-///    `from_pcrs`.
+///    `from_pcrs`. Stateful callers use
+///    [`verify_transition_link_with_fido2_sign_count`] to compare the
+///    authenticated FIDO2 counter with the stored baseline.
 /// 4. **Chain attestation.** `verify_chain_attestation` must accept the
 ///    link's `attestation` against its `payload`, i.e. the attestation's
 ///    `user_data == sha256(payload)` and its PCRs equal `from_pcrs` (the
@@ -591,7 +612,29 @@ pub fn verify_transition_link(
     old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
     debug_mode: bool,
 ) -> Result<VerifiedTransition, TransitionLinkError> {
-    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    verify_transition_link_with_fido2_sign_count(
+        link,
+        decoded,
+        session_key,
+        old_control_pubkey,
+        None,
+        debug_mode,
+    )
+}
+
+/// Stateful form of [`verify_transition_link`]. If the synchronizer has
+/// previously accepted a FIDO2 assertion under this frozen control key,
+/// `previous_fido2_sign_count` enforces monotonicity and prevents a
+/// downgrade to the counterless raw proof format.
+pub fn verify_transition_link_with_fido2_sign_count(
+    link: &ChainLink,
+    decoded: DecodedTransition,
+    session_key: PcrKey,
+    old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
+    previous_fido2_sign_count: Option<u32>,
+    debug_mode: bool,
+) -> Result<VerifiedTransition, TransitionLinkError> {
+    use p256::ecdsa::VerifyingKey;
 
     // 1. The NEW enclave submits; the session must be bound to new_key.
     if decoded.new_key != session_key {
@@ -611,10 +654,30 @@ pub fn verify_transition_link(
         .ok_or(TransitionLinkError::MissingSignature)?;
     let verifying = VerifyingKey::from_sec1_bytes(old_control_pubkey)
         .map_err(|_| TransitionLinkError::BadControlPubkey)?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| TransitionLinkError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| TransitionLinkError::SignatureInvalid)?;
+    let verified_proof = match enclavia_protocol::custody::verify_control_proof(
+        &verifying,
+        &link.payload,
+        sig_bytes,
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            return Err(if error.is_shape_error() {
+                TransitionLinkError::SignatureShape
+            } else {
+                TransitionLinkError::SignatureInvalid
+            });
+        }
+    };
+    if let Some(previous) = previous_fido2_sign_count {
+        match verified_proof.sign_count {
+            Some(current) => {
+                enclavia_protocol::custody::check_fido2_sign_count(previous, current).map_err(
+                    |_| TransitionLinkError::SignatureCounterDidNotAdvance { previous, current },
+                )?;
+            }
+            None => return Err(TransitionLinkError::SignatureCounterDowngrade),
+        }
+    }
 
     // 4. Chain attestation binds the document to sha256(payload) and to
     //    the OLD enclave's measurements (from_pcrs): the old enclave
@@ -636,6 +699,7 @@ pub fn verify_transition_link(
     Ok(VerifiedTransition {
         old_key: decoded.old_key,
         new_key: decoded.new_key,
+        fido2_sign_count: verified_proof.sign_count,
     })
 }
 
@@ -732,6 +796,39 @@ mod tests {
             attestation,
             signature: Some(sig.to_bytes().to_vec()),
         }
+    }
+
+    /// Replace a fixture's legacy signature with the equivalent
+    /// versioned CTAP2 assertion.
+    fn use_fido2_signature(link: &mut ChainLink, signing: &SigningKey) {
+        use_fido2_signature_with_counter(link, signing, 1);
+    }
+
+    fn use_fido2_signature_with_counter(
+        link: &mut ChainLink,
+        signing: &SigningKey,
+        sign_count: u32,
+    ) {
+        use enclavia_protocol::custody::{FIDO2_RP_ID, Fido2Assertion, fido2_client_data_hash};
+        use sha2::{Digest as _, Sha256};
+
+        let mut authenticator_data = Vec::with_capacity(37);
+        authenticator_data.extend_from_slice(&Sha256::digest(FIDO2_RP_ID.as_bytes()));
+        authenticator_data.push(0x01 | 0x04); // UP + UV
+        authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
+
+        let mut signed = authenticator_data.clone();
+        let credential_id = vec![0x45; 32];
+        signed.extend_from_slice(&fido2_client_data_hash(&link.payload, &credential_id));
+        let signature: Signature = signing.sign(&signed);
+        link.signature = Some(
+            Fido2Assertion {
+                credential_id,
+                authenticator_data,
+                signature: signature.to_der().as_bytes().to_vec(),
+            }
+            .encode(),
+        );
     }
 
     /// Decode then verify a link in one shot, mirroring the node's
@@ -973,6 +1070,75 @@ mod tests {
         let verified = decode_and_verify(&link, session_key, &pk_old, true).expect("verify");
         assert_eq!(verified.old_key, key_from_seed(0x30));
         assert_eq!(verified.new_key, session_key);
+        assert_eq!(verified.fido2_sign_count, None);
+    }
+
+    #[test]
+    fn transition_link_enforces_stored_fido2_counter() {
+        let (sk_old, pk_old) = keypair(0x30);
+        let mut link = upgrade_link(0x30, 0x40, &sk_old);
+        use_fido2_signature_with_counter(&mut link, &sk_old, 7);
+        let decoded = decode_transition_link(&link).unwrap();
+        let session_key = key_from_seed(0x40);
+
+        let err = verify_transition_link_with_fido2_sign_count(
+            &link,
+            decoded,
+            session_key,
+            &pk_old,
+            Some(7),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TransitionLinkError::SignatureCounterDidNotAdvance {
+                previous: 7,
+                current: 7,
+            }
+        ));
+
+        let mut advanced = link;
+        use_fido2_signature_with_counter(&mut advanced, &sk_old, 8);
+        let decoded = decode_transition_link(&advanced).unwrap();
+        let verified = verify_transition_link_with_fido2_sign_count(
+            &advanced,
+            decoded,
+            session_key,
+            &pk_old,
+            Some(7),
+            true,
+        )
+        .unwrap();
+        assert_eq!(verified.fido2_sign_count, Some(8));
+
+        let raw = upgrade_link(0x30, 0x40, &sk_old);
+        let decoded = decode_transition_link(&raw).unwrap();
+        let err = verify_transition_link_with_fido2_sign_count(
+            &raw,
+            decoded,
+            session_key,
+            &pk_old,
+            Some(7),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TransitionLinkError::SignatureCounterDowngrade
+        ));
+    }
+
+    #[test]
+    fn transition_link_accepts_fido2_control_proof() {
+        let (sk_old, pk_old) = keypair(0x30);
+        let mut link = upgrade_link(0x30, 0x40, &sk_old);
+        use_fido2_signature(&mut link, &sk_old);
+        let session_key = key_from_seed(0x40);
+        let verified = decode_and_verify(&link, session_key, &pk_old, true).expect("verify");
+        assert_eq!(verified.old_key, key_from_seed(0x30));
+        assert_eq!(verified.new_key, session_key);
+        assert_eq!(verified.fido2_sign_count, Some(1));
     }
 
     /// Signed by a different key than the one registered for old_key:
