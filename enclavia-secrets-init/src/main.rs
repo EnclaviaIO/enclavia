@@ -458,6 +458,56 @@ fn is_valid_env_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Environment variable names a host-injected secrets payload must never
+/// set on the workload: dynamic-loader / interpreter / proxy knobs that
+/// change WHAT the measured image effectively runs or WHERE its traffic
+/// goes. The payload is host-relayed and (today) unauthenticated, so an
+/// operator-declared secret named like one of these is indistinguishable
+/// from a host injection; matching is case-insensitive (`http_proxy` is
+/// the conventional form). This is defence in depth — full authenticity
+/// needs a backend-signed/encrypted payload.
+fn is_forbidden_env_name(name: &str) -> bool {
+    const FORBIDDEN: [&str; 28] = [
+        "PATH",
+        "HOME",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_PROFILE",
+        "LD_ORIGIN_PATH",
+        "LD_SHOW_AUXV",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "IFS",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "RUBYLIB",
+        "PERL5LIB",
+        "PERL5OPT",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_EXEC_PATH",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        // glibc code-loading vectors (iconv modules, locales, message
+        // catalogs): same injection class as LD_PRELOAD.
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+    ];
+    let upper = name.to_ascii_uppercase();
+    if FORBIDDEN.contains(&upper.as_str()) {
+        return true;
+    }
+    // *_PROXY in any case (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY,
+    // http_proxy, ...): proxy redirection of the workload's traffic.
+    upper.ends_with("_PROXY")
+}
+
 /// Pure helper for the merge step so it's exercised by unit tests.
 ///
 /// Walks `process.env` (creating the array if absent), replaces any
@@ -490,9 +540,33 @@ fn merge_env_into_config(
         .ok_or_else(|| "config.json: `process.env` is not an array".to_string())?;
 
     for (name, value_bytes) in secrets {
+        // The payload is host-relayed, so names are attacker-controlled.
+        // Without validation the host could inject loader/proxy-sensitive
+        // variables (`PATH`, `LD_PRELOAD`, `http_proxy`, `NODE_OPTIONS`,
+        // `GIT_SSH_COMMAND`, `BASH_ENV`, ...) into the measured workload's
+        // environment, silently changing what the image actually runs.
+        // Same grammar as the aws-creds path, plus a denylist of known
+        // hijack vectors, and values stay on one line and NUL-free (a NUL
+        // would make execve reject the whole spawn).
+        if !is_valid_env_name(name) {
+            return Err(format!(
+                "secret name `{name}` is not a valid environment variable name; refusing to inject"
+            ));
+        }
+        if is_forbidden_env_name(name) {
+            return Err(format!(
+                "secret name `{name}` is a loader/proxy-sensitive variable the host must not \
+                 inject into the measured workload; refusing to inject"
+            ));
+        }
         let value = std::str::from_utf8(value_bytes).map_err(|_| {
             format!("secret `{name}` value is not valid UTF-8; refusing to inject")
         })?;
+        if value.contains('\n') || value.contains('\r') || value.contains('\0') {
+            return Err(format!(
+                "secret `{name}` value contains a newline or NUL; refusing to inject"
+            ));
+        }
         let new_entry = format!("{name}={value}");
         let prefix = format!("{name}=");
         let mut replaced = false;
@@ -897,5 +971,83 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(strs, vec!["DATABASE_URL=postgres://user:pass=word@host/db"]);
+    }
+
+    // ---- host-injected env hardening (workload-secrets path) ----------
+
+    #[test]
+    fn rejects_invalid_secret_names() {
+        for bad in ["9BAD", "BAD-NAME", "HAS SPACE", "HAS=EQ", ""] {
+            let mut cfg = make_config(&[]);
+            let s = secrets_from(&[(bad, "x")]);
+            assert!(
+                merge_env_into_config(&mut cfg, &s).is_err(),
+                "name {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_loader_and_proxy_sensitive_names() {
+        // The exact injection class a hostile host would use to subvert the
+        // measured workload (or steer its traffic).
+        for bad in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+            "GIT_SSH_COMMAND",
+            "PYTHONSTARTUP",
+            "JAVA_TOOL_OPTIONS",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "IFS",
+        ] {
+            let mut cfg = make_config(&[]);
+            let s = secrets_from(&[(bad, "evil")]);
+            let err = merge_env_into_config(&mut cfg, &s)
+                .expect_err("hijack-vector name must be rejected");
+            assert!(err.contains(bad), "error should name the variable: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_newline_and_nul_in_secret_values() {
+        let mut cfg = make_config(&[]);
+        let s = secrets_from(&[("FOO", "a\nb")]);
+        assert!(merge_env_into_config(&mut cfg, &s).is_err());
+        let mut cfg = make_config(&[]);
+        let s = secrets_from(&[("FOO", "a\rb")]);
+        assert!(merge_env_into_config(&mut cfg, &s).is_err());
+        let mut cfg = make_config(&[]);
+        let mut s = BTreeMap::new();
+        s.insert("FOO".to_string(), b"a\0b".to_vec());
+        assert!(merge_env_into_config(&mut cfg, &s).is_err());
+    }
+
+    #[test]
+    fn ordinary_secret_names_still_merge() {
+        // The denylist must not eat normal operator secrets.
+        let mut cfg = make_config(&[]);
+        let s = secrets_from(&[
+            ("API_KEY", "k"),
+            ("DATABASE_URL", "postgres://h/db"),
+            ("_PRIVATE_TOKEN", "t"),
+        ]);
+        merge_env_into_config(&mut cfg, &s).unwrap();
+        let strs: Vec<&str> = cfg["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(strs.len(), 3);
     }
 }

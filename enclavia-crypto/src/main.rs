@@ -3,7 +3,12 @@
 //! Talks to:
 //! - storage-host meta port (key blob GET/PUT) — vsock 5002
 //! - KMS over vsock 5003. Two transports, picked from the environment:
-//!   * **mock** (default, dev/QEMU): plaintext HTTP straight to `mock-kms`.
+//!   * **mock** (dev/QEMU ONLY): plaintext HTTP straight to `mock-kms`.
+//!     Refused outright on real Nitro (host CID 3), where a missing
+//!     `KMS_AWS_REGION` is a hard error rather than a fallback (the region
+//!     arrives via host-controlled environment, so a fallback would let the
+//!     parent substitute its own plaintext "KMS" and harvest the LUKS
+//!     passphrase).
 //!   * **AWS** (set `KMS_AWS_REGION`): the vsock peer is a raw TCP relay
 //!     (`vsock-proxy`) to `kms.<region>.amazonaws.com:443`; the enclave
 //!     terminates TLS itself (validating the Amazon cert chain compiled
@@ -211,6 +216,18 @@ enum Command {
         /// Identifier (e.g. KMS ARN, or mock-kms key id) of the new key.
         #[arg(long)]
         new_key_id: String,
+        /// Hex-encoded PCR0 the new enclave version is expected to measure
+        /// (the signed UpgradePayload's `to_pcrs`). The new key's policy is
+        /// verified to gate `kms:Decrypt` to exactly these PCRs before the
+        /// new passphrase is sealed under it.
+        #[arg(long)]
+        expected_pcr0: String,
+        /// See `--expected-pcr0` (PCR1).
+        #[arg(long)]
+        expected_pcr1: String,
+        /// See `--expected-pcr0` (PCR2).
+        #[arg(long)]
+        expected_pcr2: String,
     },
     /// Roll back a pending upgrade. Kills the LUKS keyslot added at
     /// `prepare-upgrade` time and restores the key blob to its pre-prepare
@@ -235,7 +252,17 @@ async fn main() {
         Command::PrepareUpgrade {
             new_public_key,
             new_key_id,
-        } => prepare_upgrade(&new_public_key, &new_key_id).await,
+            expected_pcr0,
+            expected_pcr1,
+            expected_pcr2,
+        } => {
+            prepare_upgrade(
+                &new_public_key,
+                &new_key_id,
+                [&expected_pcr0, &expected_pcr1, &expected_pcr2],
+            )
+            .await
+        }
         Command::RevokeUpgrade => revoke_upgrade().await,
     };
 
@@ -328,10 +355,31 @@ async fn init() -> Result<(), Box<dyn std::error::Error>> {
 async fn prepare_upgrade(
     new_pubkey_b64: &str,
     new_key_id: &str,
+    expected_pcrs_hex: [&str; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if new_key_id.is_empty() {
         return Err("new_key_id must not be empty".into());
     }
+
+    // Parse the expected PCRs of the enclave version being upgraded to (the
+    // signed UpgradePayload's `to_pcrs`, forwarded by enclavia-server).
+    // Nitro PCR0/1/2 are 48 bytes (SHA-384); requiring the exact length
+    // catches a truncated/empty value here instead of relying on the
+    // policy check to mismatch downstream.
+    let mut pcr_bytes: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (i, h) in expected_pcrs_hex.iter().enumerate() {
+        pcr_bytes[i] = hex::decode(h.trim())
+            .map_err(|e| format!("expected_pcr{i} is not valid hex: {e}"))?;
+        if pcr_bytes[i].len() != 48 {
+            return Err(format!(
+                "expected_pcr{i} is {} bytes, expected the 48 bytes of a Nitro PCR",
+                pcr_bytes[i].len()
+            )
+            .into());
+        }
+    }
+    let [pcr0, pcr1, pcr2] = pcr_bytes;
+    let expected_pcrs = enclavia_protocol::attestation::Pcrs { pcr0, pcr1, pcr2 };
 
     // Reject if a rollback stash already exists: a previous prepare-upgrade
     // has not yet been revoked or committed. The backend enforces at most one
@@ -359,6 +407,32 @@ async fn prepare_upgrade(
         .ok_or("blob has no ciphertext — volume hasn't been provisioned yet")?
         .clone();
 
+    // 1b. Verify the NEW key BEFORE sealing anything under it, with the same
+    //     distrust-the-backend contract `init` applies at boot: the rekey
+    //     parameters arrive via a control-channel command, so a compromised
+    //     control key (or a buggy backend) must not be able to point the
+    //     re-key at a key whose plaintext it can read.
+    //
+    //     a. Origin must be AWS_KMS (no imported/external material whose
+    //        private half is held out-of-band).
+    //     b. The command-supplied public key must equal what KMS itself
+    //        returns for `new_key_id` — never seal to a key KMS doesn't
+    //        recognise as that id's.
+    //     c. The new key's policy must gate `kms:Decrypt` to the NEW
+    //        enclave version's PCR0/1/2 (the signed payload's `to_pcrs`),
+    //        and grant no principal a way to loosen that gate.
+    let new_pubkey_der = B64.decode(new_pubkey_b64.as_bytes())?;
+    verify_key_policy_for(new_key_id, &expected_pcrs).await?;
+    let kms_pubkey_der = kms_get_public_key(new_key_id).await?;
+    if kms_pubkey_der != new_pubkey_der {
+        return Err(format!(
+            "the control command's new_public_key does not match kms:GetPublicKey({new_key_id}); \
+             refusing to seal the new passphrase to an unverified key"
+        )
+        .into());
+    }
+    info!(new_key_id, "new KMS key origin, policy, and public key verified");
+
     // 2. Re-derive the *current* passphrase via KMS. init wipes /tmp/luks.key
     //    after mount, so cryptsetup needs a fresh copy to authenticate the
     //    luksAddKey call. One extra Decrypt per upgrade is negligible.
@@ -375,7 +449,6 @@ async fn prepare_upgrade(
     // 3. Generate the new passphrase and wrap it under the new pubkey
     //    *before* touching LUKS — if either of these fails we haven't
     //    perturbed the running volume.
-    let new_pubkey_der = B64.decode(new_pubkey_b64.as_bytes())?;
     let new_passphrase = random_passphrase();
     let new_ct = rsa_oaep_encrypt(&new_pubkey_der, &new_passphrase)?;
 
@@ -662,6 +735,11 @@ const META_PUT: u8 = 0x02;
 const META_OK: u8 = 0x00;
 
 async fn meta_get() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    /// Bound on the host-supplied blob length. The key blob is a few hundred
+    /// bytes of JSON; 1 MiB is generous slack, and without a cap the
+    /// (untrusted) storage-host could claim up to 4 GiB and OOM the enclave.
+    const MAX_META_BLOB_BYTES: usize = 1 << 20;
+
     let mut stream = meta_connect().await?;
     stream.write_all(&[META_GET]).await?;
     stream.flush().await?;
@@ -669,6 +747,11 @@ async fn meta_get() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_META_BLOB_BYTES {
+        return Err(
+            format!("meta blob claims {len} bytes (cap {MAX_META_BLOB_BYTES}); refusing").into(),
+        );
+    }
     let mut buf = vec![0u8; len];
     if len > 0 {
         stream.read_exact(&mut buf).await?;
@@ -823,8 +906,8 @@ async fn kms_key_origin(key_id: &str) -> Result<String, Box<dyn std::error::Erro
 }
 
 /// Verify the KMS key is safe to trust before we seal under it / rely on
-/// it (see the call site in `init`). Two checks, both fatal (refuse to
-/// boot on failure):
+/// it (see the call sites in `init` and `prepare_upgrade`). Two checks,
+/// both fatal:
 ///
 /// 1. **Origin must be `AWS_KMS`** (`kms:DescribeKey`). A key with imported
 ///    material (`EXTERNAL`) or a custom key store means someone holds the
@@ -832,17 +915,25 @@ async fn kms_key_origin(key_id: &str) -> Result<String, Box<dyn std::error::Erro
 ///    offline, regardless of how tight the policy looks. So even a hostile
 ///    host that swaps the bootstrap blob's `key_id` to a key it created
 ///    cannot point us at a BYOK key.
-/// 2. **Policy gates Decrypt to our own PCR0/1/2** (`kms:GetKeyPolicy` +
+/// 2. **Policy gates Decrypt to the expected PCR0/1/2** (`kms:GetKeyPolicy` +
 ///    `enclavia_protocol::kms_policy::verify_decrypt_policy`), and grants no
 ///    principal a way to loosen that gate.
 ///
+/// The "expected" PCRs differ per caller: `init` passes this enclave's own
+/// PCRs (the running image recovers the passphrase); `prepare_upgrade`
+/// passes the NEW version's `to_pcrs` (the successor must be able to
+/// recover it — and nobody else).
+///
 /// Both checks are only as trustworthy as the channel to KMS: see the
 /// authenticated-transport note on `kms_call`.
-async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn verify_key_policy_for(
+    key_id: &str,
+    expected: &enclavia_protocol::attestation::Pcrs,
+) -> Result<(), Box<dyn std::error::Error>> {
     let origin = kms_key_origin(key_id).await?;
     if origin != "AWS_KMS" {
         return Err(format!(
-            "KMS key {key_id} has Origin={origin}, refusing to boot: only KMS-generated \
+            "KMS key {key_id} has Origin={origin}, refusing to trust it: only KMS-generated \
              (non-exportable) keys are trusted; imported/external material could be held \
              out-of-band and decrypt our sealed passphrase."
         )
@@ -850,16 +941,21 @@ async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error
     }
 
     let policy = kms_get_key_policy(key_id).await?;
-    let own = own_pcrs()?;
-    enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, &own).map_err(|e| {
+    enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, expected).map_err(|e| {
         format!(
-            "KMS key {key_id} policy rejected, refusing to boot: {e}. \
-             The key's Decrypt must be gated to this enclave's PCR0/1/2 and \
+            "KMS key {key_id} policy rejected, refusing to trust it: {e}. \
+             The key's Decrypt must be gated to the expected PCR0/1/2 and \
              grant no principal a way to loosen it."
         )
     })?;
-    info!(key_id, "KMS key origin and policy verified against own attestation");
+    info!(key_id, "KMS key origin and policy verified against the expected PCRs");
     Ok(())
+}
+
+/// Boot-time wrapper: verify the CURRENT key against this enclave's own
+/// PCRs (the running image is the one that must recover the passphrase).
+async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    verify_key_policy_for(key_id, &own_pcrs()?).await
 }
 
 /// This enclave's own PCR0/1/2, read from a fresh NSM attestation document
@@ -969,15 +1065,57 @@ enum KmsTransport {
     },
 }
 
+/// Which KMS transport the environment selects.
+#[derive(Debug)]
+enum TransportSelection {
+    /// Dev/QEMU only: plaintext HTTP to `mock-kms` over vsock.
+    Mock,
+    /// Production: TLS + SigV4 to real AWS KMS in this region.
+    Aws(String),
+}
+
+/// Pure transport selection, split out of [`kms_transport`] for tests.
+///
+/// SECURITY: `Mock` is only legal when the init-recorded CID file
+/// PROVABLY says QEMU (`Some(2)`, written by the patched init's boot-time
+/// heartbeat, which answers definitively). Any other value — Nitro
+/// (`Some(3)`) or "unknown" (`None`, e.g. a probe that wrongly concluded
+/// QEMU on a real Nitro host) — is a hard error, never a mock fallback:
+/// the region ultimately arrives via host-controlled environment, and
+/// silently falling back would let the parent point us at its own
+/// plaintext "KMS" and harvest the LUKS passphrase at first boot (the
+/// boot-time policy check is only load-bearing against a transport the
+/// host cannot forge).
+fn select_transport(
+    region: Option<String>,
+    init_recorded_cid: Option<u32>,
+) -> Result<TransportSelection, Box<dyn std::error::Error>> {
+    match region {
+        Some(region) if !region.trim().is_empty() => {
+            Ok(TransportSelection::Aws(region.trim().to_string()))
+        }
+        _ if init_recorded_cid == Some(2) => Ok(TransportSelection::Mock),
+        _ => Err(
+            "KMS_AWS_REGION is not set and the init-recorded host CID does not prove this is \
+             QEMU (dev): refusing the plaintext mock-KMS transport (mock-kms exists for QEMU \
+             dev only; on real Nitro this would let the parent substitute its own KMS)"
+                .into(),
+        ),
+    }
+}
+
 /// Select the KMS transport from the environment. `KMS_AWS_REGION` set (and
 /// non-empty) selects real AWS KMS (TLS + SigV4), and then the standard
 /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional
 /// `AWS_SESSION_TOKEN`) credentials are required; otherwise the dev/QEMU
-/// plaintext-to-mock path is used.
+/// plaintext-to-mock path is used (and only there — see
+/// [`select_transport`]).
 fn kms_transport() -> Result<KmsTransport, Box<dyn std::error::Error>> {
-    match std::env::var("KMS_AWS_REGION") {
-        Ok(region) if !region.trim().is_empty() => {
-            let region = region.trim().to_string();
+    match select_transport(
+        std::env::var("KMS_AWS_REGION").ok(),
+        enclavia_vsock::init_recorded_host_cid(),
+    )? {
+        TransportSelection::Aws(region) => {
             let host = format!("kms.{region}.amazonaws.com");
             let creds = sigv4::Credentials {
                 access_key_id: std::env::var("AWS_ACCESS_KEY_ID")
@@ -988,7 +1126,7 @@ fn kms_transport() -> Result<KmsTransport, Box<dyn std::error::Error>> {
             };
             Ok(KmsTransport::Aws { region, host, creds })
         }
-        _ => Ok(KmsTransport::Mock),
+        TransportSelection::Mock => Ok(KmsTransport::Mock),
     }
 }
 
@@ -1166,5 +1304,49 @@ Digests:
         assert_eq!(first_free_from_occupied(&[0, 2]), 1);
         assert_eq!(first_free_from_occupied(&[1, 2]), 0);
         assert_eq!(first_free_from_occupied(&[]), 0);
+    }
+
+    // ---- KMS transport selection (mock requires provable QEMU) --------
+
+    /// Nitro (init file says CID 3) with no region: hard error, never a
+    /// mock fallback. This is the hole that let a host harvest the LUKS
+    /// passphrase by withholding AWS_REGION.
+    #[test]
+    fn nitro_without_region_refuses_mock() {
+        assert!(select_transport(None, Some(3)).is_err());
+        assert!(select_transport(Some("".into()), Some(3)).is_err());
+        assert!(select_transport(Some("   ".into()), Some(3)).is_err());
+    }
+
+    /// No init-recorded answer at all (e.g. a probe that wrongly concluded
+    /// QEMU on a real Nitro host): still a hard error. The mock transport
+    /// is only ever selected on PROVABLE QEMU.
+    #[test]
+    fn unknown_cid_without_region_refuses_mock() {
+        assert!(select_transport(None, None).is_err());
+        assert!(select_transport(Some("".into()), None).is_err());
+    }
+
+    /// Provable QEMU (init file says CID 2) with no region keeps the mock
+    /// transport (dev flow).
+    #[test]
+    fn qemu_without_region_selects_mock() {
+        assert!(matches!(
+            select_transport(None, Some(2)).unwrap(),
+            TransportSelection::Mock
+        ));
+    }
+
+    /// A set region selects AWS regardless of the CID answer, trimmed.
+    #[test]
+    fn region_set_selects_aws() {
+        match select_transport(Some(" eu-central-1 ".into()), Some(3)).unwrap() {
+            TransportSelection::Aws(r) => assert_eq!(r, "eu-central-1"),
+            other => panic!("expected Aws, got {other:?}"),
+        }
+        match select_transport(Some("us-east-1".into()), None).unwrap() {
+            TransportSelection::Aws(r) => assert_eq!(r, "us-east-1"),
+            other => panic!("expected Aws, got {other:?}"),
+        }
     }
 }
