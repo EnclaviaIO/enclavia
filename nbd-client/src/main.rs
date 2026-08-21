@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
@@ -73,6 +74,19 @@ async fn main() {
     }
 }
 
+/// Time allowed for the storage-host vsock connect, the NBD negotiation,
+/// or any single boot-phase read. The runtime pumps are deliberately
+/// untimed (a hung device is a hang either way), but a host that accepts
+/// the connection and then goes silent must not hang BOOT forever: a
+/// wedged boot fail-stops so the supervisor sees a clean error instead of
+/// an unbounded, silent outage.
+const BOOT_IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Overall cap on the anti-rollback boot sequence (synchronizer session
+/// setup + LUKS header check + region read + decision table). Generous
+/// relative to the inner per-RPC timeouts it contains.
+const SYNC_BOOT_TIMEOUT: Duration = Duration::from_secs(90);
+
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Connect to the host storage daemon over vsock. The host CID is
     // resolved at runtime (CID 3 on real Nitro, CID 2 under QEMU) so one EIF
@@ -84,12 +98,18 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         port = config.vsock_port,
         "Connecting to storage host via vsock"
     );
-    let mut stream =
-        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, config.vsock_port))
-            .await?;
+    let mut stream = tokio::time::timeout(
+        BOOT_IO_TIMEOUT,
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, config.vsock_port)),
+    )
+    .await
+    .map_err(|_| format!("storage host connect timed out after {BOOT_IO_TIMEOUT:?}"))??;
 
-    // 2. Perform NBD newstyle negotiation.
-    let export_info = negotiate(&mut stream).await?;
+    // 2. Perform NBD newstyle negotiation (bounded: a silent host must not
+    // hang the boot indefinitely).
+    let export_info = tokio::time::timeout(BOOT_IO_TIMEOUT, negotiate(&mut stream))
+        .await
+        .map_err(|_| format!("NBD negotiation timed out after {BOOT_IO_TIMEOUT:?}"))??;
     info!(
         size = export_info.size,
         flags = export_info.flags,
@@ -98,18 +118,39 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // 2b. Anti-rollback boot verification (#16, opt-in via
     //     SYNCHRONIZER_ENABLED). MUST complete before the kernel gets the
-    //     device: connect + attest to the synchronizer, read the primary
-    //     btrfs superblock region directly off the host stream, and run
-    //     the decision table. Any failure aborts run() and the device is
-    //     never served (fail-stop; see rollback.rs for the policy).
-    let sync_session = if config.synchronizer_enabled {
+    //     device: connect + attest to the synchronizer, cross-check the
+    //     configured LUKS data offset against the device's LUKS2 header,
+    //     read the primary btrfs superblock region directly off the host
+    //     stream, and run the decision table. Any failure aborts run() and
+    //     the device is never served (fail-stop; see rollback.rs for the
+    //     policy). The returned commitment seeds the runtime region watch.
+    let sync_boot = if config.synchronizer_enabled {
         info!("Synchronizer anti-rollback wiring enabled; verifying superblock before serving");
         Some(
-            rollback::boot(&mut stream, config.luks_data_offset)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+            tokio::time::timeout(
+                SYNC_BOOT_TIMEOUT,
+                rollback::boot(&mut stream, config.luks_data_offset),
+            )
+            .await
+            .map_err(|_| {
+                format!("anti-rollback boot verification timed out after {SYNC_BOOT_TIMEOUT:?}")
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?,
         )
     } else {
+        // Loud on purpose (enclavia#99): with the wiring off there is NO
+        // freshness protection for the persistent volume, and an operator
+        // reading the enclave console must be able to tell. On production
+        // images this branch means the MEASURED config chose no rollback
+        // protection (the EIF init exports SYNCHRONIZER_ENABLED=1 only when
+        // `synchronizer.enabled` is stamped true), so the same fact is
+        // visible in the attested PCRs.
+        warn!(
+            "SYNCHRONIZER anti-rollback wiring is DISABLED ({} unset): the persistent volume \
+             has NO freshness protection -- a malicious storage host can serve a rolled-back \
+             copy undetected. Build the image with --synchronizer-enabled to arm it.",
+            rollback::ENV_SYNCHRONIZER_ENABLED
+        );
         None
     };
 
@@ -124,6 +165,26 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     info!(device = %config.device.display(), "Configuring NBD device");
 
+    // Mask the host-advertised transmission flags down to what this proxy
+    // actually supports when the anti-rollback wiring is on: the host is
+    // untrusted, and SEND_TRIM / SEND_WRITE_ZEROES would arm the kernel
+    // with payload-less storage mutations that bypass the superblock pin
+    // gate's write classification. With the wiring off there is no pin
+    // gate to bypass, so the host's flags pass through unchanged (TRIM
+    // keeps working for sparse host-side storage).
+    let kernel_flags = if config.synchronizer_enabled {
+        let masked = export_info.flags & nbd::NBD_FLAGS_PASSTHROUGH;
+        if masked != export_info.flags {
+            warn!(
+                host_flags = export_info.flags,
+                masked, "masking unsupported NBD transmission flags (TRIM/WRITE_ZEROES et al)"
+            );
+        }
+        masked
+    } else {
+        export_info.flags
+    };
+
     unsafe {
         nbd_ioctl(
             nbd_fd,
@@ -131,11 +192,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             config.block_size as libc::c_ulong,
         )?;
         nbd_ioctl(nbd_fd, nbd::NBD_SET_SIZE, export_info.size as libc::c_ulong)?;
-        nbd_ioctl(
-            nbd_fd,
-            nbd::NBD_SET_FLAGS,
-            export_info.flags as libc::c_ulong,
-        )?;
+        nbd_ioctl(nbd_fd, nbd::NBD_SET_FLAGS, kernel_flags as libc::c_ulong)?;
         // Kernel takes a refcount on the file via fget(); our fd can be closed.
         nbd_ioctl(nbd_fd, nbd::NBD_SET_SOCK, kernel_side_fd as libc::c_ulong)?;
         libc::close(kernel_side_fd);
@@ -161,14 +218,19 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // With the synchronizer wiring enabled, the reply path runs the gated
     // pump plus a pin actor; without it, the legacy proxies run untouched.
-    let (sync_hooks, rep_task, pin_task) = match sync_session {
-        Some(session) => {
+    let (sync_hooks, rep_task, pin_task) = match sync_boot {
+        Some((session, boot_commitment)) => {
             let gate = Arc::new(rollback::PinGate::new());
+            // The runtime region watch: the boot-verified commitment seeds
+            // it, and every superblock-covering read reply is checked
+            // against the pinned history from here on (the boot-TOCTOU fix).
+            let watch = Arc::new(rollback::RegionWatch::new(boot_commitment));
             let (pin_tx, pin_rx) = tokio::sync::mpsc::channel::<rollback::PinJob>(64);
             let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel();
             let hooks = rollback::SyncHooks {
                 gate: gate.clone(),
                 pin_tx,
+                watch: watch.clone(),
             };
             let inflight_rep = inflight.clone();
             let rep_task = tokio::spawn(rollback::gated_reply_proxy(
@@ -176,10 +238,17 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 proxy_write,
                 inflight_rep,
                 gate.clone(),
+                watch.clone(),
                 nudge_rx,
             ));
             let pinner = rollback::into_pinner(session);
-            let pin_task = tokio::spawn(rollback::pin_actor(pinner, gate, pin_rx, nudge_tx));
+            let pin_task = tokio::spawn(rollback::pin_actor(
+                pinner,
+                gate,
+                watch,
+                pin_rx,
+                nudge_tx,
+            ));
             (Some(hooks), rep_task, Some(pin_task))
         }
         None => {
@@ -332,11 +401,20 @@ where
 
         // Anti-rollback: classify the write against the primary superblock
         // region and gate its handle BEFORE the request is forwarded, so
-        // the gate entry exists before the host can possibly reply.
+        // the gate entry exists before the host can possibly reply. Reads
+        // that fully cover the region get a watch entry for reply-time
+        // verification (the host cannot tell them from btrfs's own reads).
         let mut sb_capture: Option<usize> = None;
         match cmd_type {
             nbd::NBD_CMD_READ => {
                 inflight.lock().unwrap().insert(handle, length);
+                if let Some(hooks) = &sync_hooks {
+                    if let rollback::SbOverlap::Full { payload_offset } =
+                        rollback::primary_sb_overlap(offset, length, data_offset)
+                    {
+                        hooks.watch.watch_read(handle, payload_offset);
+                    }
+                }
             }
             nbd::NBD_CMD_WRITE => {
                 if let Some(label) = classify_superblock_write(offset, length, data_offset) {
@@ -364,6 +442,23 @@ where
                     }
                 }
             }
+            // Payload-less storage mutations (TRIM, WRITE_ZEROES) bypass the
+            // write-payload hashing entirely. The kernel never issues them
+            // (we mask the capability flags at NBD_SET_FLAGS), but defence
+            // in depth: one that covers the superblock region would erase or
+            // rewrite it without any pin, so it is fail-stop. Others forward
+            // normally.
+            nbd::NBD_CMD_TRIM | nbd::NBD_CMD_WRITE_ZEROES if sync_hooks.is_some() => {
+                if rollback::primary_sb_overlap(offset, length, data_offset)
+                    != rollback::SbOverlap::None
+                {
+                    return Err(format!(
+                        "command {cmd_type} at offset {offset} (len {length}) touches the \
+                         primary btrfs superblock without a payload to pin (fail-stop)"
+                    )
+                    .into());
+                }
+            }
             _ => {}
         }
 
@@ -376,12 +471,20 @@ where
                     // region's new ciphertext, then queue the durable pin.
                     // The NBD reply for `handle` stays parked in the reply
                     // pump until the pin actor reports the cluster's ack.
+                    // The new commitment registers in the region watch the
+                    // moment its last byte is captured — BEFORE those bytes
+                    // reach the host — so a read racing the write can never
+                    // observe the new content before the watch knows it.
+                    let watch = hooks.watch.clone();
                     let region = rollback::forward_bytes_extract(
                         &mut from_kernel,
                         &mut to_host,
                         length as u64,
                         payload_offset,
                         rollback::SB_REGION_LEN,
+                        move |region| {
+                            watch.begin_pending(handle, rollback::commitment_of_region(region));
+                        },
                     )
                     .await?;
                     let commitment = rollback::commitment_of_region(&region);
