@@ -25,11 +25,22 @@
 //! ```
 //!
 //! Failure modes: any error (missing config, bad config, NSM init,
-//! vsock connect, write) is fatal. The host-side `chain-host` daemon is
-//! long-lived (it serves upgrade + revocation links later in the
-//! enclave's life), so a connect refused here means something is
-//! genuinely wrong on the parent and we'd rather fail the boot loudly
-//! than launch the workload without an attested chain entry.
+//! vsock connect, write, ACK read, unexpected ACK byte) is fatal. The
+//! host-side `chain-host` daemon is long-lived (it serves upgrade +
+//! revocation links later in the enclave's life), so a connect refused
+//! here means something is genuinely wrong on the parent and we'd
+//! rather fail the boot loudly than launch the workload without an
+//! attested chain entry.
+//!
+//! The ACK is load-bearing for censorship resistance: only the ACK
+//! tells us chain-host's backend POST succeeded. Treating a missing or
+//! malformed ACK as "probably fine" would let a tampered (or silently
+//! broken) chain-host drop the boot link while the enclave happily
+//! serves clients — the chain would show no genesis and nothing would
+//! notice until an audit. Failing closed instead trades availability
+//! for integrity: a chain-host outage now fails the boot (init's
+//! `set -e` tears the enclave down and the boot is retried), which is
+//! loud and recoverable, instead of silent and unauditable.
 //!
 //! Wire format mirrors what `chain-host` re-encodes for the backend's
 //! `POST /internal/enclaves/{id}/chain-links` JSON endpoint: opaque
@@ -44,7 +55,7 @@ use enclavia_protocol::chain::{BootPayload, ChainLink, ChainLinkKind, PcrsHex};
 use enclavia_protocol::{CHAIN_LINK_ACK, submit_chain_link};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 mod attestation;
 mod config;
@@ -154,9 +165,14 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
 ///
 /// Uses the shared `enclavia_protocol::submit_chain_link` helper so the
 /// wire format is guaranteed to match what `chain-host` (and
-/// `enclavia-server`) expect. Failures here are fatal: a connect refused
-/// means the launcher mis-wired the daemon; a write error means the parent
-/// dropped us mid-stream.
+/// `enclavia-server`) expect. EVERY failure here is fatal: a connect
+/// refused means the launcher mis-wired the daemon; a write error means
+/// the parent dropped us mid-stream; a missing or wrong ACK means the
+/// backend never confirmed the boot link. Continuing past any of those
+/// would let a tampered or broken chain-host silently censor the
+/// genesis link while the enclave serves clients, so we fail closed and
+/// let the boot retry (see the module-level failure-modes note for the
+/// availability trade this makes).
 async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cid = enclavia_vsock::host_cid().await;
     let mut stream = match tokio::time::timeout(
@@ -175,21 +191,31 @@ async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send
         }
     };
 
-    // The shared helper serialises, writes the length-prefix+body in chunks
-    // safe for AF_VSOCK, calls shutdown(WRITE), and reads the ACK byte.
-    match submit_chain_link(&mut stream, link, ACK_TIMEOUT).await {
-        Ok(ack) if ack != CHAIN_LINK_ACK => {
-            warn!(
-                byte = ack,
-                "chain-host sent unexpected ack byte; continuing"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            // ACK errors are warn-not-fail: the link bytes already went out and
-            // an absent ACK doesn't tell us whether the backend accepted them.
-            warn!("chain-host ack failed: {e}; continuing");
-        }
+    submit_over(&mut stream, link, ACK_TIMEOUT).await
+}
+
+/// Write the link to an already-connected stream and enforce the ACK.
+/// Split from [`submit`] so the fail-closed ACK policy is unit-testable
+/// over an in-memory stream (no vsock in tests).
+async fn submit_over<S>(
+    stream: &mut S,
+    link: &ChainLink,
+    ack_timeout: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // The shared helper serialises, writes the length-prefix+body in
+    // chunks safe for AF_VSOCK, calls shutdown(WRITE), and reads the
+    // ACK byte. A write/shutdown/read error or ACK timeout propagates:
+    // without the ACK we cannot tell the backend accepted the link.
+    let ack = submit_chain_link(stream, link, ack_timeout).await?;
+    if ack != CHAIN_LINK_ACK {
+        return Err(format!(
+            "chain-host sent unexpected ack byte {ack:#04x} (expected {CHAIN_LINK_ACK:#04x}); \
+             the boot link is not confirmed recorded"
+        )
+        .into());
     }
     Ok(())
 }
@@ -199,4 +225,120 @@ async fn submit(link: &ChainLink) -> Result<(), Box<dyn std::error::Error + Send
 #[allow(dead_code)]
 pub(crate) fn config_path_default() -> PathBuf {
     PathBuf::from(CONFIG_PATH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Any well-formed link: the transport path doesn't inspect the
+    /// payload, so dummy bytes suffice (no NSM in tests).
+    fn boot_link_fixture() -> ChainLink {
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Boot,
+            payload: b"payload".to_vec(),
+            attestation: b"attestation".to_vec(),
+            signature: None,
+        }
+    }
+
+    /// The fake chain-host half: read the [u32 BE len | body] frame,
+    /// then drain to EOF (the client shutdown(WRITE)s before waiting
+    /// for the ACK). Returns the frame body.
+    async fn host_read_frame<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.unwrap();
+        // After the frame the client half-closes; reads hit EOF.
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "protocol writes exactly one frame");
+        body
+    }
+
+    /// Happy path: a correct ACK byte is accepted.
+    #[tokio::test]
+    async fn submit_over_accepts_correct_ack() {
+        let (mut client, mut host) = tokio::io::duplex(4096);
+        let link = boot_link_fixture();
+        let host_task = tokio::spawn(async move {
+            let body = host_read_frame(&mut host).await;
+            host.write_all(&[CHAIN_LINK_ACK]).await.unwrap();
+            body
+        });
+        submit_over(&mut client, &link, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let body = host_task.await.unwrap();
+        // The frame round-tripped the CBOR-encoded link.
+        let decoded: ChainLink = ciborium::from_reader(body.as_slice()).unwrap();
+        assert_eq!(decoded.payload, link.payload);
+    }
+
+    /// Regression: an unexpected ACK byte used to be a warning and the
+    /// boot continued; it must now be fatal (the backend never
+    /// confirmed the boot link).
+    #[tokio::test]
+    async fn submit_over_rejects_unexpected_ack_byte() {
+        let (mut client, mut host) = tokio::io::duplex(4096);
+        let link = boot_link_fixture();
+        let host_task = tokio::spawn(async move {
+            host_read_frame(&mut host).await;
+            host.write_all(&[0x00]).await.unwrap();
+        });
+        let err = submit_over(&mut client, &link, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected ack byte"),
+            "got: {err}"
+        );
+        host_task.await.unwrap();
+    }
+
+    /// Regression: the host dropping the connection without an ACK used
+    /// to be a warning; it must now be fatal.
+    #[tokio::test]
+    async fn submit_over_rejects_missing_ack() {
+        let (mut client, mut host) = tokio::io::duplex(4096);
+        let link = boot_link_fixture();
+        let host_task = tokio::spawn(async move {
+            host_read_frame(&mut host).await;
+            // Drop without writing: read_exact on the client hits EOF.
+        });
+        let err = submit_over(&mut client, &link, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        host_task.await.unwrap();
+        // EOF surfaces as an io error from the helper; the exact text is
+        // tokio's, so just assert we failed.
+        drop(err);
+    }
+
+    /// Regression: a host that accepts the frame but never ACKs must
+    /// fail via the ACK timeout, not hang or warn-and-continue.
+    #[tokio::test]
+    async fn submit_over_rejects_ack_timeout() {
+        let (mut client, mut host) = tokio::io::duplex(4096);
+        let link = boot_link_fixture();
+        let host_task = tokio::spawn(async move {
+            host_read_frame(&mut host).await;
+            // Hold the socket open without ACKing until the client
+            // gives up (its timeout is far shorter than this sleep).
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let err = submit_over(&mut client, &link, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("elapsed"), "got: {err}");
+        host_task.await.unwrap();
+    }
 }

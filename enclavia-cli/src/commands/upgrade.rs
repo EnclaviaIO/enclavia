@@ -100,8 +100,9 @@ pub struct ChainSummary {
 /// handed to `enclavia_protocol::chain::validate_chain`, which
 /// reconstructs the historical context each link saw at ingest time
 /// (the row state changes across upgrades, so validating history
-/// against today's row would reject perfectly good links) and ties the
-/// walk's final state back to the row (`tip_matches_row`).
+/// against today's row would reject perfectly good links), checks every
+/// payload binds the requested enclave id, and ties the walk's final
+/// state back to the row (`tip_matches_row`).
 ///
 /// Per-link validation failures are recorded on the link and do not
 /// abort the walk — the user wants to see the whole chain even when a
@@ -109,6 +110,21 @@ pub struct ChainSummary {
 pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliError> {
     let enclave = client.get_enclave(id).await?;
     let wire_links = client.get_enclave_chain(id).await?;
+
+    // The expected enclave id for the walk is the (already resolved)
+    // id the user asked about — the same id both GETs above were
+    // addressed to — NOT anything read off the untrusted row, so a
+    // transplanted chain cannot satisfy the validator's enclave_id
+    // binding. `run_upgrade` resolves prefixes to full UUIDs before
+    // calling here; the parse is a hard failure rather than a silent
+    // skip in case a future caller forgets. Note the CLI's transplant
+    // protection is inherently weaker than the SDK's: the resolved id
+    // itself comes from the backend's list endpoint, so a malicious
+    // backend controls both sides of this check. That's fine for an
+    // inspection tool — the load-bearing enclave_id binding is the
+    // SDK's caller-pinned id.
+    let enclave_uuid = Uuid::parse_str(id)
+        .map_err(|e| CliError::Other(format!("enclave id `{id}` is not a UUID: {e}")))?;
 
     // `mode` is CLI-specific (it picks the debug attestation path); the
     // rest of the validator context is the shared, tolerant
@@ -135,6 +151,7 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
     }
     let walk = validate_chain(
         &links,
+        &enclave_uuid,
         &row.pcrs,
         &row.image_digest,
         row.control_public_key.as_deref(),
