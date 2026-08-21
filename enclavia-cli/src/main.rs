@@ -97,8 +97,11 @@ enum Command {
     /// non-zero exit. Reads the image from the local Docker daemon by
     /// default; pass `--pull` for a registry reference, or an explicit
     /// skopeo transport (`docker-archive:img.tar`, `oci:dir`) to build
-    /// without a daemon. Needs `builder` on $PATH (or BUILDER_PATH set)
-    /// plus its tool deps: nix, skopeo, umoci. The image must be
+    /// without a daemon. Needs `nix` and the `builder` binary on $PATH
+    /// (or BUILDER_PATH set) — `nix profile install
+    /// github:EnclaviaIO/builder` is enough; no source checkout is
+    /// needed (the builder's flake source is fetched automatically
+    /// unless BUILDER_FLAKE is already exported). The image must be
     /// linux/amd64. No account or login is required.
     #[command(visible_alias = "ci")]
     Build {
@@ -143,6 +146,12 @@ enum Command {
         /// Mutually exclusive with the other egress flags.
         #[arg(long = "egress-config", value_name = "PATH")]
         egress_config: Option<std::path::PathBuf>,
+        /// Pin the builder flake source to this git rev of
+        /// EnclaviaIO/builder instead of the default branch tip, for a
+        /// CI gate that doesn't move under you. Overrides an exported
+        /// BUILDER_FLAKE.
+        #[arg(long, value_name = "GIT_REV")]
+        builder_rev: Option<String>,
     },
     /// Rebuild an enclave's EIF locally and verify the resulting PCRs
     /// match the ones the backend recorded. Pulls the image by its
@@ -581,6 +590,7 @@ async fn main() {
             egress_resolver,
             egress_dns,
             egress_config,
+            builder_rev,
         } => {
             let egress = enclave_cmds::EgressInputs {
                 allows: egress_allow,
@@ -596,6 +606,7 @@ async fn main() {
                 debug,
                 storage,
                 egress,
+                builder_rev,
                 json,
             )
             .await
@@ -1152,6 +1163,7 @@ async fn run_build(
     debug: bool,
     storage: bool,
     egress: enclave_cmds::EgressInputs,
+    builder_rev: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
     let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress)?;
@@ -1163,6 +1175,7 @@ async fn run_build(
         debug,
         storage,
         egress_allowlist,
+        builder_rev,
     })
     .await?;
 

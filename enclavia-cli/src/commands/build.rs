@@ -24,7 +24,7 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::commands::reproduce::PcrTriple;
+use crate::commands::reproduce::{fetch_flake_source, PcrTriple, BUILDER_FLAKE_URL};
 use crate::error::CliError;
 
 /// Skopeo transports we forward verbatim when the user names one
@@ -60,6 +60,10 @@ pub struct BuildArgs {
     /// mirrors the backend's default: the empty deny-all document is
     /// baked in, exactly as a create with no egress flags would.
     pub egress_allowlist: Option<serde_json::Value>,
+    /// Pin the builder flake source to this git rev instead of the
+    /// public repo's default branch tip. Ignored when the caller has
+    /// already exported BUILDER_FLAKE and passed no rev.
+    pub builder_rev: Option<String>,
 }
 
 /// Result of `enclavia build`. The binary prints it; MCP or other lib
@@ -138,6 +142,21 @@ pub async fn build(args: BuildArgs) -> Result<BuildOutput, CliError> {
     }
     if args.storage {
         cmd.arg("--storage");
+    }
+
+    // An installed builder binary carries no flake.nix (and deliberately
+    // bakes no default BUILDER_FLAKE), so without help it can only build
+    // from a source checkout. Fetch the public builder flake and hand it
+    // over, so `enclavia build` works with just nix + an installed
+    // builder — no checkout needed. A caller-exported BUILDER_FLAKE wins
+    // (that's the local-development override), unless an explicit
+    // `--builder-rev` asks to pin the fetch.
+    if let Some(rev) = args.builder_rev.as_deref() {
+        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, Some(rev)).await?;
+        cmd.env("BUILDER_FLAKE", path);
+    } else if std::env::var_os("BUILDER_FLAKE").is_none() {
+        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, None).await?;
+        cmd.env("BUILDER_FLAKE", path);
     }
 
     eprintln!("Building {source} into an EIF …");

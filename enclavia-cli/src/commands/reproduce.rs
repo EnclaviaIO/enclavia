@@ -328,7 +328,7 @@ fn expected_pcrs(enclave: &serde_json::Value) -> Result<PcrTriple, CliError> {
 /// HTTPS now that both repos are public — anyone running
 /// `enclavia reproduce` can fetch the recorded sources without an
 /// SSH key on file with GitHub.
-const BUILDER_FLAKE_URL: &str = "github:EnclaviaIO/builder";
+pub(crate) const BUILDER_FLAKE_URL: &str = "github:EnclaviaIO/builder";
 const ENCLAVIA_FLAKE_URL: &str = "github:EnclaviaIO/enclavia";
 
 /// Spawn the local builder with flags that mirror the backend's invocation
@@ -469,13 +469,13 @@ async fn run_builder(
     // /nix/store paths and hand them to the builder via the env vars
     // its `nix build` invocation honours as `--override-input`.
     if let Some(rev) = recorded_builder_rev {
-        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, rev).await?;
+        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, Some(rev)).await?;
         cmd.env("BUILDER_FLAKE", path);
     } else {
         eprintln!("No recorded builder_rev on this enclave; reproduce will use the BUILDER_FLAKE in your environment (or the builder's own default), which may differ from what the backend used and produce diverging PCRs.");
     }
     if let Some(rev) = recorded_crates_rev {
-        let path = fetch_flake_source("enclavia", ENCLAVIA_FLAKE_URL, rev).await?;
+        let path = fetch_flake_source("enclavia", ENCLAVIA_FLAKE_URL, Some(rev)).await?;
         cmd.env("ENCLAVIA_FLAKE", path);
     } else {
         eprintln!("No recorded crates_rev on this enclave; reproduce will use the ENCLAVIA_FLAKE in your environment (or the builder's flake.lock pin), which may differ from what the backend used and produce diverging PCRs.");
@@ -543,18 +543,31 @@ fn parse_builder_output(stdout: &str) -> Result<PcrTriple, String> {
     })
 }
 
-/// Fetch a flake source at a given git rev and return its /nix/store path.
-/// Used to pin the builder + enclavia sources to whatever the backend
-/// recorded for an enclave at build time. Shells out to `nix flake
-/// metadata --json <url>?rev=<rev>` and parses the `path` field.
+/// Fetch a flake source and return its /nix/store path. With a rev,
+/// pins the fetch to that exact commit — reproduce uses this to replay
+/// whatever the backend recorded for an enclave at build time. Without
+/// one, fetches the default branch tip — `enclavia build` uses this to
+/// give an installed (checkout-less) builder binary a flake source via
+/// BUILDER_FLAKE. Shells out to `nix flake metadata --json` and parses
+/// the `path` field.
 ///
 /// The user must have `nix` on PATH (a CLI prerequisite). Fetching uses
 /// whatever auth `nix` is configured with — for `git+ssh://` URLs that
 /// means the user's GitHub SSH key; for `github:` URLs (post public
 /// flip) it's unauthenticated HTTPS.
-async fn fetch_flake_source(label: &str, url: &str, rev: &str) -> Result<PathBuf, CliError> {
-    let flake_ref = format!("{url}?rev={rev}");
-    eprintln!("Fetching {label} source at {rev} from {url} …");
+pub(crate) async fn fetch_flake_source(
+    label: &str,
+    url: &str,
+    rev: Option<&str>,
+) -> Result<PathBuf, CliError> {
+    let flake_ref = match rev {
+        Some(rev) => format!("{url}?rev={rev}"),
+        None => url.to_string(),
+    };
+    match rev {
+        Some(rev) => eprintln!("Fetching {label} source at {rev} from {url} …"),
+        None => eprintln!("Fetching {label} source from {url} …"),
+    }
 
     // --no-write-lock-file: the remote URL is read-only, so don't let
     // nix try to rewrite the fetched flake's lock when it spots stale
@@ -581,8 +594,12 @@ async fn fetch_flake_source(label: &str, url: &str, rev: &str) -> Result<PathBuf
         .map_err(|e| CliError::Other(format!("`nix flake metadata` I/O error: {e}")))?;
 
     if !output.status.success() {
+        let rev_hint = match rev {
+            Some(rev) => format!(" The recorded {label} rev is {rev}; older enclaves may pin revisions that predate the repositories becoming public, which need SSH access."),
+            None => String::new(),
+        };
         return Err(CliError::Other(format!(
-            "`nix flake metadata {flake_ref}` failed ({}). The recorded {label} rev is {rev}; verify your nix has access to the source URL (older enclaves may pin revisions that predate the repositories becoming public, which need SSH access).",
+            "`nix flake metadata {flake_ref}` failed ({}). Verify your nix has access to the source URL.{rev_hint}",
             output.status,
         )));
     }
