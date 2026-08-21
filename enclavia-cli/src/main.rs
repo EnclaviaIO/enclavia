@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use enclavia_cli::api::{ApiClient, EnclaveSummary};
 use enclavia_cli::commands::{
-    auth, deploy, enclave as enclave_cmds, key as key_cmds, push, reproduce, secrets, upgrade,
+    auth, build as build_cmd, deploy, enclave as enclave_cmds, key as key_cmds, push, reproduce,
+    secrets, upgrade,
 };
 use enclavia_cli::commands::resolve::resolve_enclave_id;
 use enclavia_cli::error::CliError;
@@ -87,6 +88,61 @@ enum Command {
         /// Target enclave id. Accepts a unique prefix as long as it
         /// resolves to exactly one of your enclaves.
         enclave_id: String,
+    },
+    /// Build a Docker image into an enclave EIF locally, without
+    /// deploying anything (alias: `ci`). Runs the same `builder` binary
+    /// the backend uses, so a green exit means the image will build when
+    /// pushed for real. Meant as a CI gate: after `docker build`, run
+    /// `enclavia build myapp:candidate` and fail the pipeline on a
+    /// non-zero exit. Reads the image from the local Docker daemon by
+    /// default; pass `--pull` for a registry reference, or an explicit
+    /// skopeo transport (`docker-archive:img.tar`, `oci:dir`) to build
+    /// without a daemon. Needs `builder` on $PATH (or BUILDER_PATH set)
+    /// plus its tool deps: nix, skopeo, umoci. The image must be
+    /// linux/amd64. No account or login is required.
+    #[command(visible_alias = "ci")]
+    Build {
+        /// Image to build, e.g. `myapp:dev`. Plain references are read
+        /// from the local Docker daemon (`:latest` assumed when the tag
+        /// is omitted); explicit skopeo transports pass through as-is.
+        local_image: String,
+        /// Pull `local_image` from its registry instead of reading it
+        /// from the local Docker daemon.
+        #[arg(long)]
+        pull: bool,
+        /// Directory to write `image.eif` and `pcr.json` into.
+        #[arg(long, default_value = "./enclavia-out")]
+        output_dir: std::path::PathBuf,
+        /// Port the container listens on inside the enclave. Match the
+        /// `--container-port` you (will) use at create/deploy time.
+        #[arg(long, default_value_t = 8080)]
+        container_port: u16,
+        /// Build the debug-mode EIF (what a non-`--production` enclave
+        /// runs). Debug and production EIFs differ in PCRs, but an image
+        /// that builds as one builds as the other, so for a pass/fail CI
+        /// gate the default (production-shaped) build is fine.
+        #[arg(long)]
+        debug: bool,
+        /// Build the storage-capable variant (LUKS+btrfs over NBD), as
+        /// used by enclaves created with `--storage-size-bytes`.
+        #[arg(long)]
+        storage: bool,
+        /// Allow outbound traffic to `HOST:PORT[/PROTO]`, baked into the
+        /// EIF's egress policy. Repeatable. Same syntax as
+        /// `enclave create --egress-allow`. Without any egress flags the
+        /// deny-all policy is baked in, matching a create with none.
+        #[arg(long = "egress-allow", value_name = "HOST:PORT[/PROTO]")]
+        egress_allow: Vec<String>,
+        /// DNS resolver IPv4 for hostname allowlist entries. Repeatable.
+        #[arg(long = "egress-resolver", value_name = "IPV4")]
+        egress_resolver: Vec<String>,
+        /// DNS resolution mode: `allowlist` (default) or `open`.
+        #[arg(long = "egress-dns", value_name = "allowlist|open")]
+        egress_dns: Option<String>,
+        /// Path to a pre-written egress allowlist JSON document.
+        /// Mutually exclusive with the other egress flags.
+        #[arg(long = "egress-config", value_name = "PATH")]
+        egress_config: Option<std::path::PathBuf>,
     },
     /// Rebuild an enclave's EIF locally and verify the resulting PCRs
     /// match the ones the backend recorded. Pulls the image by its
@@ -513,6 +569,36 @@ async fn main() {
         Command::Deploy { local_image, create } => run_deploy(&local_image, *create, json).await,
         Command::Push { local_image, enclave_id } => {
             push::push(&local_image, &enclave_id, json).await
+        }
+        Command::Build {
+            local_image,
+            pull,
+            output_dir,
+            container_port,
+            debug,
+            storage,
+            egress_allow,
+            egress_resolver,
+            egress_dns,
+            egress_config,
+        } => {
+            let egress = enclave_cmds::EgressInputs {
+                allows: egress_allow,
+                resolvers: egress_resolver,
+                dns: egress_dns,
+                config_path: egress_config,
+            };
+            run_build(
+                &local_image,
+                pull,
+                output_dir,
+                container_port,
+                debug,
+                storage,
+                egress,
+                json,
+            )
+            .await
         }
         Command::Reproduce { enclave_id, upgrade } => {
             run_reproduce(&enclave_id, upgrade.as_deref(), json).await
@@ -1050,6 +1136,48 @@ fn print_secret_list(rows: &[secrets::SecretSummary]) {
         let pending = if r.pending { "yes" } else { "no" };
         println!("{:<32} {:<32} {}", r.name, r.updated_at, pending);
     }
+}
+
+/// `enclavia build` / `enclavia ci`: local EIF build as a pass/fail
+/// gate. Purely local — no ApiClient, no login. Success prints the EIF
+/// path + PCRs and exits 0; any failure (missing builder, image not
+/// found, build error) surfaces as the standard exit-1 error path, which
+/// is exactly what a CI step wants to branch on.
+#[allow(clippy::too_many_arguments)]
+async fn run_build(
+    local_image: &str,
+    pull: bool,
+    output_dir: std::path::PathBuf,
+    container_port: u16,
+    debug: bool,
+    storage: bool,
+    egress: enclave_cmds::EgressInputs,
+    json: bool,
+) -> Result<(), CliError> {
+    let egress_allowlist = enclave_cmds::build_egress_allowlist(&egress)?;
+    let result = build_cmd::build(build_cmd::BuildArgs {
+        image: local_image.to_string(),
+        pull,
+        output_dir,
+        container_port,
+        debug,
+        storage,
+        egress_allowlist,
+    })
+    .await?;
+
+    if json {
+        print_json(&result);
+        return Ok(());
+    }
+
+    println!("Build succeeded.");
+    println!("Source:  {}", result.source);
+    println!("EIF:     {}", result.eif_path.display());
+    println!("PCR0:    {}", result.pcrs.pcr0);
+    println!("PCR1:    {}", result.pcrs.pcr1);
+    println!("PCR2:    {}", result.pcrs.pcr2);
+    Ok(())
 }
 
 async fn run_reproduce(
