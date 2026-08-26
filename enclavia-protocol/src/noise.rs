@@ -78,6 +78,77 @@ impl NoiseTransport {
 
 // --- Async transport layer (requires tokio) ---
 
+/// Exact wire size of the first Noise handshake message ([`NOISE_PATTERN`]
+/// with an empty handshake payload): the initiator's 32-byte X25519
+/// ephemeral public key.
+///
+/// `Noise_NN` with empty payloads is fixed-size in both directions, which
+/// is what lets the handshake reader use `read_exact` instead of trusting
+/// a single `read()` to deliver exactly one whole message: a transport
+/// that fragments (a short read hands `read_message` a truncated buffer)
+/// or coalesces (a peer's pipelined first encrypted frame lands in the
+/// same buffer as the handshake message) no longer corrupts the
+/// handshake. The bytes on the wire are unchanged — this is purely a
+/// reader-side robustness guarantee.
+pub const NOISE_NN_MSG1_LEN: usize = 32;
+
+/// Exact wire size of the second Noise handshake message: the responder's
+/// 32-byte X25519 ephemeral plus the 16-byte ChaCha20-Poly1305 tag over
+/// the empty payload. See [`NOISE_NN_MSG1_LEN`].
+pub const NOISE_NN_MSG2_LEN: usize = 32 + 16;
+
+/// Upper bound on waiting for the peer's handshake message. With
+/// `read_exact` framing, a peer that opens a connection and then sends
+/// fewer than the fixed message size (or nothing at all — which also
+/// hung the previous single-`read()` reader) would otherwise park the
+/// handshake task forever while holding the connection open. Generous
+/// for any real link (the messages are 32/48 bytes); expiry means the
+/// peer is not speaking the protocol, and the handshake fails.
+pub const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `read_exact` bounded by [`NOISE_HANDSHAKE_TIMEOUT`]: the handshake
+/// must never wait indefinitely on a peer that sends too few bytes.
+#[cfg(feature = "async-transport")]
+async fn read_handshake_message(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    message: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match tokio::time::timeout(
+        NOISE_HANDSHAKE_TIMEOUT,
+        tokio::io::AsyncReadExt::read_exact(stream, message),
+    )
+    .await
+    {
+        Ok(res) => {
+            res?;
+            Ok(())
+        }
+        Err(_) => Err(format!(
+            "Noise handshake timed out after {NOISE_HANDSHAKE_TIMEOUT:?} waiting for the peer's \
+             {}-byte handshake message",
+            message.len()
+        )
+        .into()),
+    }
+}
+
+/// Guard that a written handshake message has the exact size the reader
+/// on the other side will `read_exact`. Cannot fail for [`NOISE_PATTERN`]
+/// with empty payloads; a mismatch means the pattern or payload changed
+/// without the framing constants being updated, and MUST fail loudly here
+/// rather than desync the peer's reader.
+#[cfg(feature = "async-transport")]
+fn check_handshake_len(written: usize, expected: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if written != expected {
+        return Err(format!(
+            "Noise handshake message is {written} bytes, expected {expected}: \
+             NOISE_PATTERN/payload changed without updating the fixed framing constants"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "async-transport")]
 #[instrument(skip(stream))]
 pub async fn perform_handshake_as_initiator(
@@ -89,12 +160,14 @@ pub async fn perform_handshake_as_initiator(
 
     debug!("Sending first handshake message");
     let len = handshake.write_message(&[], &mut buffer)?;
+    check_handshake_len(len, NOISE_NN_MSG1_LEN)?;
     tokio::io::AsyncWriteExt::write_all(stream, &buffer[..len]).await?;
 
     debug!("Waiting for handshake response");
-    let len = tokio::io::AsyncReadExt::read(stream, &mut buffer).await?;
+    let mut message = [0u8; NOISE_NN_MSG2_LEN];
+    read_handshake_message(stream, &mut message).await?;
     let mut payload = vec![0u8; 65535];
-    handshake.read_message(&buffer[..len], &mut payload)?;
+    handshake.read_message(&message, &mut payload)?;
 
     let handshake_hash = handshake.get_handshake_hash().to_vec();
 
@@ -112,12 +185,14 @@ pub async fn perform_handshake_as_responder(
     let mut buffer = vec![0u8; 65535];
 
     debug!("Waiting for first handshake message");
-    let len = tokio::io::AsyncReadExt::read(stream, &mut buffer).await?;
+    let mut message = [0u8; NOISE_NN_MSG1_LEN];
+    read_handshake_message(stream, &mut message).await?;
     let mut payload = vec![0u8; 65535];
-    handshake.read_message(&buffer[..len], &mut payload)?;
+    handshake.read_message(&message, &mut payload)?;
 
     debug!("Sending handshake response");
     let len = handshake.write_message(&[], &mut buffer)?;
+    check_handshake_len(len, NOISE_NN_MSG2_LEN)?;
     tokio::io::AsyncWriteExt::write_all(stream, &buffer[..len]).await?;
 
     let handshake_hash = handshake.get_handshake_hash().to_vec();
@@ -337,7 +412,10 @@ mod write_chunk_tests {
         hs_i.read_message(&buf_a[..len], &mut buf_b).unwrap();
         let transport = hs_i.into_transport_mode().unwrap();
 
-        let sink = RecordingSink { writes: Vec::new(), data: Vec::new() };
+        let sink = RecordingSink {
+            writes: Vec::new(),
+            data: Vec::new(),
+        };
         let mut cbor = CborTransport::new(transport, sink);
 
         // A 30 KiB Vec<u8> payload CBOR-encodes to roughly double its size
@@ -347,16 +425,182 @@ mod write_chunk_tests {
         struct Big {
             payload: Vec<u8>,
         }
-        let msg = Big { payload: vec![0xABu8; 30 * 1024] };
+        let msg = Big {
+            payload: vec![0xABu8; 30 * 1024],
+        };
         cbor.send(&msg).await.unwrap();
 
         let sink = &cbor.stream;
         let total: usize = sink.writes.iter().sum();
-        assert!(total > VSOCK_WRITE_CHUNK + 4, "frame should exceed one chunk");
+        assert!(
+            total > VSOCK_WRITE_CHUNK + 4,
+            "frame should exceed one chunk"
+        );
         assert!(
             sink.writes.iter().all(|w| *w <= VSOCK_WRITE_CHUNK),
             "single write exceeded the vsock limit: {:?}",
             sink.writes
         );
+    }
+}
+
+#[cfg(all(test, feature = "async-transport"))]
+mod handshake_framing_tests {
+    use super::*;
+
+    /// The framing constants ARE the wire format: `Noise_NN` with empty
+    /// payloads produces exactly these message sizes. If this test fails,
+    /// the pattern or handshake payload changed and every `read_exact` in
+    /// `perform_handshake_as_*` would desync.
+    #[test]
+    fn nn_handshake_messages_have_the_pinned_sizes() {
+        let mut hs_i = NoiseHandshake::initiator().unwrap();
+        let mut hs_r = NoiseHandshake::responder().unwrap();
+        let mut buf_a = vec![0u8; 65535];
+        let mut buf_b = vec![0u8; 65535];
+        let len1 = hs_i.write_message(&[], &mut buf_a).unwrap();
+        assert_eq!(len1, NOISE_NN_MSG1_LEN, "message 1 size");
+        hs_r.read_message(&buf_a[..len1], &mut buf_b).unwrap();
+        let len2 = hs_r.write_message(&[], &mut buf_a).unwrap();
+        assert_eq!(len2, NOISE_NN_MSG2_LEN, "message 2 size");
+        hs_i.read_message(&buf_a[..len2], &mut buf_b).unwrap();
+    }
+
+    /// AsyncRead adapter that delivers at most one byte per poll_read:
+    /// the worst-case fragmenting transport. The old single-`read()`
+    /// handshake handed the first byte alone to `read_message` and failed;
+    /// `read_exact` framing must complete the handshake regardless of how
+    /// the stream fragments.
+    struct OneBytePerRead<S>(S);
+
+    impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for OneBytePerRead<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut one = [0u8; 1];
+            let mut one_buf = tokio::io::ReadBuf::new(&mut one);
+            match std::pin::Pin::new(&mut self.0).poll_read(cx, &mut one_buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    buf.put_slice(one_buf.filled());
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for OneBytePerRead<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// Regression for the boundary in enclavia#102: a byte-stream
+    /// transport that fragments the handshake messages (here: one byte
+    /// per read on BOTH sides) must still complete the handshake and
+    /// agree on the handshake hash.
+    #[tokio::test]
+    async fn handshake_survives_maximally_fragmented_stream() {
+        let (a, b) = tokio::io::duplex(1024);
+        let mut a = OneBytePerRead(a);
+        let mut b = OneBytePerRead(b);
+        let initiator = tokio::spawn(async move {
+            let (_, hash) = perform_handshake_as_initiator(&mut a).await.unwrap();
+            hash
+        });
+        let responder = tokio::spawn(async move {
+            let (_, hash) = perform_handshake_as_responder(&mut b).await.unwrap();
+            hash
+        });
+        let (hi, hr) = (initiator.await.unwrap(), responder.await.unwrap());
+        assert_eq!(hi, hr, "both sides must derive the same handshake hash");
+        assert!(!hi.is_empty());
+    }
+
+    /// A peer that opens a connection, sends fewer bytes than one
+    /// handshake message, and then parks (the mesh `GarbageDialer`
+    /// shape, and any slow-loris peer) must fail the handshake at
+    /// [`NOISE_HANDSHAKE_TIMEOUT`] instead of holding the responder
+    /// task forever. Paused tokio time makes the timeout fire
+    /// immediately once both tasks are idle.
+    #[tokio::test(start_paused = true)]
+    async fn responder_times_out_on_a_peer_that_sends_too_few_bytes() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut a, &[0xde, 0xad, 0xbe, 0xef])
+            .await
+            .unwrap();
+        let err = perform_handshake_as_responder(&mut b)
+            .await
+            .err()
+            .expect("a short handshake write must not hang");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        drop(a);
+    }
+
+    /// A peer that pipelines its first length-prefixed encrypted frame in
+    /// the same flush as its final handshake message must not corrupt the
+    /// handshake: `read_exact` consumes exactly the handshake bytes and
+    /// leaves the frame in the stream for the transport layer.
+    #[tokio::test]
+    async fn coalesced_post_handshake_frame_is_left_in_the_stream() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+
+        let responder = tokio::spawn(async move {
+            // Hand-rolled responder that writes handshake message 2 and an
+            // encrypted frame in ONE write (worst-case coalescing).
+            let mut hs = NoiseHandshake::responder().unwrap();
+            let mut msg1 = [0u8; NOISE_NN_MSG1_LEN];
+            tokio::io::AsyncReadExt::read_exact(&mut b, &mut msg1)
+                .await
+                .unwrap();
+            let mut payload = vec![0u8; 1024];
+            hs.read_message(&msg1, &mut payload).unwrap();
+            let mut msg2 = vec![0u8; 65535];
+            let len2 = hs.write_message(&[], &mut msg2).unwrap();
+            let mut transport = hs.into_transport_mode().unwrap();
+            let mut frame = vec![0u8; 65535];
+            let flen = transport.write_message(b"pipelined", &mut frame).unwrap();
+            let mut combined = msg2[..len2].to_vec();
+            combined.extend_from_slice(&(flen as u32).to_be_bytes());
+            combined.extend_from_slice(&frame[..flen]);
+            tokio::io::AsyncWriteExt::write_all(&mut b, &combined)
+                .await
+                .unwrap();
+        });
+
+        let (mut transport, _) = perform_handshake_as_initiator(&mut a).await.unwrap();
+        responder.await.unwrap();
+
+        // The pipelined frame must still be intact in the stream.
+        let mut len_bytes = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut a, &mut len_bytes)
+            .await
+            .unwrap();
+        let flen = u32::from_be_bytes(len_bytes) as usize;
+        let mut ciphertext = vec![0u8; flen];
+        tokio::io::AsyncReadExt::read_exact(&mut a, &mut ciphertext)
+            .await
+            .unwrap();
+        let mut plaintext = vec![0u8; 1024];
+        let plen = transport.read_message(&ciphertext, &mut plaintext).unwrap();
+        assert_eq!(&plaintext[..plen], b"pipelined");
     }
 }

@@ -425,7 +425,7 @@ pub fn verify_server_attestation(
         nsm_doc,
         handshake_hash,
         expected,
-        debug_mode,
+        enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
     ) {
         Ok(pcrs) => Ok(pcrs),
         Err(AttestationError::PcrsNotExpected) => Err(ServerAuthError::PcrRejected),
@@ -654,7 +654,7 @@ pub fn verify_transition_link(
         &link.attestation,
         &link.payload,
         &expected_pcrs,
-        debug_mode,
+        enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
     )
     .map_err(|e| TransitionLinkError::Attestation(e.to_string()))?;
 

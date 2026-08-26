@@ -207,7 +207,7 @@ impl AttestationProvider for FakeAttestor {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use enclavia_protocol::attestation::verify_and_extract;
+    use enclavia_protocol::attestation::{VerificationMode, verify_and_extract};
 
     #[tokio::test]
     async fn fake_attestor_doc_verifies_and_yields_seed_digest() {
@@ -216,7 +216,7 @@ mod tests {
         let hh = vec![0xabu8; 32];
         let doc = attestor.attest(&hh).await.unwrap();
         // The peer side: verify with the same handshake hash, in debug mode.
-        let extracted = verify_and_extract(&doc, &hh, true).expect("verify");
+        let extracted = verify_and_extract(&doc, &hh, VerificationMode::DangerousSkipChain).expect("verify");
         let digest = crate::PcrKey(extracted.pcrs.digest());
         assert_eq!(digest, FakeAttestor::pcr_digest(0x42));
         assert_eq!(extracted.control_pubkey, identity.pubkey());
@@ -227,7 +227,8 @@ mod tests {
         let identity = MeshIdentity::generate();
         let attestor = FakeAttestor::new(0x10, &identity);
         let doc = attestor.attest(&[0x01u8; 32]).await.unwrap();
-        let err = verify_and_extract(&doc, &[0x02u8; 32], true).unwrap_err();
+        let err = 
+            verify_and_extract(&doc, &[0x02u8; 32], VerificationMode::DangerousSkipChain).unwrap_err();
         assert!(format!("{err:?}").contains("Validation"));
     }
 }

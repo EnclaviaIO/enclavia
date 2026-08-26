@@ -618,7 +618,7 @@ impl ConnectConfig {
             &attestation_data,
             &handshake_hash,
             &self.pcrs,
-            self.debug_mode,
+            attestation::VerificationMode::from_debug_flag(self.debug_mode),
         ) {
             Ok(()) => info!("Attestation verified (pinned PCRs match)"),
             Err(pinned_err) => match &self.trust_upgrades {
@@ -747,7 +747,13 @@ async fn verify_via_upgrade_chain(
     .map_err(|e| Error::TrustUpgrades(e.to_string()))?;
 
     // Bind the verified descendant version to this live session.
-    attestation::verify_against(attestation_data, handshake_hash, &tip, debug_mode).map_err(|e| {
+    attestation::verify_against(
+        attestation_data,
+        handshake_hash,
+        &tip,
+        attestation::VerificationMode::from_debug_flag(debug_mode),
+    )
+    .map_err(|e| {
         Error::TrustUpgrades(format!(
             "running enclave does not match the verified chain tip: {e}"
         ))

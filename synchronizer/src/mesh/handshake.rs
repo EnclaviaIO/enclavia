@@ -263,7 +263,11 @@ where
 
     // 3. Verify the peer's attestation document (nonce binds it to this
     //    session, yields PCRs + mesh pubkey).
-    let extracted = attestation::verify_and_extract(&peer_doc, &handshake_hash, debug_mode)
+    let extracted = attestation::verify_and_extract(
+        &peer_doc,
+        &handshake_hash,
+        attestation::VerificationMode::from_debug_flag(debug_mode),
+    )
         .map_err(|e| HandshakeError::PeerAttestation(e.to_string()))?;
     let pcr_digest = PcrKey(extracted.pcrs.digest());
 
