@@ -303,8 +303,16 @@ async fn main() {
     .await;
 
     let request = match args.cmd.as_str() {
+        // NOTE: with the compare-and-swap pin protocol this debug tool
+        // names Version(0), so it can only register a fresh key or re-pin
+        // a key still at version 0; pinning a live key further gets
+        // VersionConflict. Fine for a smoke tool (fresh enclave per run);
+        // if you ever need it against a long-lived key, thread an
+        // --expected-version flag through and mirror the nbd-client's
+        // Get-disambiguation on conflicts.
         "pin" => Request::Pin {
             key: session_key,
+            expected_version: synchronizer::Version(0),
             commitment: Commitment([args.commitment_byte; 32]),
         },
         "get" => Request::Get { key: session_key },

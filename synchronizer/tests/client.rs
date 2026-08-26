@@ -145,10 +145,16 @@ async fn pin_register_then_bump_then_get() {
     let node = Arc::new(Node::with_debug_mode(true));
     let (mut client, key, task) = connect_as(node, 0x42).await;
 
-    let v0 = client.pin(key, c(0xaa)).await.expect("first pin");
+    let v0 = client
+        .pin(key, Version(0), c(0xaa))
+        .await
+        .expect("first pin");
     assert_eq!(v0, Version(0), "first pin must be the registration");
 
-    let v1 = client.pin(key, c(0xbb)).await.expect("second pin");
+    let v1 = client
+        .pin(key, Version(0), c(0xbb))
+        .await
+        .expect("second pin");
     assert_eq!(v1, Version(1));
 
     let (commitment, version) = client.get(key).await.expect("get");
@@ -182,7 +188,7 @@ async fn cross_key_pin_is_unauthorized() {
     let (mut client, _key, _task) = connect_as(node, 0x44).await;
 
     let other = PcrKey([0u8; 32]);
-    let err = client.pin(other, c(0x01)).await.unwrap_err();
+    let err = client.pin(other, Version(0), c(0x01)).await.unwrap_err();
     assert!(
         matches!(err, ClientError::Rpc(RpcError::Unauthorized)),
         "{err:?}"
@@ -196,7 +202,7 @@ async fn second_session_reads_first_sessions_pin() {
     let node = Arc::new(Node::with_debug_mode(true));
 
     let (mut client, key, _task) = connect_as(Arc::clone(&node), 0x45).await;
-    client.pin(key, c(0xcd)).await.expect("pin");
+    client.pin(key, Version(0), c(0xcd)).await.expect("pin");
     drop(client);
 
     let (mut client2, key2, _task2) = connect_as(node, 0x45).await;
@@ -252,6 +258,7 @@ async fn register_old(node: &Node, seed: u8, control_pubkey: [u8; CONTROL_PUBKEY
         key_old,
         Request::Pin {
             key: key_old,
+            expected_version: Version(0),
             commitment: c(0xee),
         },
     )

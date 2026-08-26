@@ -45,7 +45,7 @@ use synchronizer::mesh::config::MeshConfig;
 use synchronizer::mesh::identity::MeshIdentity;
 use synchronizer::mesh::transport::{MeshHostStub, UdsMeshAcceptor};
 use synchronizer::raft::{RaftHandle, RaftHandleError, RaftRequestHandler, ReplicatedOp};
-use synchronizer::{Commitment, PcrKey, Version};
+use synchronizer::{Commitment, PcrKey, ValidationError, Version};
 
 /// All three nodes run the same EIF, so they share a PCR seed: the self-PCR
 /// allowlist admits a peer only when its digest equals the node's own.
@@ -197,12 +197,20 @@ async fn await_leader(nodes: &[Node], timeout: Duration) -> bool {
     }
 }
 
+/// The outcome of one [`submit`]: either the op applied (carries the
+/// resulting version, for the monotonicity oracle) or the state machine
+/// deterministically rejected it (a legitimate outcome — e.g. a racing
+/// duplicate Register or a stale CAS pin — not a consistency violation).
+enum SubmitOutcome {
+    Applied(Version),
+    Rejected(ValidationError),
+}
+
 /// Submit `op` to whichever node is the leader, retrying across a window so a
-/// just-changed leader or a transient ForwardToLeader does not flake. Returns
-/// the resulting [`Version`] on success (for the monotonicity oracle), `None`
-/// if the op was deterministically rejected by the state machine, or panics if
-/// the cluster never accepted/rejected it within the window (a liveness bug).
-async fn submit(nodes: &[Node], op: ReplicatedOp) -> Option<Version> {
+/// just-changed leader or a transient ForwardToLeader does not flake. Panics
+/// if the cluster never accepted/rejected it within the window (a liveness
+/// bug).
+async fn submit(nodes: &[Node], op: ReplicatedOp) -> SubmitOutcome {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let leader = match current_leader(nodes).await {
@@ -216,10 +224,10 @@ async fn submit(nodes: &[Node], op: ReplicatedOp) -> Option<Version> {
             }
         };
         match leader.raft.client_write(op.clone()).await {
-            Ok(state) => return Some(state.version),
+            Ok(state) => return SubmitOutcome::Applied(state.version),
             // Deterministic state-machine rejection: a legitimate outcome
             // (e.g. racing duplicate Register). Not a consistency violation.
-            Err(RaftHandleError::Rejected(_)) => return None,
+            Err(RaftHandleError::Rejected(e)) => return SubmitOutcome::Rejected(e),
             // Not the leader / quorum lost / transient: retry on the (possibly
             // new) leader.
             Err(_) if std::time::Instant::now() < deadline => {
@@ -334,11 +342,16 @@ async fn run_scenario(seed: u64) {
                 commitment: commitment(commit_counter),
                 control_pubkey: pubkey(pubkey_seed(idx)),
             };
-            if let Some(v) = submit(&nodes, op).await {
+            if let SubmitOutcome::Applied(v) = submit(&nodes, op).await {
                 model.record_version(idx, v.0);
             }
         } else if choice < 80 {
-            // Pin an existing live key.
+            // Pin an existing live key, naming the version we believe is
+            // current (the compare-and-swap guard). A StalePin rejection
+            // resyncs the model from the error's current version: the op
+            // did not mutate state, but the version the cluster holds may
+            // be ahead of ours (a prior write committed before its ack was
+            // lost).
             let idx = *model
                 .live
                 .keys()
@@ -347,10 +360,15 @@ async fn run_scenario(seed: u64) {
             commit_counter += 1;
             let op = ReplicatedOp::Pin {
                 key: key(idx),
+                expected_version: Version(model.live[&idx]),
                 commitment: commitment(commit_counter),
             };
-            if let Some(v) = submit(&nodes, op).await {
-                model.record_version(idx, v.0);
+            match submit(&nodes, op).await {
+                SubmitOutcome::Applied(v) => model.record_version(idx, v.0),
+                SubmitOutcome::Rejected(ValidationError::StalePin { current, .. }) => {
+                    model.live.insert(idx, current.0);
+                }
+                SubmitOutcome::Rejected(_) => {}
             }
         } else {
             // Transition an existing live key to a fresh successor.
@@ -365,7 +383,7 @@ async fn run_scenario(seed: u64) {
                 new_key: key(new_idx),
                 new_control_pubkey: pubkey(pubkey_seed(new_idx)),
             };
-            if let Some(v) = submit(&nodes, op).await {
+            if let SubmitOutcome::Applied(v) = submit(&nodes, op).await {
                 // The successor adopts the old key's state; retire the old,
                 // make the new live carrying the same version.
                 model.live.remove(&old_idx);
@@ -396,7 +414,7 @@ async fn run_scenario(seed: u64) {
                 commitment: commitment(commit_counter),
                 control_pubkey: pubkey(pubkey_seed(settle_idx)),
             };
-            if let Some(v) = submit(&nodes, op).await {
+            if let SubmitOutcome::Applied(v) = submit(&nodes, op).await {
                 model.record_version(settle_idx, v.0);
                 settle_committed = true;
             }

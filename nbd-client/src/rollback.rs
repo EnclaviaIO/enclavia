@@ -250,6 +250,8 @@ pub enum GetOutcome {
     Found {
         /// Latest pinned commitment bytes.
         commitment: [u8; 32],
+        /// Its current per-key version (the CAS input for the next pin).
+        version: Version,
     },
     /// The key has never been registered (or was retired).
     NotFound,
@@ -294,7 +296,7 @@ pub enum BootDecision {
 /// (a wiped/substituted disk is a rollback).
 pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
     match outcome {
-        GetOutcome::Found { commitment } => {
+        GetOutcome::Found { commitment, .. } => {
             if commitment_of_region(region) == *commitment {
                 BootDecision::Serve
             } else {
@@ -328,8 +330,9 @@ pub fn get_outcome(
     result: Result<(Commitment, Version), ClientError>,
 ) -> Result<GetOutcome, ClientError> {
     match result {
-        Ok((commitment, _version)) => Ok(GetOutcome::Found {
+        Ok((commitment, version)) => Ok(GetOutcome::Found {
             commitment: commitment.0,
+            version,
         }),
         Err(ClientError::Rpc(RpcError::NotFound)) => Ok(GetOutcome::NotFound),
         Err(e) => Err(e),
@@ -733,13 +736,26 @@ pub type Reconnector<S> = Box<
 
 /// Production [`Pinner`]: the authenticated synchronizer session, with
 /// [`SYNC_RPC_TIMEOUT`] applied per RPC and bounded session
-/// re-establishment on dropped connections. The retried operation is
-/// always the SAME pin: re-pinning a commitment whose first attempt may
-/// or may not have committed is safe (the value is identical, so at
-/// worst the version bumps twice).
+/// re-establishment on dropped connections.
+///
+/// The pinner tracks the key's current per-key `Version` and names it as
+/// the compare-and-swap `expected_version` on every pin: two live writers
+/// for one key (a host-booted clone pair shares the image's PCRs) can then
+/// never both keep pinning — the loser's first divergent pin is rejected
+/// with `VersionConflict` instead of silently last-write-winning, which is
+/// what stops a forked volume's acknowledged writes from being rolled back
+/// undetected. A `VersionConflict` is NOT immediately fatal: an earlier
+/// attempt of the SAME pin may have committed before its ack was lost
+/// (the at-least-once retry semantics), so we disambiguate with a `Get` —
+/// current commitment == ours means our pin landed (idempotent success);
+/// anything else is a genuine fork and fatal.
 pub struct SyncPinner<S> {
     client: Client<S>,
     key: PcrKey,
+    /// The version we currently believe the key is at (the next pin's CAS
+    /// input). Seeded from the boot `Get`/registration and advanced by
+    /// every successful pin.
+    expected: Version,
     reconnect: Option<Reconnector<S>>,
 }
 
@@ -751,19 +767,59 @@ where
     async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (bool, String)> {
         match tokio::time::timeout(
             SYNC_RPC_TIMEOUT,
-            self.client.pin(self.key, Commitment(commitment)),
+            self.client
+                .pin(self.key, self.expected, Commitment(commitment)),
         )
         .await
         {
             Ok(Ok(version)) => {
                 debug!(version = version.0, "superblock pin durably acknowledged");
+                self.expected = version;
                 Ok(())
+            }
+            Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
+                self.resolve_conflict(commitment).await
             }
             Ok(Err(e)) => Err((pin_error_is_retryable(&e), format!("pin rpc failed: {e}"))),
             // A timeout is indistinguishable from a dead node: retryable.
             Err(_) => Err((
                 true,
                 format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
+            )),
+        }
+    }
+
+    /// Disambiguate a `VersionConflict`: did an earlier attempt of THIS
+    /// pin commit before its ack was lost, or is a different writer
+    /// ahead of us (a fork)?
+    async fn resolve_conflict(&mut self, commitment: [u8; 32]) -> Result<(), (bool, String)> {
+        match tokio::time::timeout(SYNC_RPC_TIMEOUT, self.client.get(self.key)).await {
+            Ok(Ok((current, version))) if current == Commitment(commitment) => {
+                info!(
+                    version = version.0,
+                    "pin version conflict resolved: our earlier attempt had already committed"
+                );
+                self.expected = version;
+                Ok(())
+            }
+            Ok(Ok((_current, version))) => Err((
+                false,
+                format!(
+                    "pin version conflict and the cluster holds a DIFFERENT commitment \
+                     (version {}): a second live writer is pinning this key — volume fork \
+                     detected, refusing to serve",
+                    version.0
+                ),
+            )),
+            // The conflict was real but we can't even read the cluster:
+            // treat like any unreachable-oracle error (retryable).
+            Ok(Err(e)) => Err((
+                pin_error_is_retryable(&e),
+                format!("conflict-disambiguation Get failed: {e}"),
+            )),
+            Err(_) => Err((
+                true,
+                "conflict-disambiguation Get timed out (synchronizer unreachable)".to_string(),
             )),
         }
     }
@@ -967,7 +1023,10 @@ where
                     watch
                         .verify_read(handle, region)
                         .map_err(|e| format!("fatal: {e}"))?;
-                    debug!(handle, "superblock region read verified against pinned history");
+                    debug!(
+                        handle,
+                        "superblock region read verified against pinned history"
+                    );
                     to_kernel.write_all(&header).await?;
                     to_kernel.write_all(&payload).await?;
                     to_kernel.flush().await?;
@@ -1230,8 +1289,13 @@ where
 pub trait BootOracle {
     /// `Client::get`.
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError>;
-    /// `Client::pin`.
-    async fn pin(&mut self, key: PcrKey, commitment: Commitment) -> Result<Version, ClientError>;
+    /// `Client::pin` (the CAS guard is ignored on a first-time Register).
+    async fn pin(
+        &mut self,
+        key: PcrKey,
+        expected_version: Version,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError>;
     /// `Client::transition`.
     async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError>;
 }
@@ -1243,8 +1307,13 @@ where
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError> {
         Client::get(self, key).await
     }
-    async fn pin(&mut self, key: PcrKey, commitment: Commitment) -> Result<Version, ClientError> {
-        Client::pin(self, key, commitment).await
+    async fn pin(
+        &mut self,
+        key: PcrKey,
+        expected_version: Version,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError> {
+        Client::pin(self, key, expected_version, commitment).await
     }
     async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
         Client::transition(self, link).await
@@ -1258,12 +1327,17 @@ where
 /// LAZY chain-host fetch, awaited only on that branch. Any verdict other
 /// than serve / register / successful transition propagates as a fatal
 /// error.
+///
+/// Returns the key's current per-key version on success (the Found
+/// version for a plain serve, `Version(0)` after a registration, the
+/// carried-forward version after a transition): the CAS `expected_version`
+/// the runtime pinner must name on its first pin.
 pub async fn verify_or_register<O, F>(
     oracle: &mut O,
     key: PcrKey,
     region: &[u8],
     upgrade_link: F,
-) -> Result<(), FatalError>
+) -> Result<Version, FatalError>
 where
     O: BootOracle,
     F: std::future::Future<Output = Option<ChainLink>>,
@@ -1281,20 +1355,24 @@ where
     match boot_decision(region, &outcome) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches pinned commitment; serving");
-            Ok(())
+            let GetOutcome::Found { version, .. } = outcome else {
+                unreachable!("Serve implies Found");
+            };
+            Ok(version)
         }
         BootDecision::RegisterThenServe => {
             info!("boot verify: fresh device, registering with the synchronizer");
             let commitment = Commitment(commitment_of_region(region));
-            let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, commitment))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "boot verify: registration Pin timed out after {SYNC_RPC_TIMEOUT:?} \
-                         (synchronizer unreachable)"
-                    )
-                })?
-                .map_err(|e| format!("boot verify: registration Pin failed: {e}"))?;
+            let version =
+                tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, Version(0), commitment))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "boot verify: registration Pin timed out after {SYNC_RPC_TIMEOUT:?} \
+                     (synchronizer unreachable)"
+                        )
+                    })?
+                    .map_err(|e| format!("boot verify: registration Pin failed: {e}"))?;
             if version != Version(0) {
                 // Get said NotFound but the Pin did not register: another
                 // session squeezed a registration in between. Two live
@@ -1307,7 +1385,7 @@ where
                 )
                 .into());
             }
-            Ok(())
+            Ok(Version(0))
         }
         BootDecision::TransitionOrFailStop(reason) => {
             transition_and_reverify(oracle, key, region, upgrade_link, &reason).await
@@ -1335,13 +1413,16 @@ where
 /// host-relayed fetch channel adds no trust: a forged or substituted
 /// link can at worst be rejected. This path NEVER registers; Register
 /// over a written region is the rollback hole this module closes.
+///
+/// Returns the carried-forward per-key version (the post-transition
+/// `Get`'s), which the runtime pinner needs as its first CAS input.
 async fn transition_and_reverify<O, F>(
     oracle: &mut O,
     key: PcrKey,
     region: &[u8],
     upgrade_link: F,
     fail_reason: &str,
-) -> Result<(), FatalError>
+) -> Result<Version, FatalError>
 where
     O: BootOracle,
     F: std::future::Future<Output = Option<ChainLink>>,
@@ -1400,7 +1481,10 @@ where
     match boot_decision(region, &outcome) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches the migrated pinned commitment; serving");
-            Ok(())
+            let GetOutcome::Found { version, .. } = outcome else {
+                unreachable!("Serve implies Found");
+            };
+            Ok(version)
         }
         BootDecision::FailStop(reason) => Err(format!("boot verify: {reason}").into()),
         BootDecision::RegisterThenServe | BootDecision::TransitionOrFailStop(_) => Err(
@@ -1451,7 +1535,10 @@ pub fn parse_luks2_data_offset(header: &[u8]) -> Result<Option<u64>, String> {
         ));
     }
     let json_area = &header[LUKS2_BINARY_HEADER_LEN as usize..hdr_size as usize];
-    let json_end = json_area.iter().position(|b| *b == 0).unwrap_or(json_area.len());
+    let json_end = json_area
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(json_area.len());
     let json: serde_json::Value = serde_json::from_slice(&json_area[..json_end])
         .map_err(|e| format!("LUKS2 JSON metadata does not parse: {e}"))?;
     let segments = json
@@ -1510,7 +1597,9 @@ where
     )
     .await?;
     if binary[0..6] != LUKS2_MAGIC {
-        info!("boot verify: no LUKS2 header on device (fresh volume); offset check deferred to the first formatted boot");
+        info!(
+            "boot verify: no LUKS2 header on device (fresh volume); offset check deferred to the first formatted boot"
+        );
         return Ok(());
     }
     let hdr_size = u64::from_be_bytes(binary[8..16].try_into().unwrap());
@@ -1538,7 +1627,10 @@ where
         )
         .into());
     }
-    info!(data_offset = expected, "boot verify: LUKS2 data offset matches the configured watch");
+    info!(
+        data_offset = expected,
+        "boot verify: LUKS2 data offset matches the configured watch"
+    );
     Ok(())
 }
 
@@ -1769,13 +1861,24 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
     })?
 }
 
+/// The result of a successful boot verification: the live session plus
+/// the runtime-wiring seeds.
+pub struct BootResult {
+    /// RPC-ready, mutually-authenticated session (handed to the pinner).
+    pub session: SyncSession,
+    /// The boot-verified region commitment (seeds the [`RegionWatch`]).
+    pub commitment: [u8; 32],
+    /// The key's current per-key version (the runtime pinner's first CAS
+    /// `expected_version`).
+    pub version: Version,
+}
+
 /// Full boot sequence for the anti-rollback wiring: connect +
 /// authenticate, cross-check the configured LUKS data offset against the
 /// device's LUKS2 header, read the device's current superblock region off
-/// the host stream, and run the decision table. Returns the live session
-/// plus the boot-verified region commitment (the seed for the runtime
-/// [`RegionWatch`]) only if the device may be served.
-pub async fn boot<H>(host: &mut H, data_offset: u64) -> Result<(SyncSession, [u8; 32]), FatalError>
+/// the host stream, and run the decision table. Returns the
+/// [`BootResult`] only if the device may be served.
+pub async fn boot<H>(host: &mut H, data_offset: u64) -> Result<BootResult, FatalError>
 where
     H: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1790,7 +1893,7 @@ where
     // path reaches the transition branch (#46). The Transition itself
     // runs on `session.client`, i.e. strictly after the oracle's PCRs
     // were verified by `connect_and_authenticate`.
-    verify_or_register(
+    let version = verify_or_register(
         &mut session.client,
         session.key,
         &region,
@@ -1800,21 +1903,27 @@ where
     // In every serve branch (Serve / RegisterThenServe / a successful
     // Transition re-verify) the pinned commitment equals the hash of the
     // region we just read, so that hash is the watch's seed.
-    Ok((session, commitment_of_region(&region)))
+    Ok(BootResult {
+        session,
+        commitment: commitment_of_region(&region),
+        version,
+    })
 }
 
-/// Turn a [`SyncSession`] into the production [`Pinner`] for the actor,
+/// Turn a [`BootResult`] into the production [`Pinner`] for the actor,
 /// with session re-establishment wired to a full
 /// [`connect_and_authenticate`]: a fresh dial (the relay fails over to a
 /// healthy cluster node), a fresh Noise handshake, and fresh MUTUAL
 /// attestation. Boot verification is deliberately NOT re-run on
 /// reconnect: the device has been live and gated the whole time, so the
 /// pinned state cannot have moved under us; the key-continuity check in
-/// [`SyncPinner`] guards the only thing that could change.
-pub fn into_pinner(session: SyncSession) -> SyncPinner<tokio_vsock::VsockStream> {
+/// [`SyncPinner`] guards the only thing that could change. The CAS
+/// version likewise survives reconnects (same enclave, same state).
+pub fn into_pinner(boot: BootResult) -> SyncPinner<tokio_vsock::VsockStream> {
     SyncPinner {
-        client: session.client,
-        key: session.key,
+        client: boot.session.client,
+        key: boot.session.key,
+        expected: boot.version,
         reconnect: Some(Box::new(|| {
             Box::pin(async {
                 let session = connect_and_authenticate()
@@ -1988,6 +2097,7 @@ mod tests {
         let region = region_with_data();
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&region),
+            version: Version(0),
         };
         assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
     }
@@ -1997,6 +2107,7 @@ mod tests {
         let region = region_with_data();
         let outcome = GetOutcome::Found {
             commitment: [0x11; 32],
+            version: Version(0),
         };
         assert!(matches!(
             boot_decision(&region, &outcome),
@@ -2032,6 +2143,7 @@ mod tests {
         let region = vec![0u8; SB_REGION_LEN];
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&region),
+            version: Version(0),
         };
         assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
     }
@@ -2042,6 +2154,7 @@ mod tests {
         let region = vec![0u8; SB_REGION_LEN];
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&region_with_data()),
+            version: Version(0),
         };
         assert!(matches!(
             boot_decision(&region, &outcome),
@@ -2056,6 +2169,7 @@ mod tests {
         tampered[64] ^= 0x01;
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&tampered),
+            version: Version(0),
         };
         assert!(matches!(
             boot_decision(&region, &outcome),
@@ -2071,7 +2185,8 @@ mod tests {
         assert_eq!(
             out,
             GetOutcome::Found {
-                commitment: [0xaa; 32]
+                commitment: [0xaa; 32],
+                version: Version(3),
             }
         );
     }
@@ -2088,6 +2203,7 @@ mod tests {
             ClientError::Rpc(RpcError::Unavailable),
             ClientError::Rpc(RpcError::Unauthorized),
             ClientError::Rpc(RpcError::OperationRejected),
+            ClientError::Rpc(RpcError::VersionConflict),
             ClientError::ConnectionClosed,
         ] {
             assert!(get_outcome(Err(err)).is_err());
@@ -2129,6 +2245,7 @@ mod tests {
         async fn pin(
             &mut self,
             _key: PcrKey,
+            _expected_version: Version,
             _commitment: Commitment,
         ) -> Result<Version, ClientError> {
             self.pins.pop_front().expect("unexpected Pin")
@@ -2303,6 +2420,51 @@ mod tests {
         .expect("fresh device must register and serve");
     }
 
+    /// The boot outcome surfaces the per-key version for the runtime
+    /// pinner's first CAS input: the Found version on a plain serve,
+    /// `Version(0)` after a registration, the carried-forward version
+    /// after a transition.
+    #[tokio::test]
+    async fn boot_returns_the_version_for_the_first_cas_pin() {
+        let region = region_with_data();
+        // Plain serve: the Found version (7) is returned.
+        let mut oracle = ScriptedOracle::new(
+            vec![Ok((Commitment(commitment_of_region(&region)), Version(7)))],
+            vec![],
+            vec![],
+        );
+        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+            panic!("matching pin must not fetch the upgrade link")
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, Version(7));
+
+        // Register: exactly Version(0).
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
+        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .unwrap();
+        assert_eq!(v, Version(0));
+
+        // Transition: the post-transition Get's version (the carried one).
+        let mut oracle = ScriptedOracle::new(
+            vec![
+                not_found(),
+                Ok((Commitment(commitment_of_region(&region)), Version(3))),
+            ],
+            vec![],
+            vec![Ok(Version(3))],
+        );
+        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+            Some(test_upgrade_link(9))
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, Version(3));
+    }
+
     // --- #46 chain-host fetch framing -----------------------------------
 
     /// Round trip: the request is one zero-length frame, the response is
@@ -2420,9 +2582,10 @@ mod tests {
         let off = 32 * 1024 - 2048;
         let mut src = Cursor::new(payload.clone());
         let mut dst = Vec::new();
-        let region = forward_bytes_extract(&mut src, &mut dst, payload.len() as u64, off, 4096, |_| {})
-            .await
-            .unwrap();
+        let region =
+            forward_bytes_extract(&mut src, &mut dst, payload.len() as u64, off, 4096, |_| {})
+                .await
+                .unwrap();
         assert_eq!(dst, payload);
         assert_eq!(region, payload[off..off + 4096].to_vec());
     }
@@ -3307,7 +3470,8 @@ mod region_watch_tests {
     async fn pump_accepts_pending_write_content_for_a_racing_read() {
         let new_content = region(0x77);
         let mut h = spawn_pump_with_watch(RegionWatch::new(commitment_of_region(&region(0x5a))));
-        h.watch.begin_pending(42, commitment_of_region(&new_content));
+        h.watch
+            .begin_pending(42, commitment_of_region(&new_content));
         h.watch.watch_read(9, 0);
         h.inflight.lock().unwrap().insert(9, SB_REGION_LEN as u32);
 
@@ -3353,15 +3517,9 @@ mod region_watch_tests {
     #[test]
     fn parses_the_crypt_segment_offset() {
         let h = luks2_header(16 * 1024 * 1024);
-        assert_eq!(
-            parse_luks2_data_offset(&h).unwrap(),
-            Some(16 * 1024 * 1024)
-        );
+        assert_eq!(parse_luks2_data_offset(&h).unwrap(), Some(16 * 1024 * 1024));
         let h = luks2_header(8 * 1024 * 1024);
-        assert_eq!(
-            parse_luks2_data_offset(&h).unwrap(),
-            Some(8 * 1024 * 1024)
-        );
+        assert_eq!(parse_luks2_data_offset(&h).unwrap(), Some(8 * 1024 * 1024));
     }
 
     /// Regression: real cryptsetup headers zero-pad the JSON area to
@@ -3371,10 +3529,7 @@ mod region_watch_tests {
     fn parses_a_zero_padded_cryptsetup_header() {
         let h = luks2_header_padded(16 * 1024 * 1024, Some(16384));
         assert_eq!(h.len(), 16384);
-        assert_eq!(
-            parse_luks2_data_offset(&h).unwrap(),
-            Some(16 * 1024 * 1024)
-        );
+        assert_eq!(parse_luks2_data_offset(&h).unwrap(), Some(16 * 1024 * 1024));
     }
 
     #[test]

@@ -179,11 +179,17 @@ pub enum ReplicatedOp {
         #[serde(with = "control_pubkey_bytes")]
         control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     },
-    /// Pin a fresh commitment under an already-registered key. No crypto facts
-    /// to carry: the key is already attested + registered on every replica.
+    /// Pin a fresh commitment under an already-registered key. Carries the
+    /// compare-and-swap `expected_version` the leader accepted at submit
+    /// time; the pure core re-checks it deterministically on every replica
+    /// at apply (identically everywhere), so a stale fork's pin rejects on
+    /// ALL nodes, never just on the leader that first saw it.
     Pin {
         /// The registered key whose commitment is updated.
         key: PcrKey,
+        /// CAS guard: applies only when the key's current version equals
+        /// this at apply time.
+        expected_version: crate::Version,
         /// New commitment; bumps the per-key version.
         commitment: Commitment,
     },
@@ -272,7 +278,8 @@ pub enum RaftHandleError {
     /// which refuses to ACK a client write until EVERY node holds the entry (see
     /// the module docs' full-replication ACK section). The caller maps this to
     /// wire `Unavailable`: the at-least-once retry semantics apply (a duplicate
-    /// Pin is benign; a duplicate Transition surfaces `TransitionRejected` and
+    /// Pin recovers via the client's VersionConflict Get-disambiguation; a
+    /// duplicate Transition surfaces `TransitionRejected` and
     /// the client confirms via `Get`).
     #[error("write committed but not yet replicated to all nodes: {0}")]
     NotFullyReplicated(String),
@@ -625,8 +632,9 @@ impl RaftHandle {
     /// [`RaftHandleError::NotFullyReplicated`]: the entry IS committed and
     /// applied locally, but at least one peer has not caught up (a node is down /
     /// partitioned). The caller maps that to wire `Unavailable`; the
-    /// at-least-once retry semantics already documented apply (duplicate Pin
-    /// benign, duplicate Transition surfaces `TransitionRejected` and the client
+    /// at-least-once retry semantics already documented apply (a duplicate Pin
+    /// recovers via the VersionConflict Get-disambiguation; a duplicate
+    /// Transition surfaces `TransitionRejected` and the client
     /// confirms via `Get`).
     pub async fn client_write_durable(
         &self,
@@ -983,6 +991,7 @@ mod tests {
             },
             ReplicatedOp::Pin {
                 key: k(2),
+                expected_version: crate::Version(0),
                 commitment: c(0xbb),
             },
             ReplicatedOp::Transition {
