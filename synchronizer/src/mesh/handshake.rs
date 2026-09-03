@@ -51,6 +51,8 @@
 //! already-mutually-attested, identical, trusted peers; the PCR allowlist and
 //! the identity signature remain the security boundary.
 
+use std::time::Duration;
+
 use enclavia_protocol::attestation::{self, CONTROL_PUBKEY_LEN};
 use enclavia_protocol::{
     NoiseTransport, perform_handshake_as_initiator, perform_handshake_as_responder,
@@ -62,6 +64,28 @@ use crate::PcrKey;
 use crate::mesh::attestation::AttestationProvider;
 use crate::mesh::config::PcrAllowlist;
 use crate::mesh::identity::MeshIdentity;
+
+/// Upper bound on producing this node's OWN attestation document during a
+/// handshake. On Nitro this is a blocking `/dev/nsm` ioctl run on a
+/// `spawn_blocking` thread; it normally completes in milliseconds, so a call
+/// that has not returned after this long is wedged (a hung NSM device) and the
+/// connection attempt is abandoned so the dial loop can back off and retry.
+///
+/// The timeout only abandons the *await*: a genuinely hung NSM read keeps its
+/// blocking thread parked (tokio cannot cancel a blocking closure), so each
+/// such failure leaks one blocking-pool thread until the device answers. That
+/// is the accepted cost of not wedging the whole peer connection forever.
+pub const ATTEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on reading the PEER's `Authenticate` frame.
+///
+/// A healthy peer produces its own NSM document in milliseconds and writes it
+/// straight away, so this only ever fires when the peer (or the `mesh-host`
+/// relay splicing us to it) has gone silent while holding the connection open.
+/// Without it the read blocks forever: `read_frame` is a bare `read_exact`, and
+/// a half-open stream never yields EOF. The #b-2026-09-02 incident wedged here
+/// (and in the phases either side of it) for 21 hours.
+pub const PEER_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum size (bytes) of an inbound ENCRYPTED mesh frame on the wire.
 /// `Noise_NN_25519_ChaChaPoly_BLAKE2s` caps a single message at 65535 bytes;
@@ -119,6 +143,29 @@ pub enum MeshFrame {
         /// The sender's `self_name`.
         from: String,
     },
+    /// Liveness probe sent by the CLIENT (dialer) side of an established
+    /// channel that has been idle for [`super::rpc::IDLE_BEFORE_PING`]. The
+    /// server side answers [`MeshFrame::Pong`] immediately, without involving
+    /// the request handler.
+    ///
+    /// ## Why a new frame variant is wire-safe here
+    ///
+    /// A `MeshFrame` is a CBOR-tagged enum, so a node that predates these two
+    /// variants fails to decode them and drops the connection. That would
+    /// normally rule out adding a frame without a staged rollout — but a mesh
+    /// channel between two DIFFERENT images cannot exist in the first place.
+    /// The mesh allowlist is [`PcrAllowlist::self_only`](super::config::PcrAllowlist::self_only):
+    /// a node admits a peer only when the peer's attested PCR digest equals its
+    /// own, so both ends of every established channel run the bit-identical
+    /// EIF and therefore agree on this enum by construction. During a rolling
+    /// deploy an old node and a new node never complete a handshake at all
+    /// (the allowlist rejects them), so there is no mixed-version channel for a
+    /// `Ping` to break. This is the same argument the `Rpc` variant's docs
+    /// already make for its `serde_bytes` encoding.
+    Ping,
+    /// The reply to a [`MeshFrame::Ping`], proving the peer's read/write path
+    /// is still live. Carries no payload: arrival is the whole signal.
+    Pong,
     /// An id-correlated RPC envelope (request or response). Opaque to the
     /// handshake layer; decoded by [`super::rpc`].
     Rpc {
@@ -186,6 +233,37 @@ pub enum HandshakeError {
     /// The peer hung up before completing the attestation exchange.
     #[error("peer closed the connection during the handshake")]
     PeerClosed,
+    /// A handshake or channel phase exceeded its deadline. The connection is
+    /// abandoned so the dial loop backs off and re-dials; a wedged phase must
+    /// never park a peer link indefinitely (#b-2026-09-02).
+    #[error("mesh phase {phase} timed out after {after:?}")]
+    Timeout {
+        /// Which phase blew its deadline (`"local attest"`, `"peer
+        /// Authenticate read"`, `"ping"`, ...).
+        phase: &'static str,
+        /// The deadline that elapsed.
+        after: Duration,
+    },
+}
+
+/// Run `fut` under `after`, mapping an elapsed deadline to
+/// [`HandshakeError::Timeout`] tagged with `phase`.
+///
+/// Every mesh phase that can block on a peer (or on `/dev/nsm`) goes through
+/// this, so a wedged counterparty always surfaces as an error the dial loop can
+/// back off from rather than an await that never completes.
+pub(crate) async fn with_deadline<F, T>(
+    phase: &'static str,
+    after: Duration,
+    fut: F,
+) -> Result<T, HandshakeError>
+where
+    F: std::future::Future<Output = Result<T, HandshakeError>>,
+{
+    match tokio::time::timeout(after, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(HandshakeError::Timeout { phase, after }),
+    }
 }
 
 /// Which Noise role this side plays for a given physical connection.
@@ -229,10 +307,19 @@ where
 
     // 1. Produce our own attestation, bound to this session's hash, and sign
     //    the hash with our per-boot identity key.
-    let nsm_doc = attestor
-        .attest(&handshake_hash)
-        .await
-        .map_err(|e| HandshakeError::LocalAttestation(format!("{e}")))?;
+    //
+    //    Bounded by ATTEST_TIMEOUT: on Nitro this is a blocking `/dev/nsm`
+    //    ioctl dispatched to a `spawn_blocking` thread, and a wedged device
+    //    would otherwise park this connection (and, before the dial-loop
+    //    deadlines below, the peer link) forever. See the const's docs for the
+    //    blocking-thread leak this trades against.
+    let nsm_doc = with_deadline("local attest", ATTEST_TIMEOUT, async {
+        attestor
+            .attest(&handshake_hash)
+            .await
+            .map_err(|e| HandshakeError::LocalAttestation(format!("{e}")))
+    })
+    .await?;
     let identity_sig = identity.sign_handshake(&handshake_hash);
     let auth = MeshFrame::Authenticate {
         nsm_doc,
@@ -268,7 +355,7 @@ where
         &handshake_hash,
         attestation::VerificationMode::from_debug_flag(debug_mode),
     )
-        .map_err(|e| HandshakeError::PeerAttestation(e.to_string()))?;
+    .map_err(|e| HandshakeError::PeerAttestation(e.to_string()))?;
     let pcr_digest = PcrKey(extracted.pcrs.digest());
 
     // 4. Self-PCR allowlist: the peer must be running our image.
@@ -298,6 +385,12 @@ where
 
 /// Read the peer's first post-handshake frame, requiring it to be a
 /// [`MeshFrame::Authenticate`], and return `(nsm_doc, identity_sig)`.
+///
+/// Bounded by [`PEER_AUTH_READ_TIMEOUT`]. Cancelling the underlying
+/// (non-cancel-safe) [`read_frame`] on timeout can leave the stream desynced
+/// mid-frame, which is harmless here precisely because a timeout ABANDONS the
+/// connection: the caller returns the error, the stream is dropped, and the
+/// dial loop re-dials a fresh one. Nothing ever reads this stream again.
 async fn read_peer_authenticate<S>(
     stream: &mut S,
     transport: &mut NoiseTransport,
@@ -305,7 +398,13 @@ async fn read_peer_authenticate<S>(
 where
     S: AsyncRead + Unpin,
 {
-    match read_frame(stream, transport).await? {
+    let frame = with_deadline(
+        "peer Authenticate read",
+        PEER_AUTH_READ_TIMEOUT,
+        read_frame(stream, transport),
+    )
+    .await?;
+    match frame {
         Some(MeshFrame::Authenticate {
             nsm_doc,
             identity_sig,

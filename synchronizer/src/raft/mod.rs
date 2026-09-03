@@ -324,6 +324,10 @@ pub struct RaftHandle {
     /// under a partition shorten it with [`with_replication_wait`](Self::with_replication_wait)
     /// to keep CI fast without changing the production behavior.
     replication_wait: Duration,
+    /// Bounded wait for the blocking `add_learner` in [`Self::admit`]. Defaults
+    /// to [`ADD_LEARNER_TIMEOUT`]; shortened by tests via
+    /// [`with_add_learner_timeout`](Self::with_add_learner_timeout).
+    add_learner_timeout: Duration,
 }
 
 /// Bounded wait for full replication on the client write path
@@ -335,6 +339,29 @@ pub struct RaftHandle {
 /// is genuinely down or partitioned, and the write fails with
 /// [`RaftHandleError::NotFullyReplicated`] (mapped to wire `Unavailable`).
 pub const DEFAULT_REPLICATION_WAIT: Duration = Duration::from_secs(2);
+
+/// Bounded wait for the blocking `add_learner` step of a leader-side admission
+/// ([`RaftHandle::admit`]).
+///
+/// openraft's `add_learner(.., blocking = true)` waits with NO deadline of its
+/// own (`wait(None)`) for the new learner to catch up by log replay or
+/// `InstallSnapshot`. On 2026-09-03 that wait parked a leader for ~10 minutes
+/// with a snapshot install stopped at ~4.5 MB, and because the mesh serve loop
+/// is SEQUENTIAL per connection it took the joiner's whole channel with it: no
+/// further request from that peer was answered until mesh-host was restarted.
+///
+/// Two minutes is far beyond a healthy catch-up (the state machine is small and
+/// the mesh is low-latency); exceeding it means the learner is not making
+/// progress, and the leader is better off failing the admission — freeing its
+/// serve loop — and letting the joiner's retry start a fresh attempt.
+///
+/// Timing out is SAFE to retry: the admission kernel
+/// ([`plan_admission`](membership::plan_admission)) is a pure function of the
+/// committed voter set, and a learner that was added but never caught up is not
+/// a voter, so a retry recomputes the identical plan. If the earlier attempt
+/// did complete, rule 3 of the kernel reports `already_member` and the retry is
+/// a no-op.
+pub const ADD_LEARNER_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl RaftHandle {
     /// Stand up the local Raft node over `mesh`, installing its `Raft` into
@@ -495,6 +522,7 @@ impl RaftHandle {
             configured_names,
             self_id,
             replication_wait: DEFAULT_REPLICATION_WAIT,
+            add_learner_timeout: ADD_LEARNER_TIMEOUT,
         })
     }
 
@@ -507,6 +535,17 @@ impl RaftHandle {
     /// default is correct for real use.
     pub fn with_replication_wait(mut self, wait: Duration) -> Self {
         self.replication_wait = wait;
+        self
+    }
+
+    /// Override the bounded `add_learner` wait used by [`admit`](Self::admit).
+    /// Consumes and returns the handle (builder style), mirroring
+    /// [`with_replication_wait`](Self::with_replication_wait), so a test can
+    /// assert that an admission whose learner never catches up returns within
+    /// the bound without burning the full production [`ADD_LEARNER_TIMEOUT`].
+    /// Production never calls this.
+    pub fn with_add_learner_timeout(mut self, timeout: Duration) -> Self {
+        self.add_learner_timeout = timeout;
         self
     }
 
@@ -873,13 +912,44 @@ impl RaftHandle {
         // change_membership to the kernel's exact voter set (joint consensus).
         // `retain: false` DROPS the evicted previous holder entirely (not kept
         // as a learner): a replaced instance must leave the cluster.
-        if let Err(e) = self
-            .raft
-            .add_learner(plan.added_id, plan.added.clone(), true)
-            .await
+        //
+        // The blocking add_learner is bounded (see ADD_LEARNER_TIMEOUT): a
+        // learner that never catches up must not park the leader's serve loop
+        // for this connection, which would block every later request from the
+        // joiner behind it. On timeout we return a transient `Raft` error,
+        // which the join handler maps to wire `Unavailable`, so the joiner
+        // retries and the (idempotent) plan is recomputed from scratch.
+        match tokio::time::timeout(
+            self.add_learner_timeout,
+            self.raft
+                .add_learner(plan.added_id, plan.added.clone(), true),
+        )
+        .await
         {
-            return Err(Self::membership_change_err(e, self).await);
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(Self::membership_change_err(e, self).await),
+            Err(_) => {
+                tracing::warn!(
+                    candidate = %candidate_name,
+                    learner_id = plan.added_id,
+                    timeout = ?self.add_learner_timeout,
+                    "add_learner did not catch the candidate up within the bound; \
+                     abandoning this admission so the joiner can retry"
+                );
+                return Err(RaftHandleError::Raft(format!(
+                    "learner {candidate_name} did not catch up within {:?}; retry the join",
+                    self.add_learner_timeout
+                )));
+            }
         }
+        // NOT bounded, deliberately. `change_membership` needs a quorum of the
+        // committed voter set to commit, so in the designed 3-node shape it
+        // succeeds whenever the two SURVIVING nodes are up — which is exactly
+        // the replace-on-rejoin case. Cancelling it midway could leave the
+        // cluster in the joint configuration openraft transitions through, so
+        // the deadline goes on the step that genuinely stalled in production
+        // (`add_learner`, above) and not on this one. A cluster that has
+        // already lost quorum cannot admit anyone regardless.
         if let Err(e) = self
             .raft
             .change_membership(plan.new_voter_ids.clone(), false)

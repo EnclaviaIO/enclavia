@@ -80,6 +80,27 @@ use crate::raft::{MemberRecord, RaftHandle, RaftNodeId, instance_node_id};
 /// indefinitely (joins may retry forever, per the brief).
 pub const JOIN_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+/// Upper bound on ONE `Join` round-trip to a peer.
+///
+/// [`Mesh::call`] itself has no deadline: it hands the request to the peer's
+/// client channel and awaits the correlated response, so a leader that accepts
+/// the Join and then stalls (on 2026-09-03 the leader parked ~10 minutes inside
+/// its own unbounded `add_learner` wait, with a snapshot install stuck at
+/// ~4.5 MB) blocks this probe for as long as it stalls. The whole discovery
+/// loop is sequential over the peer set, so one stalled peer also starves the
+/// probes to the others.
+///
+/// Deliberately set ABOVE the leader's own bounded admission
+/// ([`ADD_LEARNER_TIMEOUT`](crate::raft::ADD_LEARNER_TIMEOUT)), so in the
+/// stalled-admission case the joiner still receives the leader's
+/// [`JoinReply::Unavailable`] instead of walking away. That ordering matters
+/// because the leader's serve loop is SEQUENTIAL per connection: abandoning
+/// early would queue the retry behind the request we gave up on, and every
+/// subsequent Join would inherit the same head-of-line block. This deadline is
+/// therefore the backstop for a peer that answers nothing at all (a dead
+/// channel whose liveness ping has not yet recycled it), not the normal path.
+pub const JOIN_CALL_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// The minimum membership a FRESH `initialize` may carry: the designed
 /// 3-node shape (this node plus the two peers `MIN_MESH_PEERS` in the
 /// binary requires). Defence in depth against an undersized configured
@@ -281,8 +302,15 @@ async fn do_initialize(raft: &RaftHandle, self_name: &str, records: Vec<MemberRe
 }
 
 /// Encode + send a [`MeshMessage::Join`] to `peer`, decode the [`JoinReply`].
-/// Returns `None` on any transport / decode failure (the peer is not reachable
-/// yet; the caller retries).
+/// Returns `None` on any transport / decode failure OR on exceeding
+/// [`JOIN_CALL_TIMEOUT`] (the peer is not reachable or is wedged; the caller
+/// treats `None` as "no signal from this peer" and retries after
+/// [`JOIN_RETRY_DELAY`]).
+///
+/// `None` is the correct outcome for a timeout, not an error: the discovery
+/// loop already documents that the ABSENCE of a reply is never read as "no
+/// cluster", so an abandoned probe can only cause a retry, never a spurious
+/// `initialize` against a live cluster.
 async fn send_join(mesh: &Mesh, peer: &str, self_name: &str) -> Option<JoinReply> {
     let msg = MeshMessage::Join(JoinRequest {
         slot_name: self_name.to_string(),
@@ -291,7 +319,16 @@ async fn send_join(mesh: &Mesh, peer: &str, self_name: &str) -> Option<JoinReply
     if ciborium::into_writer(&msg, &mut buf).is_err() {
         return None;
     }
-    let reply = mesh.call(peer, buf).await.ok()?;
+    let reply = match tokio::time::timeout(JOIN_CALL_TIMEOUT, mesh.call(peer, buf)).await {
+        Ok(result) => result.ok()?,
+        Err(_) => {
+            warn!(
+                peer = %peer, timeout = ?JOIN_CALL_TIMEOUT,
+                "join round-trip timed out; treating the peer as unreachable this pass"
+            );
+            return None;
+        }
+    };
     ciborium::from_reader(reply.as_slice()).ok()
 }
 
@@ -383,6 +420,18 @@ mod tests {
         peers: &[&str],
         dir: &std::path::Path,
     ) -> (RaftHandle, Arc<Mesh>) {
+        lone_handle_with_config(name, peers, dir, RaftHandle::default_config()).await
+    }
+
+    /// [`lone_handle`] with a caller-supplied openraft config, for the tests
+    /// that need to tune replication behaviour (see the bounded-admission
+    /// test's `replication_lag_threshold`).
+    async fn lone_handle_with_config(
+        name: &str,
+        peers: &[&str],
+        dir: &std::path::Path,
+        raft_config: openraft::Config,
+    ) -> (RaftHandle, Arc<Mesh>) {
         const IMAGE_SEED: u8 = 0x42;
         let host = MeshHostStub::new();
         let sock = dir.join(format!("{name}.sock"));
@@ -407,9 +456,16 @@ mod tests {
             handler.clone(),
             true,
         ));
-        let raft = RaftHandle::new(Arc::clone(&mesh), name, self_pubkey, &peer_names, handler)
-            .await
-            .unwrap();
+        let raft = RaftHandle::with_config(
+            Arc::clone(&mesh),
+            name,
+            self_pubkey,
+            &peer_names,
+            handler,
+            raft_config,
+        )
+        .await
+        .unwrap();
         (raft, mesh)
     }
 
@@ -463,6 +519,79 @@ mod tests {
         assert!(
             raft.self_is_committed_voter().await,
             "the initializing node is a committed voter of the fresh cluster"
+        );
+        raft.shutdown().await;
+    }
+
+    /// A leader-side admission whose learner can NEVER catch up (the candidate
+    /// name resolves to no reachable node, so replication to it never
+    /// progresses) must return within the bounded `add_learner` wait instead of
+    /// parking the leader.
+    ///
+    /// This is the 2026-09-03 stall: openraft's blocking `add_learner` ends in
+    /// `self.wait(None)`, a wait with NO deadline of its own, and because the
+    /// mesh serve loop is sequential per connection the parked leader stopped
+    /// answering the joiner entirely for ~10 minutes. The bound is shortened
+    /// here (production is two minutes) purely to keep the test fast; what is
+    /// asserted is that `admit` HONOURS it.
+    ///
+    /// Two setup details make the blocking path real rather than incidental:
+    ///
+    /// * `replication_lag_threshold = 0`. openraft's wait is satisfied once the
+    ///   learner is within `replication_lag_threshold` entries of the leader,
+    ///   and the default is 1000 — so on a short log an UNREACHABLE learner is
+    ///   still deemed "up to date" and the wait returns at once. Zero makes any
+    ///   un-replicated learner genuinely not caught up, which is the state a
+    ///   real node stuck mid-`InstallSnapshot` is in.
+    /// * The single-voter `initialize_cluster` makes this node leader on its
+    ///   own, so the admission actually reaches `add_learner`. It goes through
+    ///   the handle directly, bypassing `do_initialize`'s 3-node gate — which
+    ///   is exactly what that gate exists to stop in production.
+    ///
+    /// node-b is configured but has no route in the mesh stub, so replication
+    /// to it can never progress.
+    #[tokio::test]
+    async fn admit_returns_when_the_learner_never_catches_up() {
+        const BOUND: Duration = Duration::from_millis(500);
+        let dir = tempfile::tempdir().unwrap();
+        let mut raft_config = RaftHandle::default_config();
+        raft_config.replication_lag_threshold = 0;
+        let (raft, _mesh) =
+            lone_handle_with_config("node-a", &["node-b", "node-c"], dir.path(), raft_config).await;
+
+        let mut solo = BTreeMap::new();
+        solo.insert(raft.self_id(), raft.self_record().clone());
+        raft.initialize_cluster(solo).await.unwrap();
+        raft.wait_for_leader(Duration::from_secs(10))
+            .await
+            .expect("the solo node must elect itself leader");
+
+        let bounded = raft.clone().with_add_learner_timeout(BOUND);
+        let started = std::time::Instant::now();
+        let result = bounded.admit("node-b", &pk(2)).await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("an admission whose learner never catches up must fail");
+        assert!(
+            matches!(err, crate::raft::RaftHandleError::Raft(ref m) if m.contains("did not catch up")),
+            "expected a bounded-wait failure, got: {err}"
+        );
+        // Returning at ~the bound is the whole point: the leader's serve loop
+        // for this connection is freed instead of parking on the wait.
+        assert!(
+            elapsed < BOUND * 20,
+            "admit must return at ~the bound, took {elapsed:?}"
+        );
+        // The join handler maps a bare `Raft` error to wire `Unavailable`, so
+        // the joiner retries; `plan_admission` is pure, so the retry recomputes
+        // the same plan (or reports `already_member`). The abandoned candidate
+        // must NOT have been made a voter along the way.
+        assert!(
+            !raft
+                .committed_voters()
+                .await
+                .contains_key(&super::instance_node_id(&pk(2))),
+            "the abandoned candidate must not have become a voter"
         );
         raft.shutdown().await;
     }

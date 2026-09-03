@@ -428,6 +428,35 @@ mod test_transport {
         }
     }
 
+    /// A dialer whose relay reads the `Open` frame and then goes SILENT: it
+    /// never acks, and never closes the stream either.
+    ///
+    /// This is the 2026-09-02 failure mode exactly. `EofAckDialer` models a
+    /// relay that hangs up (the dialer sees EOF and errors promptly); this one
+    /// models a relay that keeps the connection open and stops answering, which
+    /// yields no EOF and no error, so an unbounded `read_open_ack` waits
+    /// forever. It exists to prove [`super::super::DIAL_TIMEOUT`] fires.
+    #[derive(Clone, Copy, Default)]
+    pub struct SilentAckDialer;
+
+    #[async_trait]
+    impl MeshDialer for SilentAckDialer {
+        async fn dial(&self, target_peer: &str) -> io::Result<BoxedStream> {
+            let (client, mut relay) = tokio::io::duplex(4096);
+            let target = target_peer.to_string();
+            tokio::spawn(async move {
+                let _ = read_open_frame(&mut relay).await;
+                // Hold the relay end open forever WITHOUT acking, so the
+                // dialer's ack read neither completes nor sees EOF.
+                std::future::pending::<()>().await;
+                drop(relay);
+            });
+            let mut client = client;
+            open_and_await_ack(&mut client, &target).await?;
+            Ok(Box::new(client))
+        }
+    }
+
     /// A garbage-emitting dialer: after a successful-looking ack it sends a
     /// 4-byte length prefix far over the mesh frame cap, so the responder's
     /// handshake/first-frame read rejects it. Used to prove oversized/garbage
@@ -497,6 +526,6 @@ mod test_transport {
 
 #[cfg(feature = "test-utils")]
 pub use test_transport::{
-    EofAckDialer, FailingAckDialer, GarbageDialer, MeshHostStub, MisroutingDialer, UdsMeshAcceptor,
-    UdsMeshDialer,
+    EofAckDialer, FailingAckDialer, GarbageDialer, MeshHostStub, MisroutingDialer, SilentAckDialer,
+    UdsMeshAcceptor, UdsMeshDialer,
 };
