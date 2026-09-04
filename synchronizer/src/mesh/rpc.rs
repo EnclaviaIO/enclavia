@@ -68,10 +68,10 @@ pub const IDLE_BEFORE_PING: Duration = Duration::from_secs(5);
 /// frame) answering its ping before declaring the channel dead and returning,
 /// which drops the [`ClientChannel`] and makes the dial loop reconnect.
 ///
-/// This is the fix for a dead-but-OPEN connection: a half-open stream (peer
-/// enclave gone, relay wedged) never yields EOF, so before this the reader task
-/// simply blocked in `read_exact` forever and the dial loop never got its
-/// connection back to re-dial (#b-2026-09-02, 21 h wedged).
+/// This is what detects a dead-but-OPEN connection: a half-open stream (peer
+/// enclave gone, relay wedged) never yields EOF, so without it the reader task
+/// blocks in `read_exact` forever and the dial loop never gets its connection
+/// back to re-dial.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the SERVE (accept) side tolerates a connection with no inbound
@@ -654,13 +654,13 @@ mod tests {
         (ta.await.unwrap(), tb.await.unwrap())
     }
 
-    // --- channel liveness (B) -----------------------------------------
+    // --- channel liveness ----------------------------------------------
     //
     // A peer that stops answering but keeps its stream OPEN produces no EOF
-    // and no error, so the driver's reader simply blocked in `read_exact`
-    // forever and the dial loop never got its connection back to re-dial.
-    // These two tests pin the ping/idle behaviour that recycles such a
-    // channel, and prove a healthy idle channel is NOT recycled.
+    // and no error, so without a liveness probe the driver's reader blocks in
+    // `read_exact` forever and the dial loop never gets its connection back to
+    // re-dial. These two tests pin the ping/idle behaviour that recycles such
+    // a channel, and prove a healthy idle channel is NOT recycled.
 
     /// Build a plain (unfragmented) connected Noise pair.
     async fn noise_pair() -> (
@@ -687,7 +687,7 @@ mod tests {
     ///
     /// The far end here consumes the ciphertext (so writes never block) and
     /// answers nothing at all — a wedged relay or a dead enclave, not a closed
-    /// socket. Before the ping the driver would sit here forever.
+    /// socket. Without the ping the driver would sit here forever.
     #[tokio::test(start_paused = true)]
     async fn silent_peer_channel_is_recycled_by_the_liveness_ping() {
         let ((client_stream, client_transport), (server_stream, _server_transport)) =

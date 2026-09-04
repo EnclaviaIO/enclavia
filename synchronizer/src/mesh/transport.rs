@@ -431,11 +431,11 @@ mod test_transport {
     /// A dialer whose relay reads the `Open` frame and then goes SILENT: it
     /// never acks, and never closes the stream either.
     ///
-    /// This is the 2026-09-02 failure mode exactly. `EofAckDialer` models a
-    /// relay that hangs up (the dialer sees EOF and errors promptly); this one
-    /// models a relay that keeps the connection open and stops answering, which
-    /// yields no EOF and no error, so an unbounded `read_open_ack` waits
-    /// forever. It exists to prove [`super::super::DIAL_TIMEOUT`] fires.
+    /// `EofAckDialer` models a relay that hangs up (the dialer sees EOF and
+    /// errors promptly); this one models a relay that keeps the connection
+    /// open and stops answering, which yields no EOF and no error, so an
+    /// unbounded `read_open_ack` waits forever. It exists to prove
+    /// [`super::super::DIAL_TIMEOUT`] fires.
     #[derive(Clone, Copy, Default)]
     pub struct SilentAckDialer;
 

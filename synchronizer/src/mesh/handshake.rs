@@ -83,8 +83,8 @@ pub const ATTEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// straight away, so this only ever fires when the peer (or the `mesh-host`
 /// relay splicing us to it) has gone silent while holding the connection open.
 /// Without it the read blocks forever: `read_frame` is a bare `read_exact`, and
-/// a half-open stream never yields EOF. The #b-2026-09-02 incident wedged here
-/// (and in the phases either side of it) for 21 hours.
+/// a half-open stream never yields EOF, so without a deadline this phase (and
+/// the phases either side of it) can stay parked indefinitely.
 pub const PEER_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum size (bytes) of an inbound ENCRYPTED mesh frame on the wire.
@@ -235,7 +235,7 @@ pub enum HandshakeError {
     PeerClosed,
     /// A handshake or channel phase exceeded its deadline. The connection is
     /// abandoned so the dial loop backs off and re-dials; a wedged phase must
-    /// never park a peer link indefinitely (#b-2026-09-02).
+    /// never park a peer link indefinitely.
     #[error("mesh phase {phase} timed out after {after:?}")]
     Timeout {
         /// Which phase blew its deadline (`"local attest"`, `"peer

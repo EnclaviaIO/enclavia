@@ -79,10 +79,9 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(2);
 ///
 /// The ack read is a bare `read_exact` on a stream the HOST controls, so a
 /// mesh-host that accepts the connection and then never answers parks the dial
-/// forever. That is exactly what wedged node b's dial loop toward node a for
-/// 21 hours on 2026-09-02: `dial_loop` only re-dials once `dial_once` RETURNS,
-/// so an unbounded await inside it disables the backoff entirely, and the peer
-/// is never re-admitted.
+/// forever, and that parks the whole dial loop: `dial_loop` only re-dials once
+/// `dial_once` RETURNS, so an unbounded await inside it disables the backoff
+/// entirely and the peer is never re-admitted.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Upper bound on reading the peer's `Hello` frame (the routing-name exchange
@@ -313,19 +312,18 @@ impl Drop for Mesh {
 /// is `loop {}`, so this should be unreachable) or it PANICKED — logs at error
 /// level and respawns after [`SUPERVISOR_RESPAWN_DELAY`].
 ///
-/// Before this, the dial loops were bare `tokio::spawn`s whose `JoinHandle`s
-/// were only ever aborted: a panicking loop vanished silently, its peer was
-/// never dialed again, and nothing in the logs said so. A dial loop is the only
-/// thing that can restore a peer link, so losing one takes durable writes down
-/// cluster-wide until the process restarts.
+/// A dial loop is the only thing that can restore a peer link, so a loop that
+/// is lost — an unsupervised spawn that panics vanishes silently, with nothing
+/// in the logs to say so — leaves its peer permanently undialed and takes
+/// durable writes down cluster-wide until the process restarts.
 ///
 /// ## Shutdown semantics
 ///
 /// [`Mesh::shutdown`] aborts the SUPERVISOR's handle. The in-flight loop task
 /// is held in an [`AbortOnDrop`] guard, so unwinding the supervisor also aborts
-/// the loop it was watching — abort still tears the whole chain down, exactly
-/// as with the previous bare spawns. A cancelled child is likewise never
-/// respawned (that cancellation can only come from this guard).
+/// the loop it was watching — abort tears the whole chain down. A cancelled
+/// child is likewise never respawned (that cancellation can only come from
+/// this guard).
 async fn supervise<F, Fut>(peer: PeerName, mut body: F)
 where
     F: FnMut() -> Fut,
@@ -660,10 +658,9 @@ mod robustness_tests {
     /// then answers NOTHING (no ack, no EOF) must fail within
     /// [`DIAL_TIMEOUT`], not hang.
     ///
-    /// This is the 2026-09-02 incident reduced to one function: `dial_loop`
-    /// re-dials only when `dial_once` RETURNS, so before the deadline this
-    /// await swallowed the entire backoff mechanism and the peer went 21 hours
-    /// without a re-dial attempt.
+    /// `dial_loop` re-dials only when `dial_once` RETURNS, so an unbounded
+    /// await here would swallow the entire backoff mechanism and leave the
+    /// peer without any further re-dial attempt.
     ///
     /// The clock is paused, so the 15 s production constant is asserted in
     /// milliseconds of real time: tokio auto-advances to the next timer

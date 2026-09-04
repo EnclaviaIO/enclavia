@@ -84,11 +84,10 @@ pub const JOIN_RETRY_DELAY: Duration = Duration::from_millis(200);
 ///
 /// [`Mesh::call`] itself has no deadline: it hands the request to the peer's
 /// client channel and awaits the correlated response, so a leader that accepts
-/// the Join and then stalls (on 2026-09-03 the leader parked ~10 minutes inside
-/// its own unbounded `add_learner` wait, with a snapshot install stuck at
-/// ~4.5 MB) blocks this probe for as long as it stalls. The whole discovery
-/// loop is sequential over the peer set, so one stalled peer also starves the
-/// probes to the others.
+/// the Join and then stalls (for example inside its own admission wait, with a
+/// learner that is not catching up) blocks this probe for as long as it stalls.
+/// The whole discovery loop is sequential over the peer set, so one stalled
+/// peer also starves the probes to the others.
 ///
 /// Deliberately set ABOVE the leader's own bounded admission
 /// ([`ADD_LEARNER_TIMEOUT`](crate::raft::ADD_LEARNER_TIMEOUT)), so in the
@@ -528,12 +527,12 @@ mod tests {
     /// progresses) must return within the bounded `add_learner` wait instead of
     /// parking the leader.
     ///
-    /// This is the 2026-09-03 stall: openraft's blocking `add_learner` ends in
-    /// `self.wait(None)`, a wait with NO deadline of its own, and because the
-    /// mesh serve loop is sequential per connection the parked leader stopped
-    /// answering the joiner entirely for ~10 minutes. The bound is shortened
-    /// here (production is two minutes) purely to keep the test fast; what is
-    /// asserted is that `admit` HONOURS it.
+    /// openraft's blocking `add_learner` ends in `self.wait(None)`, a wait with
+    /// NO deadline of its own, and because the mesh serve loop is sequential
+    /// per connection a leader parked in it stops answering the joiner
+    /// entirely. The bound is shortened here (the default is two minutes)
+    /// purely to keep the test fast; what is asserted is that `admit`
+    /// HONOURS it.
     ///
     /// Two setup details make the blocking path real rather than incidental:
     ///
@@ -546,7 +545,7 @@ mod tests {
     /// * The single-voter `initialize_cluster` makes this node leader on its
     ///   own, so the admission actually reaches `add_learner`. It goes through
     ///   the handle directly, bypassing `do_initialize`'s 3-node gate — which
-    ///   is exactly what that gate exists to stop in production.
+    ///   is exactly what that gate exists to stop outside tests.
     ///
     /// node-b is configured but has no route in the mesh stub, so replication
     /// to it can never progress.

@@ -345,10 +345,10 @@ pub const DEFAULT_REPLICATION_WAIT: Duration = Duration::from_secs(2);
 ///
 /// openraft's `add_learner(.., blocking = true)` waits with NO deadline of its
 /// own (`wait(None)`) for the new learner to catch up by log replay or
-/// `InstallSnapshot`. On 2026-09-03 that wait parked a leader for ~10 minutes
-/// with a snapshot install stopped at ~4.5 MB, and because the mesh serve loop
-/// is SEQUENTIAL per connection it took the joiner's whole channel with it: no
-/// further request from that peer was answered until mesh-host was restarted.
+/// `InstallSnapshot`. A learner that stops making progress therefore parks the
+/// leader in that wait, and because the mesh serve loop is SEQUENTIAL per
+/// connection it takes the joiner's whole channel with it: no further request
+/// from that peer is answered until the wait ends.
 ///
 /// Two minutes is far beyond a healthy catch-up (the state machine is small and
 /// the mesh is low-latency); exceeding it means the learner is not making
@@ -947,9 +947,9 @@ impl RaftHandle {
         // succeeds whenever the two SURVIVING nodes are up — which is exactly
         // the replace-on-rejoin case. Cancelling it midway could leave the
         // cluster in the joint configuration openraft transitions through, so
-        // the deadline goes on the step that genuinely stalled in production
-        // (`add_learner`, above) and not on this one. A cluster that has
-        // already lost quorum cannot admit anyone regardless.
+        // the deadline goes on the step that can stall on an unresponsive
+        // learner (`add_learner`, above) and not on this one. A cluster that
+        // has already lost quorum cannot admit anyone regardless.
         if let Err(e) = self
             .raft
             .change_membership(plan.new_voter_ids.clone(), false)
