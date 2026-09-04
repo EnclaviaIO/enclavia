@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::message::{ClientMessage, ServerMessage, StreamHalf};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -37,6 +38,10 @@ struct ConnectConfig {
     extra_headers: Vec<(String, String)>,
     trust_upgrades: Option<TrustUpgrades>,
     auto_reconnect: bool,
+    /// Enforced natively in `establish`; unused on wasm, where no timer
+    /// exists and the host WebSocket stack owns connection timeouts.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    connect_timeout: Duration,
 }
 
 struct ClientInner {
@@ -407,7 +412,15 @@ pub struct ClientBuilder {
     extra_headers: Vec<(String, String)>,
     trust_upgrades: Option<TrustUpgrades>,
     auto_reconnect: bool,
+    connect_timeout: Duration,
 }
+
+/// Default for [`ClientBuilder::connect_timeout`]: bounds the whole
+/// WebSocket + Noise + attestation sequence on connect and reconnect.
+/// Generous for any healthy path (the sequence is a few round trips);
+/// expiry means the network is silently dropping traffic, and the caller
+/// gets a retryable error instead of an unbounded hang.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ClientBuilder {
     fn new(url: &str) -> Self {
@@ -418,7 +431,26 @@ impl ClientBuilder {
             extra_headers: Vec::new(),
             trust_upgrades: None,
             auto_reconnect: true,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
+    }
+
+    /// Deadline for establishing the attested channel (WebSocket connect,
+    /// Noise handshake, attestation fetch + verification), applied to the
+    /// initial connect and to every transparent reconnect. Defaults to 10
+    /// seconds.
+    ///
+    /// Without a deadline, a network path that silently drops traffic (a
+    /// stale NAT entry after an idle gap is the classic case) blocks the
+    /// connect — and therefore the caller's request — until TCP gives up,
+    /// which can take minutes. Expiry surfaces as the retryable
+    /// [`Error::ConnectTimeout`].
+    ///
+    /// Enforced natively; on wasm the timer is unavailable and the host's
+    /// own WebSocket connection behavior applies.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     /// Enable or disable transparent reconnect before new requests and
@@ -554,6 +586,7 @@ impl ClientBuilder {
             extra_headers: self.extra_headers,
             trust_upgrades: self.trust_upgrades,
             auto_reconnect: self.auto_reconnect,
+            connect_timeout: self.connect_timeout,
         };
 
         // The initial connect and every later reconnect share one code
@@ -584,6 +617,24 @@ impl ConnectConfig {
     /// [`Error::TrustUpgrades`]) rather than attaching to an enclave
     /// whose measurement no longer matches.
     async fn establish(&self) -> Result<mpsc::Sender<OutboundCommand>, Error> {
+        // Bound the whole sequence: a silently-dropping path (stale NAT
+        // after idle) otherwise blocks here until TCP gives up, hanging
+        // the caller's request inside the transparent reconnect with no
+        // error. wasm has no tokio timer; the host's WebSocket stack
+        // owns connection timeouts there.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout(self.connect_timeout, self.establish_channel())
+                .await
+                .map_err(|_| Error::ConnectTimeout(self.connect_timeout))?
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.establish_channel().await
+        }
+    }
+
+    async fn establish_channel(&self) -> Result<mpsc::Sender<OutboundCommand>, Error> {
         info!(url = %self.url, "Connecting to enclavia proxy");
 
         // 1. WebSocket connect. The backend-specific parts (TLS setup and

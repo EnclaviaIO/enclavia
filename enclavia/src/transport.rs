@@ -132,7 +132,7 @@ pub(crate) async fn run_transport(
     let mut pending: PendingMap = HashMap::new();
     let mut streams: StreamMap = HashMap::new();
 
-    loop {
+    'transport: loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
@@ -230,8 +230,20 @@ pub(crate) async fn run_transport(
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
-                                    error!("Failed to decrypt incoming message: {e}");
-                                    break;
+                                    // A frame that fails to decrypt means the Noise
+                                    // transport is desynced (or the peer is corrupt);
+                                    // no later frame on this session can ever decrypt
+                                    // again. Leaving the connection up wedged the
+                                    // client silently: in-flight requests never
+                                    // resolved, and because the command channel stayed
+                                    // open, auto-reconnect never engaged. Fail the
+                                    // whole channel instead — pending requests get a
+                                    // retryable ConnectionClosed, and the next request
+                                    // reconnects and re-attests.
+                                    error!("Failed to decrypt incoming message, closing channel: {e}");
+                                    notify_all_closed(&mut pending, &mut streams);
+                                    ws.close().await;
+                                    break 'transport;
                                 }
                             }
                         }
