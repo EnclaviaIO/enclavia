@@ -81,6 +81,13 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
   separately actionable and avoids holding a process open for many
   minutes.
 
+- `enclavia build <local-image> [--pull] [--output-dir DIR] [--container-port N] [--debug] [--storage] [egress flags] [--builder-rev REV] --json`  (alias: `ci`; needs `nix` + an installed `builder` binary, no source checkout, no login)
+  -> `{"source":"docker-daemon:myapp:dev","eif_path":"...","pcrs":{PCR0,PCR1,PCR2}}`.
+  Local-only CI gate: builds the EIF from a local Docker image without creating
+  or touching any enclave. Exit 0 = image builds; non-zero = it would also fail
+  a real push. Plain refs read from the local Docker daemon; `--pull` fetches a
+  registry ref; explicit skopeo transports (`docker-archive:...`) pass through.
+
 - `enclavia reproduce <id> [--upgrade <upgrade-id>] --json`  (needs local `builder` + `nix`)
   -> `{enclave_id,image_digest,expected{PCR0,PCR1,PCR2},actual{...},mismatches[],reproducible:<bool>,recorded_builder_rev,recorded_crates_rev,...}`.
   Verification command: exit 0 = reproducible, exit 2 = diverged (stdout still
