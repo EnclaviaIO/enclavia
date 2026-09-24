@@ -21,11 +21,23 @@
 //! [`VerificationMode::DangerousSkipChain`] skips both (the in-enclave
 //! NSM self-signs when run under QEMU) and must never be reachable from
 //! runtime state a host or peer can influence.
+//!
+//! ## Which clock the certificate chain is validated at
+//!
+//! Every session-bound entry point (the ones taking a `handshake_hash`)
+//! validates the chain at the document's own signed `timestamp`, not at
+//! the verifier's clock. The nonce proves the document is fresh for the
+//! session; the verifier's clock would add only a failure mode: a Nitro
+//! leaf certificate becomes valid seconds before the first document it
+//! signs, so a verifier running even a few seconds slow would see it as
+//! "not yet valid" and refuse a genuine peer. Enclaves have no clock
+//! synchronisation, so that drift is the normal state, not an edge case.
+//! The local clock is kept only as the coarse
+//! [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] sanity bound.
 
 use attestation_doc_validation::{
     PCRProvider, attestation_doc::decode_attestation_document,
-    attestation_doc::get_pcrs as att_get_pcrs, validate_and_parse_attestation_doc,
-    validate_expected_nonce, validate_expected_pcrs,
+    attestation_doc::get_pcrs as att_get_pcrs, validate_expected_nonce, validate_expected_pcrs,
 };
 use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use base64::Engine;
@@ -291,9 +303,7 @@ pub fn verify_against(
     mode: VerificationMode,
 ) -> Result<(), AttestationError> {
     let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
-    let doc = parse_and_validate(attestation_data, mode)?;
-
-    check_nonce(&doc, handshake_hash)?;
+    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
     validate_expected_pcrs(&doc, &pcrs_hex)
         .map_err(|e| AttestationError::Validation(e.to_string()))?;
@@ -328,9 +338,7 @@ pub fn verify_control_nonce_attestation(
     mode: VerificationMode,
 ) -> Result<[u8; 32], AttestationError> {
     let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
-    let doc = parse_and_validate(attestation_data, mode)?;
-
-    check_nonce(&doc, handshake_hash)?;
+    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
     validate_expected_pcrs(&doc, &pcrs_hex)
         .map_err(|e| AttestationError::Validation(e.to_string()))?;
@@ -368,9 +376,7 @@ pub fn verify_and_extract(
     handshake_hash: &[u8],
     mode: VerificationMode,
 ) -> Result<AttestedIdentity, AttestationError> {
-    let doc = parse_and_validate(attestation_data, mode)?;
-
-    check_nonce(&doc, handshake_hash)?;
+    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
     let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
 
@@ -442,9 +448,7 @@ pub fn verify_and_extract_pcrs(
     expected: &[Pcrs],
     mode: VerificationMode,
 ) -> Result<Pcrs, AttestationError> {
-    let doc = parse_and_validate(attestation_data, mode)?;
-
-    check_nonce(&doc, handshake_hash)?;
+    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
     let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
 
@@ -558,16 +562,109 @@ pub fn verify_chain_attestation(
     Ok(())
 }
 
+/// Largest accepted distance between a session-bound document's signed
+/// `timestamp` and the verifier's clock, in either direction.
+///
+/// Not a freshness check: the handshake-hash nonce already proves the
+/// document was produced for this session. It bounds how long a leaked
+/// Nitro leaf signing key could keep producing acceptable documents past
+/// its certificate's `notAfter` (without it, a leaked key could sign a
+/// timestamp inside its old window forever). It is deliberately far wider
+/// than any realistic drift of an unsynchronised clock so that clock drift
+/// is never the reason a genuine, fresh document is refused; a
+/// verifier whose clock is off by more than this also fails the wall-clock
+/// check this replaced (the leaf is only valid for a few hours).
+pub const MAX_SESSION_DOC_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Verification context for a session-bound document: the trust anchor and
+/// the verifier's clock. Production uses [`SessionCtx::system`]; the unit
+/// tests substitute a test CA and a chosen "now".
+struct SessionCtx<'a> {
+    root_der: &'a [u8],
+    now_ms: u64,
+}
+
+impl SessionCtx<'static> {
+    fn system() -> Self {
+        Self {
+            root_der: crate::nitro_verify::AWS_NITRO_ROOT_CA_DER,
+            // chrono reads the platform clock on native targets and
+            // `Date.now()` on wasm (std's SystemTime panics there).
+            now_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+        }
+    }
+}
+
+/// Parse and verify a document bound to a live Noise session: the shared
+/// core of every entry point that takes a `handshake_hash`.
+///
+/// In [`VerificationMode::Production`] the certificate chain is validated
+/// at the document's own signed `timestamp`, not at the verifier's clock
+/// (see `nitro_verify.rs` for why that instant is sound). The nonce check
+/// below is what makes the document fresh for this session, so the
+/// verifier's clock only enters as the coarse
+/// [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] sanity bound. In
+/// [`VerificationMode::DangerousSkipChain`] nothing is authenticated, so
+/// no time check applies either (QEMU's emulated NSM stamps arbitrary
+/// times).
+fn verify_session_bound(
+    attestation_data: &[u8],
+    handshake_hash: &[u8],
+    mode: VerificationMode,
+) -> Result<AttestationDoc, AttestationError> {
+    verify_session_bound_with(
+        attestation_data,
+        handshake_hash,
+        mode,
+        &SessionCtx::system(),
+    )
+}
+
+fn verify_session_bound_with(
+    attestation_data: &[u8],
+    handshake_hash: &[u8],
+    mode: VerificationMode,
+    ctx: &SessionCtx<'_>,
+) -> Result<AttestationDoc, AttestationError> {
+    let doc = if mode.skips_chain() {
+        decode_only(attestation_data)?
+    } else {
+        let doc = crate::nitro_verify::validate_at_doc_timestamp(attestation_data, ctx.root_der)
+            .map_err(AttestationError::Validation)?;
+        let skew = doc.timestamp.abs_diff(ctx.now_ms);
+        if skew > MAX_SESSION_DOC_CLOCK_SKEW_MS {
+            return Err(AttestationError::Validation(format!(
+                "document timestamp {} ms is {skew} ms from the local clock {} ms \
+                 (limit {MAX_SESSION_DOC_CLOCK_SKEW_MS} ms)",
+                doc.timestamp, ctx.now_ms
+            )));
+        }
+        doc
+    };
+
+    check_nonce(&doc, handshake_hash)?;
+    Ok(doc)
+}
+
+/// Structural decode only (the [`VerificationMode::DangerousSkipChain`]
+/// path).
+fn decode_only(attestation_data: &[u8]) -> Result<AttestationDoc, AttestationError> {
+    let (_, doc) = decode_attestation_document(attestation_data)
+        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+    Ok(doc)
+}
+
+/// Parse without a session binding ([`verify_chain_attestation`],
+/// [`extract_own_pcrs`]). In production the chain is checked at the
+/// verifier's wall clock.
 fn parse_and_validate(
     attestation_data: &[u8],
     mode: VerificationMode,
 ) -> Result<AttestationDoc, AttestationError> {
     if mode.skips_chain() {
-        let (_, doc) = decode_attestation_document(attestation_data)
-            .map_err(|e| AttestationError::Validation(e.to_string()))?;
-        Ok(doc)
+        decode_only(attestation_data)
     } else {
-        validate_and_parse_attestation_doc(attestation_data)
+        attestation_doc_validation::validate_and_parse_attestation_doc(attestation_data)
             .map_err(|e| AttestationError::Validation(e.to_string()))
     }
 }
@@ -1371,6 +1468,323 @@ mod tests {
             matches!(err, AttestationError::PayloadBindingMismatch),
             "expected PayloadBindingMismatch, got {err:?}"
         );
+    }
+}
+
+/// Production-mode (full chain + COSE signature) tests against a throwaway
+/// test CA. The fixtures below are a P-384 root, intermediate and
+/// leaf shaped like a Nitro chain; the leaf is valid only from
+/// 2030-01-01T00:00:00Z to 2030-01-01T03:00:00Z. The verifier's "now" is
+/// injected, so these tests do not depend on the machine's clock.
+///
+/// The fixtures were made with `openssl` (secp384r1 keys, `-sha384`): a
+/// self-signed root, an intermediate with `basicConstraints=critical,CA:TRUE`,
+/// and a leaf with `basicConstraints=critical,CA:FALSE`, issued with
+/// `-not_before 20300101000000Z -not_after 20300101030000Z`.
+#[cfg(test)]
+mod production_chain_tests {
+    use super::*;
+    use crate::nitro_verify::Sha2;
+    use aws_nitro_enclaves_cose::CoseSign1;
+    use aws_nitro_enclaves_cose::crypto::{
+        MessageDigest, SignatureAlgorithm, SigningPrivateKey, SigningPublicKey,
+    };
+    use aws_nitro_enclaves_cose::error::CoseError;
+    use aws_nitro_enclaves_cose::header_map::HeaderMap;
+    use aws_nitro_enclaves_nsm_api::api::Digest as NsmDigest;
+    use ciborium::value::Value as CborValue;
+    use p384::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
+    use std::collections::BTreeMap;
+
+    const ROOT_HEX: &str = concat!(
+        "308201d83082015ea0030201020214268f4a41a5a174b37fda6b3755ce77c4e525c68a300a06082a",
+        "8648ce3d040303301a3118301606035504030c0f746573742d6e6974726f2d726f6f743020170d32",
+        "30303130313030303030305a180f32303630303130313030303030305a301a311830160603550403",
+        "0c0f746573742d6e6974726f2d726f6f743076301006072a8648ce3d020106052b81040022036200",
+        "040c7b73807020e7ec162fc6fe77952706963db218ac9bcfdb0c4aed5099ec5c98c8362d807b4834",
+        "05444d206f8726c664ae9bb149db1d7c81d2b3774436b958bc33b854411d9d4c2f39382ba5695f11",
+        "cb5c8358bb0ee54ccdfac7981d7f03015da3633061301d0603551d0e04160414579059f167083cfd",
+        "ebff6548a408a4f62d26f8c7301f0603551d23041830168014579059f167083cfdebff6548a408a4",
+        "f62d26f8c7300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300a",
+        "06082a8648ce3d040303036800306502306aa5233c9ced4fd63296a29e0bd6b5eb40f1765e53fa13",
+        "3c2f58d3bb04e244c6fcbb7631f2f02361343ed2f4fba76581023100f9dada944d7b129cd7275410",
+        "a983f890e884284e0c65f1b942a815c9f93899aa5a5070f34f34534d2a9055f355355400",
+    );
+    const INTERMEDIATE_HEX: &str = concat!(
+        "308201cc30820153a003020102020102300a06082a8648ce3d040303301a3118301606035504030c",
+        "0f746573742d6e6974726f2d726f6f743020170d3230303130313030303030305a180f3230363030",
+        "3130313030303030305a30223120301e06035504030c17746573742d6e6974726f2d696e7465726d",
+        "6564696174653076301006072a8648ce3d020106052b81040022036200042761a28416776946638a",
+        "f62ace3d84e2bde552f33b041d17014b421606b51d87a0194906a8e365ab3be2185ab0722381308f",
+        "47dedeb9ce89294d21a85cb1d2a88d9409b803d7bcae7bc246e84fb3512389ed243a366ef6877487",
+        "77ee800e01faa3633061300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403",
+        "020106301d0603551d0e04160414d157e6f8067ad4cdf903630a0f95d15a4a5ad123301f0603551d",
+        "23041830168014579059f167083cfdebff6548a408a4f62d26f8c7300a06082a8648ce3d04030303",
+        "6700306402300fba9b4105da8ed2f6fc7ad17df29c0ea9559ff95f786f78184916d0bc882c068be3",
+        "e3e9e9e8c58feeb7c6865b59841d02303a2f6e0d21e33bdf5752f4e2b8eaeab8b5e6f712fa807678",
+        "0118184a0186b9d58dd97b8407d0b189b84a298896fd06bc",
+    );
+    const LEAF_HEX: &str = concat!(
+        "308201c83082014ea003020102020103300a06082a8648ce3d04030330223120301e06035504030c",
+        "17746573742d6e6974726f2d696e7465726d656469617465301e170d333030313031303030303030",
+        "5a170d3330303130313033303030305a301a3118301606035504030c0f746573742d6e6974726f2d",
+        "6c6561663076301006072a8648ce3d020106052b8104002203620004e583b8134fc2a53cf58fe6c3",
+        "998ee6994f4a9458f8a2d2c79360ff2237a4c1b7d93f14848afbb796f0818051bc0c66905e756e25",
+        "9289f232211c76e2ecaf3186396a6ebe448d22f41adb52a31dcab7dbd8fe8c868d85af4d5f45f367",
+        "7487522aa360305e300c0603551d130101ff04023000300e0603551d0f0101ff040403020780301d",
+        "0603551d0e04160414ac4efc0af3d0f9468e75d56ab5aaebc1b4b7aa19301f0603551d2304183016",
+        "8014d157e6f8067ad4cdf903630a0f95d15a4a5ad123300a06082a8648ce3d040303036800306502",
+        "303dd4b7408cd86c1b4c106c79f86ffef93d96940c6cc66c06d3a598ba1398581fd7fd913a340ae3",
+        "89d6763187470240cc023100894430e665ab17f37baa0fc7c99f9122c6918dda0e92fca35a095c37",
+        "f2c38b95b277a731f0b6ecadcfd5d05467c1ee57",
+    );
+    /// Private scalar of `test_leaf.der` (test-only key, signs nothing real).
+    const LEAF_KEY_HEX: &str = "fadfe43e9ac388cce57702cc987d24191779f155f0b7ed868d3f7dfce69c4dfe0deee3105519c2d0d0fd3dd282f3a4b6";
+
+    fn der(hex_str: &str) -> Vec<u8> {
+        hex::decode(hex_str).unwrap()
+    }
+
+    /// 2030-01-01T00:00:00Z, the leaf's notBefore.
+    const LEAF_NOT_BEFORE_MS: u64 = 1_893_456_000_000;
+    /// 2030-01-01T03:00:00Z, the leaf's notAfter.
+    const LEAF_NOT_AFTER_MS: u64 = LEAF_NOT_BEFORE_MS + 3 * 60 * 60 * 1000;
+
+    struct TestSigner(p384::ecdsa::SigningKey);
+
+    impl TestSigner {
+        fn leaf() -> Self {
+            let bytes = hex::decode(LEAF_KEY_HEX).unwrap();
+            Self(p384::ecdsa::SigningKey::from_slice(&bytes).unwrap())
+        }
+        fn other() -> Self {
+            Self(p384::ecdsa::SigningKey::from_slice(&[0x42; 48]).unwrap())
+        }
+    }
+
+    impl SigningPublicKey for TestSigner {
+        fn get_parameters(&self) -> Result<(SignatureAlgorithm, MessageDigest), CoseError> {
+            Ok((SignatureAlgorithm::ES384, MessageDigest::Sha384))
+        }
+        fn verify(&self, digest: &[u8], signature: &[u8]) -> Result<bool, CoseError> {
+            let sig = p384::ecdsa::Signature::from_slice(signature).unwrap();
+            Ok(self.0.verifying_key().verify_prehash(digest, &sig).is_ok())
+        }
+    }
+
+    impl SigningPrivateKey for TestSigner {
+        fn sign(&self, digest: &[u8]) -> Result<Vec<u8>, CoseError> {
+            let sig: p384::ecdsa::Signature = self.0.sign_prehash(digest).unwrap();
+            Ok(sig.to_bytes().to_vec())
+        }
+    }
+
+    fn hh() -> Vec<u8> {
+        (0u8..32).collect()
+    }
+
+    fn seed_pcrs(seed: u8) -> Pcrs {
+        Pcrs {
+            pcr0: vec![seed; 48],
+            pcr1: vec![seed.wrapping_add(1); 48],
+            pcr2: vec![seed.wrapping_add(2); 48],
+        }
+    }
+
+    /// CBOR payload of an NSM-shaped document from the test chain.
+    fn doc_payload(timestamp_ms: u64, nonce: &[u8]) -> Vec<u8> {
+        let pcrs = seed_pcrs(0x31);
+        let mut map = BTreeMap::new();
+        map.insert(0usize, pcrs.pcr0);
+        map.insert(1usize, pcrs.pcr1);
+        map.insert(2usize, pcrs.pcr2);
+        map.insert(8usize, vec![0u8; 48]);
+        let mut control_pubkey = vec![0x04u8];
+        control_pubkey.extend_from_slice(&[0x55; 64]);
+        let doc = AttestationDoc::new(
+            "i-test-enc0123456789abcdef".to_string(),
+            NsmDigest::SHA384,
+            timestamp_ms,
+            map,
+            der(LEAF_HEX),
+            // Nitro order: root first, then intermediates.
+            vec![der(ROOT_HEX), der(INTERMEDIATE_HEX)],
+            Some(control_pubkey),
+            Some(nonce.to_vec()),
+            None,
+        );
+        let mut payload = Vec::new();
+        ciborium::into_writer(&doc, &mut payload).unwrap();
+        payload
+    }
+
+    fn sign(payload: &[u8], signer: &TestSigner) -> Vec<u8> {
+        CoseSign1::new::<Sha2>(payload, &HeaderMap::new(), signer)
+            .unwrap()
+            .as_bytes(false)
+            .unwrap()
+    }
+
+    fn signed_doc(timestamp_ms: u64, nonce: &[u8]) -> Vec<u8> {
+        sign(&doc_payload(timestamp_ms, nonce), &TestSigner::leaf())
+    }
+
+    fn verify(doc: &[u8], nonce: &[u8], now_ms: u64) -> Result<AttestationDoc, AttestationError> {
+        let root = der(ROOT_HEX);
+        let ctx = SessionCtx {
+            root_der: &root,
+            now_ms,
+        };
+        verify_session_bound_with(doc, nonce, VerificationMode::Production, &ctx)
+    }
+
+    #[test]
+    fn leaf_not_yet_valid_at_verifier_clock_passes_at_doc_timestamp() {
+        // The NSM minted the leaf 5 s before signing; the verifier's clock
+        // runs 20 s slow, so by its clock the leaf is not valid yet.
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let verifier_now = doc_ts - 20_000;
+        assert!(verifier_now < LEAF_NOT_BEFORE_MS);
+        let doc = signed_doc(doc_ts, &hh());
+
+        // Validating the chain at the verifier's clock refuses it: this is
+        // the failure the doc-timestamp check removes.
+        let err = validate_chain_at_for_test(&doc, verifier_now / 1000).unwrap_err();
+        assert!(err.contains("CertNotValidYet"), "{err}");
+
+        let got = verify(&doc, &hh(), verifier_now).expect("must verify at doc timestamp");
+        assert_eq!(got.timestamp, doc_ts);
+    }
+
+    #[test]
+    fn verifier_clock_fast_or_slow_within_bound_passes() {
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let doc = signed_doc(doc_ts, &hh());
+        for now in [
+            doc_ts - MAX_SESSION_DOC_CLOCK_SKEW_MS,
+            doc_ts - 60 * 60 * 1000,
+            doc_ts,
+            doc_ts + 60 * 60 * 1000,
+            doc_ts + MAX_SESSION_DOC_CLOCK_SKEW_MS,
+        ] {
+            verify(&doc, &hh(), now).unwrap_or_else(|e| panic!("now={now}: {e}"));
+        }
+    }
+
+    #[test]
+    fn verifier_clock_beyond_sanity_bound_fails() {
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let doc = signed_doc(doc_ts, &hh());
+        for now in [
+            doc_ts - MAX_SESSION_DOC_CLOCK_SKEW_MS - 1,
+            doc_ts + MAX_SESSION_DOC_CLOCK_SKEW_MS + 1,
+        ] {
+            let err = verify(&doc, &hh(), now).unwrap_err();
+            assert!(err.to_string().contains("from the local clock"), "{err}");
+        }
+    }
+
+    #[test]
+    fn doc_timestamp_after_leaf_expiry_fails() {
+        // Signed by the genuine leaf key, but at an instant the leaf is
+        // expired: must fail even if the verifier's clock agrees.
+        let doc_ts = LEAF_NOT_AFTER_MS + 1_000;
+        let doc = signed_doc(doc_ts, &hh());
+        let err = verify(&doc, &hh(), doc_ts).unwrap_err();
+        assert!(err.to_string().contains("CertExpired"), "{err}");
+    }
+
+    #[test]
+    fn doc_timestamp_before_leaf_validity_fails() {
+        let doc_ts = LEAF_NOT_BEFORE_MS - 1_000;
+        let doc = signed_doc(doc_ts, &hh());
+        let err = verify(&doc, &hh(), doc_ts).unwrap_err();
+        assert!(err.to_string().contains("CertNotValidYet"), "{err}");
+    }
+
+    #[test]
+    fn tampered_timestamp_fails_signature() {
+        // Take a genuine document whose leaf is expired at its timestamp and
+        // move the timestamp back into the leaf's window without re-signing.
+        // The chain check now passes, so the COSE signature is what must
+        // catch it.
+        let genuine = signed_doc(LEAF_NOT_AFTER_MS + 1_000, &hh());
+        let moved_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let tampered = replace_payload(&genuine, doc_payload(moved_ts, &hh()));
+        let err = verify(&tampered, &hh(), moved_ts).unwrap_err();
+        assert!(err.to_string().contains("COSE signature"), "{err}");
+    }
+
+    #[test]
+    fn tampered_nonce_fails_signature() {
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let other: Vec<u8> = vec![0xab; 32];
+        let genuine = signed_doc(doc_ts, &hh());
+        // Re-bind the document to a different session without re-signing.
+        let tampered = replace_payload(&genuine, doc_payload(doc_ts, &other));
+        let err = verify(&tampered, &other, doc_ts).unwrap_err();
+        assert!(err.to_string().contains("COSE signature"), "{err}");
+    }
+
+    #[test]
+    fn doc_signed_by_key_other_than_leaf_fails() {
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let doc = sign(&doc_payload(doc_ts, &hh()), &TestSigner::other());
+        let err = verify(&doc, &hh(), doc_ts).unwrap_err();
+        assert!(err.to_string().contains("COSE signature"), "{err}");
+    }
+
+    #[test]
+    fn nonce_mismatch_fails() {
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let doc = signed_doc(doc_ts, &hh());
+        let wrong: Vec<u8> = vec![0xab; 32];
+        let err = verify(&doc, &wrong, doc_ts).unwrap_err();
+        assert!(err.to_string().contains("Nonce"), "{err}");
+    }
+
+    #[test]
+    fn chain_not_rooted_in_the_aws_nitro_root_fails() {
+        // Production entry points use the embedded AWS root, which the test
+        // chain does not lead to.
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let doc = signed_doc(doc_ts, &hh());
+        let err = verify_and_extract(&doc, &hh(), VerificationMode::Production).unwrap_err();
+        assert!(
+            err.to_string().contains("certificate chain invalid"),
+            "{err}"
+        );
+    }
+
+    /// Replace the payload of a COSE_Sign1, keeping its protected header and
+    /// signature.
+    fn replace_payload(cose: &[u8], payload: Vec<u8>) -> Vec<u8> {
+        let value: CborValue = ciborium::from_reader(cose).unwrap();
+        let CborValue::Array(mut parts) = value else {
+            panic!("COSE_Sign1 is an array")
+        };
+        parts[2] = CborValue::Bytes(payload);
+        let mut out = Vec::new();
+        ciborium::into_writer(&CborValue::Array(parts), &mut out).unwrap();
+        out
+    }
+
+    /// The chain check as the verifier's-clock path performed it: same
+    /// anchor and algorithms, validated at `at_secs`.
+    fn validate_chain_at_for_test(cose: &[u8], at_secs: u64) -> Result<(), String> {
+        let (_, doc) = decode_attestation_document(cose).map_err(|e| e.to_string())?;
+        let leaf = webpki::EndEntityCert::try_from(doc.certificate.as_slice())
+            .map_err(|e| format!("{e:?}"))?;
+        let root = der(ROOT_HEX);
+        let anchor = [webpki::TrustAnchor::try_from_cert_der(&root).unwrap()];
+        let intermediates: Vec<&[u8]> = doc.cabundle.iter().map(|c| c.as_slice()).collect();
+        leaf.verify_is_valid_tls_server_cert(
+            &[&webpki::ECDSA_P384_SHA384],
+            &webpki::TlsServerTrustAnchors(&anchor),
+            &intermediates,
+            webpki::Time::from_seconds_since_unix_epoch(at_secs),
+        )
+        .map_err(|e| format!("{e:?}"))
     }
 }
 
