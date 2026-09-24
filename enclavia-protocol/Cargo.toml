@@ -41,6 +41,12 @@ ipnet = { workspace = true, optional = true }
 # both production callers — gating it behind a feature would just be
 # bookkeeping.
 attestation-doc-validation = { workspace = true }
+# Chain validation at the attestation document's own timestamp
+# (nitro_verify.rs): webpki for the chain, the COSE crate for the
+# Sig_structure, p384 for the leaf's ES384 signature.
+aws-nitro-enclaves-cose = { workspace = true }
+webpki = { workspace = true }
+p384 = { workspace = true }
 # The workspace pins `default-features = false`, which strips the `nix`
 # feature (NSM driver / `/dev/nsm` syscalls). We only need the `api`
 # module's pure data types here.

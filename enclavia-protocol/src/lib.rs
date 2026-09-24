@@ -9,6 +9,7 @@ pub mod kms_policy;
 pub mod kms_recipient;
 #[cfg(feature = "async-transport")]
 pub mod mesh;
+mod nitro_verify;
 mod noise;
 pub mod staging;
 
