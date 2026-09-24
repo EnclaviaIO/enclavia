@@ -63,6 +63,12 @@ httparse = "1"
 url = "2"
 base64 = "0.22"
 attestation-doc-validation = "0.10"
+# Nitro attestation verification at the document's own timestamp
+# (enclavia-protocol nitro_verify.rs). Same versions attestation-doc-validation
+# already pulls in, so the dependency graph does not grow.
+aws-nitro-enclaves-cose = { version = "0.5", default-features = false }
+webpki = { version = "0.22", features = ["alloc"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 aws-nitro-enclaves-nsm-api = { version = "0.4", default-features = false }
 hex = "0.4"
 axum = "0.8"

@@ -1350,6 +1350,7 @@ version = "0.2.0"
 dependencies = [
  "aes",
  "attestation-doc-validation",
+ "aws-nitro-enclaves-cose",
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "cbc",
@@ -1360,6 +1361,7 @@ dependencies = [
  "hex",
  "ipnet",
  "p256",
+ "p384",
  "rand 0.8.6",
  "rsa",
  "serde",
@@ -1373,6 +1375,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "webpki",
  "x509-cert",
 ]
 
