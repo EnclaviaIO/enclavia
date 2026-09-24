@@ -34,6 +34,10 @@
 //! synchronisation, so that drift is the normal state, not an edge case.
 //! The local clock is kept only as the coarse
 //! [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] sanity bound.
+//!
+//! [`verify_chain_attestation`] (stored chain-link documents, verified
+//! long after they were produced) also validates at the document's own
+//! timestamp, with no local-clock bound.
 
 use attestation_doc_validation::{
     PCRProvider, attestation_doc::decode_attestation_document,
@@ -522,9 +526,18 @@ pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationErro
 ///    PCRs for this enclave, post-build).
 ///
 /// In [`VerificationMode::Production`], the AWS Nitro CA chain is
-/// validated and the COSE signature is verified by the upstream
-/// `attestation-doc-validation` crate, same as the existing entry
-/// points. In [`VerificationMode::DangerousSkipChain`], only
+/// validated and the COSE signature is verified, same as the
+/// session-bound entry points. The chain is validated at the document's
+/// own signed `timestamp`: a chain link is a stored record that is verified
+/// again long after it was produced (the synchronizer's `Transition` after
+/// an upgrade timelock, SDK and CLI chain walks), while a Nitro leaf
+/// certificate is valid for only a few hours, so validating at the
+/// verifier's clock would reject every link older than that. What the
+/// check establishes is "genuine Nitro hardware attested this payload at
+/// `timestamp`", which is the claim a chain link makes. No bound against
+/// the local clock applies here, since old links are legitimate.
+///
+/// In [`VerificationMode::DangerousSkipChain`], only
 /// structural validity is required —
 /// matching QEMU's emulated NSM device, which signs documents with its
 /// own key instead of the AWS CA (and the `test-utils` doc builders,
@@ -626,11 +639,8 @@ fn verify_session_bound_with(
     mode: VerificationMode,
     ctx: &SessionCtx<'_>,
 ) -> Result<AttestationDoc, AttestationError> {
-    let doc = if mode.skips_chain() {
-        decode_only(attestation_data)?
-    } else {
-        let doc = crate::nitro_verify::validate_at_doc_timestamp(attestation_data, ctx.root_der)
-            .map_err(AttestationError::Validation)?;
+    let doc = parse_and_validate_with_root(attestation_data, mode, ctx.root_der)?;
+    if !mode.skips_chain() {
         let skew = doc.timestamp.abs_diff(ctx.now_ms);
         if skew > MAX_SESSION_DOC_CLOCK_SKEW_MS {
             return Err(AttestationError::Validation(format!(
@@ -639,8 +649,7 @@ fn verify_session_bound_with(
                 doc.timestamp, ctx.now_ms
             )));
         }
-        doc
-    };
+    }
 
     check_nonce(&doc, handshake_hash)?;
     Ok(doc)
@@ -656,16 +665,28 @@ fn decode_only(attestation_data: &[u8]) -> Result<AttestationDoc, AttestationErr
 
 /// Parse without a session binding ([`verify_chain_attestation`],
 /// [`extract_own_pcrs`]). In production the chain is checked at the
-/// verifier's wall clock.
+/// document's own signed `timestamp`, and the local clock is not consulted.
 fn parse_and_validate(
     attestation_data: &[u8],
     mode: VerificationMode,
 ) -> Result<AttestationDoc, AttestationError> {
+    parse_and_validate_with_root(
+        attestation_data,
+        mode,
+        crate::nitro_verify::AWS_NITRO_ROOT_CA_DER,
+    )
+}
+
+fn parse_and_validate_with_root(
+    attestation_data: &[u8],
+    mode: VerificationMode,
+    root_der: &[u8],
+) -> Result<AttestationDoc, AttestationError> {
     if mode.skips_chain() {
         decode_only(attestation_data)
     } else {
-        attestation_doc_validation::validate_and_parse_attestation_doc(attestation_data)
-            .map_err(|e| AttestationError::Validation(e.to_string()))
+        crate::nitro_verify::validate_at_doc_timestamp(attestation_data, root_der)
+            .map_err(AttestationError::Validation)
     }
 }
 
@@ -1754,6 +1775,38 @@ mod production_chain_tests {
             err.to_string().contains("certificate chain invalid"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn stored_doc_validates_at_its_own_timestamp_regardless_of_local_clock() {
+        // The unbound path (chain links) never reads the local clock: the
+        // test leaf's validity window does not contain the real current
+        // time, yet the document verifies at its own timestamp.
+        let root = der(ROOT_HEX);
+        let doc_ts = LEAF_NOT_BEFORE_MS + 60 * 60 * 1000;
+        let doc = signed_doc(doc_ts, &[0u8; 32]);
+        let parsed = parse_and_validate_with_root(&doc, VerificationMode::Production, &root)
+            .expect("stored doc must verify at its own timestamp");
+        assert_eq!(parsed.timestamp, doc_ts);
+    }
+
+    #[test]
+    fn stored_doc_expired_at_its_own_timestamp_fails() {
+        let root = der(ROOT_HEX);
+        let doc = signed_doc(LEAF_NOT_AFTER_MS + 1_000, &[0u8; 32]);
+        let err =
+            parse_and_validate_with_root(&doc, VerificationMode::Production, &root).unwrap_err();
+        assert!(err.to_string().contains("CertExpired"), "{err}");
+    }
+
+    #[test]
+    fn stored_doc_with_moved_timestamp_fails_signature() {
+        let root = der(ROOT_HEX);
+        let genuine = signed_doc(LEAF_NOT_AFTER_MS + 1_000, &[0u8; 32]);
+        let tampered = replace_payload(&genuine, doc_payload(LEAF_NOT_BEFORE_MS, &[0u8; 32]));
+        let err = parse_and_validate_with_root(&tampered, VerificationMode::Production, &root)
+            .unwrap_err();
+        assert!(err.to_string().contains("COSE signature"), "{err}");
     }
 
     /// Replace the payload of a COSE_Sign1, keeping its protected header and
