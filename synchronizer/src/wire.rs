@@ -183,13 +183,23 @@ impl Frame {
 /// prefer a capability.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Capability: the server stores revocations of upgrade links and refuses a
+/// `Transition` whose link a revocation names ([`Request::Revoke`],
+/// [`Response::RevokeOk`], [`RpcError::TransitionRevoked`],
+/// [`RpcError::RevocationRejected`]).
+///
+/// A customer that revokes an upgrade MUST check the server advertised this
+/// before reporting the revocation as done: a server without it would let the
+/// revoked link through.
+pub const CAPABILITY_REVOCATION: &str = "revocation";
+
 /// Optional features this build supports, advertised in
-/// [`Frame::Authenticate`]. Empty in version 1: nothing optional exists yet.
+/// [`Frame::Authenticate`].
 ///
 /// Adding a feature: give it a stable, never-reused name, add it here, and
 /// only use it on a session where [`negotiate_capabilities`] says BOTH ends
 /// support it.
-pub const SUPPORTED_CAPABILITIES: &[&str] = &[];
+pub const SUPPORTED_CAPABILITIES: &[&str] = &[CAPABILITY_REVOCATION];
 
 /// [`SUPPORTED_CAPABILITIES`] as the set carried on the wire.
 pub fn supported_capabilities() -> BTreeSet<String> {
@@ -317,6 +327,26 @@ pub enum Request {
         /// The #47 upgrade chain link authorizing the transition.
         link: ChainLink,
     },
+
+    /// Revoke one upgrade link out of the session's own key
+    /// ([`CAPABILITY_REVOCATION`]; send only to a server that advertised it).
+    ///
+    /// Submitted by the enclave that currently holds the pin (the OLD image,
+    /// during the upgrade delay): the session must be authenticated as the
+    /// key being revoked. `link` is the #47 revocation [`ChainLink`] (kind
+    /// [`ChainLinkKind::Revocation`]) the enclave emits for the customer's
+    /// revoke command; its `signature` is the control key's 64-byte raw r||s
+    /// P-256 signature over the CBOR `RevocationPayload`, verified against the
+    /// control pubkey frozen for the session's key, and its `revokes_link`
+    /// names the revoked link (see [`verify_revocation_link`]).
+    ///
+    /// On success a `Transition` out of the session's key presenting that
+    /// exact link is refused, for good. Any other link (a re-approved
+    /// upgrade) still goes through.
+    Revoke {
+        /// The #47 revocation chain link.
+        link: ChainLink,
+    },
 }
 
 /// Response frame sent by the synchronizer to a customer enclave.
@@ -350,6 +380,10 @@ pub enum Response {
         /// Per-key monotonic version (unchanged across transition).
         version: Version,
     },
+
+    /// Successful [`Request::Revoke`]: the revocation is committed (on a
+    /// quorum, in the replicated deployment) and the server enforces it.
+    RevokeOk,
 
     /// Failure response. Carries a structured [`RpcError`] so the client
     /// can branch on the failure category without parsing strings.
@@ -405,6 +439,17 @@ pub enum RpcError {
     /// Reads may still succeed; clients should back off and retry.
     #[error("synchronizer cluster unavailable")]
     Unavailable,
+
+    /// `Transition` was refused because a committed revocation names the
+    /// presented link ([`CAPABILITY_REVOCATION`]).
+    #[error("transition link revoked")]
+    TransitionRevoked,
+
+    /// `Revoke` was refused: the link failed verification, or the session's
+    /// key is not currently registered (never pinned, or the upgrade already
+    /// activated). The revocation did NOT take effect ([`CAPABILITY_REVOCATION`]).
+    #[error("revocation rejected")]
+    RevocationRejected,
 }
 
 impl From<ValidationError> for RpcError {
@@ -422,6 +467,7 @@ impl From<ValidationError> for RpcError {
             ValidationError::NoTransitionAuthorization => RpcError::TransitionRejected,
             ValidationError::NewKeyAlreadyExists => RpcError::TransitionRejected,
             ValidationError::OldKeyEqualsNew => RpcError::TransitionRejected,
+            ValidationError::TransitionRevoked => RpcError::TransitionRevoked,
 
             // KeyNotCurrent surfaces from Pin/Get on an unregistered key
             // (NotFound for the caller) AND from Transition on an
@@ -680,6 +726,9 @@ pub struct VerifiedTransition {
     /// `sha256(payload.to_pcrs)`, the successor key adopted by the
     /// transition. Equals the submitting session's bound key.
     pub new_key: PcrKey,
+    /// [`upgrade_link_hash`] of the link's payload: the identity a
+    /// committed revocation of `old_key` names to refuse this link.
+    pub link_hash: [u8; 32],
 }
 
 /// Derive a [`PcrKey`] from a chain payload's hex-PCR triple, matching
@@ -845,6 +894,110 @@ pub fn verify_transition_link(
     Ok(VerifiedTransition {
         old_key: decoded.old_key,
         new_key: decoded.new_key,
+        link_hash: upgrade_link_hash(&link.payload),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Revocation-link verifier (pure; called by the node before applying a Revoke)
+// ---------------------------------------------------------------------------
+
+pub use enclavia_protocol::chain::{RevocationPayload, upgrade_link_hash};
+
+/// Why a [`Request::Revoke`]'s chain link failed verification. Every variant
+/// folds to [`RpcError::RevocationRejected`] on the wire.
+#[derive(Debug, thiserror::Error)]
+pub enum RevocationLinkError {
+    /// The link's `kind` is not [`ChainLinkKind::Revocation`].
+    #[error("revocation link has the wrong kind ({0:?})")]
+    NotARevocationLink(ChainLinkKind),
+    /// The link carried no `signature`.
+    #[error("revocation link is missing the control-key signature")]
+    MissingSignature,
+    /// `signature` is not 64 bytes raw r||s ECDSA P-256.
+    #[error("revocation link signature is not 64 bytes raw r||s P-256")]
+    SignatureShape,
+    /// The frozen control pubkey does not decode as SEC1 P-256.
+    #[error("frozen control pubkey does not decode as SEC1 P-256")]
+    BadControlPubkey,
+    /// `signature` does not verify against the frozen control pubkey.
+    #[error("revocation link signature does not verify under the key's frozen control pubkey")]
+    SignatureInvalid,
+    /// The payload does not CBOR-decode as a [`RevocationPayload`].
+    #[error("revocation link payload is not a decodable RevocationPayload: {0}")]
+    PayloadDecode(String),
+}
+
+impl From<RevocationLinkError> for RpcError {
+    fn from(_: RevocationLinkError) -> Self {
+        RpcError::RevocationRejected
+    }
+}
+
+/// Successful output of [`verify_revocation_link`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedRevocation {
+    /// [`upgrade_link_hash`] of the revoked upgrade link.
+    pub link_hash: [u8; 32],
+}
+
+/// Verify a [`Request::Revoke`]'s #47 revocation chain link against the
+/// control pubkey frozen for the key being revoked. The caller has already
+/// required that key to be the submitting session's own, currently registered
+/// key.
+///
+/// Who may revoke: the same authority that approves upgrades. An upgrade link
+/// counts because the enclave's CONTROL key signed its payload; a revocation
+/// counts only if that same key, as frozen in the key's `KeyState` at
+/// registration, signed the `RevocationPayload`. The host holds no control
+/// key, so it cannot mint a revocation (it could only deny service, which it
+/// can already do by withholding the upgrade), and because revoked hashes are
+/// only ever added, nobody can undo one.
+///
+/// What is revoked is exactly the link whose payload hashes to the signed
+/// `revokes_link`: nothing the backend stamps (timestamps, chain ids) decides
+/// it. A signer who checked that hash against a link it verified itself knows
+/// precisely which upgrade stops working.
+///
+/// Checks, in order:
+/// 1. `kind` is [`ChainLinkKind::Revocation`] and a signature is present.
+/// 2. The 64-byte raw r||s P-256 signature verifies over the exact payload
+///    bytes against `control_pubkey`, the key's FROZEN pubkey (never the
+///    session's announced one).
+/// 3. The payload decodes as a [`RevocationPayload`]; its `revokes_link` is
+///    the revoked link.
+///
+/// Not checked, deliberately:
+/// * The link's `attestation`: the old enclave's document for the public
+///   chain's auditors. The synchronizer already holds a fresher proof of the
+///   same fact, the session's own attestation as the key.
+/// * `revokes` (the backend's chain entry id) and `issued_at`: both are
+///   stamped by the backend and say nothing the hash does not.
+/// * `enclave_id`: the key is already bound to the session, and a mismatch
+///   check could only make a genuine revocation silently ineffective.
+pub fn verify_revocation_link(
+    link: &ChainLink,
+    control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
+) -> Result<VerifiedRevocation, RevocationLinkError> {
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+    if link.kind != ChainLinkKind::Revocation {
+        return Err(RevocationLinkError::NotARevocationLink(link.kind));
+    }
+    let sig_bytes = link
+        .signature
+        .as_deref()
+        .ok_or(RevocationLinkError::MissingSignature)?;
+    let verifying = VerifyingKey::from_sec1_bytes(control_pubkey)
+        .map_err(|_| RevocationLinkError::BadControlPubkey)?;
+    let sig = Signature::from_slice(sig_bytes).map_err(|_| RevocationLinkError::SignatureShape)?;
+    verifying
+        .verify(&link.payload, &sig)
+        .map_err(|_| RevocationLinkError::SignatureInvalid)?;
+    let payload: RevocationPayload = ciborium::from_reader(link.payload.as_slice())
+        .map_err(|e| RevocationLinkError::PayloadDecode(e.to_string()))?;
+    Ok(VerifiedRevocation {
+        link_hash: payload.revokes_link,
     })
 }
 
@@ -1055,6 +1208,8 @@ mod tests {
             RpcError::OperationRejected,
             RpcError::VersionConflict,
             RpcError::Unavailable,
+            RpcError::TransitionRevoked,
+            RpcError::RevocationRejected,
         ] {
             roundtrip(&Response::Err { error: code });
         }
@@ -1095,6 +1250,10 @@ mod tests {
             (
                 ValidationError::OldKeyEqualsNew,
                 RpcError::TransitionRejected,
+            ),
+            (
+                ValidationError::TransitionRevoked,
+                RpcError::TransitionRevoked,
             ),
         ];
         for (input, expected) in cases {
@@ -1544,5 +1703,139 @@ mod tests {
             matches!(err, TransitionLinkError::SignatureInvalid),
             "{err:?}"
         );
+    }
+
+    // --- revocation ------------------------------------------------------
+
+    /// A #47 revocation chain link signed by `signing`, naming the revoked
+    /// link by `revokes_link`. The attestation is a placeholder: the synchronizer does not check it (the session's own
+    /// attestation already proves the key).
+    fn revocation_link(signing: &SigningKey, revokes_link: [u8; 32]) -> ChainLink {
+        let payload = RevocationPayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            revokes: uuid::Uuid::new_v4(),
+            issued_at: t0(),
+            nonce: vec![0x6b; 32],
+            revokes_link,
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Revocation,
+            payload: payload_bytes,
+            attestation: vec![],
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn revoke_request_and_response_roundtrip() {
+        let (sk, _) = keypair(0x30);
+        roundtrip(&Request::Revoke {
+            link: revocation_link(&sk, [1; 32]),
+        });
+        roundtrip(&Response::RevokeOk);
+    }
+
+    /// This build advertises the revocation capability, and a session only
+    /// negotiates it when the peer advertised it too.
+    #[test]
+    fn revocation_capability_is_advertised() {
+        assert!(supported_capabilities().contains(CAPABILITY_REVOCATION));
+        let both = PeerProtocol::from_advertised(PROTOCOL_VERSION, &supported_capabilities());
+        assert!(both.supports(CAPABILITY_REVOCATION));
+        let legacy = PeerProtocol::from_advertised(0, &BTreeSet::new());
+        assert!(!legacy.supports(CAPABILITY_REVOCATION));
+    }
+
+    #[test]
+    fn revocation_link_verifies_under_the_frozen_key() {
+        let (sk, pk) = keypair(0x31);
+        let v = verify_revocation_link(&revocation_link(&sk, [9; 32]), &pk).unwrap();
+        assert_eq!(v.link_hash, [9; 32]);
+    }
+
+    /// Signed by any key other than the frozen control key: rejected. This
+    /// is what keeps the host (which holds no control key) from revoking.
+    #[test]
+    fn revocation_link_signed_by_another_key_is_rejected() {
+        let (_, frozen) = keypair(0x32);
+        let (other, _) = keypair(0x33);
+        assert!(matches!(
+            verify_revocation_link(&revocation_link(&other, [9; 32]), &frozen),
+            Err(RevocationLinkError::SignatureInvalid)
+        ));
+    }
+
+    /// The signature covers `revokes_link`: pointing the revocation at
+    /// another link breaks it.
+    #[test]
+    fn revokes_link_is_signature_covered() {
+        let (sk, pk) = keypair(0x34);
+        let mut link = revocation_link(&sk, [9; 32]);
+        let mut payload: RevocationPayload =
+            ciborium::from_reader(link.payload.as_slice()).unwrap();
+        payload.revokes_link = [8; 32];
+        link.payload.clear();
+        ciborium::into_writer(&payload, &mut link.payload).unwrap();
+        assert!(matches!(
+            verify_revocation_link(&link, &pk),
+            Err(RevocationLinkError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn revocation_link_shape_errors() {
+        let (sk, pk) = keypair(0x35);
+
+        let mut unsigned = revocation_link(&sk, [9; 32]);
+        unsigned.signature = None;
+        assert!(matches!(
+            verify_revocation_link(&unsigned, &pk),
+            Err(RevocationLinkError::MissingSignature)
+        ));
+
+        let mut short = revocation_link(&sk, [9; 32]);
+        short.signature = Some(vec![0u8; 10]);
+        assert!(matches!(
+            verify_revocation_link(&short, &pk),
+            Err(RevocationLinkError::SignatureShape)
+        ));
+
+        // An upgrade link, even one validly signed by the same key, is not a
+        // revocation.
+        let upgrade = upgrade_link(0x10, 0x20, &sk);
+        assert!(matches!(
+            verify_revocation_link(&upgrade, &pk),
+            Err(RevocationLinkError::NotARevocationLink(ChainLinkKind::Upgrade))
+        ));
+
+        // A signed payload that is not a RevocationPayload.
+        let mut garbage = revocation_link(&sk, [9; 32]);
+        garbage.payload = vec![0xff, 0x00];
+        let sig: Signature = sk.sign(&garbage.payload);
+        garbage.signature = Some(sig.to_bytes().to_vec());
+        assert!(matches!(
+            verify_revocation_link(&garbage, &pk),
+            Err(RevocationLinkError::PayloadDecode(_))
+        ));
+
+        assert_eq!(
+            RpcError::from(RevocationLinkError::SignatureInvalid),
+            RpcError::RevocationRejected
+        );
+    }
+
+    /// The verified transition carries the hash of the exact signed payload,
+    /// the identity revocations name.
+    #[test]
+    fn verified_transition_carries_the_link_hash() {
+        let (sk, pk) = keypair(0x36);
+        let link = upgrade_link(0x40, 0x41, &sk);
+        let v = decode_and_verify(&link, key_from_seed(0x41), &pk, true).unwrap();
+        assert_eq!(v.link_hash, upgrade_link_hash(&link.payload));
     }
 }

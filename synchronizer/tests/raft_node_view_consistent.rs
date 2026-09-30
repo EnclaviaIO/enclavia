@@ -251,6 +251,8 @@ struct Model {
     max_version: BTreeMap<u64, u64>,
     /// Next fresh key index to hand out.
     next_idx: u64,
+    /// ACKed revocations per key index (link numbers, see [`link_hash`]).
+    revoked: BTreeMap<u64, std::collections::BTreeSet<u8>>,
 }
 
 impl Model {
@@ -269,6 +271,13 @@ impl Model {
         *m = v.max(*m);
         self.live.insert(idx, v);
     }
+}
+
+/// Payload hash of possible upgrade link number `link` out of key `idx`.
+fn link_hash(idx: u64, link: u8) -> [u8; 32] {
+    let mut h = [link; 32];
+    h[..8].copy_from_slice(&idx.to_be_bytes());
+    h
 }
 
 /// Run one randomized scenario under `seed`: bring the cluster up, drive a
@@ -370,25 +379,51 @@ async fn run_scenario(seed: u64) {
                 }
                 SubmitOutcome::Rejected(_) => {}
             }
-        } else {
-            // Transition an existing live key to a fresh successor.
+        } else if choice < 90 {
+            // Transition an existing live key to a fresh successor, presenting
+            // one of a few possible links (by payload hash), so some of them
+            // are revoked.
             let old_idx = *model
                 .live
                 .keys()
                 .nth(rng.gen_range(0..model.live.len()))
                 .unwrap();
             let new_idx = model.fresh_idx();
+            let link = rng.gen_range(0..4u8);
             let op = ReplicatedOp::Transition {
                 old_key: key(old_idx),
                 new_key: key(new_idx),
                 new_control_pubkey: pubkey(pubkey_seed(new_idx)),
+                link_hash: link_hash(old_idx, link),
             };
             if let SubmitOutcome::Applied(v) = submit(&nodes, op).await {
+                // A committed revocation of this link would have refused it.
+                // The model only knows ACKed revocations, a subset of the
+                // committed ones, so this cannot flake.
+                assert!(
+                    !model.revoked.get(&old_idx).is_some_and(|r| r.contains(&link)),
+                    "a revoked link moved key {old_idx} (seed {seed})"
+                );
                 // The successor adopts the old key's state; retire the old,
                 // make the new live carrying the same version.
                 model.live.remove(&old_idx);
                 model.retired.insert(old_idx);
                 model.record_version(new_idx, v.0);
+            }
+        } else {
+            // Revoke one of a live key's possible links.
+            let idx = *model
+                .live
+                .keys()
+                .nth(rng.gen_range(0..model.live.len()))
+                .unwrap();
+            let link = rng.gen_range(0..4u8);
+            let op = ReplicatedOp::Revoke {
+                key: key(idx),
+                link_hash: link_hash(idx, link),
+            };
+            if let SubmitOutcome::Applied(_) = submit(&nodes, op).await {
+                model.revoked.entry(idx).or_default().insert(link);
             }
         }
     }
@@ -457,6 +492,25 @@ async fn run_scenario(seed: u64) {
             retired, ref_retired,
             "retired view diverged: {name} vs {ref_name} (seed {seed})"
         );
+    }
+
+    // --- invariant: all three nodes hold the same revoked links, including
+    // every ACKed revocation ---
+    for idx in 0..model.next_idx {
+        let mut sets = Vec::new();
+        for n in &nodes {
+            sets.push(n.raft.state_machine().revoked_links(&key(idx)).await);
+        }
+        assert!(
+            sets.iter().all(|s| *s == sets[0]),
+            "revoked links of key {idx} diverged (seed {seed})"
+        );
+        for link in model.revoked.get(&idx).into_iter().flatten() {
+            assert!(
+                sets[0].contains(&link_hash(idx, *link)),
+                "ACKed revocation of key {idx} link {link} lost (seed {seed})"
+            );
+        }
     }
 
     // --- invariant: the converged view matches the model ---
