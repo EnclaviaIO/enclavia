@@ -137,6 +137,12 @@
 //! made re-seeding from any single survivor lossless, but it meant one dead
 //! node turned every client write into `Unavailable`, which is the far more
 //! common failure. Linearizable reads need a fresh quorum either way.
+//!
+//! **When cold-start re-seed from a survivor (enclavia-crates#122) is
+//! implemented, client writes MUST go back to full-replication ACK (every
+//! current voter).** Under quorum ACK a single survivor may lack ACKed
+//! entries, so re-seeding the cluster from a stale survivor chosen by the
+//! operator is a rollback.
 
 pub mod forward;
 pub mod join;
