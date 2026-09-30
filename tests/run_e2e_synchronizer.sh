@@ -29,7 +29,9 @@
 #   ENCLAVIA_DIR    path to the enclavia checkout (this branch). Default:
 #                   resolved from this script's location.
 #   CRATES_DIR      path to the enclavia-crates checkout (mesh-host). Default ../enclavia-crates
-#   BUILDER_DIR     path to the builder checkout (init-patched + blobs). Default ../builder
+#   BUILDER_DIR     path to the builder checkout (heartbeat.py only; the EIF
+#                   builds its kernel and init from the pinned
+#                   `builder-src` input). Default ../builder
 #   MEMORY          guest RAM (default 768M)
 #   CLUSTER_TIMEOUT seconds to wait for leader election (default 180)
 #   KEEP            if set, do not tear down at the end (debugging)
@@ -106,7 +108,6 @@ echo "=== build (one EIF, identical PCRs) ==="
 
 echo "  building synchronizer EIF..."
 nice nix build "path:$ENCLAVIA_DIR#synchronizer-eif" \
-    --override-input builder-src "path:$BUILDER_DIR" \
     --out-link "$WORK/eif" --print-build-logs
 EIF="$WORK/eif/image.eif"
 [ -f "$EIF" ] || { echo "FATAL: EIF not produced at $EIF" >&2; ls -la "$WORK/eif" >&2; exit 1; }
