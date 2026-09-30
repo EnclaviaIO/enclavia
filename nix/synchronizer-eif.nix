@@ -10,13 +10,16 @@
 # This file is parameterized over `synchronizerPkg`, and flake.nix
 # instantiates it TWICE, as two separate images with separate PCRs:
 #
-# * `synchronizer-eif` carries the QEMU/dev binary (skip-cert-chain
-#   attestation): for the local QEMU harness ONLY.
-# * `synchronizer-eif-nitro` carries the production binary (`enclave`
-#   feature, full AWS Nitro CA chain verification): the ONLY image a real
-#   Nitro deployment may run. The two images measure different PCR0/1/2,
-#   so customer configs' `synchronizer.expected_pcrs` must pin the nitro
-#   build's measurements.
+# * `synchronizer-eif` (x86_64) carries the QEMU/dev binary
+#   (skip-cert-chain attestation): for the local QEMU harness ONLY. QEMU's
+#   nitro-enclave machine is x86_64-only.
+# * `synchronizer-eif-nitro` (aarch64, for Graviton) carries the
+#   production binary (`enclave` feature, full AWS Nitro CA chain
+#   verification): the ONLY image a real Nitro deployment may run. It is
+#   cross-built on x86_64-linux, kernel and init included, which is also
+#   how third parties reproduce its PCRs. The two images measure different
+#   PCR0/1/2, so customer configs' `synchronizer.expected_pcrs` must pin
+#   the nitro build's measurements.
 #
 # Patched init: the stock Nitro init heartbeats to CID 3 (the real Nitro
 # parent), but under QEMU `vhost-device-vsock` only handles CID 2, so we
