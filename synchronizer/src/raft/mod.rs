@@ -155,7 +155,7 @@ pub use membership::{
     AdmissionError, AdmissionPlan, MemberRecord, instance_node_id, plan_admission,
 };
 pub use network::{MeshRaftNetworkFactory, RaftRequestHandler};
-pub use store::{LogStore, StateMachineStore, control_pubkey_bytes};
+pub use store::{LogStore, StateMachineStore, StoreStats, control_pubkey_bytes};
 
 /// Re-export of openraft's tuning [`Config`](openraft::Config) +
 /// [`SnapshotPolicy`](openraft::SnapshotPolicy), so callers (slice 4, tests)
@@ -827,6 +827,13 @@ impl RaftHandle {
             .await
         {
             return Err(Self::membership_change_err(e, self).await);
+        }
+        let join = &crate::metrics::global().join;
+        join.admissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if plan.evicted_id.is_some() {
+            join.evictions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(true)
     }

@@ -323,6 +323,10 @@ where
                     error = %e,
                     "customer attestation rejected"
                 );
+                crate::metrics::record_rejection(
+                    crate::metrics::RejectionSource::Client,
+                    e.reason(),
+                );
                 ConnError::Attestation(e)
             })?;
             let key = PcrKey(identity.pcrs.digest());
@@ -370,9 +374,14 @@ where
             }
         };
 
+        let kind = crate::metrics::RpcKind::of_request(&request);
+        let started = std::time::Instant::now();
         let response = dispatch
             .dispatch(session_key, control_pubkey, request)
             .await;
+        crate::metrics::global()
+            .rpc
+            .record_response(kind, &response, started.elapsed());
         write_response(&mut stream, &mut transport, &response).await?;
     }
 
