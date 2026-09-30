@@ -43,14 +43,23 @@
 //! quorum of voters (2 of 3) and applied on the leader. That ACK survives the
 //! loss of any single node; the argument is in the [`crate::raft`] module docs'
 //! "Majority ACK" section. One node down therefore does not stop writes. Losing
-//! quorum does: openraft cannot commit, and the client sees
-//! [`RpcError::Unavailable`] (or its own RPC timeout) rather than an ACK. A
-//! write that fails after it may already have committed is retried by the
-//! client at least once: a duplicate Pin is recovered via the
-//! `VersionConflict` Get-disambiguation (the earlier attempt committed), a
-//! duplicate Transition surfaces `TransitionRejected` and the client confirms
-//! via `Get`.
+//! quorum does: openraft cannot commit, and after
+//! [`COMMIT_TIMEOUT`](crate::raft::COMMIT_TIMEOUT) the client gets
+//! [`RpcError::Unavailable`] rather than an ACK.
+//!
+//! ## `Unavailable` after a write means "outcome unknown"
+//!
+//! A write that timed out stays in the leader's log and may still commit. The
+//! answer is therefore never "not applied", and the client must treat it as
+//! "maybe applied". It does: a retried Pin names the same `expected_version`,
+//! so if the first attempt committed the retry fails the compare-and-swap with
+//! `VersionConflict`, and the client's `Get` finds its own commitment; a
+//! retried Transition or Revoke is rejected or idempotent in the same way, and
+//! the client confirms with `Get`. Timed-out writes are not retried on the
+//! server side (see [`super::forward`]), so a lost quorum does not pile up
+//! duplicate entries.
 
+use crate::metrics::Answered;
 use crate::raft::{RaftHandle, RaftHandleError, ReplicatedOp};
 use crate::wire::{Request, Response, RpcError, decode_transition_link, verify_transition_link};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
@@ -67,15 +76,18 @@ use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
 /// fails because this node is not the leader / quorum is lost surfaces as
 /// [`RpcError::Unavailable`]; the caller (the listener on a node that thought it
 /// was leader but raced a step-down) should not normally see it because it only
-/// calls this after `is_leader`, but it is mapped defensively. The
-/// non-leader-forwarding path lives in [`super::forward`].
+/// calls this after `is_leader`, but it is mapped defensively. When no quorum
+/// answers within the commit timeout the response is also `Unavailable`, with
+/// [`Answered::timed_out`] set: the write's outcome is unknown and the caller
+/// must not resubmit it. The non-leader-forwarding path lives in
+/// [`super::forward`].
 pub async fn handle_on_leader(
     raft: &RaftHandle,
     session_key: PcrKey,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     req: Request,
     debug_mode: bool,
-) -> Response {
+) -> Answered {
     match req {
         Request::Get { key } => handle_get(raft, session_key, key).await,
         Request::Pin {
@@ -103,20 +115,20 @@ pub async fn handle_on_leader(
 /// so this uses [`RaftHandle::linearizable_get`] (leader + fresh quorum) and
 /// NEVER a follower-local read. The redundant `key` must match the session's
 /// bound key (belt-and-braces, same as the single-node path).
-async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Response {
+async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Answered {
     if key != session_key {
         return err(RpcError::Unauthorized);
     }
     match raft.linearizable_get(&key).await {
-        Ok(Some(state)) => Response::GetOk {
+        Ok(Some(state)) => Answered::new(Response::GetOk {
             commitment: state.commitment,
             version: state.version,
-        },
+        }),
         Ok(None) => err(RpcError::NotFound),
         // Not the leader / quorum lost: cannot guarantee freshness. The caller
         // forwards to the leader before reaching here, so on the leader this is
         // a transient quorum loss the client retries.
-        Err(RaftHandleError::NotLinearizable(_)) => err(RpcError::Unavailable),
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("get"),
         Err(_) => err(RpcError::Unavailable),
     }
 }
@@ -155,7 +167,7 @@ async fn handle_pin(
     expected_version: crate::Version,
     commitment: crate::Commitment,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
-) -> Response {
+) -> Answered {
     if key != session_key {
         return err(RpcError::Unauthorized);
     }
@@ -192,9 +204,9 @@ async fn handle_pin(
     };
 
     match raft.client_write(first_op).await {
-        Ok(state) => Response::PinOk {
+        Ok(state) => Answered::new(Response::PinOk {
             version: state.version,
-        },
+        }),
         // Concurrent first-pin race: our Register lost to another session's
         // Register for the same key. The key is now registered, so retry ONCE
         // as a Pin (bounded, deterministic: a live key's Pin cannot itself hit
@@ -219,16 +231,20 @@ async fn handle_pin(
                 })
                 .await
             {
-                Ok(state) => Response::PinOk {
+                Ok(state) => Answered::new(Response::PinOk {
                     version: state.version,
-                },
+                }),
                 Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
+                Err(RaftHandleError::CommitTimeout(_)) => timed_out("pin"),
                 // Not the leader any more, or quorum lost: the write is not
                 // known to be committed, so never ACK it.
                 Err(_) => err(RpcError::Unavailable),
             }
         }
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
+        // No quorum within the bound: the entry may still commit, so the
+        // answer is "outcome unknown", never an ACK.
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("pin"),
         // Raft errors (not the leader any more / quorum lost): the write is not
         // known to be committed on a quorum, so the oracle must not ACK it.
         Err(_) => err(RpcError::Unavailable),
@@ -268,7 +284,7 @@ async fn handle_transition(
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     link: crate::wire::ChainLink,
     debug_mode: bool,
-) -> Response {
+) -> Answered {
     // Phase one: structurally decode the (still-untrusted) link.
     let decoded = match decode_transition_link(&link) {
         Ok(d) => d,
@@ -335,21 +351,33 @@ async fn handle_transition(
         })
         .await
     {
-        Ok(state) => Response::TransitionOk {
+        Ok(state) => Answered::new(Response::TransitionOk {
             version: state.version,
-        },
+        }),
         // KeyNotCurrent from a Transition means the old key isn't registered:
         // a transition rejection, not a Get-style NotFound.
         Err(RaftHandleError::Rejected(ValidationError::KeyNotCurrent)) => {
             err(RpcError::TransitionRejected)
         }
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
+        // No quorum within the bound: the transition may still commit.
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("transition"),
         // Raft error (not the leader any more / quorum lost): the transition is
         // not known to be committed on a quorum, so do not ACK it.
         Err(_) => err(RpcError::Unavailable),
     }
 }
 
-fn err(error: RpcError) -> Response {
-    Response::Err { error }
+fn err(error: RpcError) -> Answered {
+    Answered::new(Response::Err { error })
+}
+
+/// `Unavailable` after the commit timeout. For a write the outcome is
+/// unknown, which is what the flag records.
+fn timed_out(op: &'static str) -> Answered {
+    tracing::warn!(
+        op,
+        "no quorum within the commit timeout; answering Unavailable (a write may still commit)"
+    );
+    Answered::deadline_elapsed()
 }

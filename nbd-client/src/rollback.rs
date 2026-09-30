@@ -830,18 +830,45 @@ pub struct SyncPinner<S> {
     reconnect: Option<Reconnector<S>>,
 }
 
-impl<S> SyncPinner<S>
+/// One pin RPC under [`SYNC_RPC_TIMEOUT`], naming `*expected` as the
+/// compare-and-swap version and advancing it on success.
+///
+/// A `VersionConflict` is resolved with [`disambiguate_conflict`]: did an
+/// earlier attempt of THIS pin commit before its ack was lost, or is a
+/// different writer ahead of us (a fork)? This is what makes a retry safe
+/// when the oracle answered an earlier attempt `Unavailable` (outcome
+/// unknown) and that attempt committed anyway: the retry names the same
+/// `expected`, fails the CAS, and the `Get` finds our own commitment.
+pub async fn pin_once_on<O>(
+    oracle: &mut O,
+    key: PcrKey,
+    expected: &mut Version,
+    commitment: [u8; 32],
+) -> Result<(), (PinFailure, String)>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    O: BootOracle,
 {
-    /// Disambiguate a `VersionConflict`: did an earlier attempt of THIS
-    /// pin commit before its ack was lost, or is a different writer
-    /// ahead of us (a fork)? Delegates to [`disambiguate_conflict`],
-    /// which the boot registration path shares.
-    async fn resolve_conflict(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
-        let version = disambiguate_conflict(&mut self.client, self.key, commitment).await?;
-        self.expected = version;
-        Ok(())
+    match tokio::time::timeout(
+        SYNC_RPC_TIMEOUT,
+        oracle.pin(key, *expected, Commitment(commitment)),
+    )
+    .await
+    {
+        Ok(Ok(version)) => {
+            debug!(version = version.0, "superblock pin durably acknowledged");
+            *expected = version;
+            Ok(())
+        }
+        Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
+            *expected = disambiguate_conflict(oracle, key, commitment).await?;
+            Ok(())
+        }
+        Ok(Err(e)) => Err((classify_pin_error(&e), format!("pin rpc failed: {e}"))),
+        // A timeout is indistinguishable from a dead node: retryable.
+        Err(_) => Err((
+            PinFailure::Session,
+            format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
+        )),
     }
 }
 
@@ -867,28 +894,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
-        match tokio::time::timeout(
-            SYNC_RPC_TIMEOUT,
-            self.client
-                .pin(self.key, self.expected, Commitment(commitment)),
-        )
-        .await
-        {
-            Ok(Ok(version)) => {
-                debug!(version = version.0, "superblock pin durably acknowledged");
-                self.expected = version;
-                Ok(())
-            }
-            Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
-                self.resolve_conflict(commitment).await
-            }
-            Ok(Err(e)) => Err((classify_pin_error(&e), format!("pin rpc failed: {e}"))),
-            // A timeout is indistinguishable from a dead node: retryable.
-            Err(_) => Err((
-                PinFailure::Session,
-                format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
-            )),
-        }
+        pin_once_on(&mut self.client, self.key, &mut self.expected, commitment).await
     }
 
     fn can_reconnect(&self) -> bool {
@@ -3943,6 +3949,117 @@ mod retry_budget_tests {
         pin_with_retries(&mut session, [0xaa; 32]).await.unwrap();
         assert_eq!(session.reconnects, 1);
         assert_eq!(session.attempts, 4);
+    }
+
+    /// A CAS oracle model. `lost_acks` pins commit (the CAS is applied) but
+    /// are answered `Unavailable`, the synchronizer's answer when its commit
+    /// wait times out and the entry commits afterwards.
+    struct CasOracle {
+        commitment: Commitment,
+        version: Version,
+        lost_acks: usize,
+        pins: usize,
+    }
+
+    impl BootOracle for CasOracle {
+        async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
+            Ok((self.commitment, self.version))
+        }
+        async fn pin(
+            &mut self,
+            _key: PcrKey,
+            expected_version: Version,
+            commitment: Commitment,
+        ) -> Result<Version, ClientError> {
+            self.pins += 1;
+            if expected_version != self.version {
+                return Err(ClientError::Rpc(RpcError::VersionConflict));
+            }
+            self.commitment = commitment;
+            self.version = Version(self.version.0 + 1);
+            if self.lost_acks > 0 {
+                self.lost_acks -= 1;
+                return Err(ClientError::Rpc(RpcError::Unavailable));
+            }
+            Ok(self.version)
+        }
+        async fn transition(&mut self, _link: ChainLink) -> Result<Version, ClientError> {
+            unreachable!("no transition on the pin path")
+        }
+    }
+
+    /// The production pin attempt ([`pin_once_on`]) over the model.
+    struct ModelPinner {
+        oracle: CasOracle,
+        expected: Version,
+    }
+
+    impl PinAttempt for ModelPinner {
+        async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
+            pin_once_on(
+                &mut self.oracle,
+                super::tests::test_key(),
+                &mut self.expected,
+                commitment,
+            )
+            .await
+        }
+        fn can_reconnect(&self) -> bool {
+            false
+        }
+        async fn reconnect_session(&mut self) -> Result<(), (PinFailure, String)> {
+            unreachable!("no reconnect in this model")
+        }
+    }
+
+    /// "Timed out but committed": the oracle answers a pin `Unavailable`
+    /// although the pin committed. The retry names the same CAS version,
+    /// hits `VersionConflict`, the `Get` finds our own commitment, and the
+    /// pinner continues from the committed version, so the NEXT pin's CAS
+    /// is right and succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_but_committed_pin_resolves_and_next_cas_succeeds() {
+        let mut pinner = ModelPinner {
+            oracle: CasOracle {
+                commitment: Commitment([0x01; 32]),
+                version: Version(4),
+                lost_acks: 1,
+                pins: 0,
+            },
+            expected: Version(4),
+        };
+        pin_with_retries(&mut pinner, [0x02; 32])
+            .await
+            .expect("our own committed pin must resolve, not fail-stop");
+        assert_eq!(pinner.expected, Version(5));
+        assert_eq!(pinner.oracle.pins, 2);
+
+        pin_with_retries(&mut pinner, [0x03; 32]).await.unwrap();
+        assert_eq!(pinner.expected, Version(6));
+        assert_eq!(pinner.oracle.commitment, Commitment([0x03; 32]));
+    }
+
+    /// The same unknown outcome, but another writer's pin is what landed:
+    /// the retry's CAS fails, the `Get` shows a foreign commitment, and the
+    /// pin fail-stops as a fork.
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_then_foreign_commit_is_a_fork() {
+        let mut pinner = ModelPinner {
+            oracle: CasOracle {
+                commitment: Commitment([0x01; 32]),
+                version: Version(4),
+                lost_acks: 0,
+                pins: 0,
+            },
+            expected: Version(4),
+        };
+        // Another writer pinned in between.
+        pinner.oracle.commitment = Commitment([0x77; 32]);
+        pinner.oracle.version = Version(5);
+        let err = pin_with_retries(&mut pinner, [0x02; 32])
+            .await
+            .unwrap_err();
+        assert!(err.contains("fork"), "{err}");
     }
 }
 

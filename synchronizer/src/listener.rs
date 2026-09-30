@@ -79,6 +79,7 @@
 use enclavia_protocol::{NoiseTransport, attestation, perform_handshake_as_responder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::metrics::Answered;
 use crate::wire::{PeerProtocol, Request, Response, RpcError};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 
@@ -174,13 +175,15 @@ impl SessionAttestor for FakeSessionAttestor {
 #[async_trait::async_trait]
 pub trait SessionDispatch: Send + Sync {
     /// Handle one request from a session authenticated as `session_key` with
-    /// `control_pubkey`. Returns the wire [`Response`] to send back.
+    /// `control_pubkey`. Returns the wire [`Response`] to send back, plus
+    /// whether it is an `Unavailable` produced by an elapsed deadline (the
+    /// metrics count those separately; see [`Answered`]).
     async fn dispatch(
         &self,
         session_key: PcrKey,
         control_pubkey: [u8; CONTROL_PUBKEY_LEN],
         request: Request,
-    ) -> Response;
+    ) -> Answered;
 }
 
 /// The single-node [`Node`](crate::Node) is a [`SessionDispatch`]: it observes
@@ -194,9 +197,9 @@ impl SessionDispatch for crate::node::Node {
         session_key: PcrKey,
         control_pubkey: [u8; CONTROL_PUBKEY_LEN],
         request: Request,
-    ) -> Response {
+    ) -> Answered {
         self.observe_attestation(session_key, control_pubkey).await;
-        self.handle_request(session_key, request).await
+        Answered::new(self.handle_request(session_key, request).await)
     }
 }
 
@@ -376,13 +379,13 @@ where
 
         let kind = crate::metrics::RpcKind::of_request(&request);
         let started = std::time::Instant::now();
-        let response = dispatch
+        let answered = dispatch
             .dispatch(session_key, control_pubkey, request)
             .await;
         crate::metrics::global()
             .rpc
-            .record_response(kind, &response, started.elapsed());
-        write_response(&mut stream, &mut transport, &response).await?;
+            .record_answered(kind, &answered, started.elapsed());
+        write_response(&mut stream, &mut transport, &answered.response).await?;
     }
 
     Ok(())
