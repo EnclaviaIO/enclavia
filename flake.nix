@@ -318,6 +318,28 @@
         # time read from /dev/nsm attestation documents.
         nitroTimesync = nitro-timesync.packages.${system}.nitro-timesync-static;
 
+        # Host-side receiver for the synchronizer's metrics frames. Runs on
+        # each synchronizer parent instance, which builds it itself (small
+        # Graviton nodes, `colmena apply` with build-on-target). So it gets
+        # its own dependency derivation scoped to this one crate, and the
+        # minimal toolchain profile: the workspace-wide `cargoArtifacts`
+        # would compile every crate's dependencies, and the dev toolchain
+        # above carries rust-src, rust-analyzer and a wasm target the
+        # parent does not need. A plain native (glibc) build for the host.
+        craneLibHost = (crane.mkLib pkgs).overrideToolchain (p:
+          p.rust-bin.stable."1.88.0".minimal);
+        metricsHostArgs = {
+          src = rustSrc;
+          strictDeps = true;
+          pname = "synchronizer-metrics-host";
+          inherit (craneLibHost.crateNameFromCargoToml { src = rustSrc; }) version;
+          cargoExtraArgs = "-p synchronizer-metrics-host";
+          doCheck = false;
+        };
+        synchronizerMetricsHost = craneLibHost.buildPackage (metricsHostArgs // {
+          cargoArtifacts = craneLibHost.buildDepsOnly metricsHostArgs;
+        });
+
         # --- aarch64 (Graviton) cross builds ------------------------------
         #
         # The production synchronizer runs on Graviton, so every binary in
@@ -603,6 +625,8 @@
           # pin ITS measurements.
           synchronizer = synchronizer;
           synchronizer-nitro = synchronizerNitro;
+          # Host side: the metrics receiver for a synchronizer parent.
+          synchronizer-metrics-host = synchronizerMetricsHost;
           synchronizer-names-init = synchronizerNamesInit;
         } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # Built on the builder's kernels, which build on x86_64-linux
