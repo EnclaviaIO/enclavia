@@ -94,29 +94,40 @@
 //! slice. A single node restarting with empty state is fine: it rejoins as a
 //! follower and hydrates from the survivors' snapshot before serving.
 //!
-//! ## Full-replication ACK (client writes wait for ALL nodes)
+//! ## Majority ACK (client writes are durable on a quorum of voters)
 //!
-//! Raft commit is a MAJORITY (2 of 3): openraft applies and would return an
-//! entry as soon as a quorum has it, while the third node may never have seen
-//! it. With no persistence, recovery from a catastrophic loss is "re-seed from
-//! a surviving node" (#122). If the two nodes holding a
-//! majority-committed-but-not-fully-replicated entry die, re-seeding from the
-//! single survivor silently loses the most recent pins: a bounded rollback
-//! window, the one thing a freshness oracle must not have.
+//! A client write ([`client_write`](RaftHandle::client_write), used by the
+//! serve path for every `Pin` / `Register` / `Transition`) is ACKed when
+//! openraft returns it: the entry has been COMMITTED, i.e. appended to the log
+//! of a quorum of the effective membership (both halves of a joint config
+//! during a membership change), and applied on the leader. With three voters
+//! that is the leader plus at least one follower. Applied-on-the-leader alone
+//! is never an ACK: openraft only applies committed entries.
 //!
-//! So the CLIENT-facing write path
-//! ([`client_write_durable`](RaftHandle::client_write_durable)) does NOT ACK on
-//! the majority commit; it waits until EVERY current voter has replicated the
-//! written entry's log index before returning success. Every ACKed write is
-//! then present on every node, so re-seeding from ANY single survivor is
-//! lossless. The cost: while a node is down, writes (Pin / Transition) stall
-//! and fail with `Unavailable` until the cluster is whole again. Linearizable
-//! reads are unaffected (they still only need a fresh quorum). This is
-//! acceptable for a freshness oracle whose writes are boot-time events.
+//! Safety invariant: **an ACKed write survives the loss of any single node.**
 //!
-//! [`client_write`](RaftHandle::client_write) keeps the plain majority-ACK
-//! semantics and is retained for internal use and the multi-node test harnesses
-//! (which submit ops directly, not through the serve path).
+//! * The leader dies: at least one surviving follower holds the entry. Any new
+//!   leader needs votes from a quorum of the voters, which among two survivors
+//!   means both, and Raft's election restriction makes the holder refuse a
+//!   candidate whose log is behind its own. So the new leader holds the entry
+//!   and the committed history is never rolled back.
+//! * A follower dies: the leader still holds the entry, and so does every
+//!   other quorum member it counted.
+//! * The node that died comes back with an empty log. It cannot vote the
+//!   entry away because its identity is per boot (#209): it is a new id, not a
+//!   voter, until the leader admits it (`add_learner` catches it up first,
+//!   then `change_membership` commits under the current quorum). This part of
+//!   the argument depends on per-boot identity; a restarted node that kept its
+//!   old voter id with an empty in-memory log would break it.
+//!
+//! What this does NOT cover: losing two nodes at once. With no persistence
+//! (#122) an entry that reached only two nodes is gone if both die, and the
+//! remaining node cannot commit anything (no quorum), so the cluster halts
+//! rather than serving; recovery from that is the cold-start design, out of
+//! scope here. The alternative (ACK only once EVERY voter holds the entry)
+//! made re-seeding from any single survivor lossless, but it meant one dead
+//! node turned every client write into `Unavailable`, which is the far more
+//! common failure. Linearizable reads need a fresh quorum either way.
 
 pub mod forward;
 pub mod join;
@@ -272,17 +283,6 @@ pub enum RaftHandleError {
     /// surfaces this rather than returning a possibly-stale value.
     #[error("linearizable read unavailable: {0}")]
     NotLinearizable(String),
-    /// The write committed and applied locally (a Raft majority has it) but at
-    /// least one peer had not replicated it to its log within the bounded wait.
-    /// Returned ONLY by [`client_write_durable`](RaftHandle::client_write_durable),
-    /// which refuses to ACK a client write until EVERY node holds the entry (see
-    /// the module docs' full-replication ACK section). The caller maps this to
-    /// wire `Unavailable`: the at-least-once retry semantics apply (a duplicate
-    /// Pin recovers via the client's VersionConflict Get-disambiguation; a
-    /// duplicate Transition surfaces `TransitionRejected` and
-    /// the client confirms via `Get`).
-    #[error("write committed but not yet replicated to all nodes: {0}")]
-    NotFullyReplicated(String),
     /// The kernel ([`plan_admission`](membership::plan_admission)) refused a
     /// join request: an unknown slot name, an id collision with a live voter
     /// of a different slot, or corrupt committed membership. Deterministic on
@@ -317,28 +317,11 @@ pub struct RaftHandle {
     /// fresh-cluster initializer).
     configured_names: BTreeSet<String>,
     self_id: RaftNodeId,
-    /// Bounded wait used by
-    /// [`client_write_durable`](Self::client_write_durable) for EVERY voter to
-    /// replicate a just-committed entry before the client write is ACKed.
-    /// Defaults to [`DEFAULT_REPLICATION_WAIT`]; tests that intentionally write
-    /// under a partition shorten it with [`with_replication_wait`](Self::with_replication_wait)
-    /// to keep CI fast without changing the production behavior.
-    replication_wait: Duration,
     /// Bounded wait for the blocking `add_learner` in [`Self::admit`]. Defaults
     /// to [`ADD_LEARNER_TIMEOUT`]; shortened by tests via
     /// [`with_add_learner_timeout`](Self::with_add_learner_timeout).
     add_learner_timeout: Duration,
 }
-
-/// Bounded wait for full replication on the client write path
-/// ([`RaftHandle::client_write_durable`]). The entry IS already committed and
-/// applied on a Raft majority once `client_write` returns; this is only the
-/// extra window we give the LAST node to catch up before we tell the client the
-/// write is durable on every replica. Two seconds comfortably covers a healthy
-/// follower's append latency on the low-latency mesh; exceeding it means a node
-/// is genuinely down or partitioned, and the write fails with
-/// [`RaftHandleError::NotFullyReplicated`] (mapped to wire `Unavailable`).
-pub const DEFAULT_REPLICATION_WAIT: Duration = Duration::from_secs(2);
 
 /// Bounded wait for the blocking `add_learner` step of a leader-side admission
 /// ([`RaftHandle::admit`]).
@@ -521,26 +504,12 @@ impl RaftHandle {
             self_record,
             configured_names,
             self_id,
-            replication_wait: DEFAULT_REPLICATION_WAIT,
             add_learner_timeout: ADD_LEARNER_TIMEOUT,
         })
     }
 
-    /// Override the full-replication wait used by
-    /// [`client_write_durable`](Self::client_write_durable). Consumes and
-    /// returns the handle (builder style) so a test can shorten the wait, e.g.
-    /// to assert that a write under a partition fails fast with
-    /// [`RaftHandleError::NotFullyReplicated`] rather than burning the full
-    /// production [`DEFAULT_REPLICATION_WAIT`]. Production never calls this; the
-    /// default is correct for real use.
-    pub fn with_replication_wait(mut self, wait: Duration) -> Self {
-        self.replication_wait = wait;
-        self
-    }
-
     /// Override the bounded `add_learner` wait used by [`admit`](Self::admit).
-    /// Consumes and returns the handle (builder style), mirroring
-    /// [`with_replication_wait`](Self::with_replication_wait), so a test can
+    /// Consumes and returns the handle (builder style) so a test can
     /// assert that an admission whose learner never catches up returns within
     /// the bound without burning the full production [`ADD_LEARNER_TIMEOUT`].
     /// Production never calls this.
@@ -624,21 +593,22 @@ impl RaftHandle {
         }
     }
 
-    /// Submit a verified [`ReplicatedOp`] for replication and application,
-    /// returning as soon as a Raft MAJORITY has committed it.
+    /// Submit a verified [`ReplicatedOp`] for replication and application.
+    /// This is the client write primitive: the serve path ([`super::serve`])
+    /// uses it for every `Pin` / `Register` / `Transition`.
     ///
     /// Must be called on the leader. Returns the applied [`KeyState`] on
     /// success, [`RaftHandleError::Rejected`] if the pure core deterministically
     /// rejected the op, or [`RaftHandleError::Raft`] (carrying a leader hint
     /// when openraft knows one) if this node is not the leader / quorum is lost.
     ///
-    /// This is the MAJORITY-ACK primitive. The CUSTOMER-facing serve path must
-    /// NOT use it directly: a majority commit can ACK an entry to a client while
-    /// the third node has never seen it, which is the bounded rollback window a
-    /// freshness oracle must not have (see the module docs). Use it only
-    /// internally, and from the multi-node test harnesses that drive ops
-    /// directly. The serve path uses
-    /// [`client_write_durable`](Self::client_write_durable) instead.
+    /// Success means the entry is durable on a quorum of voters: openraft
+    /// resolves a client write only after the entry is committed (in the log of
+    /// a quorum of the effective membership, joint configs included) and then
+    /// applied on the leader. Both outcomes, `Applied` and `Rejected`, are
+    /// committed facts that every replica reproduces. See the module docs'
+    /// "Majority ACK" section for why a quorum-durable ACK survives the loss of
+    /// any single node.
     pub async fn client_write(&self, op: ReplicatedOp) -> Result<KeyState, RaftHandleError> {
         match self.raft.client_write(op).await {
             Ok(resp) => match resp.data {
@@ -647,105 +617,6 @@ impl RaftHandle {
             },
             Err(e) => Err(RaftHandleError::Raft(format!("client_write failed: {e}"))),
         }
-    }
-
-    /// Submit a verified [`ReplicatedOp`] and ACK only after EVERY current voter
-    /// has replicated it. This is the CLIENT write primitive; the serve path
-    /// ([`super::serve`]) uses it for `Pin` / `Register` / `Transition`.
-    ///
-    /// Must be called on the leader. Replicates exactly like
-    /// [`client_write`](Self::client_write) (same `Rejected` / `Raft` behavior on
-    /// a rejection or a non-leader / quorum-lost error), but on a successful
-    /// majority commit it does NOT return yet: it takes the written entry's log
-    /// index from openraft's `ClientWriteResponse::log_id` and waits, by watching
-    /// [`Raft::metrics`](openraft::Raft::metrics) (a `watch` channel of
-    /// `RaftMetrics`), until every voter has caught up to at least that index.
-    /// The leader itself is treated as matched (it wrote and applied the entry);
-    /// the per-follower match index lives in `metrics.replication`
-    /// (`Some(BTreeMap<NodeId, Option<LogId>>)` on a leader). The voter set is
-    /// read live from `metrics.membership_config` each poll, so it tracks the
-    /// CURRENT membership rather than assuming a hardcoded 3.
-    ///
-    /// On a [`replication_wait`](Self::replication_wait) timeout (default
-    /// [`DEFAULT_REPLICATION_WAIT`], 2s) it returns
-    /// [`RaftHandleError::NotFullyReplicated`]: the entry IS committed and
-    /// applied locally, but at least one peer has not caught up (a node is down /
-    /// partitioned). The caller maps that to wire `Unavailable`; the
-    /// at-least-once retry semantics already documented apply (a duplicate Pin
-    /// recovers via the VersionConflict Get-disambiguation; a duplicate
-    /// Transition surfaces `TransitionRejected` and the client
-    /// confirms via `Get`).
-    pub async fn client_write_durable(
-        &self,
-        op: ReplicatedOp,
-    ) -> Result<KeyState, RaftHandleError> {
-        let resp = match self.raft.client_write(op).await {
-            Ok(resp) => resp,
-            Err(e) => return Err(RaftHandleError::Raft(format!("client_write failed: {e}"))),
-        };
-        let state = match resp.data {
-            ReplicatedOpResult::Applied(state) => state,
-            ReplicatedOpResult::Rejected(e) => return Err(RaftHandleError::Rejected(e)),
-        };
-
-        // The entry is committed + applied on a majority. Wait for the LAST node
-        // to catch up to its index before ACKing, so every replica holds it and
-        // re-seeding from any single survivor is lossless.
-        let target = resp.log_id.index;
-        let mut rx = self.raft.metrics();
-        let deadline = tokio::time::Instant::now() + self.replication_wait;
-        loop {
-            if Self::all_voters_replicated(&rx.borrow(), self.self_id, target) {
-                return Ok(state);
-            }
-            // Wait for the next metrics tick or the deadline, whichever first.
-            // `changed()` resolves on every metrics update (replication progress
-            // included); the timeout bounds a genuinely-down peer.
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(RaftHandleError::NotFullyReplicated(format!(
-                    "entry at index {target} committed + applied locally, but not every node \
-                     replicated it within {:?}",
-                    self.replication_wait
-                )));
-            }
-            match tokio::time::timeout(remaining, rx.changed()).await {
-                Ok(Ok(())) => continue,
-                // The metrics sender dropped (the Raft core is shutting down):
-                // treat as not-fully-replicated rather than hanging.
-                Ok(Err(_)) => {
-                    return Err(RaftHandleError::NotFullyReplicated(
-                        "raft metrics channel closed before full replication".to_string(),
-                    ));
-                }
-                // Timed out waiting for the next tick: re-check the deadline at
-                // the top of the loop (it will return NotFullyReplicated).
-                Err(_) => continue,
-            }
-        }
-    }
-
-    /// Whether every voter in the current membership has replicated the log
-    /// entry at `target` (its match index is `>= target`). The leader
-    /// (`self_id`) is always treated as matched: it wrote and applied the entry
-    /// before any follower could replicate it. Returns `false` (not fully
-    /// replicated) if `metrics.replication` is absent, which happens when this
-    /// node is not (or no longer) the leader, so the caller keeps waiting until
-    /// the deadline rather than falsely ACKing.
-    fn all_voters_replicated(
-        metrics: &openraft::RaftMetrics<RaftNodeId, MemberRecord>,
-        self_id: RaftNodeId,
-        target: u64,
-    ) -> bool {
-        let Some(replication) = metrics.replication.as_ref() else {
-            return false;
-        };
-        metrics.membership_config.voter_ids().all(|voter| {
-            if voter == self_id {
-                return true;
-            }
-            matches!(replication.get(&voter), Some(Some(log_id)) if log_id.index >= target)
-        })
     }
 
     /// Whether this node currently believes it is the leader. A best-effort

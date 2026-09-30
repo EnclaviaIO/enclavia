@@ -3,9 +3,9 @@
 //! Maps a customer enclave's [`wire::Request`] onto the Raft layer. This is the
 //! replicated successor to the single-node [`Node`](crate::Node): instead of
 //! mutating one in-memory [`StateMachine`](crate::StateMachine) behind a Mutex,
-//! it submits verified [`ReplicatedOp`]s through
-//! [`RaftHandle::client_write_durable`] (which replicates them to EVERY node
-//! before ACKing, see "Full-replication ACK" below) and serves reads through
+//! it submits verified [`ReplicatedOp`]s through [`RaftHandle::client_write`]
+//! (which ACKs once the entry is committed on a quorum of voters, see
+//! "Majority ACK" below) and serves reads through
 //! [`RaftHandle::linearizable_get`] (which refuses to answer off a stale
 //! follower).
 //!
@@ -28,7 +28,7 @@
 //!
 //! ## Leader-only writes + linearizable reads
 //!
-//! Both `client_write_durable` and `linearizable_get` are leader-only by
+//! Both `client_write` and `linearizable_get` are leader-only by
 //! construction: openraft rejects a write on a follower (`ForwardToLeader`) and
 //! refuses to confirm linearizability off a non-leader. So [`handle_on_leader`]
 //! only ever succeeds when this node is the leader; a non-leader's caller must
@@ -36,24 +36,20 @@
 //! [`super::forward`]). The freshness-oracle rule, never serve a stale read,
 //! falls out of using `linearizable_get` for every `Get`.
 //!
-//! ## Full-replication ACK
+//! ## Majority ACK
 //!
-//! Writes (`Pin` / `Register` / `Transition`) go through
-//! [`RaftHandle::client_write_durable`], NOT the majority-ACK
-//! [`RaftHandle::client_write`]. A Raft commit is a majority (2 of 3): an entry
-//! can be majority-committed (and ACKed) while the third node never saw it, and
-//! with no persistence that is a bounded rollback window a freshness oracle must
-//! not have (re-seeding from the wrong survivor after a catastrophic loss would
-//! drop the most recent pins, see the [`crate::raft`] module docs). So a client
-//! write is ACKed only after EVERY node holds the entry. The price: while any
-//! single node is down, writes stall and fail with
-//! [`RpcError::Unavailable`] (mapped from
-//! [`RaftHandleError::NotFullyReplicated`]) until the cluster is whole; the
-//! client retries (at-least-once: a duplicate Pin is recovered via the
-//! `VersionConflict` Get-disambiguation — the earlier attempt committed — a
-//! duplicate
-//! Transition surfaces `TransitionRejected` and the client confirms via `Get`).
-//! Linearizable reads are unaffected: they still need only a fresh quorum.
+//! Writes (`Pin` / `Register` / `Transition`) are ACKed once
+//! [`RaftHandle::client_write`] returns, i.e. once the entry is committed on a
+//! quorum of voters (2 of 3) and applied on the leader. That ACK survives the
+//! loss of any single node; the argument is in the [`crate::raft`] module docs'
+//! "Majority ACK" section. One node down therefore does not stop writes. Losing
+//! quorum does: openraft cannot commit, and the client sees
+//! [`RpcError::Unavailable`] (or its own RPC timeout) rather than an ACK. A
+//! write that fails after it may already have committed is retried by the
+//! client at least once: a duplicate Pin is recovered via the
+//! `VersionConflict` Get-disambiguation (the earlier attempt committed), a
+//! duplicate Transition surfaces `TransitionRejected` and the client confirms
+//! via `Get`.
 
 use crate::raft::{RaftHandle, RaftHandleError, ReplicatedOp};
 use crate::wire::{Request, Response, RpcError, decode_transition_link, verify_transition_link};
@@ -195,7 +191,7 @@ async fn handle_pin(
         }
     };
 
-    match raft.client_write_durable(first_op).await {
+    match raft.client_write(first_op).await {
         Ok(state) => Response::PinOk {
             version: state.version,
         },
@@ -216,7 +212,7 @@ async fn handle_pin(
         // conservative stop on both sides, never a silent rollback.
         Err(RaftHandleError::Rejected(ValidationError::AlreadyRegistered)) => {
             match raft
-                .client_write_durable(ReplicatedOp::Pin {
+                .client_write(ReplicatedOp::Pin {
                     key,
                     expected_version,
                     commitment,
@@ -227,16 +223,14 @@ async fn handle_pin(
                     version: state.version,
                 },
                 Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-                // NotFullyReplicated and any other write failure: a node is down
-                // or quorum was lost, so we cannot confirm the write reached
-                // every replica. Surface Unavailable rather than a false ACK.
+                // Not the leader any more, or quorum lost: the write is not
+                // known to be committed, so never ACK it.
                 Err(_) => err(RpcError::Unavailable),
             }
         }
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-        // Covers NotFullyReplicated (write committed on a majority but not on
-        // every node) and Raft errors (not leader / quorum lost): the freshness
-        // oracle must not ACK a write it cannot guarantee on all replicas.
+        // Raft errors (not the leader any more / quorum lost): the write is not
+        // known to be committed on a quorum, so the oracle must not ACK it.
         Err(_) => err(RpcError::Unavailable),
     }
 }
@@ -324,7 +318,7 @@ async fn handle_transition(
     // record it (observe_attestation) before applying the Transition so the pure
     // core's NewKeyNotAttested check passes.
     match raft
-        .client_write_durable(ReplicatedOp::Transition {
+        .client_write(ReplicatedOp::Transition {
             old_key: verified.old_key,
             new_key: verified.new_key,
             new_control_pubkey: control_pubkey,
@@ -340,9 +334,8 @@ async fn handle_transition(
             err(RpcError::TransitionRejected)
         }
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-        // NotFullyReplicated (majority-committed but a node is behind) or a Raft
-        // error (not leader / quorum lost): cannot confirm the transition on
-        // every replica, so do not ACK it.
+        // Raft error (not the leader any more / quorum lost): the transition is
+        // not known to be committed on a quorum, so do not ACK it.
         Err(_) => err(RpcError::Unavailable),
     }
 }

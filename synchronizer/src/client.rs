@@ -50,11 +50,11 @@
 //!
 //! ## Durability
 //!
-//! In the replicated deployment the server answers `PinOk` only after
-//! `client_write_durable` has replicated the entry to EVERY voter (see
-//! `crate::raft::serve`). Awaiting [`Client::pin`]'s response therefore
-//! IS the durable-replication ack the anti-rollback gate in `nbd-client`
-//! relies on.
+//! In the replicated deployment the server answers `PinOk` only after the
+//! entry is committed on a quorum of voters (see `crate::raft`'s "Majority
+//! ACK"), which survives the loss of any single node. Awaiting
+//! [`Client::pin`]'s response therefore IS the durable-replication ack the
+//! anti-rollback gate in `nbd-client` relies on.
 //!
 //! ## vsock write sizing
 //!
@@ -249,7 +249,7 @@ where
     /// non-existence); pass `Version(0)` there by convention.
     ///
     /// In the replicated deployment the response only arrives after the
-    /// entry is replicated to every voter, so awaiting this is the
+    /// entry is committed on a quorum of voters, so awaiting this is the
     /// durable ack.
     pub async fn pin(
         &mut self,
