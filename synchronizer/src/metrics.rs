@@ -139,11 +139,15 @@ pub enum RpcOutcome {
     VersionConflict,
     /// [`RpcError::Unavailable`].
     Unavailable,
+    /// [`RpcError::Unavailable`] because a deadline elapsed while waiting for
+    /// a quorum (see [`Answered::timed_out`]). For a write the outcome is
+    /// unknown: the entry may still commit.
+    Timeout,
 }
 
 impl RpcOutcome {
     /// Every outcome, in label order.
-    pub const ALL: [RpcOutcome; 7] = [
+    pub const ALL: [RpcOutcome; 8] = [
         RpcOutcome::Ok,
         RpcOutcome::Unauthorized,
         RpcOutcome::NotFound,
@@ -151,6 +155,7 @@ impl RpcOutcome {
         RpcOutcome::OperationRejected,
         RpcOutcome::VersionConflict,
         RpcOutcome::Unavailable,
+        RpcOutcome::Timeout,
     ];
 
     /// Metric label.
@@ -163,6 +168,17 @@ impl RpcOutcome {
             RpcOutcome::OperationRejected => "operation_rejected",
             RpcOutcome::VersionConflict => "version_conflict",
             RpcOutcome::Unavailable => "unavailable",
+            RpcOutcome::Timeout => "timeout",
+        }
+    }
+
+    /// The outcome of `answered`: [`RpcOutcome::Timeout`] for an
+    /// `Unavailable` produced by an elapsed deadline, otherwise the outcome
+    /// of its response.
+    pub fn of_answered(answered: &Answered) -> Self {
+        match Self::of_response(&answered.response) {
+            RpcOutcome::Unavailable if answered.timed_out => RpcOutcome::Timeout,
+            other => other,
         }
     }
 
@@ -179,6 +195,48 @@ impl RpcOutcome {
             },
             _ => RpcOutcome::Ok,
         }
+    }
+}
+
+/// A customer response plus how it was produced, for the metrics.
+///
+/// The wire has one `Unavailable` for "no quorum right now", whether the node
+/// found that out at once (not the leader, no leader known) or only after a
+/// deadline elapsed. The two differ for a write: after a deadline the write
+/// may still commit. `timed_out` keeps them apart in the RPC outcome label
+/// without changing the wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answered {
+    /// The response sent to the customer.
+    pub response: Response,
+    /// The node answered `Unavailable` because a deadline elapsed while it
+    /// waited for a quorum.
+    pub timed_out: bool,
+}
+
+impl Answered {
+    /// An answer that did not come from an elapsed deadline.
+    pub fn new(response: Response) -> Self {
+        Self {
+            response,
+            timed_out: false,
+        }
+    }
+
+    /// `Unavailable` because a deadline elapsed.
+    pub fn deadline_elapsed() -> Self {
+        Self {
+            response: Response::Err {
+                error: RpcError::Unavailable,
+            },
+            timed_out: true,
+        }
+    }
+}
+
+impl From<Response> for Answered {
+    fn from(response: Response) -> Self {
+        Self::new(response)
     }
 }
 
@@ -302,6 +360,15 @@ impl RpcStats {
         self.record(
             kind.refine(response),
             RpcOutcome::of_response(response),
+            elapsed,
+        );
+    }
+
+    /// Count one completed request, classified from its [`Answered`].
+    pub fn record_answered(&self, kind: RpcKind, answered: &Answered, elapsed: Duration) {
+        self.record(
+            kind.refine(&answered.response),
+            RpcOutcome::of_answered(answered),
             elapsed,
         );
     }
@@ -999,6 +1066,53 @@ mod tests {
             }),
             RpcOutcome::Ok
         );
+    }
+
+    /// An `Unavailable` produced by an elapsed deadline is counted as
+    /// `timeout`; the same response without the flag stays `unavailable`,
+    /// and the flag never relabels any other response.
+    #[test]
+    fn timed_out_unavailable_is_labelled_timeout() {
+        assert_eq!(
+            RpcOutcome::of_answered(&Answered::deadline_elapsed()),
+            RpcOutcome::Timeout
+        );
+        assert_eq!(RpcOutcome::Timeout.as_str(), "timeout");
+        let unavailable = Response::Err {
+            error: RpcError::Unavailable,
+        };
+        assert_eq!(
+            RpcOutcome::of_answered(&Answered::new(unavailable)),
+            RpcOutcome::Unavailable
+        );
+        let ok = Answered {
+            response: Response::PinOk {
+                version: Version(3),
+            },
+            timed_out: true,
+        };
+        assert_eq!(RpcOutcome::of_answered(&ok), RpcOutcome::Ok);
+
+        let stats = RpcStats::new();
+        stats.record_answered(
+            RpcKind::Pin,
+            &Answered::deadline_elapsed(),
+            Duration::from_secs(5),
+        );
+        let pin = stats
+            .sample()
+            .into_iter()
+            .find(|k| k.kind == "pin")
+            .unwrap();
+        let count = |label: &str| {
+            pin.outcomes
+                .iter()
+                .find(|o| o.outcome == label)
+                .unwrap()
+                .count
+        };
+        assert_eq!(count("timeout"), 1);
+        assert_eq!(count("unavailable"), 0);
     }
 
     #[test]

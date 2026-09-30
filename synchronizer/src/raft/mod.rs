@@ -296,6 +296,11 @@ pub enum RaftHandleError {
     /// no leader is currently known (an election is in progress).
     #[error("not the leader; redirect to {0:?}")]
     NotLeader(Option<String>),
+    /// No quorum confirmed the operation within the bound (see
+    /// [`COMMIT_TIMEOUT`]). For a write the outcome is UNKNOWN: the entry may
+    /// still commit later.
+    #[error("no quorum within {0:?}; a write may still commit")]
+    CommitTimeout(Duration),
 }
 
 /// Handle the listener / slice-4 drives to submit ops and read state.
@@ -321,7 +326,39 @@ pub struct RaftHandle {
     /// to [`ADD_LEARNER_TIMEOUT`]; shortened by tests via
     /// [`with_add_learner_timeout`](Self::with_add_learner_timeout).
     add_learner_timeout: Duration,
+    /// Bounded wait for a quorum on the client path: a commit in
+    /// [`Self::client_write`], a ReadIndex round in
+    /// [`Self::linearizable_get`]. Defaults to [`COMMIT_TIMEOUT`]; changed by
+    /// tests via [`with_commit_timeout`](Self::with_commit_timeout).
+    commit_timeout: Duration,
 }
+
+/// How long the client path waits for a quorum before answering
+/// `Unavailable`: for a write, until the entry is committed and applied on the
+/// leader; for a linearizable read, until the leader has confirmed that it
+/// still leads a quorum.
+///
+/// openraft's `client_write` has no deadline of its own. Without a quorum it
+/// waits until one comes back, so the customer's request would hang until its
+/// own RPC timeout (30 s in nbd-client), and a forwarded request would also
+/// hold the forwarding peer's mesh channel, whose serve loop is sequential.
+///
+/// Five seconds, against the numbers this cluster runs at: a healthy commit
+/// takes about a millisecond, a snapshot build stalls writes for 50-100 ms,
+/// and an election takes 300-600 ms. So 5 s only elapses when no quorum is
+/// reachable. It is also well below the customer's 30 s RPC timeout, so the
+/// customer gets the structured `Unavailable` (and retries on the same session
+/// under its own budget) instead of an RPC timeout, which it treats as a dead
+/// session.
+///
+/// A write that times out is NOT abandoned: the entry stays in the leader's
+/// log and may still commit later. `Unavailable` therefore means "outcome
+/// unknown" for a write, never "not applied". This is safe because the
+/// deterministic `apply` checks every op again when it commits (the pin's
+/// compare-and-swap, `AlreadyRegistered`, the transition and revocation
+/// rules), and because a pending entry either commits before any entry
+/// appended after it, or never.
+pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bounded wait for the blocking `add_learner` step of a leader-side admission
 /// ([`RaftHandle::admit`]).
@@ -505,6 +542,7 @@ impl RaftHandle {
             configured_names,
             self_id,
             add_learner_timeout: ADD_LEARNER_TIMEOUT,
+            commit_timeout: COMMIT_TIMEOUT,
         })
     }
 
@@ -516,6 +554,22 @@ impl RaftHandle {
     pub fn with_add_learner_timeout(mut self, timeout: Duration) -> Self {
         self.add_learner_timeout = timeout;
         self
+    }
+
+    /// Override the bounded quorum wait used by
+    /// [`client_write`](Self::client_write) and
+    /// [`linearizable_get`](Self::linearizable_get) (default
+    /// [`COMMIT_TIMEOUT`]). Consumes and returns the handle (builder style).
+    /// Tests use a near-zero value on a clone to get a write that times out
+    /// and still commits. Production never calls this.
+    pub fn with_commit_timeout(mut self, timeout: Duration) -> Self {
+        self.commit_timeout = timeout;
+        self
+    }
+
+    /// The bounded quorum wait of the client path (see [`COMMIT_TIMEOUT`]).
+    pub fn commit_timeout(&self) -> Duration {
+        self.commit_timeout
     }
 
     /// Enable serving FORWARDED client requests on this node.
@@ -609,13 +663,18 @@ impl RaftHandle {
     /// committed facts that every replica reproduces. See the module docs'
     /// "Majority ACK" section for why a quorum-durable ACK survives the loss of
     /// any single node.
+    ///
+    /// The wait is bounded by [`COMMIT_TIMEOUT`]. When it elapses this returns
+    /// [`RaftHandleError::CommitTimeout`] and the entry may STILL commit later:
+    /// the caller must report "outcome unknown", never "not applied".
     pub async fn client_write(&self, op: ReplicatedOp) -> Result<KeyState, RaftHandleError> {
-        match self.raft.client_write(op).await {
-            Ok(resp) => match resp.data {
+        match tokio::time::timeout(self.commit_timeout, self.raft.client_write(op)).await {
+            Ok(Ok(resp)) => match resp.data {
                 ReplicatedOpResult::Applied(state) => Ok(state),
                 ReplicatedOpResult::Rejected(e) => Err(RaftHandleError::Rejected(e)),
             },
-            Err(e) => Err(RaftHandleError::Raft(format!("client_write failed: {e}"))),
+            Ok(Err(e)) => Err(RaftHandleError::Raft(format!("client_write failed: {e}"))),
+            Err(_) => Err(RaftHandleError::CommitTimeout(self.commit_timeout)),
         }
     }
 
@@ -696,14 +755,18 @@ impl RaftHandle {
     /// so a non-leader / quorum-lost node returns
     /// [`RaftHandleError::NotLinearizable`] instead of a possibly-stale local
     /// read. `Ok(None)` means the key is not currently registered.
+    ///
+    /// The quorum confirmation is bounded by [`COMMIT_TIMEOUT`]
+    /// ([`RaftHandleError::CommitTimeout`] when it elapses).
     pub async fn linearizable_get(
         &self,
         key: &PcrKey,
     ) -> Result<Option<KeyState>, RaftHandleError> {
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|e| RaftHandleError::NotLinearizable(format!("{e}")))?;
+        match tokio::time::timeout(self.commit_timeout, self.raft.ensure_linearizable()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(RaftHandleError::NotLinearizable(format!("{e}"))),
+            Err(_) => return Err(RaftHandleError::CommitTimeout(self.commit_timeout)),
+        }
         Ok(self.sm.get(key).await)
     }
 
