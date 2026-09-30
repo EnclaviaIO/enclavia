@@ -150,6 +150,11 @@ nitroLib.buildEif {
   # at boot to surface /dev/nsm.
   nsmKo = blobs.nsmKo;
   copyToRoot = rootfs;
+  # The rootfs is self-contained (static binaries and a /bin/sh script,
+  # enforced above), so nothing in the image resolves a /nix/store path.
+  # Copying its closure would only add a second copy of the rootfs and the
+  # whole busybox package under /nix/store.
+  copyToRootWithClosure = false;
   entrypoint = "/bin/enclave-init";
   init = initBinary;
 }
