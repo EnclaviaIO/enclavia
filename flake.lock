@@ -3,16 +3,17 @@
     "builder-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1783697223,
-        "narHash": "sha256-7lnyiIYNhO7jF+9FK87TMdiFH9WCkXh3/M+5oKM2Z/E=",
+        "lastModified": 1790778323,
+        "narHash": "sha256-kf2gXiiTkWuyiMn1LioOCJdMbO4xxCyjLLEHifwdjes=",
         "owner": "EnclaviaIO",
         "repo": "builder",
-        "rev": "be630db4854eb6154a4c4cfaf2e20f2202a22f35",
+        "rev": "efa534b610b4cb3e90d9141831d60966d719090a",
         "type": "github"
       },
       "original": {
         "owner": "EnclaviaIO",
         "repo": "builder",
+        "rev": "efa534b610b4cb3e90d9141831d60966d719090a",
         "type": "github"
       }
     },
@@ -157,6 +158,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-builder": {
+      "locked": {
+        "lastModified": 1785692966,
+        "narHash": "sha256-vUfIeBEfpbAfZ5zjgIkYk7eHBeVfCYVjLbWnMkseYnk=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "643809054d65fdd466a63e3155b8c498cb483c04",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "643809054d65fdd466a63e3155b8c498cb483c04",
+        "type": "github"
+      }
+    },
     "nixpkgs_2": {
       "locked": {
         "lastModified": 1711703276,
@@ -197,6 +214,7 @@
         "nitro-timesync": "nitro-timesync",
         "nitro-util": "nitro-util",
         "nixpkgs": "nixpkgs_3",
+        "nixpkgs-builder": "nixpkgs-builder",
         "rust-overlay": "rust-overlay_2"
       }
     },
