@@ -336,8 +336,9 @@ impl From<ValidationError> for RpcError {
 // ---------------------------------------------------------------------------
 
 // Re-exported so policy construction has one import site alongside the
-// verifier that consumes it.
-pub use enclavia_protocol::attestation::Pcrs;
+// verifier that consumes it, and so rejection sites can name the classified
+// cause without importing enclavia-protocol themselves.
+pub use enclavia_protocol::attestation::{Pcrs, RejectionReason};
 
 /// Which synchronizer measurements a customer accepts when the oracle
 /// attests back to it (#208).
@@ -393,12 +394,22 @@ pub enum ServerAuthError {
     /// `nonce` that does not bind this session's handshake hash (a
     /// replayed capture from another session).
     #[error("server attestation document invalid: {0}")]
-    Attestation(String),
+    Attestation(enclavia_protocol::attestation::AttestationError),
     /// The document verified, but its PCRs are not admitted by the
     /// caller's [`ServerPcrPolicy`]: whatever is on the other end of
     /// this session, it is not the synchronizer the caller trusts.
     #[error("server attestation PCRs are not the expected synchronizer measurements")]
     PcrRejected,
+}
+
+impl ServerAuthError {
+    /// The classified cause of the rejection.
+    pub fn reason(&self) -> RejectionReason {
+        match self {
+            ServerAuthError::Attestation(e) => e.reason(),
+            ServerAuthError::PcrRejected => RejectionReason::PcrMismatch,
+        }
+    }
 }
 
 /// Verify the server's `Authenticate` document for one customer session
@@ -430,7 +441,7 @@ pub fn verify_server_attestation(
     ) {
         Ok(pcrs) => Ok(pcrs),
         Err(AttestationError::PcrsNotExpected) => Err(ServerAuthError::PcrRejected),
-        Err(e) => Err(ServerAuthError::Attestation(e.to_string())),
+        Err(e) => Err(ServerAuthError::Attestation(e)),
     }
 }
 
@@ -472,7 +483,7 @@ pub enum TransitionLinkError {
     /// or `user_data != sha256(payload)`, or PCRs disagree with
     /// `from_pcrs`).
     #[error("transition link attestation failed: {0}")]
-    Attestation(String),
+    Attestation(enclavia_protocol::attestation::AttestationError),
     /// A PCR string inside `from_pcrs` / `to_pcrs` was not valid hex / not
     /// a usable length.
     #[error("transition link payload carries a malformed PCR set: {0}")]
@@ -510,6 +521,18 @@ pub enum TransitionLinkError {
 /// time), so the tolerance only has to absorb the difference between two
 /// Nitro hosts' clocks and the whole-second stamps of QEMU's emulated NSM.
 pub const TRANSITION_VALID_FROM_TOLERANCE_MS: u64 = 60_000;
+
+impl TransitionLinkError {
+    /// The classified cause when the link's attestation document was
+    /// rejected; `None` for the non-attestation checks (signature shape,
+    /// key derivation, session binding, `valid_from`).
+    pub fn attestation_reason(&self) -> Option<RejectionReason> {
+        match self {
+            TransitionLinkError::Attestation(e) => Some(e.reason()),
+            _ => None,
+        }
+    }
+}
 
 impl From<TransitionLinkError> for RpcError {
     fn from(_: TransitionLinkError) -> Self {
@@ -708,7 +731,7 @@ pub fn verify_transition_link(
         &expected_pcrs,
         enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
     )
-    .map_err(|e| TransitionLinkError::Attestation(e.to_string()))?;
+    .map_err(TransitionLinkError::Attestation)?;
 
     Ok(VerifiedTransition {
         old_key: decoded.old_key,
@@ -1047,6 +1070,7 @@ mod tests {
         let policy = ServerPcrPolicy::Expected(Vec::new());
         let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
         assert!(matches!(err, ServerAuthError::PcrRejected), "{err:?}");
+        assert_eq!(err.reason(), RejectionReason::PcrMismatch);
     }
 
     /// Nonce binding: a document captured from ANOTHER session (replay)
@@ -1057,6 +1081,7 @@ mod tests {
         let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x56)]);
         let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
         assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
+        assert_eq!(err.reason(), RejectionReason::NonceMismatch);
     }
 
     /// Garbage bytes are rejected as a malformed document (before any
@@ -1067,6 +1092,7 @@ mod tests {
         let err =
             verify_server_attestation(&[0xde, 0xad, 0xbe, 0xef], &hh(), &policy, true).unwrap_err();
         assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
+        assert_eq!(err.reason(), RejectionReason::Malformed);
     }
 
     /// A correctly-bound, expected-PCR document verifies, and the SAME
@@ -1227,6 +1253,12 @@ mod tests {
         assert!(
             matches!(err, TransitionLinkError::Attestation(_)),
             "{err:?}"
+        );
+        assert_eq!(err.attestation_reason(), Some(RejectionReason::PcrMismatch));
+        // A non-attestation failure carries no attestation reason.
+        assert_eq!(
+            TransitionLinkError::SelfTransition.attestation_reason(),
+            None
         );
     }
 

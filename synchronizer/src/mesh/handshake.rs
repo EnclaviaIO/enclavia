@@ -220,7 +220,7 @@ pub enum HandshakeError {
     /// The peer's attestation document failed verification (bad nonce
     /// binding, malformed document, or missing/short `user_data`).
     #[error("peer attestation: {0}")]
-    PeerAttestation(String),
+    PeerAttestation(attestation::AttestationError),
     /// The peer attested, but its PCR digest is not in the self-PCR
     /// allowlist: it is not running our image, so it is not a cluster peer.
     #[error("peer PCR digest not in allowlist (peer is not running our image)")]
@@ -244,6 +244,23 @@ pub enum HandshakeError {
         /// The deadline that elapsed.
         after: Duration,
     },
+}
+
+impl HandshakeError {
+    /// The classified cause when the peer itself was refused: its
+    /// attestation document was rejected, its PCRs are not ours
+    /// ([`RejectionReason::PcrMismatch`](attestation::RejectionReason::PcrMismatch)),
+    /// or its identity signature over the handshake hash failed
+    /// ([`RejectionReason::Signature`](attestation::RejectionReason::Signature)).
+    /// `None` for transport, framing, timeout and local failures.
+    pub fn peer_rejection(&self) -> Option<attestation::RejectionReason> {
+        match self {
+            HandshakeError::PeerAttestation(e) => Some(e.reason()),
+            HandshakeError::PcrNotAllowed => Some(attestation::RejectionReason::PcrMismatch),
+            HandshakeError::IdentitySignature(_) => Some(attestation::RejectionReason::Signature),
+            _ => None,
+        }
+    }
 }
 
 /// Run `fut` under `after`, mapping an elapsed deadline to
@@ -355,11 +372,18 @@ where
         &handshake_hash,
         attestation::VerificationMode::from_debug_flag(debug_mode),
     )
-    .map_err(|e| HandshakeError::PeerAttestation(e.to_string()))?;
+    .map_err(|e| {
+        tracing::warn!(reason = %e.reason(), error = %e, "mesh peer attestation rejected");
+        HandshakeError::PeerAttestation(e)
+    })?;
     let pcr_digest = PcrKey(extracted.pcrs.digest());
 
     // 4. Self-PCR allowlist: the peer must be running our image.
     if !allowlist.admits(&pcr_digest) {
+        tracing::warn!(
+            reason = %attestation::RejectionReason::PcrMismatch,
+            "mesh peer attestation rejected: PCR digest not in the self-PCR allowlist"
+        );
         return Err(HandshakeError::PcrNotAllowed);
     }
 
@@ -372,7 +396,14 @@ where
         &peer_sig,
         &handshake_hash,
     )
-    .map_err(|e| HandshakeError::IdentitySignature(e.to_string()))?;
+    .map_err(|e| {
+        tracing::warn!(
+            reason = %attestation::RejectionReason::Signature,
+            error = %e,
+            "mesh peer rejected: identity signature over the handshake hash failed"
+        );
+        HandshakeError::IdentitySignature(e.to_string())
+    })?;
 
     Ok((
         transport,
@@ -562,6 +593,11 @@ mod tests {
         let (ra, rb) = (ta.await.unwrap(), tb.await.unwrap());
         assert!(matches!(ra, Err(HandshakeError::PcrNotAllowed)));
         assert!(matches!(rb, Err(HandshakeError::PcrNotAllowed)));
+        let Err(e) = ra else { unreachable!() };
+        assert_eq!(
+            e.peer_rejection(),
+            Some(attestation::RejectionReason::PcrMismatch)
+        );
     }
 
     /// A peer whose attestation announces a mesh pubkey it does NOT hold the
@@ -601,7 +637,10 @@ mod tests {
         // `NoiseTransport` is not `Debug`, so match instead of formatting the
         // whole `Result`.
         match ra {
-            Err(HandshakeError::IdentitySignature(_)) => {}
+            Err(e @ HandshakeError::IdentitySignature(_)) => assert_eq!(
+                e.peer_rejection(),
+                Some(attestation::RejectionReason::Signature)
+            ),
             Err(other) => panic!("expected IdentitySignature, got {other:?}"),
             Ok(_) => panic!("expected the stolen-attestation handshake to be rejected"),
         }

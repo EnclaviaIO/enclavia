@@ -109,15 +109,114 @@ impl Pcrs {
     }
 }
 
+/// Why an attestation document was rejected, as a small fixed set of
+/// causes.
+///
+/// Every [`AttestationError`] maps to exactly one reason
+/// ([`AttestationError::reason`]). The set is deliberately coarse and
+/// stable so a verifier can log and count rejections by cause; the
+/// human-readable detail stays in the error's `Display`. [`Self::as_str`]
+/// gives a stable snake_case label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RejectionReason {
+    /// The bytes are not a well-formed NSM attestation document: CBOR /
+    /// COSE decode or structure checks failed, a certificate or key in it
+    /// does not decode, or a field the caller requires (PCRs, `user_data`)
+    /// has the wrong shape.
+    Malformed,
+    /// The leaf certificate is not valid yet at the document's timestamp.
+    NotYetValid,
+    /// The leaf certificate has expired at the document's timestamp.
+    Expired,
+    /// The certificate chain does not lead to the trusted root (unknown
+    /// issuer, or any other path-validation failure above the leaf).
+    UntrustedChain,
+    /// A signature does not verify: the COSE signature under the leaf key,
+    /// or a certificate signature in the chain.
+    Signature,
+    /// The document's timestamp is further from the verifier's clock than
+    /// [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] (session-bound documents only).
+    ClockSkew,
+    /// The document's `nonce` is not this session's handshake hash: it was
+    /// produced for another session (replay, or a relay's substitution).
+    NonceMismatch,
+    /// A chain-link document's `user_data` is not `sha256(payload)`.
+    PayloadBindingMismatch,
+    /// The document is genuine but its PCRs are not the expected ones.
+    PcrMismatch,
+}
+
+impl RejectionReason {
+    /// Every reason, in declaration order (for pre-registering counters).
+    pub const ALL: &'static [RejectionReason] = &[
+        RejectionReason::Malformed,
+        RejectionReason::NotYetValid,
+        RejectionReason::Expired,
+        RejectionReason::UntrustedChain,
+        RejectionReason::Signature,
+        RejectionReason::ClockSkew,
+        RejectionReason::NonceMismatch,
+        RejectionReason::PayloadBindingMismatch,
+        RejectionReason::PcrMismatch,
+    ];
+
+    /// Stable snake_case label, suitable for a log field or a metric label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RejectionReason::Malformed => "malformed",
+            RejectionReason::NotYetValid => "not_yet_valid",
+            RejectionReason::Expired => "expired",
+            RejectionReason::UntrustedChain => "untrusted_chain",
+            RejectionReason::Signature => "signature",
+            RejectionReason::ClockSkew => "clock_skew",
+            RejectionReason::NonceMismatch => "nonce_mismatch",
+            RejectionReason::PayloadBindingMismatch => "payload_binding_mismatch",
+            RejectionReason::PcrMismatch => "pcr_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for RejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A document validation failure: the classified [`RejectionReason`] plus
+/// a human-readable detail (often the upstream crate's error text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationFailure {
+    /// Classified cause.
+    pub reason: RejectionReason,
+    /// Human-readable detail, for logs only (not a stable format).
+    pub detail: String,
+}
+
+impl ValidationFailure {
+    pub(crate) fn new(reason: RejectionReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.detail, self.reason)
+    }
+}
+
 /// Errors from attestation verification.
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
-    /// Parse/structure/signature/PCR/nonce validation failed in the
-    /// upstream `attestation-doc-validation` crate. Carries the original
-    /// error rendered to a string — the upstream type is non-exhaustive
-    /// and not worth re-exporting.
+    /// Decode / structure / certificate chain / signature / clock-skew /
+    /// nonce / PCR validation failed. Carries the classified reason and the
+    /// upstream detail (the upstream error types are non-exhaustive and not
+    /// worth re-exporting).
     #[error("attestation document validation failed: {0}")]
-    Validation(String),
+    Validation(ValidationFailure),
     /// A PCR value coming out of the validated document hex-decoded to
     /// something other than 32/48/64 bytes, which would break PcrKey
     /// derivation. Should be unreachable for real Nitro docs.
@@ -162,6 +261,25 @@ pub enum AttestationError {
     /// (server authentication).
     #[error("attestation document PCRs match none of the expected values")]
     PcrsNotExpected,
+}
+
+impl AttestationError {
+    /// The classified cause of this rejection.
+    pub fn reason(&self) -> RejectionReason {
+        match self {
+            AttestationError::Validation(f) => f.reason,
+            AttestationError::InvalidPcrLength { .. }
+            | AttestationError::InvalidPcrHex(_)
+            | AttestationError::InvalidControlPubkey
+            | AttestationError::InvalidControlNonce => RejectionReason::Malformed,
+            AttestationError::PayloadBindingMismatch => RejectionReason::PayloadBindingMismatch,
+            AttestationError::PcrsNotExpected => RejectionReason::PcrMismatch,
+        }
+    }
+
+    fn validation(reason: RejectionReason, detail: impl Into<String>) -> Self {
+        AttestationError::Validation(ValidationFailure::new(reason, detail))
+    }
 }
 
 /// Length of an ECDSA P-256 verifying key in uncompressed SEC1 form
@@ -310,7 +428,7 @@ pub fn verify_against(
     let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
     validate_expected_pcrs(&doc, &pcrs_hex)
-        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+        .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
 
     Ok(())
 }
@@ -345,7 +463,7 @@ pub fn verify_control_nonce_attestation(
     let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
     validate_expected_pcrs(&doc, &pcrs_hex)
-        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+        .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
 
     let user_data = doc
         .user_data
@@ -382,7 +500,8 @@ pub fn verify_and_extract(
 ) -> Result<AttestedIdentity, AttestationError> {
     let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
-    let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
+    let hex_pcrs = att_get_pcrs(&doc)
+        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
 
     let pcrs = Pcrs {
         pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
@@ -454,7 +573,8 @@ pub fn verify_and_extract_pcrs(
 ) -> Result<Pcrs, AttestationError> {
     let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
-    let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
+    let hex_pcrs = att_get_pcrs(&doc)
+        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
 
     let pcrs = Pcrs {
         pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
@@ -502,7 +622,8 @@ pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationErro
     // real Nitro because the caller is reading its own local device, not
     // authenticating a remote party.
     let doc = parse_and_validate(attestation_data, VerificationMode::DangerousSkipChain)?;
-    let hex_pcrs = att_get_pcrs(&doc).map_err(|e| AttestationError::Validation(e.to_string()))?;
+    let hex_pcrs = att_get_pcrs(&doc)
+        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
     Ok(Pcrs {
         pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
         pcr1: decode_pcr(&hex_pcrs.pcr_1, 1)?,
@@ -588,7 +709,7 @@ pub fn verify_chain_attestation(
     }
 
     validate_expected_pcrs(&doc, &pcrs_hex)
-        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+        .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
 
     Ok(())
 }
@@ -661,11 +782,14 @@ fn verify_session_bound_with(
     let doc = parse_and_validate_with_root(attestation_data, mode, ctx.root_der)?;
     let skew = doc.timestamp.abs_diff(ctx.now_ms);
     if skew > MAX_SESSION_DOC_CLOCK_SKEW_MS {
-        return Err(AttestationError::Validation(format!(
-            "document timestamp {} ms is {skew} ms from the local clock {} ms \
-             (limit {MAX_SESSION_DOC_CLOCK_SKEW_MS} ms)",
-            doc.timestamp, ctx.now_ms
-        )));
+        return Err(AttestationError::validation(
+            RejectionReason::ClockSkew,
+            format!(
+                "document timestamp {} ms is {skew} ms from the local clock {} ms \
+                 (limit {MAX_SESSION_DOC_CLOCK_SKEW_MS} ms)",
+                doc.timestamp, ctx.now_ms
+            ),
+        ));
     }
 
     check_nonce(&doc, handshake_hash)?;
@@ -676,7 +800,7 @@ fn verify_session_bound_with(
 /// path).
 fn decode_only(attestation_data: &[u8]) -> Result<AttestationDoc, AttestationError> {
     let (_, doc) = decode_attestation_document(attestation_data)
-        .map_err(|e| AttestationError::Validation(e.to_string()))?;
+        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
     Ok(doc)
 }
 
@@ -710,7 +834,7 @@ fn parse_and_validate_with_root(
 fn check_nonce(doc: &AttestationDoc, handshake_hash: &[u8]) -> Result<(), AttestationError> {
     let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(handshake_hash);
     validate_expected_nonce(doc, &nonce_b64)
-        .map_err(|e| AttestationError::Validation(e.to_string()))
+        .map_err(|e| AttestationError::validation(RejectionReason::NonceMismatch, e.to_string()))
 }
 
 fn decode_pcr(hex_str: &str, idx: usize) -> Result<Vec<u8>, AttestationError> {
@@ -1532,6 +1656,72 @@ mod tests {
         );
     }
 
+    /// Rejection reasons in skip-chain mode: the structural, nonce, PCR and
+    /// payload-binding causes are classified the same as in production.
+    #[test]
+    fn rejection_reasons_in_skip_chain_mode() {
+        let doc = test_utils::FakeAttestation::with_seed(0x21, hh()).encode();
+        let reason = |r: Result<Pcrs, AttestationError>| r.unwrap_err().reason();
+
+        assert_eq!(
+            reason(verify_and_extract_pcrs(
+                b"garbage",
+                &hh(),
+                &[pcrs_from_seed(0x21)],
+                DM
+            )),
+            RejectionReason::Malformed
+        );
+        assert_eq!(
+            reason(verify_and_extract_pcrs(
+                &doc,
+                &[0xee; 32],
+                &[pcrs_from_seed(0x21)],
+                DM
+            )),
+            RejectionReason::NonceMismatch
+        );
+        assert_eq!(
+            reason(verify_and_extract_pcrs(
+                &doc,
+                &hh(),
+                &[pcrs_from_seed(0x22)],
+                DM
+            )),
+            RejectionReason::PcrMismatch
+        );
+        assert_eq!(
+            verify_against(&doc, &hh(), &pcrs_from_seed(0x22), DM)
+                .unwrap_err()
+                .reason(),
+            RejectionReason::PcrMismatch
+        );
+
+        let payload = b"chain-link-payload".to_vec();
+        let link = test_utils::FakeChainAttestation::for_payload(0x23, &payload).encode();
+        assert_eq!(
+            verify_chain_attestation(&link, b"other", &pcrs_from_seed(0x23), DM)
+                .unwrap_err()
+                .reason(),
+            RejectionReason::PayloadBindingMismatch
+        );
+        assert_eq!(
+            verify_chain_attestation(&link, &payload, &pcrs_from_seed(0x24), DM)
+                .unwrap_err()
+                .reason(),
+            RejectionReason::PcrMismatch
+        );
+    }
+
+    /// Labels are unique and `ALL` lists every reason once.
+    #[test]
+    fn rejection_reason_labels_are_unique() {
+        let labels: std::collections::BTreeSet<&str> =
+            RejectionReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(labels.len(), RejectionReason::ALL.len());
+        assert_eq!(RejectionReason::NotYetValid.to_string(), "not_yet_valid");
+    }
+
     #[test]
     fn verify_chain_attestation_rejects_doc_without_user_data() {
         use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
@@ -1789,6 +1979,7 @@ mod production_chain_tests {
         ] {
             let err = verify(&doc, &hh(), now).unwrap_err();
             assert!(err.to_string().contains("from the local clock"), "{err}");
+            assert_eq!(err.reason(), RejectionReason::ClockSkew);
         }
     }
 
@@ -1800,6 +1991,7 @@ mod production_chain_tests {
         let doc = signed_doc(doc_ts, &hh());
         let err = verify(&doc, &hh(), doc_ts).unwrap_err();
         assert!(err.to_string().contains("CertExpired"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::Expired);
     }
 
     #[test]
@@ -1808,6 +2000,7 @@ mod production_chain_tests {
         let doc = signed_doc(doc_ts, &hh());
         let err = verify(&doc, &hh(), doc_ts).unwrap_err();
         assert!(err.to_string().contains("CertNotValidYet"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::NotYetValid);
     }
 
     #[test]
@@ -1821,6 +2014,7 @@ mod production_chain_tests {
         let tampered = replace_payload(&genuine, doc_payload(moved_ts, &hh()));
         let err = verify(&tampered, &hh(), moved_ts).unwrap_err();
         assert!(err.to_string().contains("COSE signature"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::Signature);
     }
 
     #[test]
@@ -1832,6 +2026,7 @@ mod production_chain_tests {
         let tampered = replace_payload(&genuine, doc_payload(doc_ts, &other));
         let err = verify(&tampered, &other, doc_ts).unwrap_err();
         assert!(err.to_string().contains("COSE signature"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::Signature);
     }
 
     #[test]
@@ -1840,6 +2035,7 @@ mod production_chain_tests {
         let doc = sign(&doc_payload(doc_ts, &hh()), &TestSigner::other());
         let err = verify(&doc, &hh(), doc_ts).unwrap_err();
         assert!(err.to_string().contains("COSE signature"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::Signature);
     }
 
     #[test]
@@ -1849,6 +2045,7 @@ mod production_chain_tests {
         let wrong: Vec<u8> = vec![0xab; 32];
         let err = verify(&doc, &wrong, doc_ts).unwrap_err();
         assert!(err.to_string().contains("Nonce"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::NonceMismatch);
     }
 
     #[test]
@@ -1862,6 +2059,7 @@ mod production_chain_tests {
             err.to_string().contains("certificate chain invalid"),
             "{err}"
         );
+        assert_eq!(err.reason(), RejectionReason::UntrustedChain);
     }
 
     #[test]
@@ -1884,6 +2082,7 @@ mod production_chain_tests {
         let err =
             parse_and_validate_with_root(&doc, VerificationMode::Production, &root).unwrap_err();
         assert!(err.to_string().contains("CertExpired"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::Expired);
     }
 
     #[test]
@@ -1894,6 +2093,15 @@ mod production_chain_tests {
         let err = parse_and_validate_with_root(&tampered, VerificationMode::Production, &root)
             .unwrap_err();
         assert!(err.to_string().contains("COSE signature"), "{err}");
+        assert_eq!(err.reason(), RejectionReason::Signature);
+    }
+
+    #[test]
+    fn garbage_is_malformed_in_production_mode() {
+        let root = der(ROOT_HEX);
+        let err = parse_and_validate_with_root(b"not cose", VerificationMode::Production, &root)
+            .unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::Malformed);
     }
 
     /// Replace the payload of a COSE_Sign1, keeping its protected header and

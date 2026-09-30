@@ -219,7 +219,7 @@ pub enum ConnError {
     /// Attestation document failed validation, or did not bind to the
     /// Noise handshake hash via its `nonce` field.
     #[error("attestation: {0}")]
-    Attestation(String),
+    Attestation(attestation::AttestationError),
     /// Producing this node's OWN attestation document for the mandatory
     /// server-authentication step (#208) failed. The session cannot
     /// proceed unauthenticated, so the connection is torn down.
@@ -235,6 +235,17 @@ pub enum ConnError {
     /// Noise transport-mode encrypt or decrypt failed mid-session.
     #[error("noise crypto: {0}")]
     Crypto(String),
+}
+
+impl ConnError {
+    /// The classified cause when the connection was refused because the
+    /// customer's attestation document was rejected.
+    pub fn attestation_rejection(&self) -> Option<attestation::RejectionReason> {
+        match self {
+            ConnError::Attestation(e) => Some(e.reason()),
+            _ => None,
+        }
+    }
 }
 
 /// Drive one accepted connection to completion. Performs the Noise
@@ -293,7 +304,14 @@ where
                 &handshake_hash,
                 attestation::VerificationMode::from_debug_flag(debug_mode),
             )
-                .map_err(|e| ConnError::Attestation(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    reason = %e.reason(),
+                    error = %e,
+                    "customer attestation rejected"
+                );
+                ConnError::Attestation(e)
+            })?;
             let key = PcrKey(identity.pcrs.digest());
             (key, identity.control_pubkey)
         }
@@ -775,6 +793,10 @@ mod tests {
             matches!(result, Err(ConnError::Attestation(_))),
             "expected Attestation error, got {result:?}"
         );
+        assert_eq!(
+            result.unwrap_err().attestation_rejection(),
+            Some(attestation::RejectionReason::NonceMismatch)
+        );
     }
 
     /// Random bytes that are not a valid NSM document are rejected.
@@ -796,6 +818,10 @@ mod tests {
         assert!(
             matches!(result, Err(ConnError::Attestation(_))),
             "expected Attestation error, got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap_err().attestation_rejection(),
+            Some(attestation::RejectionReason::Malformed)
         );
     }
 
