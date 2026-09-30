@@ -45,16 +45,37 @@
 //! links validate against the in-force state, attested by the enclave
 //! version running at the time.
 //!
-//! **Wire-compatibility note.** This breaks the previous `Transition`
-//! shape (`{ old_key, new_key, signature }`). The single-node binary has
-//! no deployed users, so the break is free; this mirrors enclavia#30, which
-//! did the same for `PrepareUpgrade`. There is no migration path because
-//! there is nothing to migrate.
+//! ## Versioning and capabilities
+//!
+//! The protocol is deployed: customer enclaves (nbd-client) talk to a
+//! running synchronizer cluster, and the two are built and rolled out
+//! separately. Both ends therefore advertise a [`PROTOCOL_VERSION`] and a
+//! capability set in their [`Frame::Authenticate`]; a session may use an
+//! optional feature only if BOTH ends advertised it
+//! ([`negotiate_capabilities`], [`PeerProtocol`]). Rules for changing the
+//! wire format:
+//!
+//! * Never remove or rename a field or variant, never change a field's
+//!   type, and never reuse a capability name.
+//! * A new field on an existing frame gets `#[serde(default)]`, so frames
+//!   from older peers still decode (unknown fields are already ignored).
+//! * A new [`Request`], [`Response`] or [`RpcError`] variant, or any new
+//!   behaviour a peer has to understand, is gated on a capability: an
+//!   older peer fails to decode a variant it does not know, so it must
+//!   only be sent to a peer that advertised support.
+//! * Bump [`PROTOCOL_VERSION`] only for a change a capability cannot
+//!   express.
+//!
+//! A peer that predates versioning decodes as version 0 with no
+//! capabilities and ignores the new fields, so the exchange itself is
+//! backward compatible in both directions.
 //!
 //! Errors are flattened into a small `RpcError` enum that the client can
 //! match against without depending on the state machine's
 //! [`crate::ValidationError`] type, the synchronizer is allowed to evolve
 //! the internal validation surface without breaking wire compatibility.
+
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -112,9 +133,23 @@ pub enum Frame {
     /// as a fake oracle: `Noise_NN` is unauthenticated DH, so without
     /// the server attesting back the customer would have no idea who is
     /// on the other end.
+    ///
+    /// Both ends also advertise their protocol version and capability set
+    /// here (see "Versioning and capabilities" in the module docs). Both
+    /// fields default when absent, so a peer that predates them decodes
+    /// as version 0 with no capabilities, and a peer that predates them
+    /// ignores them.
     Authenticate {
         /// Raw NSM attestation document bytes.
         nsm_doc: Vec<u8>,
+        /// The sender's [`PROTOCOL_VERSION`]; 0 when absent.
+        #[serde(default)]
+        protocol_version: u32,
+        /// The optional features the sender supports (see
+        /// [`SUPPORTED_CAPABILITIES`]). Names the receiver does not know
+        /// are ignored.
+        #[serde(default)]
+        capabilities: BTreeSet<String>,
     },
 
     /// Subsequent frame: an RPC [`Request`] to dispatch against the
@@ -123,6 +158,80 @@ pub enum Frame {
         /// RPC payload to dispatch against the session's bound key.
         request: Request,
     },
+}
+
+impl Frame {
+    /// This build's [`Frame::Authenticate`]: `nsm_doc` plus our
+    /// [`PROTOCOL_VERSION`] and [`SUPPORTED_CAPABILITIES`].
+    pub fn authenticate(nsm_doc: Vec<u8>) -> Self {
+        Frame::Authenticate {
+            nsm_doc,
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: supported_capabilities(),
+        }
+    }
+}
+
+/// Version of the customer protocol this build speaks, advertised in both
+/// ends' [`Frame::Authenticate`].
+///
+/// * 0: a peer that sends no version (built before versioning existed).
+/// * 1: adds the version / capability exchange itself. The frames,
+///   requests and responses are otherwise those of version 0.
+///
+/// Bump it only for a change that cannot be expressed as a capability;
+/// prefer a capability.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Optional features this build supports, advertised in
+/// [`Frame::Authenticate`]. Empty in version 1: nothing optional exists yet.
+///
+/// Adding a feature: give it a stable, never-reused name, add it here, and
+/// only use it on a session where [`negotiate_capabilities`] says BOTH ends
+/// support it.
+pub const SUPPORTED_CAPABILITIES: &[&str] = &[];
+
+/// [`SUPPORTED_CAPABILITIES`] as the set carried on the wire.
+pub fn supported_capabilities() -> BTreeSet<String> {
+    SUPPORTED_CAPABILITIES
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// The capabilities a session may use: those both this build and the peer
+/// advertised. Unknown names from the peer drop out here.
+pub fn negotiate_capabilities(peer: &BTreeSet<String>) -> BTreeSet<String> {
+    SUPPORTED_CAPABILITIES
+        .iter()
+        .filter(|c| peer.contains(**c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// What the other end of a session advertised in its
+/// [`Frame::Authenticate`], and the capability set the session negotiated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerProtocol {
+    /// The peer's advertised [`PROTOCOL_VERSION`] (0 if it sent none).
+    pub version: u32,
+    /// The capabilities both ends support ([`negotiate_capabilities`]).
+    pub capabilities: BTreeSet<String>,
+}
+
+impl PeerProtocol {
+    /// Build from the peer's advertised version and capability set.
+    pub fn from_advertised(version: u32, capabilities: &BTreeSet<String>) -> Self {
+        Self {
+            version,
+            capabilities: negotiate_capabilities(capabilities),
+        }
+    }
+
+    /// Whether the session may use `capability`.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.contains(capability)
+    }
 }
 
 /// Compile-time check that the pure core's [`crate::CONTROL_PUBKEY_LEN`]
@@ -1014,6 +1123,83 @@ mod tests {
             })
             .expect("type discriminator present");
         assert_eq!(ty, "Get");
+    }
+
+    // --- protocol version / capabilities --------------------------------
+
+    /// The `Authenticate` shape of a peer built before versioning existed.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "frame")]
+    enum LegacyFrame {
+        Authenticate { nsm_doc: Vec<u8> },
+    }
+
+    fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(v, &mut buf).unwrap();
+        buf
+    }
+
+    /// A pre-versioning client's `Authenticate` still decodes, as version 0
+    /// with no capabilities.
+    #[test]
+    fn legacy_authenticate_decodes_as_version_zero() {
+        let legacy = LegacyFrame::Authenticate {
+            nsm_doc: vec![1, 2, 3],
+        };
+        let frame: Frame = ciborium::from_reader(cbor(&legacy).as_slice()).unwrap();
+        match frame {
+            Frame::Authenticate {
+                nsm_doc,
+                protocol_version,
+                capabilities,
+            } => {
+                assert_eq!(nsm_doc, vec![1, 2, 3]);
+                assert_eq!(protocol_version, 0);
+                assert!(capabilities.is_empty());
+            }
+            other => panic!("expected Authenticate, got {other:?}"),
+        }
+    }
+
+    /// A pre-versioning peer decodes our `Authenticate`, ignoring the new
+    /// fields.
+    #[test]
+    fn versioned_authenticate_decodes_on_a_legacy_peer() {
+        let frame = Frame::authenticate(vec![4, 5, 6]);
+        let legacy: LegacyFrame = ciborium::from_reader(cbor(&frame).as_slice()).unwrap();
+        assert_eq!(
+            legacy,
+            LegacyFrame::Authenticate {
+                nsm_doc: vec![4, 5, 6]
+            }
+        );
+    }
+
+    /// Our `Authenticate` carries this build's version and capabilities
+    /// and round-trips; unknown capability names from a newer peer survive
+    /// decoding and drop out of the negotiated set.
+    #[test]
+    fn authenticate_advertises_and_negotiates() {
+        let frame = Frame::authenticate(vec![7]);
+        let back: Frame = ciborium::from_reader(cbor(&frame).as_slice()).unwrap();
+        let Frame::Authenticate {
+            protocol_version,
+            capabilities,
+            ..
+        } = back
+        else {
+            panic!("expected Authenticate");
+        };
+        assert_eq!(protocol_version, PROTOCOL_VERSION);
+        assert_eq!(capabilities, supported_capabilities());
+
+        let mut newer: BTreeSet<String> = supported_capabilities();
+        newer.insert("from-a-future-release".to_string());
+        let peer = PeerProtocol::from_advertised(PROTOCOL_VERSION + 1, &newer);
+        assert_eq!(peer.version, PROTOCOL_VERSION + 1);
+        assert_eq!(peer.capabilities, supported_capabilities());
+        assert!(!peer.supports("from-a-future-release"));
     }
 
     // --- verify_server_attestation (#208) ------------------------------
