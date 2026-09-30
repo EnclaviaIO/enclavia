@@ -11,9 +11,9 @@
 //!
 //! * (a) Pin then Get against the SAME node, in both the leader and non-leader
 //!   cases (a follower forwards to the leader for both the write and the
-//!   linearizable read). Each Pin ACK is immediately checked against ALL THREE
-//!   nodes' state machines: under full-replication ACK the ACK itself
-//!   guarantees the entry is on every replica (no settle loop);
+//!   linearizable read). Each Pin ACK is immediately checked against the
+//!   nodes' logs: under majority ACK the ACK itself guarantees the entry is on
+//!   a quorum (no settle loop), and all three state machines then converge;
 //! * Pin against one node, Get against ANOTHER (forwarding + linearizable
 //!   read see the committed write regardless of which node the client dialed);
 //! * (c) the full Transition flow with a real p256-signed #47 upgrade chain
@@ -22,14 +22,14 @@
 //! * (d) restart one node with EMPTY state, wait for it to hydrate from the
 //!   survivors, then serve a Get from it (forwarded to the leader) and verify
 //!   the three nodes' views are identical;
-//! * (e) partition the LEADER: under full-replication ACK the survivors
-//!   re-elect but writes now STALL (a write needs all three nodes), so a client
-//!   write fails with `Unavailable` while reads keep working; after healing,
-//!   writes succeed on all three again;
-//! * (b) partition a NON-leader and submit a Pin to the leader: the client must
-//!   receive `Unavailable`, NEVER a false success ACK, because the committed
-//!   entry cannot reach the down node. Heal, retry, assert success +
-//!   all-three visibility.
+//! * (e) partition the LEADER: the survivors re-elect and keep ACKing writes
+//!   (a quorum of two), reads keep working; after healing, the old leader
+//!   catches up and all three agree;
+//! * (b) partition a NON-leader and submit a Pin to the leader: it is ACKed on
+//!   the remaining quorum. Then lose the LEADER and bring the partitioned node
+//!   back: the only survivor holding the ACKed pin must win the election, so
+//!   the pin is still served (an ACKed write survives the loss of any single
+//!   node).
 //!
 //! Gated on `raft` + `test-utils` + `node` (the UDS transport + `FakeAttestor`
 //! are never compiled into the production binary; `node` brings in the customer
@@ -162,7 +162,7 @@ impl Drop for Node {
 }
 
 async fn spawn_node(name: &str, host: &MeshHostStub) -> Node {
-    spawn_node_full(name, host, RaftHandle::default_config(), None).await
+    spawn_node_full(name, host, RaftHandle::default_config()).await
 }
 
 /// Like [`spawn_node`] but with a caller-chosen openraft config, so the
@@ -173,19 +173,14 @@ async fn spawn_node_with_config(
     host: &MeshHostStub,
     raft_config: synchronizer::raft::Config,
 ) -> Node {
-    spawn_node_full(name, host, raft_config, None).await
+    spawn_node_full(name, host, raft_config).await
 }
 
-/// Full spawn with an optional full-replication-wait override. The
-/// partitioned-write test passes a short wait so a write that can never reach
-/// all three replicas fails fast (with `Unavailable`) instead of burning the
-/// 2s production default on every dispatcher retry; everything else uses the
-/// default by passing `None`.
+/// Full spawn: mesh, Raft, customer listener, and the #209 discovery task.
 async fn spawn_node_full(
     name: &str,
     host: &MeshHostStub,
     raft_config: synchronizer::raft::Config,
-    replication_wait: Option<Duration>,
 ) -> Node {
     let peers: Vec<String> = NODE_NAMES
         .iter()
@@ -219,7 +214,7 @@ async fn spawn_node_full(
         /* debug_mode */ true,
     ));
 
-    let mut raft = RaftHandle::with_config(
+    let raft = RaftHandle::with_config(
         Arc::clone(&mesh),
         name,
         self_pubkey,
@@ -229,12 +224,6 @@ async fn spawn_node_full(
     )
     .await
     .expect("RaftHandle::with_config");
-    // Apply the replication-wait override BEFORE installing the handle into the
-    // serving handler / dispatcher: both take a clone, and the wait must travel
-    // with it.
-    if let Some(wait) = replication_wait {
-        raft = raft.with_replication_wait(wait);
-    }
     raft.enable_serving(&handler, true);
     // Drive #209 discovery/join in the background: the smallest-name node
     // initializes the fresh cluster from peers' attested pubkeys, the others
@@ -456,52 +445,23 @@ async fn cluster_with_config(
     nodes
 }
 
-/// A short full-replication wait for the partitioned-write test: a write that
-/// can never reach the down node fails fast instead of burning the 2s
-/// production default per dispatcher retry. Still well above the healthy
-/// follower append latency on the in-process UDS mesh, so a whole cluster ACKs
-/// normally.
-const TEST_REPLICATION_WAIT: Duration = Duration::from_millis(150);
-
-/// Like [`cluster`] but every node uses [`TEST_REPLICATION_WAIT`] for the
-/// full-replication ACK, so partitioned writes fail quickly.
-async fn cluster_short_replication_wait(host: &MeshHostStub) -> Vec<Node> {
-    let mut nodes = Vec::new();
-    for name in NODE_NAMES {
-        nodes.push(
-            spawn_node_full(
-                name,
-                host,
-                RaftHandle::default_config(),
-                Some(TEST_REPLICATION_WAIT),
-            )
-            .await,
-        );
-    }
-    // Cluster bootstraps itself via #209 discovery (driven in spawn_node_full).
-    assert!(
-        await_leader(&nodes, Duration::from_secs(10)).await,
-        "no leader elected at startup"
-    );
-    nodes
-}
-
 fn find<'a>(nodes: &'a [Node], name: &str) -> &'a Node {
     nodes.iter().find(|n| n.name == name).unwrap()
 }
 
-/// The IMMEDIATE, no-settle-loop proof of the full-replication ACK: the moment
-/// a write is ACKed, EVERY node's LOG already holds the committed entry. This is
-/// exactly what `client_write_durable` waits for (every voter's match index
-/// reaches the entry's index) and is the durability guarantee the design rests
-/// on: with the entry in every node's log, re-seeding from ANY single survivor
-/// (#122) replays it, so no ACKed write is ever lost.
+/// The IMMEDIATE, no-settle-loop proof of the majority ACK: the moment a write
+/// is ACKed, a QUORUM of the given nodes already holds the committed entry in
+/// its LOG. This is the durability guarantee the design rests on (see the
+/// `raft` module docs' "Majority ACK"): with the entry on a quorum, the loss of
+/// any single node leaves a holder that no election can bypass.
 ///
-/// Concretely: assert every node's `last_log_index` covers the leader's
-/// last-applied index (the leader applied the entry before ACKing, and the ACK
-/// waited for every follower's log to reach it). NO loop: if this is not true
-/// the instant the ACK returns, the full-replication ACK is broken.
-fn assert_all_nodes_logged_committed(nodes: &[Node]) {
+/// Concretely: the leader applied the entry before ACKing, so the target is the
+/// highest `last_applied` index among `nodes`; assert that more than half of
+/// `cluster_size` nodes have `last_log_index >= target`. `nodes` may be a subset
+/// of the cluster (e.g. only the reachable nodes during a partition), but the
+/// quorum is always counted against the full `cluster_size`. NO loop: if this
+/// is not true the instant the ACK returns, the majority ACK is broken.
+fn assert_quorum_logged_committed(nodes: &[&Node], cluster_size: usize) {
     let target = nodes
         .iter()
         .filter_map(|n| {
@@ -514,26 +474,33 @@ fn assert_all_nodes_logged_committed(nodes: &[Node]) {
         })
         .max()
         .expect("at least one node has applied something");
-    for n in nodes {
-        let last_log = n.raft.raft().metrics().borrow().last_log_index.unwrap_or(0);
-        assert!(
-            last_log >= target,
-            "node {} log index {last_log} < committed index {target} right after the ACK \
-             (full-replication ACK violated)",
-            n.name
-        );
-    }
+    let holders: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.raft.raft().metrics().borrow().last_log_index.unwrap_or(0) >= target)
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        holders.len() * 2 > cluster_size,
+        "only {holders:?} hold committed index {target} right after the ACK; a quorum of \
+         {cluster_size} must (majority ACK violated)"
+    );
 }
 
-/// Assert EVERY node's state machine holds `key` at `version`. The
-/// full-replication ACK guarantees the entry is in every node's LOG immediately
-/// (proven separately, no loop, by [`assert_all_nodes_logged_committed`]);
-/// applying that committed entry into the follower's STATE MACHINE trails log
-/// replication by at most one heartbeat (openraft applies on the follower once
-/// it learns the advanced commit index). So observing the applied projection
-/// uses a short bounded convergence: this is NOT a replication settle loop (the
-/// durability is already guaranteed at ACK), only a wait for the downstream
-/// deterministic apply to land.
+/// [`assert_quorum_logged_committed`] over a whole, healthy cluster.
+fn assert_all_nodes_logged_committed(nodes: &[Node]) {
+    let all: Vec<&Node> = nodes.iter().collect();
+    assert_quorum_logged_committed(&all, nodes.len());
+}
+
+/// Assert EVERY node's state machine holds `key` at `version`. The majority
+/// ACK guarantees the entry is in a quorum's LOG immediately (proven
+/// separately, no loop, by [`assert_all_nodes_logged_committed`]); in a
+/// healthy cluster the remaining follower receives it within a heartbeat, and
+/// applying a committed entry into a follower's STATE MACHINE trails log
+/// replication by at most one more heartbeat. So observing the applied
+/// projection uses a short bounded convergence: this is NOT what makes the
+/// write durable (the quorum already did at ACK), only a wait for the
+/// downstream deterministic apply to land everywhere.
 async fn assert_all_nodes_have(nodes: &[Node], key: PcrKey, version: Version) {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -573,9 +540,9 @@ async fn assert_all_nodes_have(nodes: &[Node], key: PcrKey, version: Version) {
 /// pinned down: while a node was partitioned the dispatcher's at-least-once
 /// retry can commit several duplicate Pins (each benignly bumps the version),
 /// so the final version is `>= the ACKed value` but not a fixed number. What
-/// MUST hold is full-replication: the ACKed entry is on all three nodes (its
-/// log presence proven with no loop), applied at the identical version (a short
-/// bounded apply-convergence, as in [`assert_all_nodes_have`]).
+/// MUST hold after the heal is convergence: every node applies the same
+/// committed history, so all three agree on one version (a short bounded
+/// apply-convergence, as in [`assert_all_nodes_have`]).
 async fn assert_all_nodes_agree(nodes: &[Node], key: PcrKey) -> Version {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -625,12 +592,11 @@ async fn pin_then_get_same_node_leader() {
         }
     );
 
-    // Full-replication ACK: the moment the Pin is ACKed, EVERY node's LOG
-    // already holds the committed entry. NO settle loop, the ACK is the
-    // guarantee (this is what `client_write_durable` waited for).
+    // Majority ACK: the moment the Pin is ACKed, a quorum's LOG already holds
+    // the committed entry. NO settle loop, the ACK is the guarantee.
     assert_all_nodes_logged_committed(&nodes);
-    // And the entry applies into every node's state machine (apply trails log
-    // replication by <= one heartbeat; bounded convergence, not a settle loop).
+    // And the entry applies into every node's state machine (bounded
+    // convergence, not what makes it durable).
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
     let resp = client.rpc(Request::Get { key }).await;
@@ -677,9 +643,9 @@ async fn pin_then_get_same_node_follower() {
         }
     );
 
-    // Full-replication ACK holds regardless of which node the client dialed:
-    // the forwarded write was ACKed only after every node's log had it (no
-    // loop), and applies into every state machine (bounded convergence).
+    // Majority ACK holds regardless of which node the client dialed: the
+    // forwarded write was ACKed only once a quorum's log had it (no loop), and
+    // applies into every state machine (bounded convergence).
     assert_all_nodes_logged_committed(&nodes);
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
@@ -937,200 +903,114 @@ async fn restarted_node_hydrates_and_serves_get() {
     }
 }
 
-/// (e) Partition the LEADER; under full-replication ACK the two survivors
-/// re-elect but writes through the new leader now STALL (a write needs all
-/// three nodes, and the old leader is down), so a client write must fail with
-/// `Unavailable` rather than a false ACK. Linearizable reads still work (they
-/// need only a fresh quorum). After healing the partition, writes succeed again
-/// and the value is present on all three nodes.
-///
-/// This is the deliberate behavior change from the old majority-ACK world,
-/// where a survivor-served write would commit on the 2-node quorum. Under
-/// full-replication ACK, ANY single-node outage blocks writes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn writes_stall_under_node_outage_reads_ok_then_heal() {
-    let host = MeshHostStub::new();
-    let nodes = cluster_short_replication_wait(&host).await;
+/// Pin through `node` until it is ACKed, riding out the `Unavailable` answers
+/// of a leader election. Uses the CAS-aware [`Client::pin_cas`], so an attempt
+/// that committed before its ACK was lost is recognised on the retry. Returns
+/// the ACKed version.
+async fn pin_until_acked(
+    node: &Node,
+    seed: u8,
+    pk: [u8; CONTROL_PUBKEY_LEN],
+    key: PcrKey,
+    expected: Version,
+    commitment: Commitment,
+) -> Version {
+    let mut client = Client::connect(node, seed, pk).await;
+    for _ in 0..40 {
+        match client.pin_cas(key, expected, commitment).await {
+            Ok(version) => return version,
+            Err(Response::Err {
+                error: RpcError::Unavailable,
+            }) => tokio::time::sleep(Duration::from_millis(200)).await,
+            Err(other) => panic!("unexpected response to pin via {}: {other:?}", node.name),
+        }
+    }
+    panic!("pin via {} was never ACKed", node.name);
+}
 
-    // Commit one key while the cluster is whole (all three replicate it).
+/// Wait until one of `candidates` is leader and return its name.
+async fn await_leader_among(candidates: &[&Node], timeout: Duration) -> Option<String> {
+    let start = std::time::Instant::now();
+    loop {
+        for n in candidates {
+            if n.raft.is_leader().await {
+                return Some(n.name.clone());
+            }
+        }
+        if start.elapsed() > timeout {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// (e) Partition the LEADER. The two survivors re-elect and keep ACKing writes
+/// (they are a quorum), linearizable reads keep working, and after the
+/// partition heals the old leader catches up so all three nodes agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_continue_through_leader_outage_then_heal() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    // Commit one key while the cluster is whole.
     let seed = 0x55;
     let (_, pk) = keypair(seed);
     let key = key_from_seed(seed);
-    {
-        let mut client = Client::connect(find(&nodes, "node-a"), seed, pk).await;
-        let r = client
-            .rpc(Request::Pin {
-                key,
-                expected_version: Version(0),
-                commitment: c(0x01),
-            })
-            .await;
-        assert_eq!(
-            r,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
-    }
+    let v0 = pin_until_acked(find(&nodes, "node-a"), seed, pk, key, Version(0), c(0x01)).await;
+    assert_eq!(v0, Version(0));
     assert_all_nodes_logged_committed(&nodes);
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
-    // Partition the current leader from the mesh: its splices are severed and
-    // new dials to/from it are refused, so the surviving two re-elect a leader
-    // among themselves. But the cluster is no longer whole.
+    // Partition the current leader: the other two must elect a new one.
     let leader_name = current_leader(&nodes).await.unwrap().name.clone();
     host.block(leader_name.clone());
-
-    // Let the surviving two re-elect so the survivor we dial has a leader to
-    // forward to (otherwise the failure would be "no leader", not "not fully
-    // replicated"; we want to prove the write reaches a leader and STILL cannot
-    // be ACKed because the third node is down).
     let survivors: Vec<&Node> = nodes.iter().filter(|n| n.name != leader_name).collect();
-    let elected = {
-        let start = std::time::Instant::now();
-        loop {
-            let mut found = None;
-            for n in &survivors {
-                if n.raft.is_leader().await {
-                    found = Some(n.name.clone());
-                    break;
-                }
-            }
-            if found.is_some() {
-                break found;
-            }
-            if start.elapsed() > Duration::from_secs(10) {
-                break None;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
     assert!(
-        elected.is_some(),
+        await_leader_among(&survivors, Duration::from_secs(10))
+            .await
+            .is_some(),
         "survivors never re-elected a leader after the leader partition"
     );
 
-    // A client against a survivor: the Pin is forwarded to the new leader, which
-    // commits it on the 2-node majority but can NEVER replicate it to the
-    // partitioned node, so client_write_durable times out and the client sees
-    // Unavailable. It must NEVER see a PinOk: that would be a false ACK of a
-    // write not present on all replicas. Try a handful of times to be sure it is
-    // never spuriously a success.
-    let survivor = survivors[0];
-    let mut client = Client::connect(survivor, seed, pk).await;
-    // A single client RPC already exercises the partitioned write thoroughly:
-    // the dispatcher internally retries the forward up to FORWARD_MAX_RETRIES
-    // times, each paying one short replication-wait, before surfacing
-    // Unavailable. Two outer attempts are belt-and-braces against a transient
-    // re-election window where no leader is momentarily known.
-    for _ in 0..2 {
-        let r = client
-            .rpc(Request::Pin {
-                key,
-                expected_version: Version(0),
-                commitment: c(0x02),
-            })
-            .await;
-        match r {
-            // The write committed on the majority but could not reach the
-            // down node, so the ACK is refused (first attempt). A retry
-            // then reports VersionConflict: the majority-committed first
-            // attempt already bumped the version, so our expected v0 is
-            // stale (the CAS guard working — the pin is applied at most
-            // once instead of benignly bumping per retry). Either way the
-            // client never sees a false PinOk.
-            Response::Err {
-                error: RpcError::Unavailable,
-            } => {}
-            Response::Err {
-                error: RpcError::VersionConflict,
-            } => {}
-            Response::PinOk { version } => panic!(
-                "FALSE ACK: write returned PinOk(version={version:?}) while a node was down; \
-                 full-replication ACK must refuse to ACK"
-            ),
-            other => panic!("unexpected response during outage: {other:?}"),
-        }
-    }
+    // A write through a survivor is ACKed on the 2-node quorum.
+    let v1 = pin_until_acked(survivors[0], seed, pk, key, Version(0), c(0x02)).await;
+    assert_eq!(v1, Version(1));
+    assert_quorum_logged_committed(&survivors, nodes.len());
 
-    // Linearizable reads keep working through a survivor while a node is down: a
-    // read needs only a fresh quorum, not full replication. Note the read
-    // reflects the latest MAJORITY-COMMITTED value: the writes above were
-    // refused at the ACK boundary (the client never got a PinOk), but openraft
-    // still committed them on the 2-node majority, so the linearized read sees
-    // commitment 0x02 at whatever version those committed pins reached. The
-    // point being asserted is that the read SUCCEEDS (reads are unaffected by
-    // the full-replication write gate), not a specific version.
-    let r = client.rpc(Request::Get { key }).await;
-    match r {
-        Response::GetOk { commitment, .. } => {
-            assert!(
-                commitment == c(0x01) || commitment == c(0x02),
-                "linearizable read returned an unexpected commitment: {commitment:?}"
-            );
+    // Linearizable read through a survivor sees the ACKed write.
+    let mut client = Client::connect(survivors[1], seed, pk).await;
+    assert_eq!(
+        client.rpc(Request::Get { key }).await,
+        Response::GetOk {
+            commitment: c(0x02),
+            version: Version(1),
         }
-        other => panic!("linearizable read failed while a node was down: {other:?}"),
-    }
+    );
 
-    // Heal the partition. Once the cluster is whole again, the same write
-    // succeeds and is present on all three nodes. The exact version is not
-    // pinned down: whether the outage attempts majority-committed decides if
-    // the retry applies fresh (PinOk) or reports VersionConflict, which the
-    // CAS-aware recovery (`pin_cas`, mirroring the nbd-client) disambiguates
-    // with a Get — current commitment == ours means the earlier attempt had
-    // already landed. Either way we assert success + full-replication
-    // agreement rather than a fixed number.
+    // Heal: the old leader rejoins as a follower and catches up.
     host.unblock(&leader_name);
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
         "no leader after healing"
     );
-    let mut committed = None;
-    for _ in 0..20 {
-        match client.pin_cas(key, Version(0), c(0x02)).await {
-            Ok(version) => {
-                committed = Some(version);
-                break;
-            }
-            Err(Response::Err {
-                error: RpcError::Unavailable,
-            }) => tokio::time::sleep(Duration::from_millis(200)).await,
-            other => panic!("unexpected response after heal: {other:?}"),
-        }
-    }
-    let committed = committed.expect("write never succeeded after healing the partition");
-    // The ACKed version is on all three nodes (full-replication ACK), and it is
-    // at least the pre-outage version + 1.
-    let agreed = assert_all_nodes_agree(&nodes, key).await;
-    assert_eq!(agreed, committed, "ACKed version not the one on all nodes");
-    assert!(
-        committed.0 >= 1,
-        "version did not advance past the pre-outage value"
-    );
+    assert_all_nodes_have(&nodes, key, Version(1)).await;
+    assert_eq!(assert_all_nodes_agree(&nodes, key).await, Version(1));
 
     for n in &nodes {
         n.raft.shutdown().await;
     }
 }
 
-/// (b) No false ACK under a single-node outage. Partition ONE node (a
-/// non-leader, so no re-election is needed), submit a Pin to the LEADER, and
-/// assert the client receives `Unavailable`, NOT a success: the entry committed
-/// on the 2-node majority but cannot reach the partitioned node, so the
-/// full-replication ACK refuses to ACK. Then heal, retry, and assert success
-/// plus all-three visibility.
-///
-/// Leader-submitted timing note: `route_client_request`'s leader fast path runs
-/// `handle_on_leader` directly; the `client_write_durable` there waits up to
-/// [`TEST_REPLICATION_WAIT`] for the down node, then returns
-/// `NotFullyReplicated` -> wire `Unavailable`. That `Unavailable` is "transient"
-/// to the dispatcher, so it retries the whole dispatch a bounded number of times
-/// (`FORWARD_MAX_RETRIES`), each paying one short replication-wait, then the RPC
-/// returns `Unavailable` to the client. The short wait keeps the total bounded.
+/// (b) An ACKed pin survives the loss of any single node, including the worst
+/// case for a majority ACK: the pin is ACKed while one follower is partitioned
+/// (so only the leader and the other follower hold it), then the LEADER is
+/// lost and the node that never saw the pin comes back. The only surviving
+/// holder must win the election (Raft's election restriction), so the pin is
+/// still served, never rolled back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_false_ack_when_a_node_is_partitioned() {
+async fn acked_pin_survives_loss_of_any_single_node() {
     let host = MeshHostStub::new();
-    let nodes = cluster_short_replication_wait(&host).await;
+    let nodes = cluster(&host).await;
 
     let seed = 0x66;
     let (_, pk) = keypair(seed);
@@ -1138,102 +1018,127 @@ async fn no_false_ack_when_a_node_is_partitioned() {
 
     // Commit a first version while the cluster is whole.
     let leader_name = current_leader(&nodes).await.unwrap().name.clone();
-    {
-        let leader = find(&nodes, &leader_name);
-        let mut client = Client::connect(leader, seed, pk).await;
-        let r = client
-            .rpc(Request::Pin {
-                key,
-                expected_version: Version(0),
-                commitment: c(0x01),
-            })
-            .await;
-        assert_eq!(
-            r,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
-    }
-    assert_all_nodes_logged_committed(&nodes);
+    let v0 = pin_until_acked(
+        find(&nodes, &leader_name),
+        seed,
+        pk,
+        key,
+        Version(0),
+        c(0x01),
+    )
+    .await;
+    assert_eq!(v0, Version(0));
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
-    // Partition a NON-leader so the leader stays put (no re-election): the
-    // cluster keeps its leader + a 2-node majority, but is no longer whole.
+    // Partition a follower (the victim). The leader keeps a 2-node quorum with
+    // the other follower (the holder).
     let victim_name = nodes
         .iter()
         .find(|n| n.name != leader_name)
         .unwrap()
         .name
         .clone();
+    let holder_name = nodes
+        .iter()
+        .find(|n| n.name != leader_name && n.name != victim_name)
+        .unwrap()
+        .name
+        .clone();
     host.block(victim_name.clone());
 
-    // Submit a Pin to the LEADER. The leader commits on the majority but cannot
-    // replicate to the partitioned node, so client_write_durable times out and
-    // the client must see Unavailable, never a false PinOk.
-    let leader = find(&nodes, &leader_name);
-    let mut client = Client::connect(leader, seed, pk).await;
-    // One client RPC already drives the dispatcher's internal forward-retry to
-    // exhaustion against the down node; two outer attempts guard a transient
-    // re-election window.
-    for _ in 0..2 {
-        let r = client
-            .rpc(Request::Pin {
-                key,
-                expected_version: Version(0),
-                commitment: c(0x02),
-            })
-            .await;
-        match r {
-            // Unavailable (first attempt: committed on the majority, ACK
-            // refused) or VersionConflict (retry: the majority-committed
-            // first attempt already bumped the version — the CAS guard
-            // applying the pin at most once). Never a false PinOk.
-            Response::Err {
-                error: RpcError::Unavailable,
-            } => {}
-            Response::Err {
-                error: RpcError::VersionConflict,
-            } => {}
-            Response::PinOk { version } => panic!(
-                "FALSE ACK: leader returned PinOk(version={version:?}) with a node partitioned; \
-                 full-replication ACK must refuse to ACK"
-            ),
-            other => panic!("unexpected response during partition: {other:?}"),
-        }
-    }
+    // With one node down the pin is still ACKed (it used to be refused).
+    let v1 = pin_until_acked(
+        find(&nodes, &leader_name),
+        seed,
+        pk,
+        key,
+        Version(0),
+        c(0x02),
+    )
+    .await;
+    assert_eq!(v1, Version(1));
+    let quorum = [find(&nodes, &leader_name), find(&nodes, &holder_name)];
+    assert_quorum_logged_committed(&quorum, nodes.len());
+    // The victim really does not have it: the rest of the test depends on the
+    // holder being the only survivor with the ACKed entry.
+    let acked_index = find(&nodes, &leader_name)
+        .raft
+        .raft()
+        .metrics()
+        .borrow()
+        .last_applied
+        .map(|l| l.index)
+        .unwrap();
+    let victim_last_log = find(&nodes, &victim_name)
+        .raft
+        .raft()
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+    assert!(
+        victim_last_log < acked_index,
+        "the partitioned node already holds the ACKed entry ({victim_last_log} >= \
+         {acked_index}); the scenario would prove nothing"
+    );
 
-    // Heal: unblock the partitioned node, wait for it to catch up, then retry
-    // the Pin. It now succeeds and is visible on all three nodes. The exact
-    // version is not pinned (a majority-committed-but-unACKed attempt may
-    // already have bumped it; the `pin_cas` recovery disambiguates with a
-    // Get, mirroring the nbd-client), so we assert success +
-    // full-replication agreement.
+    // Lose the leader, THEN let the victim back in. Survivors: the holder (has
+    // the pin) and the victim (does not).
+    host.block(leader_name.clone());
     host.unblock(&victim_name);
-    assert!(
-        await_leader(&nodes, Duration::from_secs(10)).await,
-        "no leader after healing"
+
+    let survivors = [find(&nodes, &holder_name), find(&nodes, &victim_name)];
+    let new_leader = await_leader_among(&survivors, Duration::from_secs(15))
+        .await
+        .expect("the two survivors never elected a leader");
+    assert_eq!(
+        new_leader, holder_name,
+        "a node missing an ACKed entry won the election"
     );
-    let mut committed = None;
+
+    // Read through the victim (forwarded to the new leader): the ACKed pin is
+    // there, at the ACKed version.
+    let mut client = Client::connect(find(&nodes, &victim_name), seed, pk).await;
+    let mut resp = client.rpc(Request::Get { key }).await;
     for _ in 0..20 {
-        match client.pin_cas(key, Version(0), c(0x02)).await {
-            Ok(version) => {
-                committed = Some(version);
-                break;
-            }
-            Err(Response::Err {
+        if resp
+            != (Response::Err {
                 error: RpcError::Unavailable,
-            }) => tokio::time::sleep(Duration::from_millis(200)).await,
-            other => panic!("unexpected response after heal: {other:?}"),
+            })
+        {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        resp = client.rpc(Request::Get { key }).await;
     }
-    let committed = committed.expect("Pin never succeeded after healing the partition");
-    let agreed = assert_all_nodes_agree(&nodes, key).await;
-    assert_eq!(agreed, committed, "ACKed version not the one on all nodes");
-    assert!(
-        committed.0 >= 1,
-        "version did not advance past the pre-outage value"
+    assert_eq!(
+        resp,
+        Response::GetOk {
+            commitment: c(0x02),
+            version: Version(1),
+        },
+        "the ACKed pin was lost after a single-node failure"
     );
+    // And the victim catches up from the new leader.
+    let victim = find(&nodes, &victim_name);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if victim
+            .raft
+            .state_machine()
+            .get(&key)
+            .await
+            .map(|s| s.version)
+            == Some(Version(1))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the returning node never caught up to the ACKed pin"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     for n in &nodes {
         n.raft.shutdown().await;
