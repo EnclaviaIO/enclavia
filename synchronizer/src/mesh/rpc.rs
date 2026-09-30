@@ -46,13 +46,42 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::mesh::handshake::{
-    HandshakeError, MeshFrame, decrypt_frame, read_ciphertext_frame, read_frame, write_frame,
+    HandshakeError, MeshFrame, decrypt_frame, read_ciphertext_frame, read_frame, with_deadline,
+    write_frame,
 };
+
+/// How long an established client channel may sit with NO inbound frame before
+/// the driver sends a [`MeshFrame::Ping`].
+///
+/// Only inbound traffic resets this: bytes we WRITE prove nothing about the
+/// peer. On a healthy but idle mesh this costs one tiny frame per peer per
+/// interval, which is nothing next to Raft's own heartbeat traffic.
+pub const IDLE_BEFORE_PING: Duration = Duration::from_secs(5);
+
+/// How long the driver waits for the [`MeshFrame::Pong`] (or any other inbound
+/// frame) answering its ping before declaring the channel dead and returning,
+/// which drops the [`ClientChannel`] and makes the dial loop reconnect.
+///
+/// This is what detects a dead-but-OPEN connection: a half-open stream (peer
+/// enclave gone, relay wedged) never yields EOF, so without it the reader task
+/// blocks in `read_exact` forever and the dial loop never gets its connection
+/// back to re-dial.
+pub const PONG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the SERVE (accept) side tolerates a connection with no inbound
+/// frame before dropping it.
+///
+/// Comfortably above [`IDLE_BEFORE_PING`] + [`PONG_TIMEOUT`]: a live client
+/// pings whenever it has nothing else to say, so silence for this long means
+/// the dialer is gone and the serve task would otherwise leak, parked in
+/// `read_exact` on a half-open stream, still holding a peer slot.
+pub const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Opaque application payload carried in an [`Envelope`]. CBOR bytes for now;
 /// the Raft layer (slice 3) defines the message set encoded inside without
@@ -278,8 +307,33 @@ where
         // Abort the reader when the driver returns, so a peer that stops
         // sending but keeps the stream open does not leak the reader task.
         let _reader_guard = AbortOnDrop(reader);
+        // Liveness state. `deadline` is when we next act on silence: send a
+        // ping (normally) or give up (once `awaiting_pong` is set). ANY inbound
+        // frame clears both, because any frame proves the peer is reading and
+        // writing this channel.
+        let mut awaiting_pong = false;
+        let mut deadline = tokio::time::Instant::now() + IDLE_BEFORE_PING;
         loop {
+            let idle = tokio::time::sleep_until(deadline);
+            tokio::pin!(idle);
             tokio::select! {
+                // Silence deadline. `sleep_until` is cancel-safe and keyed on
+                // an absolute instant, so recreating it each iteration does not
+                // extend the deadline.
+                _ = &mut idle => {
+                    if awaiting_pong {
+                        // We pinged, nothing came back: the channel is open but
+                        // dead. Returning drops the ClientChannel and lets the
+                        // dial loop rebuild a working connection.
+                        return Err(HandshakeError::Timeout {
+                            phase: "peer pong",
+                            after: PONG_TIMEOUT,
+                        });
+                    }
+                    write_frame(&mut write_half, &mut transport, &MeshFrame::Ping).await?;
+                    awaiting_pong = true;
+                    deadline = tokio::time::Instant::now() + PONG_TIMEOUT;
+                }
                 maybe_req = outbound_rx.recv() => {
                     match maybe_req {
                         Some(env) => {
@@ -295,7 +349,20 @@ where
                 maybe_ct = inbound_rx.recv() => {
                     match maybe_ct {
                         Some(ciphertext) => {
+                            // Any inbound frame is proof of life: clear the
+                            // outstanding ping and restart the idle window.
+                            awaiting_pong = false;
+                            deadline = tokio::time::Instant::now() + IDLE_BEFORE_PING;
                             match decrypt_frame(&mut transport, &ciphertext)? {
+                                // A Pong needs nothing beyond the liveness
+                                // bookkeeping above. A Ping on the client side
+                                // is not expected (the serve side never probes)
+                                // but is answered anyway, so the liveness
+                                // protocol stays symmetric if that changes.
+                                MeshFrame::Pong => {}
+                                MeshFrame::Ping => {
+                                    write_frame(&mut write_half, &mut transport, &MeshFrame::Pong).await?;
+                                }
                                 MeshFrame::Rpc { envelope } => {
                                     let env: Envelope = ciborium::from_reader(&envelope[..])
                                         .map_err(|e| HandshakeError::Cbor(format!("{e}")))?;
@@ -327,8 +394,10 @@ where
 }
 
 /// Aborts the wrapped task handle when dropped. Used to tear down
-/// [`spawn_client`]'s reader task when its driver returns.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// [`spawn_client`]'s reader task when its driver returns, and by the mesh's
+/// dial-loop supervisor so aborting the supervisor also stops the loop task it
+/// is currently watching.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -352,11 +421,14 @@ impl Drop for AbortOnDrop {
 /// ## Cancel-safety
 ///
 /// Unlike [`spawn_client`], this loop is strictly sequential: read one
-/// request, handle it, write the response, repeat. There is no `select!`, so
-/// the non-cancel-safe [`read_frame`] is used directly and is never dropped
-/// mid-frame, the only `.await` between two reads is the handler + write, both
-/// of which run to completion. The split-reader machinery is therefore
-/// unnecessary here, so it is deliberately not applied.
+/// request, handle it, write the response, repeat. Nothing races the read
+/// except its own [`SERVE_IDLE_TIMEOUT`], so the non-cancel-safe [`read_frame`]
+/// is used directly and is never dropped mid-frame on any path that CONTINUES
+/// the loop; the only `.await` between two reads is the handler + write, both
+/// of which run to completion. The idle timeout is the single cancellation
+/// point and it is terminal (it returns, ending the connection), so a
+/// half-consumed frame can never be resumed. The split-reader machinery is
+/// therefore still unnecessary here.
 pub async fn serve<S, H>(
     mut stream: S,
     mut transport: enclavia_protocol::NoiseTransport,
@@ -368,7 +440,28 @@ where
     H: RequestHandler + ?Sized,
 {
     loop {
-        match read_frame(&mut stream, &mut transport).await? {
+        // Bounded read: a dialer that vanished without closing the stream (a
+        // wedged relay, a hard-killed enclave) leaves a half-open connection
+        // that never yields EOF, and this task would park in `read_exact`
+        // forever. Cancelling the non-cancel-safe `read_frame` on timeout is
+        // safe here because a timeout ENDS the connection: we return, the
+        // stream is dropped, and the peer's dial loop rebuilds it.
+        let frame = with_deadline(
+            "inbound peer idle",
+            SERVE_IDLE_TIMEOUT,
+            read_frame(&mut stream, &mut transport),
+        )
+        .await?;
+        match frame {
+            // Liveness probe from the peer's client driver: answer at once,
+            // without troubling the request handler.
+            Some(MeshFrame::Ping) => {
+                write_frame(&mut stream, &mut transport, &MeshFrame::Pong).await?;
+            }
+            // The serve side never pings, so a Pong is unsolicited. It still
+            // counts as traffic (the read above succeeded), so just ignore it
+            // rather than tearing down an otherwise healthy connection.
+            Some(MeshFrame::Pong) => {}
             Some(MeshFrame::Rpc { envelope }) => {
                 let env: Envelope = ciborium::from_reader(&envelope[..])
                     .map_err(|e| HandshakeError::Cbor(format!("{e}")))?;
@@ -559,6 +652,123 @@ mod tests {
             (Fragmenting::new(b), t)
         });
         (ta.await.unwrap(), tb.await.unwrap())
+    }
+
+    // --- channel liveness ----------------------------------------------
+    //
+    // A peer that stops answering but keeps its stream OPEN produces no EOF
+    // and no error, so without a liveness probe the driver's reader blocks in
+    // `read_exact` forever and the dial loop never gets its connection back to
+    // re-dial. These two tests pin the ping/idle behaviour that recycles such
+    // a channel, and prove a healthy idle channel is NOT recycled.
+
+    /// Build a plain (unfragmented) connected Noise pair.
+    async fn noise_pair() -> (
+        (tokio::io::DuplexStream, enclavia_protocol::NoiseTransport),
+        (tokio::io::DuplexStream, enclavia_protocol::NoiseTransport),
+    ) {
+        use enclavia_protocol::{perform_handshake_as_initiator, perform_handshake_as_responder};
+        let (mut a, mut b) = tokio::io::duplex(256 * 1024);
+        let ta = tokio::spawn(async move {
+            let (t, _h) = perform_handshake_as_initiator(&mut a).await.unwrap();
+            (a, t)
+        });
+        let tb = tokio::spawn(async move {
+            let (t, _h) = perform_handshake_as_responder(&mut b).await.unwrap();
+            (b, t)
+        });
+        (ta.await.unwrap(), tb.await.unwrap())
+    }
+
+    /// A channel whose peer holds the stream open but never writes another
+    /// byte must be recycled: the driver pings after [`IDLE_BEFORE_PING`],
+    /// gets no pong within [`PONG_TIMEOUT`], and RETURNS, which is what makes
+    /// the dial loop rebuild the connection.
+    ///
+    /// The far end here consumes the ciphertext (so writes never block) and
+    /// answers nothing at all — a wedged relay or a dead enclave, not a closed
+    /// socket. Without the ping the driver would sit here forever.
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_channel_is_recycled_by_the_liveness_ping() {
+        let ((client_stream, client_transport), (server_stream, _server_transport)) =
+            noise_pair().await;
+
+        // Black hole: drain every byte the client writes, reply to nothing.
+        let black_hole = tokio::spawn(async move {
+            let mut server_stream = server_stream;
+            let mut sink = [0u8; 4096];
+            loop {
+                use tokio::io::AsyncReadExt;
+                if server_stream.read(&mut sink).await.unwrap_or(0) == 0 {
+                    return;
+                }
+            }
+        });
+
+        let (channel, driver) = spawn_client(client_stream, client_transport);
+        let started = tokio::time::Instant::now();
+        let err = driver
+            .await
+            .expect_err("a silent peer must end the driver, not park it");
+        let elapsed = started.elapsed();
+
+        match err {
+            HandshakeError::Timeout { phase, .. } => assert_eq!(phase, "peer pong"),
+            other => panic!("expected a pong timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed >= IDLE_BEFORE_PING + PONG_TIMEOUT
+                && elapsed < (IDLE_BEFORE_PING + PONG_TIMEOUT) * 2,
+            "recycle should happen at ~IDLE_BEFORE_PING + PONG_TIMEOUT, took {elapsed:?}"
+        );
+
+        // The driver returning drops the pending map, so in-flight and later
+        // calls fail and the mesh reports the peer down.
+        assert!(matches!(
+            channel.call(b"x".to_vec()).await,
+            Err(RpcError::ConnectionClosed)
+        ));
+        black_hole.abort();
+    }
+
+    /// The converse: a channel that is idle but ALIVE (the peer's `serve` loop
+    /// answers pings) must survive well past the ping interval. This is what
+    /// stops the liveness check from flapping healthy links, and it exercises
+    /// the `Ping` -> `Pong` path through the real serve loop.
+    #[tokio::test(start_paused = true)]
+    async fn idle_but_live_channel_survives_and_still_serves() {
+        let ((client_stream, client_transport), (server_stream, server_transport)) =
+            noise_pair().await;
+
+        let server = tokio::spawn(async move {
+            let peer = PeerContext {
+                name: "peer".to_string(),
+                mesh_pubkey: [0u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN],
+                pcr_digest: crate::PcrKey([0u8; 32]),
+            };
+            serve(server_stream, server_transport, &peer, &EchoHandler).await
+        });
+
+        let (channel, driver) = spawn_client(client_stream, client_transport);
+        let driver = tokio::spawn(driver);
+
+        // Sit idle across many ping intervals; each one must be answered.
+        tokio::time::sleep(IDLE_BEFORE_PING * 10).await;
+        assert!(
+            !driver.is_finished(),
+            "a live idle channel must not recycle"
+        );
+
+        // ...and the channel still carries real RPC afterwards.
+        let resp = channel
+            .call(b"still here".to_vec())
+            .await
+            .expect("an idle-but-live channel must still serve calls");
+        assert_eq!(resp, b"still here");
+
+        drop(channel);
+        let _ = driver.await;
+        server.abort();
     }
 
     /// Many concurrent `call`s over a transport that fragments every read and

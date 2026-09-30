@@ -54,14 +54,17 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::mesh::attestation::AttestationProvider;
 use crate::mesh::config::{MeshConfig, PeerName};
-use crate::mesh::handshake::{MeshFrame, Role, mutual_authenticate, read_frame, write_frame};
+use crate::mesh::handshake::{
+    MeshFrame, Role, mutual_authenticate, read_frame, with_deadline, write_frame,
+};
 use crate::mesh::identity::MeshIdentity;
 use crate::mesh::rpc::{
-    ClientChannel, MeshPayload, PeerContext, RequestHandler, RpcError, serve, spawn_client,
+    AbortOnDrop, ClientChannel, MeshPayload, PeerContext, RequestHandler, RpcError, serve,
+    spawn_client,
 };
 use crate::mesh::transport::{BoxedStream, MeshAcceptor, MeshDialer};
 
@@ -69,6 +72,29 @@ use crate::mesh::transport::{BoxedStream, MeshAcceptor, MeshDialer};
 pub const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 /// Cap on the exponential reconnect backoff.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Upper bound on [`MeshDialer::dial`]: the vsock connect to `mesh-host` PLUS
+/// the `Open` frame write and the single ack byte the relay writes back once it
+/// has spliced us to the target's bootstrap listener.
+///
+/// The ack read is a bare `read_exact` on a stream the HOST controls, so a
+/// mesh-host that accepts the connection and then never answers parks the dial
+/// forever, and that parks the whole dial loop: `dial_loop` only re-dials once
+/// `dial_once` RETURNS, so an unbounded await inside it disables the backoff
+/// entirely and the peer is never re-admitted.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on reading the peer's `Hello` frame (the routing-name exchange
+/// that follows mutual attestation), on both the dial and the accept side.
+///
+/// By this point the peer has attested successfully, so it is a healthy
+/// same-image node and its `Hello` is the very next thing it writes. Silence
+/// here means the relay or the peer wedged between the two frames.
+pub const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause before a supervisor respawns a dial loop that exited or panicked, so
+/// a deterministically-crashing loop cannot spin the runtime.
+pub const SUPERVISOR_RESPAWN_DELAY: Duration = Duration::from_secs(1);
 
 /// Errors surfaced by [`Mesh::call`].
 #[derive(Debug, thiserror::Error)]
@@ -167,16 +193,28 @@ impl Mesh {
         for peer in &config.peers {
             let slot: PeerSlot = Arc::new(Mutex::new(None));
             peers.insert(peer.clone(), Arc::clone(&slot));
-            let handle = tokio::spawn(dial_loop(
+            // Supervised, not a bare spawn: a dial loop that panics or returns
+            // must be restarted, not silently lost (a lost loop means the peer
+            // is never re-dialed and every durable write fails cluster-wide).
+            let (config, dialer, attestor, observed) = (
                 Arc::clone(&config),
-                peer.clone(),
                 Arc::clone(&dialer),
                 Arc::clone(&attestor),
-                identity.clone(),
-                debug_mode,
-                slot,
                 Arc::clone(&observed),
-            ));
+            );
+            let (peer_name, identity) = (peer.clone(), identity.clone());
+            let handle = tokio::spawn(supervise(peer.clone(), move || {
+                dial_loop(
+                    Arc::clone(&config),
+                    peer_name.clone(),
+                    Arc::clone(&dialer),
+                    Arc::clone(&attestor),
+                    identity.clone(),
+                    debug_mode,
+                    Arc::clone(&slot),
+                    Arc::clone(&observed),
+                )
+            }));
             tasks.push(handle);
         }
 
@@ -267,6 +305,51 @@ impl Drop for Mesh {
     }
 }
 
+/// Keep one per-peer dial loop alive for the lifetime of the mesh.
+///
+/// `body` builds a fresh dial-loop future on every attempt. The supervisor runs
+/// it on its own task and, if that task ever finishes — it returned (the loop
+/// is `loop {}`, so this should be unreachable) or it PANICKED — logs at error
+/// level and respawns after [`SUPERVISOR_RESPAWN_DELAY`].
+///
+/// A dial loop is the only thing that can restore a peer link, so a loop that
+/// is lost — an unsupervised spawn that panics vanishes silently, with nothing
+/// in the logs to say so — leaves its peer permanently undialed and takes
+/// durable writes down cluster-wide until the process restarts.
+///
+/// ## Shutdown semantics
+///
+/// [`Mesh::shutdown`] aborts the SUPERVISOR's handle. The in-flight loop task
+/// is held in an [`AbortOnDrop`] guard, so unwinding the supervisor also aborts
+/// the loop it was watching — abort tears the whole chain down. A cancelled
+/// child is likewise never respawned (that cancellation can only come from
+/// this guard).
+async fn supervise<F, Fut>(peer: PeerName, mut body: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        let mut guard = AbortOnDrop(tokio::spawn(body()));
+        match (&mut guard.0).await {
+            Ok(()) => {
+                error!(peer = %peer, "dial loop exited unexpectedly (it should never return); respawning");
+            }
+            Err(e) if e.is_cancelled() => {
+                // Only our own guard cancels the child, i.e. we are being torn
+                // down. Do not respawn.
+                debug!(peer = %peer, "dial loop cancelled; supervisor stopping");
+                return;
+            }
+            Err(e) => {
+                error!(peer = %peer, error = %e, "dial loop PANICKED; respawning");
+            }
+        }
+        drop(guard);
+        tokio::time::sleep(SUPERVISOR_RESPAWN_DELAY).await;
+    }
+}
+
 /// Outbound dial loop for one peer. Re-dials with backoff forever; each
 /// successful dial attests, sends the `Hello`, publishes a live
 /// [`ClientChannel`] into `slot`, and drives the connection until it drops.
@@ -336,7 +419,16 @@ where
     D: MeshDialer + ?Sized,
     A: AttestationProvider + ?Sized,
 {
-    let mut stream = dialer.dial(peer).await?;
+    // Bounded dial: connect + `Open` frame + the relay's ack byte. See
+    // DIAL_TIMEOUT for why an unbounded await here disables the whole backoff.
+    let mut stream = match tokio::time::timeout(DIAL_TIMEOUT, dialer.dial(peer)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(
+                format!("dial to {peer:?} (open + ack) timed out after {DIAL_TIMEOUT:?}").into(),
+            );
+        }
+    };
     let (mut transport, peer_id) = mutual_authenticate(
         &mut stream,
         Role::Initiator,
@@ -362,7 +454,13 @@ where
         },
     )
     .await?;
-    let announced = match read_frame(&mut stream, &mut transport).await? {
+    let announced = match with_deadline(
+        "responder Hello read",
+        HELLO_READ_TIMEOUT,
+        read_frame(&mut stream, &mut transport),
+    )
+    .await?
+    {
         Some(MeshFrame::Hello { from }) => from,
         Some(_) => return Err("responder's first frame was not Hello".into()),
         None => return Err("responder closed before sending Hello".into()),
@@ -494,7 +592,13 @@ where
     // peer should never announce a name we do not know, but we refuse to
     // attribute traffic to an unconfigured name; self-name is never in the
     // peer set, which also rejects a reflected dial).
-    let from = match read_frame(&mut stream, &mut transport).await? {
+    let from = match with_deadline(
+        "inbound Hello read",
+        HELLO_READ_TIMEOUT,
+        read_frame(&mut stream, &mut transport),
+    )
+    .await?
+    {
         Some(MeshFrame::Hello { from }) => from,
         Some(_) => return Err("inbound peer's first frame was not Hello".into()),
         None => return Ok(()),
@@ -540,6 +644,107 @@ async fn sleep_with_jitter(base: Duration) {
     use rand::Rng;
     let jitter_ms = rand::thread_rng().gen_range(0..=(base.as_millis() as u64 / 2 + 1));
     tokio::time::sleep(base + Duration::from_millis(jitter_ms)).await;
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod robustness_tests {
+    use super::*;
+    use crate::mesh::attestation::FakeAttestor;
+    use crate::mesh::config::MeshConfig;
+    use crate::mesh::transport::SilentAckDialer;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A dial whose relay accepts the connection, reads the `Open` frame, and
+    /// then answers NOTHING (no ack, no EOF) must fail within
+    /// [`DIAL_TIMEOUT`], not hang.
+    ///
+    /// `dial_loop` re-dials only when `dial_once` RETURNS, so an unbounded
+    /// await here would swallow the entire backoff mechanism and leave the
+    /// peer without any further re-dial attempt.
+    ///
+    /// The clock is paused, so the 15 s production constant is asserted in
+    /// milliseconds of real time: tokio auto-advances to the next timer
+    /// whenever every task is idle, which is precisely the wedged state here.
+    #[tokio::test(start_paused = true)]
+    async fn dial_that_never_acks_fails_within_the_deadline() {
+        const SEED: u8 = 0x51;
+        let identity = MeshIdentity::generate();
+        let attestor = FakeAttestor::new(SEED, &identity);
+        let config = MeshConfig::new(
+            "node-a",
+            vec!["node-b".to_string()],
+            FakeAttestor::pcr_digest(SEED),
+        );
+        let slot: PeerSlot = Arc::new(Mutex::new(None));
+        let observed: ObservedPeers = Arc::new(Mutex::new(HashMap::new()));
+
+        let started = tokio::time::Instant::now();
+        let result = dial_once(
+            &config,
+            "node-b",
+            &SilentAckDialer,
+            &attestor,
+            &identity,
+            true,
+            &slot,
+            &observed,
+        )
+        .await;
+
+        let err = result.expect_err("a silent relay must fail the dial, not hang");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a dial timeout, got: {err}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DIAL_TIMEOUT && elapsed < DIAL_TIMEOUT * 2,
+            "dial should fail at ~DIAL_TIMEOUT, took {elapsed:?}"
+        );
+        // Nothing was published: the peer stays down and the loop backs off.
+        assert!(slot.lock().await.is_none());
+    }
+
+    /// A supervised dial loop that PANICS is logged and respawned, rather than
+    /// vanishing silently and leaving the peer permanently undialed.
+    ///
+    /// The body panics on its first run and parks forever on its second, so
+    /// observing a second run is proof the supervisor restarted it.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_dial_loop_is_respawned_after_a_panic() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let body_runs = Arc::clone(&runs);
+        let supervisor = tokio::spawn(supervise("node-b".to_string(), move || {
+            let runs = Arc::clone(&body_runs);
+            async move {
+                let n = runs.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    panic!("simulated dial-loop panic");
+                }
+                // Second incarnation: behave like the real loop and never
+                // return.
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        // Let the panic land and the respawn delay elapse (auto-advanced).
+        tokio::time::sleep(SUPERVISOR_RESPAWN_DELAY * 3).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the panicking loop must be respawned exactly once more"
+        );
+
+        // Shutdown semantics: aborting the supervisor stops the chain, and the
+        // respawned loop is not restarted again.
+        supervisor.abort();
+        tokio::time::sleep(SUPERVISOR_RESPAWN_DELAY * 3).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "an aborted supervisor must not respawn anything"
+        );
+    }
 }
 
 #[cfg(test)]

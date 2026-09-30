@@ -36,6 +36,16 @@
 //! served. Serving without freshness assurance would silently reopen the
 //! rollback hole this module exists to close.
 //!
+//! Bounded RETRY is not a degraded mode and does not weaken any of that.
+//! Two transient conditions are re-tried before the same fail-stop
+//! verdict is reached: a dropped session ([`SYNC_RECONNECT_ATTEMPTS`]
+//! full re-establishments, each with fresh MUTUAL attestation) and the
+//! oracle's documented `Unavailable` "no durable quorum right now"
+//! refusal ([`SYNC_UNAVAILABLE_BUDGET`] of wall clock). Throughout, the
+//! gated NBD reply stays parked, so the kernel still never sees an ack
+//! for a write that is not pinned; when a budget runs out the device
+//! fail-stops exactly as it did before.
+//!
 //! ## Mutual authentication: verifying the oracle (#208)
 //!
 //! The session protocol authenticates BOTH ways. This enclave attests to
@@ -250,6 +260,8 @@ pub enum GetOutcome {
     Found {
         /// Latest pinned commitment bytes.
         commitment: [u8; 32],
+        /// Its current per-key version (the CAS input for the next pin).
+        version: Version,
     },
     /// The key has never been registered (or was retired).
     NotFound,
@@ -294,7 +306,7 @@ pub enum BootDecision {
 /// (a wiped/substituted disk is a rollback).
 pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
     match outcome {
-        GetOutcome::Found { commitment } => {
+        GetOutcome::Found { commitment, .. } => {
             if commitment_of_region(region) == *commitment {
                 BootDecision::Serve
             } else {
@@ -328,8 +340,9 @@ pub fn get_outcome(
     result: Result<(Commitment, Version), ClientError>,
 ) -> Result<GetOutcome, ClientError> {
     match result {
-        Ok((commitment, _version)) => Ok(GetOutcome::Found {
+        Ok((commitment, version)) => Ok(GetOutcome::Found {
             commitment: commitment.0,
+            version,
         }),
         Err(ClientError::Rpc(RpcError::NotFound)) => Ok(GetOutcome::NotFound),
         Err(e) => Err(e),
@@ -716,8 +729,70 @@ pub const SYNC_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 /// a malformed frame, or a protocol mismatch stay immediately fatal,
 /// because retrying them against another node would repeat the same
 /// answer (or mask a real bug).
+///
+/// `Rpc(Unavailable)` is deliberately NOT in here: it is retryable, but
+/// on the SAME session and under its own wall-clock budget rather than
+/// by reconnecting. See [`PinFailure`] and [`SYNC_UNAVAILABLE_BUDGET`].
 pub fn pin_error_is_retryable(e: &ClientError) -> bool {
     matches!(e, ClientError::Io(_) | ClientError::ConnectionClosed)
+}
+
+/// Whether the oracle answered the documented transient "no durable
+/// quorum right now" refusal. This is the ONE structured `Rpc` error the
+/// client retries: the synchronizer returns it while a Raft node is
+/// rejoining (the leader waits for all voters, and a node that is
+/// rejoining is not yet a voter), a condition that clears on its own in
+/// seconds to minutes without any state having changed.
+pub fn pin_error_is_unavailable(e: &ClientError) -> bool {
+    matches!(e, ClientError::Rpc(RpcError::Unavailable))
+}
+
+/// Wall-clock ceiling for tolerating `Rpc(Unavailable)` on one pin.
+///
+/// A single oracle-node restart makes every durable write answer
+/// `Unavailable` until the rejoining node is re-admitted as a voter,
+/// which is observed to take up to several minutes. The pre-existing
+/// budget (3 reconnects x [`SYNC_RECONNECT_BACKOFF`] + RPC timeouts,
+/// ~96 s worst case) is shorter than that, so an entirely healthy
+/// cluster undergoing a planned restart used to fail-stop the device.
+///
+/// Five minutes covers an observed rejoin with slack while keeping the
+/// fail-stop policy intact: the budget is a DEADLINE checked against the
+/// wall clock, not an attempt count, so the 30 s [`SYNC_RPC_TIMEOUT`]
+/// cannot inflate it, and once it expires the pin fails exactly as
+/// before. Throughout, the gated NBD reply stays parked — the kernel
+/// never sees an ack for an unpinned superblock write, which is the
+/// property the anti-rollback design rests on.
+pub const SYNC_UNAVAILABLE_BUDGET: Duration = Duration::from_secs(300);
+
+/// Pause between re-submissions while the oracle is answering
+/// `Unavailable`. Short enough to catch the quorum coming back promptly,
+/// long enough not to hammer a cluster that is already degraded.
+pub const SYNC_UNAVAILABLE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// How the pin retry loop may respond to a failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinFailure {
+    /// Fail-stop immediately: a definitive refusal (Unauthorized, a
+    /// genuine fork, a protocol violation) that retrying cannot change.
+    Fatal,
+    /// The session looks dead (I/O error, closed connection, timeout):
+    /// re-establish it, bounded by [`SYNC_RECONNECT_ATTEMPTS`].
+    Session,
+    /// The oracle is up but has no durable quorum right now: re-submit
+    /// on the same session until [`SYNC_UNAVAILABLE_BUDGET`] expires.
+    Unavailable,
+}
+
+/// Classify a [`ClientError`] for the pin retry loop.
+pub fn classify_pin_error(e: &ClientError) -> PinFailure {
+    if pin_error_is_unavailable(e) {
+        PinFailure::Unavailable
+    } else if pin_error_is_retryable(e) {
+        PinFailure::Session
+    } else {
+        PinFailure::Fatal
+    }
 }
 
 /// Re-establishes a full session after a dropped connection. Returns
@@ -733,13 +808,26 @@ pub type Reconnector<S> = Box<
 
 /// Production [`Pinner`]: the authenticated synchronizer session, with
 /// [`SYNC_RPC_TIMEOUT`] applied per RPC and bounded session
-/// re-establishment on dropped connections. The retried operation is
-/// always the SAME pin: re-pinning a commitment whose first attempt may
-/// or may not have committed is safe (the value is identical, so at
-/// worst the version bumps twice).
+/// re-establishment on dropped connections.
+///
+/// The pinner tracks the key's current per-key `Version` and names it as
+/// the compare-and-swap `expected_version` on every pin: two live writers
+/// for one key (a host-booted clone pair shares the image's PCRs) can then
+/// never both keep pinning — the loser's first divergent pin is rejected
+/// with `VersionConflict` instead of silently last-write-winning, which is
+/// what stops a forked volume's acknowledged writes from being rolled back
+/// undetected. A `VersionConflict` is NOT immediately fatal: an earlier
+/// attempt of the SAME pin may have committed before its ack was lost
+/// (the at-least-once retry semantics), so we disambiguate with a `Get` —
+/// current commitment == ours means our pin landed (idempotent success);
+/// anything else is a genuine fork and fatal.
 pub struct SyncPinner<S> {
     client: Client<S>,
     key: PcrKey,
+    /// The version we currently believe the key is at (the next pin's CAS
+    /// input). Seeded from the boot `Get`/registration and advanced by
+    /// every successful pin.
+    expected: Version,
     reconnect: Option<Reconnector<S>>,
 }
 
@@ -747,24 +835,185 @@ impl<S> SyncPinner<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    /// One pin attempt on the current session. `Err((retryable, msg))`.
-    async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (bool, String)> {
+    /// Disambiguate a `VersionConflict`: did an earlier attempt of THIS
+    /// pin commit before its ack was lost, or is a different writer
+    /// ahead of us (a fork)? Delegates to [`disambiguate_conflict`],
+    /// which the boot registration path shares.
+    async fn resolve_conflict(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
+        let version = disambiguate_conflict(&mut self.client, self.key, commitment).await?;
+        self.expected = version;
+        Ok(())
+    }
+}
+
+/// One pin attempt plus the session re-establishment hook, factored out
+/// of [`SyncPinner`] so [`pin_with_retries`] (and its tests) can drive
+/// the retry policy without a Noise stack.
+#[allow(async_fn_in_trait)]
+pub trait PinAttempt {
+    /// Issue one Pin on the current session, resolving a
+    /// `VersionConflict` against our own committed pin.
+    async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)>;
+    /// Whether a session re-establishment hook is configured at all.
+    fn can_reconnect(&self) -> bool;
+    /// Re-establish the session (fresh dial, handshake and MUTUAL
+    /// attestation). `Err((PinFailure::Session, _))` just burns one
+    /// attempt of the caller's budget; `Err((PinFailure::Fatal, _))`
+    /// aborts immediately.
+    async fn reconnect_session(&mut self) -> Result<(), (PinFailure, String)>;
+}
+
+impl<S> PinAttempt for SyncPinner<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
         match tokio::time::timeout(
             SYNC_RPC_TIMEOUT,
-            self.client.pin(self.key, Commitment(commitment)),
+            self.client
+                .pin(self.key, self.expected, Commitment(commitment)),
         )
         .await
         {
             Ok(Ok(version)) => {
                 debug!(version = version.0, "superblock pin durably acknowledged");
+                self.expected = version;
                 Ok(())
             }
-            Ok(Err(e)) => Err((pin_error_is_retryable(&e), format!("pin rpc failed: {e}"))),
+            Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
+                self.resolve_conflict(commitment).await
+            }
+            Ok(Err(e)) => Err((classify_pin_error(&e), format!("pin rpc failed: {e}"))),
             // A timeout is indistinguishable from a dead node: retryable.
             Err(_) => Err((
-                true,
+                PinFailure::Session,
                 format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
             )),
+        }
+    }
+
+    fn can_reconnect(&self) -> bool {
+        self.reconnect.is_some()
+    }
+
+    async fn reconnect_session(&mut self) -> Result<(), (PinFailure, String)> {
+        let key_before = self.key;
+        let reconnect = self
+            .reconnect
+            .as_mut()
+            .ok_or((PinFailure::Fatal, "no reconnector configured".to_string()))?;
+        let (client, key) = reconnect().await.map_err(|e| {
+            (
+                PinFailure::Session,
+                format!("session re-establishment failed: {e}"),
+            )
+        })?;
+        if key != key_before {
+            // NOT retryable: our own attested identity changing mid-run
+            // is fatal, and the caller must not paper over it.
+            return Err((
+                PinFailure::Fatal,
+                format!(
+                    "reconnected session attested a DIFFERENT key ({key:?} != {key_before:?}); \
+                     our own identity cannot change mid-run, refusing"
+                ),
+            ));
+        }
+        self.client = client;
+        Ok(())
+    }
+}
+
+/// The retry policy around a single logical pin, shared by
+/// [`SyncPinner`] and its tests.
+///
+/// Two independent, both-bounded tolerances, then fail-stop:
+///
+/// * [`PinFailure::Session`] (dropped connection / RPC timeout):
+///   at most [`SYNC_RECONNECT_ATTEMPTS`] full session re-establishments,
+///   exactly as before.
+/// * [`PinFailure::Unavailable`] (the oracle has no durable quorum right
+///   now): re-submit on the SAME session every
+///   [`SYNC_UNAVAILABLE_BACKOFF`] until the
+///   [`SYNC_UNAVAILABLE_BUDGET`] deadline, then fail-stop.
+///
+/// SAFETY: neither tolerance ever lets an unpinned write be acked. The
+/// gated NBD reply stays parked for the whole loop, and re-submitting is
+/// safe under the documented at-least-once semantics: a duplicate Pin
+/// either passes the CAS again (the oracle deduplicates a committed
+/// entry) or comes back `VersionConflict`, which
+/// [`disambiguate_conflict`] resolves with a `Get` — our own commitment
+/// means the earlier attempt landed, ANY other commitment is a fork and
+/// stays fatal. Every pre-existing fail-stop reason ([`PinFailure::Fatal`]:
+/// Unauthorized, attestation failure, mismatched commitment, protocol
+/// violation) still fails on the first answer.
+///
+/// Both budgets are monotone (an attempt counter and a fixed deadline
+/// taken at the first `Unavailable`), so the loop always terminates.
+pub async fn pin_with_retries<T>(session: &mut T, commitment: [u8; 32]) -> Result<(), String>
+where
+    T: PinAttempt,
+{
+    let mut reconnects: u32 = 0;
+    let mut unavailable_deadline: Option<tokio::time::Instant> = None;
+    let mut last_err;
+
+    loop {
+        match session.pin_once(commitment).await {
+            Ok(()) => return Ok(()),
+            Err((PinFailure::Fatal, msg)) => return Err(msg),
+            Err((PinFailure::Unavailable, msg)) => {
+                let deadline = *unavailable_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + SYNC_UNAVAILABLE_BUDGET);
+                // Deadline-based, and checked BEFORE sleeping: the 30 s
+                // RPC timeout can never push the loop past the budget by
+                // more than the attempt already in flight.
+                if tokio::time::Instant::now() + SYNC_UNAVAILABLE_BACKOFF >= deadline {
+                    return Err(format!(
+                        "pin still Unavailable after the {SYNC_UNAVAILABLE_BUDGET:?} \
+                         no-quorum budget: {msg}"
+                    ));
+                }
+                warn!(
+                    last_err = %msg,
+                    "oracle reports no durable quorum; re-submitting the pin within the budget"
+                );
+                tokio::time::sleep(SYNC_UNAVAILABLE_BACKOFF).await;
+                continue;
+            }
+            Err((PinFailure::Session, msg)) => {
+                if !session.can_reconnect() {
+                    return Err(msg);
+                }
+                last_err = msg;
+                // Bounded re-establishment. A re-establishment that
+                // itself fails burns one attempt and retries the DIAL,
+                // not the pin (an RPC on a known-dead session would only
+                // wait out the RPC timeout).
+                loop {
+                    if reconnects >= SYNC_RECONNECT_ATTEMPTS {
+                        return Err(format!(
+                            "pin failed after {SYNC_RECONNECT_ATTEMPTS} session \
+                             re-establishments: {last_err}"
+                        ));
+                    }
+                    reconnects += 1;
+                    warn!(
+                        attempt = reconnects,
+                        last_err, "pin failed on a dropped session; re-establishing"
+                    );
+                    tokio::time::sleep(SYNC_RECONNECT_BACKOFF).await;
+                    match session.reconnect_session().await {
+                        Ok(()) => break,
+                        Err((PinFailure::Fatal, e)) => return Err(e),
+                        Err((_, e)) => last_err = e,
+                    }
+                }
+                info!(
+                    attempt = reconnects,
+                    "session re-established; retrying the pin"
+                );
+            }
         }
     }
 }
@@ -774,54 +1023,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn pin(&mut self, commitment: [u8; 32]) -> Result<(), String> {
-        let mut last_err = match self.pin_once(commitment).await {
-            Ok(()) => return Ok(()),
-            Err((retryable, msg)) => {
-                if !retryable || self.reconnect.is_none() {
-                    return Err(msg);
-                }
-                msg
-            }
-        };
-        for attempt in 1..=SYNC_RECONNECT_ATTEMPTS {
-            warn!(
-                attempt,
-                last_err, "pin failed on a dropped session; re-establishing"
-            );
-            tokio::time::sleep(SYNC_RECONNECT_BACKOFF).await;
-            let reconnect = self.reconnect.as_mut().expect("checked above");
-            match reconnect().await {
-                Ok((client, key)) => {
-                    if key != self.key {
-                        return Err(format!(
-                            "reconnected session attested a DIFFERENT key ({key:?} != {:?}); \
-                             our own identity cannot change mid-run, refusing",
-                            self.key
-                        ));
-                    }
-                    self.client = client;
-                }
-                Err(e) => {
-                    last_err = format!("session re-establishment failed: {e}");
-                    continue;
-                }
-            }
-            match self.pin_once(commitment).await {
-                Ok(()) => {
-                    info!(attempt, "pin succeeded after session re-establishment");
-                    return Ok(());
-                }
-                Err((retryable, msg)) => {
-                    if !retryable {
-                        return Err(msg);
-                    }
-                    last_err = msg;
-                }
-            }
-        }
-        Err(format!(
-            "pin failed after {SYNC_RECONNECT_ATTEMPTS} session re-establishments: {last_err}"
-        ))
+        pin_with_retries(self, commitment).await
     }
 }
 
@@ -967,7 +1169,10 @@ where
                     watch
                         .verify_read(handle, region)
                         .map_err(|e| format!("fatal: {e}"))?;
-                    debug!(handle, "superblock region read verified against pinned history");
+                    debug!(
+                        handle,
+                        "superblock region read verified against pinned history"
+                    );
                     to_kernel.write_all(&header).await?;
                     to_kernel.write_all(&payload).await?;
                     to_kernel.flush().await?;
@@ -1230,8 +1435,13 @@ where
 pub trait BootOracle {
     /// `Client::get`.
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError>;
-    /// `Client::pin`.
-    async fn pin(&mut self, key: PcrKey, commitment: Commitment) -> Result<Version, ClientError>;
+    /// `Client::pin` (the CAS guard is ignored on a first-time Register).
+    async fn pin(
+        &mut self,
+        key: PcrKey,
+        expected_version: Version,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError>;
     /// `Client::transition`.
     async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError>;
 }
@@ -1243,11 +1453,69 @@ where
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError> {
         Client::get(self, key).await
     }
-    async fn pin(&mut self, key: PcrKey, commitment: Commitment) -> Result<Version, ClientError> {
-        Client::pin(self, key, commitment).await
+    async fn pin(
+        &mut self,
+        key: PcrKey,
+        expected_version: Version,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError> {
+        Client::pin(self, key, expected_version, commitment).await
     }
     async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
         Client::transition(self, link).await
+    }
+}
+
+/// Resolve a `VersionConflict` with a `Get`: did an earlier attempt of
+/// OUR OWN pin commit before its ack was lost, or is a different writer
+/// ahead of us (a fork)?
+///
+/// This is the disambiguation the runtime pinner has always done; it
+/// lives here as a free function over [`BootOracle`] because the boot
+/// registration path needs exactly the same answer. Returns the key's
+/// current version when the cluster holds OUR commitment.
+///
+/// SAFETY: the tolerance is strictly "the oracle already holds the very
+/// commitment we are trying to write", which is indistinguishable from
+/// our write having succeeded — the anti-rollback invariant (the served
+/// device's superblock is the pinned one) holds either way. Any OTHER
+/// commitment means a second live writer owns the key and stays
+/// fail-stop, as does a `Get` we cannot complete.
+pub async fn disambiguate_conflict<O>(
+    oracle: &mut O,
+    key: PcrKey,
+    commitment: [u8; 32],
+) -> Result<Version, (PinFailure, String)>
+where
+    O: BootOracle,
+{
+    match tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.get(key)).await {
+        Ok(Ok((current, version))) if current == Commitment(commitment) => {
+            info!(
+                version = version.0,
+                "pin version conflict resolved: our earlier attempt had already committed"
+            );
+            Ok(version)
+        }
+        Ok(Ok((_current, version))) => Err((
+            PinFailure::Fatal,
+            format!(
+                "pin version conflict and the cluster holds a DIFFERENT commitment \
+                 (version {}): a second live writer is pinning this key — volume fork \
+                 detected, refusing to serve",
+                version.0
+            ),
+        )),
+        // The conflict was real but we can't even read the cluster:
+        // treat like any unreachable-oracle error (retryable).
+        Ok(Err(e)) => Err((
+            classify_pin_error(&e),
+            format!("conflict-disambiguation Get failed: {e}"),
+        )),
+        Err(_) => Err((
+            PinFailure::Session,
+            "conflict-disambiguation Get timed out (synchronizer unreachable)".to_string(),
+        )),
     }
 }
 
@@ -1258,12 +1526,17 @@ where
 /// LAZY chain-host fetch, awaited only on that branch. Any verdict other
 /// than serve / register / successful transition propagates as a fatal
 /// error.
+///
+/// Returns the key's current per-key version on success (the Found
+/// version for a plain serve, `Version(0)` after a registration, the
+/// carried-forward version after a transition): the CAS `expected_version`
+/// the runtime pinner must name on its first pin.
 pub async fn verify_or_register<O, F>(
     oracle: &mut O,
     key: PcrKey,
     region: &[u8],
     upgrade_link: F,
-) -> Result<(), FatalError>
+) -> Result<Version, FatalError>
 where
     O: BootOracle,
     F: std::future::Future<Output = Option<ChainLink>>,
@@ -1281,20 +1554,43 @@ where
     match boot_decision(region, &outcome) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches pinned commitment; serving");
-            Ok(())
+            let GetOutcome::Found { version, .. } = outcome else {
+                unreachable!("Serve implies Found");
+            };
+            Ok(version)
         }
         BootDecision::RegisterThenServe => {
             info!("boot verify: fresh device, registering with the synchronizer");
             let commitment = Commitment(commitment_of_region(region));
-            let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, commitment))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "boot verify: registration Pin timed out after {SYNC_RPC_TIMEOUT:?} \
-                         (synchronizer unreachable)"
-                    )
-                })?
-                .map_err(|e| format!("boot verify: registration Pin failed: {e}"))?;
+            let result =
+                tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, Version(0), commitment))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "boot verify: registration Pin timed out after {SYNC_RPC_TIMEOUT:?} \
+                     (synchronizer unreachable)"
+                        )
+                    })?;
+            let version = match result {
+                Ok(version) => version,
+                // At-least-once, same as the runtime path: an earlier
+                // attempt of THIS registration can commit and still lose
+                // its ack (the oracle re-submits a Pin it answered
+                // `Unavailable`, and the re-submission passes the CAS).
+                // The next attempt then sees `VersionConflict` for a pin
+                // that is already ours. Disambiguate with a `Get`: our
+                // own commitment means the registration landed; ANY
+                // other commitment is a second writer and stays
+                // fail-stop, exactly as before.
+                Err(ClientError::Rpc(RpcError::VersionConflict)) => {
+                    disambiguate_conflict(oracle, key, commitment.0)
+                        .await
+                        .map_err(|(_, msg)| {
+                            format!("boot verify: registration Pin conflicted: {msg}")
+                        })?
+                }
+                Err(e) => return Err(format!("boot verify: registration Pin failed: {e}").into()),
+            };
             if version != Version(0) {
                 // Get said NotFound but the Pin did not register: another
                 // session squeezed a registration in between. Two live
@@ -1307,7 +1603,7 @@ where
                 )
                 .into());
             }
-            Ok(())
+            Ok(Version(0))
         }
         BootDecision::TransitionOrFailStop(reason) => {
             transition_and_reverify(oracle, key, region, upgrade_link, &reason).await
@@ -1335,13 +1631,16 @@ where
 /// host-relayed fetch channel adds no trust: a forged or substituted
 /// link can at worst be rejected. This path NEVER registers; Register
 /// over a written region is the rollback hole this module closes.
+///
+/// Returns the carried-forward per-key version (the post-transition
+/// `Get`'s), which the runtime pinner needs as its first CAS input.
 async fn transition_and_reverify<O, F>(
     oracle: &mut O,
     key: PcrKey,
     region: &[u8],
     upgrade_link: F,
     fail_reason: &str,
-) -> Result<(), FatalError>
+) -> Result<Version, FatalError>
 where
     O: BootOracle,
     F: std::future::Future<Output = Option<ChainLink>>,
@@ -1400,7 +1699,10 @@ where
     match boot_decision(region, &outcome) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches the migrated pinned commitment; serving");
-            Ok(())
+            let GetOutcome::Found { version, .. } = outcome else {
+                unreachable!("Serve implies Found");
+            };
+            Ok(version)
         }
         BootDecision::FailStop(reason) => Err(format!("boot verify: {reason}").into()),
         BootDecision::RegisterThenServe | BootDecision::TransitionOrFailStop(_) => Err(
@@ -1451,7 +1753,10 @@ pub fn parse_luks2_data_offset(header: &[u8]) -> Result<Option<u64>, String> {
         ));
     }
     let json_area = &header[LUKS2_BINARY_HEADER_LEN as usize..hdr_size as usize];
-    let json_end = json_area.iter().position(|b| *b == 0).unwrap_or(json_area.len());
+    let json_end = json_area
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(json_area.len());
     let json: serde_json::Value = serde_json::from_slice(&json_area[..json_end])
         .map_err(|e| format!("LUKS2 JSON metadata does not parse: {e}"))?;
     let segments = json
@@ -1510,7 +1815,9 @@ where
     )
     .await?;
     if binary[0..6] != LUKS2_MAGIC {
-        info!("boot verify: no LUKS2 header on device (fresh volume); offset check deferred to the first formatted boot");
+        info!(
+            "boot verify: no LUKS2 header on device (fresh volume); offset check deferred to the first formatted boot"
+        );
         return Ok(());
     }
     let hdr_size = u64::from_be_bytes(binary[8..16].try_into().unwrap());
@@ -1538,7 +1845,10 @@ where
         )
         .into());
     }
-    info!(data_offset = expected, "boot verify: LUKS2 data offset matches the configured watch");
+    info!(
+        data_offset = expected,
+        "boot verify: LUKS2 data offset matches the configured watch"
+    );
     Ok(())
 }
 
@@ -1769,13 +2079,24 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
     })?
 }
 
+/// The result of a successful boot verification: the live session plus
+/// the runtime-wiring seeds.
+pub struct BootResult {
+    /// RPC-ready, mutually-authenticated session (handed to the pinner).
+    pub session: SyncSession,
+    /// The boot-verified region commitment (seeds the [`RegionWatch`]).
+    pub commitment: [u8; 32],
+    /// The key's current per-key version (the runtime pinner's first CAS
+    /// `expected_version`).
+    pub version: Version,
+}
+
 /// Full boot sequence for the anti-rollback wiring: connect +
 /// authenticate, cross-check the configured LUKS data offset against the
 /// device's LUKS2 header, read the device's current superblock region off
-/// the host stream, and run the decision table. Returns the live session
-/// plus the boot-verified region commitment (the seed for the runtime
-/// [`RegionWatch`]) only if the device may be served.
-pub async fn boot<H>(host: &mut H, data_offset: u64) -> Result<(SyncSession, [u8; 32]), FatalError>
+/// the host stream, and run the decision table. Returns the
+/// [`BootResult`] only if the device may be served.
+pub async fn boot<H>(host: &mut H, data_offset: u64) -> Result<BootResult, FatalError>
 where
     H: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1790,7 +2111,7 @@ where
     // path reaches the transition branch (#46). The Transition itself
     // runs on `session.client`, i.e. strictly after the oracle's PCRs
     // were verified by `connect_and_authenticate`.
-    verify_or_register(
+    let version = verify_or_register(
         &mut session.client,
         session.key,
         &region,
@@ -1800,21 +2121,27 @@ where
     // In every serve branch (Serve / RegisterThenServe / a successful
     // Transition re-verify) the pinned commitment equals the hash of the
     // region we just read, so that hash is the watch's seed.
-    Ok((session, commitment_of_region(&region)))
+    Ok(BootResult {
+        session,
+        commitment: commitment_of_region(&region),
+        version,
+    })
 }
 
-/// Turn a [`SyncSession`] into the production [`Pinner`] for the actor,
+/// Turn a [`BootResult`] into the production [`Pinner`] for the actor,
 /// with session re-establishment wired to a full
 /// [`connect_and_authenticate`]: a fresh dial (the relay fails over to a
 /// healthy cluster node), a fresh Noise handshake, and fresh MUTUAL
 /// attestation. Boot verification is deliberately NOT re-run on
 /// reconnect: the device has been live and gated the whole time, so the
 /// pinned state cannot have moved under us; the key-continuity check in
-/// [`SyncPinner`] guards the only thing that could change.
-pub fn into_pinner(session: SyncSession) -> SyncPinner<tokio_vsock::VsockStream> {
+/// [`SyncPinner`] guards the only thing that could change. The CAS
+/// version likewise survives reconnects (same enclave, same state).
+pub fn into_pinner(boot: BootResult) -> SyncPinner<tokio_vsock::VsockStream> {
     SyncPinner {
-        client: session.client,
-        key: session.key,
+        client: boot.session.client,
+        key: boot.session.key,
+        expected: boot.version,
         reconnect: Some(Box::new(|| {
             Box::pin(async {
                 let session = connect_and_authenticate()
@@ -1988,6 +2315,7 @@ mod tests {
         let region = region_with_data();
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&region),
+            version: Version(0),
         };
         assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
     }
@@ -1997,6 +2325,7 @@ mod tests {
         let region = region_with_data();
         let outcome = GetOutcome::Found {
             commitment: [0x11; 32],
+            version: Version(0),
         };
         assert!(matches!(
             boot_decision(&region, &outcome),
@@ -2032,6 +2361,7 @@ mod tests {
         let region = vec![0u8; SB_REGION_LEN];
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&region),
+            version: Version(0),
         };
         assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
     }
@@ -2042,6 +2372,7 @@ mod tests {
         let region = vec![0u8; SB_REGION_LEN];
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&region_with_data()),
+            version: Version(0),
         };
         assert!(matches!(
             boot_decision(&region, &outcome),
@@ -2056,6 +2387,7 @@ mod tests {
         tampered[64] ^= 0x01;
         let outcome = GetOutcome::Found {
             commitment: commitment_of_region(&tampered),
+            version: Version(0),
         };
         assert!(matches!(
             boot_decision(&region, &outcome),
@@ -2071,7 +2403,8 @@ mod tests {
         assert_eq!(
             out,
             GetOutcome::Found {
-                commitment: [0xaa; 32]
+                commitment: [0xaa; 32],
+                version: Version(3),
             }
         );
     }
@@ -2088,6 +2421,7 @@ mod tests {
             ClientError::Rpc(RpcError::Unavailable),
             ClientError::Rpc(RpcError::Unauthorized),
             ClientError::Rpc(RpcError::OperationRejected),
+            ClientError::Rpc(RpcError::VersionConflict),
             ClientError::ConnectionClosed,
         ] {
             assert!(get_outcome(Err(err)).is_err());
@@ -2100,15 +2434,15 @@ mod tests {
     /// and records every Transition link. `expect` panics double as the
     /// "this RPC must never be issued on this path" assertions (e.g. no
     /// Pin/Register on a written region).
-    struct ScriptedOracle {
+    pub(super) struct ScriptedOracle {
         gets: std::collections::VecDeque<Result<(Commitment, Version), ClientError>>,
         pins: std::collections::VecDeque<Result<Version, ClientError>>,
         transitions: std::collections::VecDeque<Result<Version, ClientError>>,
-        seen_transitions: Vec<ChainLink>,
+        pub(super) seen_transitions: Vec<ChainLink>,
     }
 
     impl ScriptedOracle {
-        fn new(
+        pub(super) fn new(
             gets: Vec<Result<(Commitment, Version), ClientError>>,
             pins: Vec<Result<Version, ClientError>>,
             transitions: Vec<Result<Version, ClientError>>,
@@ -2129,6 +2463,7 @@ mod tests {
         async fn pin(
             &mut self,
             _key: PcrKey,
+            _expected_version: Version,
             _commitment: Commitment,
         ) -> Result<Version, ClientError> {
             self.pins.pop_front().expect("unexpected Pin")
@@ -2139,11 +2474,11 @@ mod tests {
         }
     }
 
-    fn test_key() -> PcrKey {
+    pub(super) fn test_key() -> PcrKey {
         PcrKey([0x42; 32])
     }
 
-    fn not_found() -> Result<(Commitment, Version), ClientError> {
+    pub(super) fn not_found() -> Result<(Commitment, Version), ClientError> {
         Err(ClientError::Rpc(RpcError::NotFound))
     }
 
@@ -2303,6 +2638,51 @@ mod tests {
         .expect("fresh device must register and serve");
     }
 
+    /// The boot outcome surfaces the per-key version for the runtime
+    /// pinner's first CAS input: the Found version on a plain serve,
+    /// `Version(0)` after a registration, the carried-forward version
+    /// after a transition.
+    #[tokio::test]
+    async fn boot_returns_the_version_for_the_first_cas_pin() {
+        let region = region_with_data();
+        // Plain serve: the Found version (7) is returned.
+        let mut oracle = ScriptedOracle::new(
+            vec![Ok((Commitment(commitment_of_region(&region)), Version(7)))],
+            vec![],
+            vec![],
+        );
+        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+            panic!("matching pin must not fetch the upgrade link")
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, Version(7));
+
+        // Register: exactly Version(0).
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
+        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .unwrap();
+        assert_eq!(v, Version(0));
+
+        // Transition: the post-transition Get's version (the carried one).
+        let mut oracle = ScriptedOracle::new(
+            vec![
+                not_found(),
+                Ok((Commitment(commitment_of_region(&region)), Version(3))),
+            ],
+            vec![],
+            vec![Ok(Version(3))],
+        );
+        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+            Some(test_upgrade_link(9))
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, Version(3));
+    }
+
     // --- #46 chain-host fetch framing -----------------------------------
 
     /// Round trip: the request is one zero-length frame, the response is
@@ -2420,9 +2800,10 @@ mod tests {
         let off = 32 * 1024 - 2048;
         let mut src = Cursor::new(payload.clone());
         let mut dst = Vec::new();
-        let region = forward_bytes_extract(&mut src, &mut dst, payload.len() as u64, off, 4096, |_| {})
-            .await
-            .unwrap();
+        let region =
+            forward_bytes_extract(&mut src, &mut dst, payload.len() as u64, off, 4096, |_| {})
+                .await
+                .unwrap();
         assert_eq!(dst, payload);
         assert_eq!(region, payload[off..off + 4096].to_vec());
     }
@@ -3307,7 +3688,8 @@ mod region_watch_tests {
     async fn pump_accepts_pending_write_content_for_a_racing_read() {
         let new_content = region(0x77);
         let mut h = spawn_pump_with_watch(RegionWatch::new(commitment_of_region(&region(0x5a))));
-        h.watch.begin_pending(42, commitment_of_region(&new_content));
+        h.watch
+            .begin_pending(42, commitment_of_region(&new_content));
         h.watch.watch_read(9, 0);
         h.inflight.lock().unwrap().insert(9, SB_REGION_LEN as u32);
 
@@ -3353,15 +3735,9 @@ mod region_watch_tests {
     #[test]
     fn parses_the_crypt_segment_offset() {
         let h = luks2_header(16 * 1024 * 1024);
-        assert_eq!(
-            parse_luks2_data_offset(&h).unwrap(),
-            Some(16 * 1024 * 1024)
-        );
+        assert_eq!(parse_luks2_data_offset(&h).unwrap(), Some(16 * 1024 * 1024));
         let h = luks2_header(8 * 1024 * 1024);
-        assert_eq!(
-            parse_luks2_data_offset(&h).unwrap(),
-            Some(8 * 1024 * 1024)
-        );
+        assert_eq!(parse_luks2_data_offset(&h).unwrap(), Some(8 * 1024 * 1024));
     }
 
     /// Regression: real cryptsetup headers zero-pad the JSON area to
@@ -3371,10 +3747,7 @@ mod region_watch_tests {
     fn parses_a_zero_padded_cryptsetup_header() {
         let h = luks2_header_padded(16 * 1024 * 1024, Some(16384));
         assert_eq!(h.len(), 16384);
-        assert_eq!(
-            parse_luks2_data_offset(&h).unwrap(),
-            Some(16 * 1024 * 1024)
-        );
+        assert_eq!(parse_luks2_data_offset(&h).unwrap(), Some(16 * 1024 * 1024));
     }
 
     #[test]
@@ -3404,5 +3777,283 @@ mod region_watch_tests {
         h[8..16].copy_from_slice(&(hdr_size as u64).to_be_bytes());
         h[LUKS2_BINARY_HEADER_LEN as usize..].copy_from_slice(json.as_bytes());
         assert!(parse_luks2_data_offset(&h).is_err());
+    }
+}
+
+/// The pin retry policy: which oracle answers are re-tried, on what
+/// budget, and which stay fail-stop on the first answer.
+#[cfg(test)]
+mod retry_budget_tests {
+    use super::*;
+
+    #[test]
+    fn classify_pin_error_separates_the_three_responses() {
+        assert_eq!(
+            classify_pin_error(&ClientError::Rpc(RpcError::Unavailable)),
+            PinFailure::Unavailable
+        );
+        assert_eq!(
+            classify_pin_error(&ClientError::ConnectionClosed),
+            PinFailure::Session
+        );
+        assert_eq!(
+            classify_pin_error(&ClientError::Io(std::io::Error::other("x"))),
+            PinFailure::Session
+        );
+        // Every other structured refusal stays fail-stop.
+        for e in [
+            ClientError::Rpc(RpcError::Unauthorized),
+            ClientError::Rpc(RpcError::NotFound),
+            ClientError::Rpc(RpcError::OperationRejected),
+            ClientError::Rpc(RpcError::VersionConflict),
+            ClientError::Cbor("x".into()),
+            ClientError::Crypto("x".into()),
+        ] {
+            assert_eq!(classify_pin_error(&e), PinFailure::Fatal, "{e}");
+        }
+    }
+
+    /// Scripted [`PinAttempt`]: pops pre-programmed attempt results and
+    /// falls back to `tail` once the script runs out, so a
+    /// "never recovers" scenario needs no 150-entry deque.
+    struct ScriptedAttempt {
+        results: std::collections::VecDeque<Result<(), (PinFailure, String)>>,
+        tail: Result<(), (PinFailure, String)>,
+        attempts: usize,
+        reconnects: usize,
+        can_reconnect: bool,
+        reconnect_result: Result<(), (PinFailure, String)>,
+    }
+
+    impl ScriptedAttempt {
+        fn new(results: Vec<Result<(), (PinFailure, String)>>) -> Self {
+            Self {
+                results: results.into_iter().collect(),
+                tail: Err((PinFailure::Fatal, "script exhausted".to_string())),
+                attempts: 0,
+                reconnects: 0,
+                can_reconnect: true,
+                reconnect_result: Ok(()),
+            }
+        }
+
+        fn with_tail(mut self, tail: Result<(), (PinFailure, String)>) -> Self {
+            self.tail = tail;
+            self
+        }
+    }
+
+    impl PinAttempt for ScriptedAttempt {
+        async fn pin_once(&mut self, _commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
+            self.attempts += 1;
+            self.results
+                .pop_front()
+                .unwrap_or_else(|| self.tail.clone())
+        }
+        fn can_reconnect(&self) -> bool {
+            self.can_reconnect
+        }
+        async fn reconnect_session(&mut self) -> Result<(), (PinFailure, String)> {
+            self.reconnects += 1;
+            self.reconnect_result.clone()
+        }
+    }
+
+    fn unavailable() -> Result<(), (PinFailure, String)> {
+        Err((
+            PinFailure::Unavailable,
+            "pin rpc failed: no durable quorum".to_string(),
+        ))
+    }
+
+    /// The Sep 2/3 runtime symptom: a rejoining oracle node answers
+    /// `Unavailable` for a while, then the quorum comes back. The pin
+    /// must ride it out on the SAME session (no reconnect churn) and
+    /// succeed.
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_is_retried_then_succeeds() {
+        let mut session =
+            ScriptedAttempt::new(vec![unavailable(), unavailable(), unavailable(), Ok(())]);
+        pin_with_retries(&mut session, [0xaa; 32])
+            .await
+            .expect("a transient no-quorum window must not fail-stop the device");
+        assert_eq!(session.attempts, 4);
+        // Unavailable is an ANSWER, not a dead session: never reconnect.
+        assert_eq!(session.reconnects, 0);
+    }
+
+    /// The tolerance is bounded: an oracle that never regains quorum
+    /// fail-stops once the wall-clock budget expires, and it does so
+    /// within the budget (deadline-based, not attempt-counted).
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_budget_exhausted_fail_stops() {
+        let start = tokio::time::Instant::now();
+        let mut session = ScriptedAttempt::new(vec![]).with_tail(unavailable());
+        let err = pin_with_retries(&mut session, [0xaa; 32])
+            .await
+            .expect_err("an oracle that never recovers must still fail-stop");
+        assert!(err.contains("no-quorum budget"), "{err}");
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(elapsed <= SYNC_UNAVAILABLE_BUDGET, "{elapsed:?}");
+        assert!(
+            elapsed >= SYNC_UNAVAILABLE_BUDGET - 2 * SYNC_UNAVAILABLE_BACKOFF,
+            "budget must actually be spent, not short-circuited: {elapsed:?}"
+        );
+        assert_eq!(session.reconnects, 0);
+    }
+
+    /// Regression: a definitive refusal is still fatal on the FIRST
+    /// answer — no budget, no reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn fatal_pin_error_is_never_retried() {
+        let mut session = ScriptedAttempt::new(vec![Err((
+            PinFailure::Fatal,
+            "pin rpc failed: unauthorized".to_string(),
+        ))]);
+        let err = pin_with_retries(&mut session, [0xaa; 32])
+            .await
+            .unwrap_err();
+        assert!(err.contains("unauthorized"), "{err}");
+        assert_eq!(session.attempts, 1);
+        assert_eq!(session.reconnects, 0);
+    }
+
+    /// Regression: the pre-existing dropped-session budget is unchanged
+    /// — [`SYNC_RECONNECT_ATTEMPTS`] re-establishments, then fail-stop.
+    #[tokio::test(start_paused = true)]
+    async fn session_failures_still_bounded_by_reconnect_attempts() {
+        let mut session = ScriptedAttempt::new(vec![])
+            .with_tail(Err((PinFailure::Session, "connection closed".to_string())));
+        let err = pin_with_retries(&mut session, [0xaa; 32])
+            .await
+            .unwrap_err();
+        assert!(err.contains("session re-establishments"), "{err}");
+        assert_eq!(session.reconnects, SYNC_RECONNECT_ATTEMPTS as usize);
+    }
+
+    /// A dropped session and a no-quorum window in the same pin: both
+    /// budgets apply independently and the pin still succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn session_drop_then_unavailable_then_success() {
+        let mut session = ScriptedAttempt::new(vec![
+            Err((PinFailure::Session, "connection closed".to_string())),
+            unavailable(),
+            unavailable(),
+            Ok(()),
+        ]);
+        pin_with_retries(&mut session, [0xaa; 32]).await.unwrap();
+        assert_eq!(session.reconnects, 1);
+        assert_eq!(session.attempts, 4);
+    }
+}
+
+/// The boot registration path's `VersionConflict` handling: our own
+/// already-committed registration must serve, anything else fail-stops.
+#[cfg(test)]
+mod boot_conflict_tests {
+    use super::tests::{ScriptedOracle, not_found, test_key};
+    use super::*;
+
+    fn conflict() -> Result<Version, ClientError> {
+        Err(ClientError::Rpc(RpcError::VersionConflict))
+    }
+
+    /// The boot brick: on a fresh device the registration Pin is
+    /// answered `Unavailable`, the oracle re-submits it, the
+    /// re-submission commits, and the next attempt sees
+    /// `VersionConflict`. The disambiguating `Get` returns OUR OWN
+    /// commitment, so the registration did land: serve.
+    #[tokio::test]
+    async fn boot_registration_conflict_with_own_commitment_serves() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let ours = Commitment(commitment_of_region(&blank));
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found(), Ok((ours, Version(0)))],
+            vec![conflict()],
+            vec![],
+        );
+
+        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .expect("our own already-committed registration must not brick the boot");
+        assert_eq!(v, Version(0));
+        assert!(oracle.seen_transitions.is_empty());
+    }
+
+    /// Same conflict, but the cluster holds SOMEONE ELSE's commitment:
+    /// two live writers for one key. Fail-stop, exactly as before.
+    #[tokio::test]
+    async fn boot_registration_conflict_with_other_commitment_fail_stops() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found(), Ok((Commitment([0x77; 32]), Version(4)))],
+            vec![conflict()],
+            vec![],
+        );
+
+        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("registration Pin conflicted"), "{msg}");
+        assert!(msg.contains("DIFFERENT commitment"), "{msg}");
+    }
+
+    /// A conflict whose disambiguating `Get` cannot be completed stays
+    /// fail-stop too: we never serve on an unresolved conflict.
+    #[tokio::test]
+    async fn boot_registration_conflict_with_unreadable_oracle_fail_stops() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found(), Err(ClientError::ConnectionClosed)],
+            vec![conflict()],
+            vec![],
+        );
+
+        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflict-disambiguation Get failed"),
+            "{err}"
+        );
+    }
+
+    /// A registration Pin refused for any OTHER reason keeps failing on
+    /// the first answer, with no Get issued (the scripted deque holds
+    /// only the boot Get, so a second one would panic).
+    #[tokio::test]
+    async fn boot_registration_other_error_still_fail_stops() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found()],
+            vec![Err(ClientError::Rpc(RpcError::Unauthorized))],
+            vec![],
+        );
+
+        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("registration Pin failed"), "{err}");
+    }
+
+    /// The conflict tolerance does NOT weaken the registration-race
+    /// check: our commitment coming back at a non-zero version still
+    /// means another session owns the key.
+    #[tokio::test]
+    async fn boot_registration_conflict_at_nonzero_version_fail_stops() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let ours = Commitment(commitment_of_region(&blank));
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found(), Ok((ours, Version(9)))],
+            vec![conflict()],
+            vec![],
+        );
+
+        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("registration raced"), "{err}");
     }
 }

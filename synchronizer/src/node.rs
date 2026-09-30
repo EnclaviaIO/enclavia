@@ -131,7 +131,14 @@ impl Node {
     pub async fn handle_request(&self, session_key: PcrKey, req: Request) -> Response {
         match req {
             Request::Get { key } => self.handle_get(session_key, key).await,
-            Request::Pin { key, commitment } => self.handle_pin(session_key, key, commitment).await,
+            Request::Pin {
+                key,
+                expected_version,
+                commitment,
+            } => {
+                self.handle_pin(session_key, key, expected_version, commitment)
+                    .await
+            }
             Request::Transition { link } => self.handle_transition(session_key, link).await,
         }
     }
@@ -154,6 +161,7 @@ impl Node {
         &self,
         session_key: PcrKey,
         key: PcrKey,
+        expected_version: crate::Version,
         commitment: crate::Commitment,
     ) -> Response {
         if key != session_key {
@@ -163,9 +171,16 @@ impl Node {
         // Pin is a single wire RPC; map to Register (first pin) or Pin
         // (subsequent) based on what's already committed. The caller
         // distinguishes the two by inspecting the returned version:
-        // Version(0) means this was the registration.
+        // Version(0) means this was the registration. The CAS guard is
+        // checked only for the Pin arm: a Register is inherently a
+        // compare-and-swap on non-existence, so `expected_version` is
+        // ignored there.
         let op = if inner.get(&key).is_some() {
-            Op::Pin { key, commitment }
+            Op::Pin {
+                key,
+                expected_version,
+                commitment,
+            }
         } else {
             Op::Register { key, commitment }
         };
@@ -359,6 +374,7 @@ mod tests {
             key_old,
             Request::Pin {
                 key: key_old,
+                expected_version: Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -389,6 +405,7 @@ mod tests {
                 k(1),
                 Request::Pin {
                     key: k(1),
+                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -410,6 +427,7 @@ mod tests {
                 k(1),
                 Request::Pin {
                     key: k(1),
+                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -419,6 +437,7 @@ mod tests {
                 k(1),
                 Request::Pin {
                     key: k(1),
+                    expected_version: Version(0),
                     commitment: c(0xbb),
                 },
             )
@@ -434,6 +453,7 @@ mod tests {
                 k(1),
                 Request::Pin {
                     key: k(1),
+                    expected_version: Version(1),
                     commitment: c(0xcc),
                 },
             )
@@ -454,6 +474,7 @@ mod tests {
             k(1),
             Request::Pin {
                 key: k(1),
+                expected_version: Version(0),
                 commitment: c(0xab),
             },
         )
@@ -462,6 +483,7 @@ mod tests {
             k(1),
             Request::Pin {
                 key: k(1),
+                expected_version: Version(0),
                 commitment: c(0xcd),
             },
         )
@@ -497,6 +519,7 @@ mod tests {
                 k(1),
                 Request::Pin {
                     key: k(2),
+                    expected_version: Version(0),
                     commitment: c(0xff),
                 },
             )
@@ -524,6 +547,7 @@ mod tests {
             key_b,
             Request::Pin {
                 key: key_b,
+                expected_version: Version(0),
                 commitment: c(0xbb),
             },
         )
@@ -629,6 +653,7 @@ mod tests {
             key_old,
             Request::Pin {
                 key: key_old,
+                expected_version: Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -637,6 +662,7 @@ mod tests {
             key_old,
             Request::Pin {
                 key: key_old,
+                expected_version: Version(0),
                 commitment: c(0xbb),
             },
         )
@@ -713,6 +739,7 @@ mod tests {
                 key_old,
                 Request::Pin {
                     key: key_old,
+                    expected_version: Version(0),
                     commitment: c(0xee),
                 },
             )
@@ -735,6 +762,7 @@ mod tests {
                 k(1),
                 Request::Pin {
                     key: k(1),
+                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -745,6 +773,7 @@ mod tests {
                 k(2),
                 Request::Pin {
                     key: k(2),
+                    expected_version: Version(0),
                     commitment: c(0xbb),
                 },
             )

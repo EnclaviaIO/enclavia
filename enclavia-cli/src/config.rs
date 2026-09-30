@@ -48,10 +48,46 @@ pub fn credentials_path() -> PathBuf {
 }
 
 pub fn save_credentials(creds: &Credentials) -> std::io::Result<()> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
+    save_credentials_at(&config_dir(), &credentials_path(), creds)
+}
+
+/// [`save_credentials`] with explicit paths, so tests don't touch the
+/// real config directory.
+///
+/// The file holds a live bearer token plus a ~30-day refresh token, so it
+/// gets the same treatment as the YubiKey key index in `keys.rs`: created
+/// `0600` via `OpenOptions::mode` (no chmod-after-write window) and
+/// re-clamped to `0600` on every rewrite, since an existing file keeps
+/// its creation-time mode. The containing directory is clamped to `0700`.
+fn save_credentials_at(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    creds: &Credentials,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
     let json = serde_json::to_string_pretty(creds).expect("serialize credentials");
-    std::fs::write(credentials_path(), json)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(json.as_bytes())?;
     Ok(())
 }
 
@@ -61,6 +97,15 @@ pub fn save_credentials(creds: &Credentials) -> std::io::Result<()> {
 /// as logged-out forces an explicit `enclavia auth login`.
 pub fn load_credentials() -> Option<Credentials> {
     let path = credentials_path();
+    // Files written before permission hardening may still be
+    // world/group-readable from their default-umask creation; clamp them
+    // on first touch. Best-effort: a failed chmod must not lock the user
+    // out of credentials they can read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let data = std::fs::read_to_string(path).ok()?;
     // Strict parse: missing fields → returns None → CLI prompts to login.
     serde_json::from_str(&data).ok()
@@ -98,5 +143,55 @@ mod tests {
         assert_eq!(back.access_token, "at");
         assert_eq!(back.refresh_token, "rt");
         assert_eq!(back.backend_url, "http://localhost:3000");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn test_creds() -> Credentials {
+        Credentials {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_at: Utc::now(),
+            backend_url: "http://localhost:3000".into(),
+        }
+    }
+
+    /// The credentials file holds a bearer + refresh token: it must be
+    /// created `0600` (and the directory `0700`) regardless of umask.
+    #[cfg(unix)]
+    #[test]
+    fn credentials_are_written_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("enclavia");
+        let path = dir.join("credentials.json");
+        save_credentials_at(&dir, &path, &test_creds()).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "credentials file must be 0600");
+        assert_eq!(mode_of(&dir), 0o700, "config dir must be 0700");
+    }
+
+    /// Rewriting an existing world-readable file (pre-hardening layout)
+    /// must clamp it back to `0600`: `OpenOptions::mode` only applies at
+    /// creation, so the writer re-applies permissions explicitly.
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_clamps_existing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("enclavia");
+        let path = dir.join("credentials.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_credentials_at(&dir, &path, &test_creds()).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "rewrite must clamp to 0600");
+        // And the content actually round-trips.
+        let back: Credentials =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.access_token, "at");
     }
 }

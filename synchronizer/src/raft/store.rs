@@ -246,8 +246,13 @@ impl StateMachineStore {
                     commitment: *commitment,
                 })
             }
-            ReplicatedOp::Pin { key, commitment } => sm.apply(Op::Pin {
+            ReplicatedOp::Pin {
+                key,
+                expected_version,
+                commitment,
+            } => sm.apply(Op::Pin {
                 key: *key,
+                expected_version: *expected_version,
                 commitment: *commitment,
             }),
             ReplicatedOp::Transition {

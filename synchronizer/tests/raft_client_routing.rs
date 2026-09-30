@@ -365,6 +365,40 @@ impl Client {
         .await;
         read_response(&mut self.stream, &mut self.transport).await
     }
+
+    /// CAS-aware Pin mirroring the nbd-client's recovery: issue the pin
+    /// with `expected`; on `VersionConflict`, disambiguate with a Get —
+    /// if the current commitment is ours, an earlier attempt of the SAME
+    /// pin committed before its ack was lost (benign); anything else is
+    /// a genuine fork and surfaces as-is. Returns the version the pin
+    /// landed at, or the non-success response.
+    async fn pin_cas(
+        &mut self,
+        key: PcrKey,
+        expected: Version,
+        commitment: Commitment,
+    ) -> Result<Version, Response> {
+        match self
+            .rpc(Request::Pin {
+                key,
+                expected_version: expected,
+                commitment,
+            })
+            .await
+        {
+            Response::PinOk { version } => Ok(version),
+            Response::Err {
+                error: RpcError::VersionConflict,
+            } => match self.rpc(Request::Get { key }).await {
+                Response::GetOk {
+                    commitment: current,
+                    version,
+                } if current == commitment => Ok(version),
+                other => Err(other),
+            },
+            other => Err(other),
+        }
+    }
 }
 
 async fn write_frame(stream: &mut UnixStream, transport: &mut NoiseTransport, frame: &Frame) {
@@ -580,6 +614,7 @@ async fn pin_then_get_same_node_leader() {
     let resp = client
         .rpc(Request::Pin {
             key,
+            expected_version: Version(0),
             commitment: c(0xaa),
         })
         .await;
@@ -631,6 +666,7 @@ async fn pin_then_get_same_node_follower() {
     let resp = client
         .rpc(Request::Pin {
             key,
+            expected_version: Version(0),
             commitment: c(0xbb),
         })
         .await;
@@ -680,6 +716,7 @@ async fn pin_on_one_node_get_on_another() {
     let resp = writer
         .rpc(Request::Pin {
             key,
+            expected_version: Version(0),
             commitment: c(0xcd),
         })
         .await;
@@ -727,6 +764,7 @@ async fn transition_flow_carries_version_and_retires_old() {
         let r = old
             .rpc(Request::Pin {
                 key: old_key,
+                expected_version: Version(0),
                 commitment: c(0xaa),
             })
             .await;
@@ -739,6 +777,7 @@ async fn transition_flow_carries_version_and_retires_old() {
         let r = old
             .rpc(Request::Pin {
                 key: old_key,
+                expected_version: Version(0),
                 commitment: c(0xbb),
             })
             .await;
@@ -824,6 +863,7 @@ async fn restarted_node_hydrates_and_serves_get() {
         let r = client
             .rpc(Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: c(0x10 + i),
             })
             .await;
@@ -921,6 +961,7 @@ async fn writes_stall_under_node_outage_reads_ok_then_heal() {
         let r = client
             .rpc(Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: c(0x01),
             })
             .await;
@@ -986,12 +1027,23 @@ async fn writes_stall_under_node_outage_reads_ok_then_heal() {
         let r = client
             .rpc(Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: c(0x02),
             })
             .await;
         match r {
+            // The write committed on the majority but could not reach the
+            // down node, so the ACK is refused (first attempt). A retry
+            // then reports VersionConflict: the majority-committed first
+            // attempt already bumped the version, so our expected v0 is
+            // stale (the CAS guard working — the pin is applied at most
+            // once instead of benignly bumping per retry). Either way the
+            // client never sees a false PinOk.
             Response::Err {
                 error: RpcError::Unavailable,
+            } => {}
+            Response::Err {
+                error: RpcError::VersionConflict,
             } => {}
             Response::PinOk { version } => panic!(
                 "FALSE ACK: write returned PinOk(version={version:?}) while a node was down; \
@@ -1022,9 +1074,12 @@ async fn writes_stall_under_node_outage_reads_ok_then_heal() {
 
     // Heal the partition. Once the cluster is whole again, the same write
     // succeeds and is present on all three nodes. The exact version is not
-    // pinned down (each failed-but-committed Pin during the outage benignly
-    // bumped it, the documented at-least-once duplicate-Pin behavior), so we
-    // assert success + full-replication agreement rather than a fixed number.
+    // pinned down: whether the outage attempts majority-committed decides if
+    // the retry applies fresh (PinOk) or reports VersionConflict, which the
+    // CAS-aware recovery (`pin_cas`, mirroring the nbd-client) disambiguates
+    // with a Get — current commitment == ours means the earlier attempt had
+    // already landed. Either way we assert success + full-replication
+    // agreement rather than a fixed number.
     host.unblock(&leader_name);
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
@@ -1032,20 +1087,14 @@ async fn writes_stall_under_node_outage_reads_ok_then_heal() {
     );
     let mut committed = None;
     for _ in 0..20 {
-        let r = client
-            .rpc(Request::Pin {
-                key,
-                commitment: c(0x02),
-            })
-            .await;
-        match r {
-            Response::PinOk { version } => {
+        match client.pin_cas(key, Version(0), c(0x02)).await {
+            Ok(version) => {
                 committed = Some(version);
                 break;
             }
-            Response::Err {
+            Err(Response::Err {
                 error: RpcError::Unavailable,
-            } => tokio::time::sleep(Duration::from_millis(200)).await,
+            }) => tokio::time::sleep(Duration::from_millis(200)).await,
             other => panic!("unexpected response after heal: {other:?}"),
         }
     }
@@ -1095,6 +1144,7 @@ async fn no_false_ack_when_a_node_is_partitioned() {
         let r = client
             .rpc(Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: c(0x01),
             })
             .await;
@@ -1130,12 +1180,20 @@ async fn no_false_ack_when_a_node_is_partitioned() {
         let r = client
             .rpc(Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: c(0x02),
             })
             .await;
         match r {
+            // Unavailable (first attempt: committed on the majority, ACK
+            // refused) or VersionConflict (retry: the majority-committed
+            // first attempt already bumped the version — the CAS guard
+            // applying the pin at most once). Never a false PinOk.
             Response::Err {
                 error: RpcError::Unavailable,
+            } => {}
+            Response::Err {
+                error: RpcError::VersionConflict,
             } => {}
             Response::PinOk { version } => panic!(
                 "FALSE ACK: leader returned PinOk(version={version:?}) with a node partitioned; \
@@ -1147,8 +1205,10 @@ async fn no_false_ack_when_a_node_is_partitioned() {
 
     // Heal: unblock the partitioned node, wait for it to catch up, then retry
     // the Pin. It now succeeds and is visible on all three nodes. The exact
-    // version is not pinned (failed-but-committed Pins during the outage benignly
-    // bumped it), so we assert success + full-replication agreement.
+    // version is not pinned (a majority-committed-but-unACKed attempt may
+    // already have bumped it; the `pin_cas` recovery disambiguates with a
+    // Get, mirroring the nbd-client), so we assert success +
+    // full-replication agreement.
     host.unblock(&victim_name);
     assert!(
         await_leader(&nodes, Duration::from_secs(10)).await,
@@ -1156,20 +1216,14 @@ async fn no_false_ack_when_a_node_is_partitioned() {
     );
     let mut committed = None;
     for _ in 0..20 {
-        let r = client
-            .rpc(Request::Pin {
-                key,
-                commitment: c(0x02),
-            })
-            .await;
-        match r {
-            Response::PinOk { version } => {
+        match client.pin_cas(key, Version(0), c(0x02)).await {
+            Ok(version) => {
                 committed = Some(version);
                 break;
             }
-            Response::Err {
+            Err(Response::Err {
                 error: RpcError::Unavailable,
-            } => tokio::time::sleep(Duration::from_millis(200)).await,
+            }) => tokio::time::sleep(Duration::from_millis(200)).await,
             other => panic!("unexpected response after heal: {other:?}"),
         }
     }
@@ -1260,7 +1314,8 @@ async fn restart_of_bootstrap_name_node_joins_never_initializes_competitor() {
             client
                 .rpc(Request::Pin {
                     key,
-                    commitment: c(0xb2)
+                    expected_version: Version(0),
+                    commitment: c(0xb2),
                 })
                 .await,
             Response::PinOk {
@@ -1375,7 +1430,8 @@ async fn restart_with_new_identity_is_admitted_via_join() {
             client
                 .rpc(Request::Pin {
                     key,
-                    commitment: c(0xa1)
+                    expected_version: Version(0),
+                    commitment: c(0xa1),
                 })
                 .await,
             Response::PinOk {
@@ -1532,7 +1588,8 @@ async fn clone_race_evicts_original_exactly_one_holder() {
         client
             .rpc(Request::Pin {
                 key,
-                commitment: c(0xb2)
+                expected_version: Version(0),
+                commitment: c(0xb2),
             })
             .await,
         Response::PinOk {
@@ -1659,6 +1716,7 @@ async fn double_loss_halts_and_refuses_a_fresh_joiner() {
             Duration::from_secs(8),
             client.rpc(Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: c(0x5a),
             }),
         )

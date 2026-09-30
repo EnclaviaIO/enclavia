@@ -46,6 +46,12 @@ base64.workspace = true
 # fetch path (#46).
 ciborium.workspace = true
 
+[dev-dependencies]
+# `tokio::time::pause` / `#[tokio::test(start_paused = true)]`: the
+# Unavailable-budget tests span five minutes of wall clock, which only
+# the paused test clock makes tractable. Test-only, never in the EIF.
+tokio = { workspace = true, features = ["test-util"] }
+
 [[bin]]
 name = "enclavia-nbd-client"
 path = "src/main.rs"

@@ -175,7 +175,12 @@ raft = [
 [dev-dependencies]
 ciborium = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "io-util"] }
+# `test-util` gives the deadline tests `tokio::time::pause()`: the mesh
+# handshake / channel-liveness deadlines are 5-15 s of WALL time, which the
+# paused clock auto-advances through the moment the runtime goes idle, so the
+# tests assert the real production constants in milliseconds. Dev-only; it is
+# never part of the enclave build.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "io-util", "test-util"] }
 # Tests construct real P-256 keypairs from deterministic seeds, sign
 # transition-link payloads, and build `FakeChainAttestation` fixtures to
 # drive the listener/Node verifier end to end. P-256 is the upgrade-chain

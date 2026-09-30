@@ -33,7 +33,7 @@ use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use p256::ecdsa::SigningKey;
 use synchronizer::listener::Frame;
 use synchronizer::wire::{Request, Response};
-use synchronizer::{Commitment, PcrKey};
+use synchronizer::{Commitment, PcrKey, Version};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -294,11 +294,15 @@ async fn run_session(args: Args, expected: Pcrs, idx: usize) -> SessionResult {
 
     let key = sess.key;
     if args.mode == "pin" {
-        // Op 0 is the Register: time it into its own bucket.
+        // Op 0 is the Register: time it into its own bucket. The
+        // expected_version is ignored on a Register (it is inherently a
+        // CAS on non-existence); subsequent pins name the version the
+        // previous PinOk returned (the compare-and-swap guard).
         let (us, ok) = timed_op(
             &mut sess,
             Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: commitment_for(seed, 0),
             },
         )
@@ -312,6 +316,7 @@ async fn run_session(args: Args, expected: Pcrs, idx: usize) -> SessionResult {
                 &mut sess,
                 Request::Pin {
                     key,
+                    expected_version: Version((op - 1) as u64),
                     commitment: commitment_for(seed, op),
                 },
             )
@@ -327,6 +332,7 @@ async fn run_session(args: Args, expected: Pcrs, idx: usize) -> SessionResult {
             &mut sess,
             Request::Pin {
                 key,
+                expected_version: Version(0),
                 commitment: commitment_for(seed, 0),
             },
         )

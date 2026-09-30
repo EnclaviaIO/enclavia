@@ -521,7 +521,12 @@ pub fn validate_chain_link(
         return Err(ChainValidationError::EmptyAttestation);
     }
     let recorded_pcrs = ctx.enclave_pcrs.to_pcrs()?;
-    verify_chain_attestation(&link.attestation, &link.payload, &recorded_pcrs, debug_mode)?;
+    verify_chain_attestation(
+        &link.attestation,
+        &link.payload,
+        &recorded_pcrs,
+        crate::attestation::VerificationMode::from_debug_flag(debug_mode),
+    )?;
 
     match link.kind {
         ChainLinkKind::Boot => validate_boot(link, ctx),

@@ -219,12 +219,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // With the synchronizer wiring enabled, the reply path runs the gated
     // pump plus a pin actor; without it, the legacy proxies run untouched.
     let (sync_hooks, rep_task, pin_task) = match sync_boot {
-        Some((session, boot_commitment)) => {
+        Some(boot) => {
             let gate = Arc::new(rollback::PinGate::new());
             // The runtime region watch: the boot-verified commitment seeds
             // it, and every superblock-covering read reply is checked
             // against the pinned history from here on (the boot-TOCTOU fix).
-            let watch = Arc::new(rollback::RegionWatch::new(boot_commitment));
+            let watch = Arc::new(rollback::RegionWatch::new(boot.commitment));
             let (pin_tx, pin_rx) = tokio::sync::mpsc::channel::<rollback::PinJob>(64);
             let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel();
             let hooks = rollback::SyncHooks {
@@ -241,14 +241,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 watch.clone(),
                 nudge_rx,
             ));
-            let pinner = rollback::into_pinner(session);
-            let pin_task = tokio::spawn(rollback::pin_actor(
-                pinner,
-                gate,
-                watch,
-                pin_rx,
-                nudge_tx,
-            ));
+            let pinner = rollback::into_pinner(boot);
+            let pin_task = tokio::spawn(rollback::pin_actor(pinner, gate, watch, pin_rx, nudge_tx));
             (Some(hooks), rep_task, Some(pin_task))
         }
         None => {

@@ -73,3 +73,6 @@ x509-cert = { workspace = true }
 [dev-dependencies]
 # egress_config's load_or_empty tests write allowlist files to a tempdir.
 tempfile = "3"
+# `start_paused` for the handshake-timeout regression test, so it fires
+# the NOISE_HANDSHAKE_TIMEOUT instantly instead of sleeping through it.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

@@ -40,6 +40,15 @@ pub enum Error {
     #[error("Connection closed")]
     ConnectionClosed,
 
+    /// Establishing the attested channel (WebSocket + Noise +
+    /// attestation) did not complete within
+    /// [`ClientBuilder::connect_timeout`](crate::ClientBuilder::connect_timeout).
+    /// Raised on the initial connect and on reconnect preflights; native
+    /// targets only (wasm has no timer and defers to the host's
+    /// WebSocket stack).
+    #[error("connection attempt timed out after {0:?}")]
+    ConnectTimeout(std::time::Duration),
+
     #[error("HTTP parse error: {0}")]
     HttpParse(String),
 
@@ -72,7 +81,9 @@ impl Error {
     /// verified outcome and are NOT retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Error::ConnectionClosed => true,
+            // A connect that timed out never reached attestation — it is a
+            // transport-level failure like a drop, not a verified outcome.
+            Error::ConnectionClosed | Error::ConnectTimeout(_) => true,
             // On wasm the host WebSocket API deliberately hides error
             // details (the variant is just a message), so any WebSocket
             // error is treated as a transient transport drop — the same

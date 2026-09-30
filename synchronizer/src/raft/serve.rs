@@ -49,7 +49,9 @@
 //! single node is down, writes stall and fail with
 //! [`RpcError::Unavailable`] (mapped from
 //! [`RaftHandleError::NotFullyReplicated`]) until the cluster is whole; the
-//! client retries (at-least-once: a duplicate Pin is benign, a duplicate
+//! client retries (at-least-once: a duplicate Pin is recovered via the
+//! `VersionConflict` Get-disambiguation — the earlier attempt committed — a
+//! duplicate
 //! Transition surfaces `TransitionRejected` and the client confirms via `Get`).
 //! Linearizable reads are unaffected: they still need only a fresh quorum.
 
@@ -80,8 +82,20 @@ pub async fn handle_on_leader(
 ) -> Response {
     match req {
         Request::Get { key } => handle_get(raft, session_key, key).await,
-        Request::Pin { key, commitment } => {
-            handle_pin(raft, session_key, key, commitment, control_pubkey).await
+        Request::Pin {
+            key,
+            expected_version,
+            commitment,
+        } => {
+            handle_pin(
+                raft,
+                session_key,
+                key,
+                expected_version,
+                commitment,
+                control_pubkey,
+            )
+            .await
         }
         Request::Transition { link } => {
             handle_transition(raft, session_key, control_pubkey, link, debug_mode).await
@@ -115,6 +129,15 @@ async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Resp
 /// `Pin` (re-pin), deciding from the CURRENT leader state (the replicated state
 /// machine), then submit it.
 ///
+/// The `expected_version` compare-and-swap guard is enforced by the pure
+/// core's deterministic `apply` on the committed entry (identically on every
+/// replica), never by this pre-check: it is what stops two live writers for
+/// one key (a host-booted clone pair shares the image's PCRs) from forking
+/// the pinned history — the loser's first divergent pin is rejected with
+/// `VersionConflict` instead of silently last-write-winning. For a first
+/// pin the op maps to `Register`, which is inherently a CAS on
+/// non-existence, so the guard is ignored there.
+///
 /// ## The concurrent-first-pin race
 ///
 /// Two enclaves cannot share a `PcrKey` (it is the SHA-256 of their PCR triple),
@@ -133,6 +156,7 @@ async fn handle_pin(
     raft: &RaftHandle,
     session_key: PcrKey,
     key: PcrKey,
+    expected_version: crate::Version,
     commitment: crate::Commitment,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
 ) -> Response {
@@ -158,7 +182,11 @@ async fn handle_pin(
     let is_registered = raft.state_machine().get(&key).await.is_some();
 
     let first_op = if is_registered {
-        ReplicatedOp::Pin { key, commitment }
+        ReplicatedOp::Pin {
+            key,
+            expected_version,
+            commitment,
+        }
     } else {
         ReplicatedOp::Register {
             key,
@@ -175,9 +203,24 @@ async fn handle_pin(
         // Register for the same key. The key is now registered, so retry ONCE
         // as a Pin (bounded, deterministic: a live key's Pin cannot itself hit
         // AlreadyRegistered).
+        //
+        // The retried Pin carries the caller's `expected_version`, which the
+        // CAS then enforces against the just-registered key. This is only
+        // reachable in the concurrent-first-pin race (the wire has one Pin
+        // RPC for both Register and re-pin), and it is contained: both
+        // racers booted from the same snapshot, so their commitments are
+        // identical in practice; even in the divergent case the fallback
+        // pin wins the CAS (v0 matches) but the loser's client sees
+        // `version != 0` and fail-stops, and the "winner"'s next pin hits
+        // VersionConflict with a foreign commitment and fail-stops too —
+        // conservative stop on both sides, never a silent rollback.
         Err(RaftHandleError::Rejected(ValidationError::AlreadyRegistered)) => {
             match raft
-                .client_write_durable(ReplicatedOp::Pin { key, commitment })
+                .client_write_durable(ReplicatedOp::Pin {
+                    key,
+                    expected_version,
+                    commitment,
+                })
                 .await
             {
                 Ok(state) => Response::PinOk {
