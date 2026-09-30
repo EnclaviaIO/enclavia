@@ -428,6 +428,10 @@ impl RaftRequestHandler {
                 error: RpcError::Unavailable,
             });
         }
+        crate::metrics::global()
+            .routes
+            .forwarded_served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let resp = crate::raft::serve::handle_on_leader(
             handle,
             fwd.session_key,
