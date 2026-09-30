@@ -19,6 +19,8 @@
 #   WORKERS    TLC workers per model (default 4)
 #   JOBS       models run in parallel (default 1)
 #   LOGDIR     where to keep TLC output (default: a temporary directory)
+#   HEAVY      1 = also run models marked `\* TIER: heavy` (tens of minutes to
+#              hours each; the default set is meant for CI)
 set -uo pipefail
 cd "$(dirname "$0")"
 
@@ -82,6 +84,10 @@ for cfg in models/$glob.cfg; do
   [ -e "$cfg" ] || continue
   name=$(basename "$cfg" .cfg)
   expect=$(sed -n 's/^\\\* EXPECT: //p' "$cfg" | head -1)
+  if grep -q '^\\\* TIER: heavy' "$cfg" && [ "${HEAVY:-0}" != 1 ]; then
+    printf 'SKIP  %-44s (heavy; run with HEAVY=1)\n' "$name"
+    continue
+  fi
   printf '%s\t%s\t%s\t%s\t%s\n' "." MCAntiRollback.tla "$cfg" "$name" "$expect" >>"$jobs_file"
 done
 if [ "$run_may" = 1 ]; then

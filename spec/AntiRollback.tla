@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* End-to-end model of Enclavia's storage anti-rollback protocol as it     *)
 (* stands in the Train 2 synchronizer release (EnclaviaIO/enclavia branch  *)
-(* train2 @ bd673c2). See spec/README.md for the prose specification, the *)
+(* train2 @ f413b5e). See spec/README.md for the prose specification, the *)
 (* trust model and the action -> code mapping table.                       *)
 (*                                                                         *)
 (* Actors:                                                                 *)
@@ -45,12 +45,13 @@ CONSTANTS
     Shadow,             \* host runs a second cluster "S" from the trusted image
     DevTrusted,         \* client trusts a dev synchronizer "D" (skip-chain)
     ValidFromGate,      \* Transition refused before valid_from - Tol (fd09cff)
-    RevocationMode,     \* "watermark" (bd673c2) | "linkhash" (planned fix) | "none" |
+    RevocationMode,     \* "linkhash" (f413b5e) | "watermark" (bd673c2, superseded) | "none" |
                         \* "submit" (link hash checked only in the leader pre-check) |
                         \* "unsigned_id" (keyed by the backend-assigned ChainLink.id)
     HostileBackend,     \* the backend builds the payloads the owner signs, adversarially
-    CliChecks,          \* "none" (today: the CLI signs the bytes it is given) |
-                        \* "decode" (the CLI decodes and checks from/to/valid_from/link hash)
+    CliChecks,          \* what the self-custody CLI checks before signing a backend-built
+                        \* payload: "none" | "revocation" (f413b5e: revocations only,
+                        \* check_revocation_target) | "decode" (upgrades too: target, valid_from)
     StrictPayloads,     \* payload types cannot be confused (domain separation or
                         \* unknown fields rejected); FALSE = a polyglot payload decodes as
                         \* both a RevocationPayload and an UpgradePayload
@@ -62,7 +63,7 @@ CONSTANTS
 
 ASSUME AckPolicy \in {"quorum", "all"}
 ASSUME RevocationMode \in {"watermark", "linkhash", "none", "submit", "unsigned_id"}
-ASSUME CliChecks \in {"none", "decode"}
+ASSUME CliChecks \in {"none", "revocation", "decode"}
 ASSUME Reseed \in {"none", "current", "believed", "any"}
 ASSUME CommitMode \in {"injective", "shape"}
 ASSUME MaxInst >= 3
@@ -112,7 +113,8 @@ VARIABLES
     \* ---- ghosts (history, never read by the protocol) ----
     acked,     \* <<image, state>> pairs whose pin was ACKed to the enclave
     ackIdx,    \* <<index, entry id>> ACKed from cluster R
-    revEver,   \* links whose revocation (as the owner meant it) was ever committed anywhere
+    revEver,   \* [lk, snap]: a link whose revocation (as the owner meant it) was committed
+               \* somewhere, with the written states ACKed at that moment
     violRollback, violStale, violAuth, violRev, violOwner
 
 nodeVars   == << ns, slotOf, cfg, was, thinks, has, leader, rlog, rcommit >>
@@ -154,8 +156,8 @@ Lineage(i) == {i} \cup {j \in Images : Linked(i, j)}
 NoKey == [reg |-> FALSE, com |-> 0, ver |-> 0]
 NoLink == [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0]
 
-\* Per-cluster applied state. `wm` is the bd673c2 watermark, `rl` the set of
-\* link hashes named by committed revocations (planned fix), `rids` the
+\* Per-cluster applied state. `wm` is the bd673c2 watermark (superseded), `rl` the set of
+\* link hashes named by committed revocations (f413b5e), `rids` the
 \* unsigned ids (negative model). `rt` is a GHOST: the links the owner MEANT
 \* to revoke with the committed revocations, whatever the payload said.
 EmptyCS == [k |-> [i \in Images |-> NoKey], ret |-> {},
@@ -224,15 +226,23 @@ OwnerAuthorized(s, e) ==
 GhostApply(s, e, res) ==
     /\ violAuth' = (violAuth \/
           (e.kind = "Trans" /\ res.r.kind = "Ok" /\ ~ OwnerAuthorized(s, e)))
-    \* 0 = never; 1 = a revoked link moved a blank-volume pin; 2 = a revoked
-    \* link moved a pin over written data.
-    /\ violRev' = IF e.kind = "Trans" /\ res.r.kind = "Ok" /\ e.lk \in revEver
-                  THEN IF violRev = 2 \/ s.k[e.key].com # Com(0) THEN 2 ELSE 1
+    \* 0 = never; 1 = a revoked link moved a pin; 2 = the pin it moved covers
+    \* data derived from a written state the lineage had ACKed when the
+    \* revocation committed (the owner's real data, not a fresh volume).
+    /\ violRev' = IF /\ e.kind = "Trans" /\ res.r.kind = "Ok"
+                     /\ \E r \in revEver : r.lk = e.lk
+                  THEN IF \/ violRev = 2
+                          \/ \E r \in revEver :
+                                /\ r.lk = e.lk
+                                /\ \E a \in r.snap : a # 0 /\ CommitMode = "injective"
+                                                   /\ Desc(a, s.k[e.key].com)
+                       THEN 2 ELSE 1
                   ELSE violRev
     /\ violOwner' = (violOwner \/
           (e.kind \in {"Reg", "Pin"} /\ res.r.kind = "Ok" /\ e.by = "adv"))
     /\ revEver' = IF e.kind = "Rev" /\ res.r.kind = "Ok"
-                  THEN revEver \cup {e.tgt} ELSE revEver
+                  THEN revEver \cup {[lk |-> e.tgt, snap |-> {p[2] : p \in acked}]}
+                  ELSE revEver
 
 (***************************************************************************)
 (* Real cluster helpers                                                    *)
@@ -340,7 +350,8 @@ Tick == /\ now < MaxTime /\ now' = now + 1
 \* then emits the link; it is public (chain) and the host keeps it.
 \*   honest backend:           the payload is the template.
 \*   hostile, CLI "decode":    only issued_at is free (the CLI cannot check it).
-\*   hostile, CLI "none":      to, valid_from and issued_at are all free.
+\*   hostile, CLI "none" or "revocation" (f413b5e): to, valid_from and
+\*                             issued_at are all free.
 Issue(t, to, vf, iss) ==
     /\ t.id \notin Approved
     /\ IF ~ HostileBackend THEN to = t.to /\ vf = t.vf /\ iss = t.iss
@@ -354,8 +365,9 @@ Issue(t, to, vf, iss) ==
 \* Revoking an upgrade the owner confirmed (only before its valid_from: the
 \* backend refuses later, upgrades.rs revoke). The backend builds the
 \* RevocationPayload; the owner signs it.
-\*   names: the link hash the payload carries (planned fix);
-\*   riss:  its issued_at (the bd673c2 watermark compares it).
+\*   names: the link hash the payload carries (revokes_link, f413b5e);
+\*          NoLink = a hash of no signed link at all;
+\*   riss:  its issued_at (only the superseded bd673c2 watermark reads it).
 \* With StrictPayloads = FALSE a hostile backend can make the signed bytes a
 \* polyglot that ALSO decodes as an UpgradePayload out of the same key (serde
 \* ignores unknown fields); the old enclave attests those bytes when it
@@ -364,7 +376,7 @@ IssueRevoke(L, names, riss, pto, pvf, piss) ==
     /\ L \in issued /\ L.tpl # 0 /\ now < Tpl(L.tpl).vf
     /\ ~ \E r \in revIssued : r.tgt = L
     /\ IF ~ HostileBackend THEN names = L /\ riss = L.iss
-       ELSE IF CliChecks = "decode" THEN names = L
+       ELSE IF CliChecks \in {"revocation", "decode"} THEN names = L
        ELSE TRUE
     /\ revIssued' = revIssued \cup {[tgt |-> L, names |-> names, riss |-> riss]}
     /\ issued' = IF HostileBackend /\ ~ StrictPayloads
@@ -740,7 +752,7 @@ Next ==
     \/ Tick
     \/ \E t \in Links : \E to \in Images \ {t.from}, vf \in VfVals \cup {t.vf}, iss \in IssVals \cup {t.iss} :
           Issue(t, to, vf, iss)
-    \/ \E L \in {l \in issued : l.tpl # 0} : \E N \in issued, riss \in IssVals \cup {L.iss} :
+    \/ \E L \in {l \in issued : l.tpl # 0} : \E N \in issued \cup {NoLink}, riss \in IssVals \cup {L.iss} :
        \E pto \in (IF HostileBackend /\ ~ StrictPayloads THEN Images \ {L.from} ELSE {"-"}),
           pvf \in (IF HostileBackend /\ ~ StrictPayloads THEN VfVals \cup {Tpl(L.tpl).vf} ELSE {0}),
           piss \in (IF HostileBackend /\ ~ StrictPayloads THEN IssVals ELSE {0}) :
@@ -790,7 +802,8 @@ TransitionAuthorized == ~ violAuth
 \* covers ever applies afterwards (in any cluster history).
 RevocationPermanent == violRev = 0
 
-\* Weaker: no revoked link ever moves a pin that covers WRITTEN data.
+\* Weaker: no revoked link ever moves a pin whose data derives from a written
+\* state the lineage had ACKed when the revocation committed.
 RevocationPermanentData == violRev < 2
 
 \* Only a session attested as key K can register or pin under K.

@@ -1,0 +1,1701 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 105 and seed -7985367899131046916 with 4 workers on 48 cores with 9102MB heap and 64MB offheap memory [pid: 2355134] (Linux 6.18.26 amd64, N/A 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /tmp/tmp.I6IBLRllq9/MCAntiRollback.tla
+Parsing file /tmp/tmp.I6IBLRllq9/AntiRollback.tla
+Parsing file /tmp/tmp.I6IBLRllq9/Integers.tla
+Parsing file /tmp/tmp.I6IBLRllq9/FiniteSets.tla
+Parsing file /tmp/tmp.I6IBLRllq9/Sequences.tla
+Parsing file /tmp/tmp.I6IBLRllq9/TLC.tla
+Parsing file /tmp/tmp.I6IBLRllq9/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module AntiRollback
+Semantic processing of module MCAntiRollback
+Starting... (2026-09-30 19:58:19)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-30 19:58:19.
+Error: Invariant NoStaleRestore is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<0, 0, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"off", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = <<>>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 0
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 2: <Next line 759, col 8 to line 759, col 87 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<0, 0, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"get", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = <<>>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 0
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 3: <BootGet line 403, col 5 to line 418, col 75 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<0, 0, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"reg", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = <<>>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 0
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 4: <BootRegister line 432, col 5 to line 438, col 63 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<1, 0, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<1, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"reg", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 5: <Replicate line 600, col 5 to line 604, col 54 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<1, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<1, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"reg", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 6: <Start line 640, col 5 to line 644, col 49 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<1, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<1, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"reg", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 7: <AdvanceR line 609, col 5 to line 622, col 73 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 1
+/\ has = <<1, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<1, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"reg", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> TRUE,
+     r |-> [ver |-> 0, kind |-> "Ok"],
+     idx |-> 1,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 8: <Deliver line 560, col 5 to line 594, col 60 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 1
+/\ has = <<1, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>}
+/\ violStale = FALSE
+/\ ph = <<"srv", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 9: <Write line 491, col 5 to line 498, col 46 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 1
+/\ has = <<1, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<1, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 1
+
+State 10: <Next line 759, col 8 to line 759, col 87 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 1
+/\ has = <<1, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<0, 1>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<1, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 1
+
+State 11: <PinSubmit line 503, col 5 to line 509, col 63 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 1
+/\ has = <<2, 1, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<2, 0>>
+/\ ackIdx = {<<1, 1>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<0, 1>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<1, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 2
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 1
+
+State 12: <Replicate line 600, col 5 to line 604, col 54 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 1
+/\ has = <<2, 2, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<2, 0>>
+/\ ackIdx = {<<1, 1>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<0, 1>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<1, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 2
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 1
+
+State 13: <AdvanceR line 609, col 5 to line 622, col 73 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 2
+/\ has = <<2, 2, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<2, 0>>
+/\ ackIdx = {<<1, 1>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<0, 1>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<1, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> TRUE,
+     r |-> [ver |-> 1, kind |-> "Ok"],
+     idx |-> 2,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 2
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 1
+
+State 14: <Deliver line 560, col 5 to line 594, col 60 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 2
+/\ has = <<2, 2, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>}
+/\ violStale = FALSE
+/\ ph = <<"srv", "get">>
+/\ disk = <<1, 1>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<1, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<1, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 2
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 1
+
+State 15: <Write line 491, col 5 to line 498, col 46 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 2
+/\ has = <<2, 2, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<1, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<1, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 2
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 2
+
+State 16: <PinSubmit line 503, col 5 to line 509, col 63 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 2
+/\ has = <<3, 2, 0, 0>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<3, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<1, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 3,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 2,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 1,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<1, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 2
+
+State 17: <Admit line 649, col 5 to line 657, col 37 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 2
+/\ has = <<3, 2, 0, 3>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<3, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<1, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 3,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 2,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 1,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<1, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {1, 2, 3, 4}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 4}
+/\ nstate = 2
+
+State 18: <AdvanceR line 609, col 5 to line 622, col 73 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 3
+/\ has = <<3, 2, 0, 3>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 2, reg |-> TRUE, com |-> 2]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<3, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>}
+/\ violStale = FALSE
+/\ ph = <<"pin", "get">>
+/\ disk = <<1, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 3,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 2,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 1,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<1, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {1, 2, 3, 4}
+/\ rsp = << [ has |-> TRUE,
+     r |-> [ver |-> 2, kind |-> "Ok"],
+     idx |-> 3,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 4}
+/\ nstate = 2
+
+State 19: <Deliver line 560, col 5 to line 594, col 60 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 3
+/\ has = <<3, 2, 0, 3>>
+/\ ns = <<"up", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 2, reg |-> TRUE, com |-> 2]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>, <<3, 3>>}
+/\ violStale = FALSE
+/\ ph = <<"srv", "get">>
+/\ disk = <<2, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 3,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 2,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 1,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<2, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {1, 2, 3, 4}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>, <<"A", 2>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 4}
+/\ nstate = 2
+
+State 20: <Crash line 628, col 5 to line 635, col 37 of module AntiRollback>
+/\ leader = 0
+/\ rcommit = 3
+/\ has = <<0, 2, 0, 3>>
+/\ ns = <<"down", "up", "up", "up">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 2, reg |-> TRUE, com |-> 2]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>, <<3, 3>>}
+/\ violStale = FALSE
+/\ ph = <<"srv", "get">>
+/\ disk = <<2, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 3,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 2,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 1,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<2, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {2, 3, 4}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>, <<"A", 2>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 4}
+/\ nstate = 2
+
+State 21: <Crash line 628, col 5 to line 635, col 37 of module AntiRollback>
+/\ leader = 0
+/\ rcommit = 3
+/\ has = <<0, 2, 0, 0>>
+/\ ns = <<"down", "up", "up", "down">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 2, reg |-> TRUE, com |-> 2]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>, <<3, 3>>}
+/\ violStale = FALSE
+/\ ph = <<"srv", "get">>
+/\ disk = <<2, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 3,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 2,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 1,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<2, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<2, 0>>
+/\ thinks = {2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>, <<"A", 2>>}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 4}
+/\ nstate = 2
+
+State 22: <ReseedFrom line 715, col 5 to line 733, col 51 of module AntiRollback>
+/\ leader = 2
+/\ rcommit = 2
+/\ has = <<0, 2, 0, 0>>
+/\ ns = <<"down", "up", "up", "down">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>, <<3, 3>>}
+/\ violStale = FALSE
+/\ ph = <<"srv", "get">>
+/\ disk = <<2, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<2, 0>>
+/\ violOwner = FALSE
+/\ disasters = 1
+/\ pst = <<2, 0>>
+/\ thinks = {2}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>, <<"A", 2>>}
+/\ violAuth = FALSE
+/\ cfg = {2}
+/\ nstate = 2
+
+State 23: <BootGet line 403, col 5 to line 418, col 75 of module AntiRollback>
+/\ leader = 2
+/\ rcommit = 2
+/\ has = <<0, 2, 0, 0>>
+/\ ns = <<"down", "up", "up", "down">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 1, reg |-> TRUE, com |-> 1]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {<<1, 1>>, <<2, 2>>, <<3, 3>>}
+/\ violStale = TRUE
+/\ ph = <<"srv", "srv">>
+/\ disk = <<2, 1>>
+/\ parent = <<0, 1>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 3>>
+/\ rlog = << [ id |-> 1,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 0,
+     kind |-> "Reg",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ],
+   [ id |-> 2,
+     iss |-> 0,
+     t |-> 0,
+     com |-> 1,
+     kind |-> "Pin",
+     key |-> "A",
+     lk |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     rid |-> 0,
+     ev |-> 0,
+     new |-> "A",
+     tgt |->
+         [id |-> 0, from |-> "-", to |-> "-", vf |-> 0, iss |-> 0, tpl |-> 0],
+     by |-> "enc" ] >>
+/\ img = <<"A", "A">>
+/\ ver = <<2, 1>>
+/\ violOwner = FALSE
+/\ disasters = 1
+/\ pst = <<2, 0>>
+/\ thinks = {2}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3, 4}
+/\ violRev = 0
+/\ nid = 3
+/\ violRollback = TRUE
+/\ revIssued = {}
+/\ acked = {<<"A", 0>>, <<"A", 1>>, <<"A", 2>>}
+/\ violAuth = FALSE
+/\ cfg = {2}
+/\ nstate = 2
+
+10596165 states generated, 2487721 distinct states found, 657424 states left on queue.
+The depth of the complete state graph search is 24.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 9 and the 95th percentile is 4).
+Finished in 34s at (2026-09-30 19:58:53)

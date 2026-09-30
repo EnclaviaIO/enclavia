@@ -1,0 +1,138 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 80 and seed 611903105348313063 with 4 workers on 48 cores with 9102MB heap and 64MB offheap memory [pid: 2354811] (Linux 6.18.26 amd64, N/A 21.0.12.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /tmp/tmp.SgGAkTwBaB/MCAntiRollback.tla
+Parsing file /tmp/tmp.SgGAkTwBaB/AntiRollback.tla
+Parsing file /tmp/tmp.SgGAkTwBaB/Integers.tla
+Parsing file /tmp/tmp.SgGAkTwBaB/FiniteSets.tla
+Parsing file /tmp/tmp.SgGAkTwBaB/Sequences.tla
+Parsing file /tmp/tmp.SgGAkTwBaB/TLC.tla
+Parsing file /tmp/tmp.SgGAkTwBaB/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module AntiRollback
+Semantic processing of module MCAntiRollback
+Starting... (2026-09-30 19:58:12)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-30 19:58:12.
+Error: Invariant OwnerOnly is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<0, 0, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ],
+  D |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"off", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = <<>>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = FALSE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 0
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+State 2: <Next line 772, col 8 to line 772, col 55 of module AntiRollback>
+/\ leader = 1
+/\ rcommit = 0
+/\ has = <<0, 0, 0, 0>>
+/\ ns = <<"up", "up", "up", "unborn">>
+/\ cl = <<"R", "R">>
+/\ now = 0
+/\ cs = [ R |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> FALSE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ],
+  D |->
+      [ k |-> [A |-> [ver |-> 0, reg |-> TRUE, com |-> 0]],
+        ret |-> {},
+        wm |-> [A |-> -1],
+        rl |-> {},
+        rids |-> {},
+        rt |-> {} ] ]
+/\ pend = <<0, 0>>
+/\ ackIdx = {}
+/\ violStale = FALSE
+/\ ph = <<"off", "off">>
+/\ disk = <<0, 0>>
+/\ parent = <<0, 0>>
+/\ revEver = {}
+/\ issued = {}
+/\ slotOf = <<1, 2, 3, 1>>
+/\ rlog = <<>>
+/\ img = <<"A", "A">>
+/\ ver = <<0, 0>>
+/\ violOwner = TRUE
+/\ disasters = 0
+/\ pst = <<0, 0>>
+/\ thinks = {1, 2, 3}
+/\ rsp = << [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ],
+   [ has |-> FALSE,
+     r |-> [ver |-> 0, kind |-> "None"],
+     idx |-> 0,
+     sv |-> FALSE,
+     ov |-> FALSE ] >>
+/\ was = {1, 2, 3}
+/\ violRev = 0
+/\ nid = 1
+/\ violRollback = FALSE
+/\ revIssued = {}
+/\ acked = {}
+/\ violAuth = FALSE
+/\ cfg = {1, 2, 3}
+/\ nstate = 0
+
+51 states generated, 39 distinct states found, 31 states left on queue.
+The depth of the complete state graph search is 4.
+Finished in 00s at (2026-09-30 19:58:12)

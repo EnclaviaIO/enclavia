@@ -5,6 +5,7 @@ EXTENDS AntiRollback
 
 ImagesOne == {"A"}
 ImagesTwo == {"A", "B"}
+ImagesThree == {"A", "B", "C"}   \* C: an image the owner never approved
 
 \* Upgrade template A -> B: valid_from at tick 2 (so valid_from - Tol = 1),
 \* and the issued_at an honest backend stamps (1).
