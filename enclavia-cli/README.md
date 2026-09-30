@@ -96,8 +96,20 @@ All create-time flags are immutable: to change one, create a new enclave.
 ```sh
 enclavia deploy <local-image> [FLAGS]      # create + push + watch until running (takes the create flags)
 enclavia push <local-image> <enclave-id>   # docker tag + push into the enclave's repo
+enclavia build <local-image> [FLAGS]       # build the EIF locally, no deploy (alias: enclavia ci)
 enclavia reproduce <enclave-id> [--upgrade <upgrade-id>]
 ```
+
+`build` (alias `ci`) turns a local Docker image into an EIF on your own
+machine with the same `builder` the backend runs, without creating or
+touching any enclave. Use it as a CI gate right after `docker build`: a
+non-zero exit means the image would also fail to build when pushed. No
+login is needed. Needs `nix` plus the `builder` binary on `$PATH` (or
+`BUILDER_PATH`); `nix profile install github:EnclaviaIO/builder` covers
+both tool deps and the binary, and no source checkout is required — the
+builder's flake source is fetched automatically (pin it with
+`--builder-rev`, or export `BUILDER_FLAKE` to use a local checkout).
+The image must be linux/amd64.
 
 `reproduce` rebuilds the EIF locally from the exact pinned sources the
 backend used and compares the resulting PCRs, so you can independently
