@@ -248,6 +248,12 @@ impl Node {
         ) {
             Ok(v) => v,
             Err(e) => {
+                if let Some(reason) = e.attestation_reason() {
+                    crate::metrics::record_rejection(
+                        crate::metrics::RejectionSource::TransitionLink,
+                        reason,
+                    );
+                }
                 tracing::warn!(
                     reason = e.attestation_reason().map(|r| r.as_str()),
                     error = %e,

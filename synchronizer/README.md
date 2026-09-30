@@ -15,6 +15,39 @@ Current scope (incremental):
 
 vsock-only.
 
+## Operational metrics (one-way, guest to host)
+
+A replicated node exports aggregate metrics to its parent instance every 15 s (`metrics` module; wire types in `enclavia-protocol::synchronizer_metrics`). The host is untrusted: it can fake, drop or replay samples, so nothing may act on these values beyond dashboards and alerts.
+
+**Transport.** The node dials the parent on vsock port **5014** (`SYNCHRONIZER_METRICS_PORT`; the synchronizer image uses 5008-5011, and the customer-enclave monitor draft's use of 5014 is on customer parents, never on a synchronizer parent). The `debug` dev listener sends to the Unix socket named by `METRICS_UDS_PATH` instead, or nothing if it is unset. Under QEMU's `vhost-device-vsock` a guest connection to host port 5014 arrives on `<uds-path>_5014`.
+
+**Frame.** One frame per connection: a 4-byte big-endian length in `1..=16384`, then that many bytes of CBOR `SynchronizerSample`. The node then shuts down its write side and closes.
+
+**One-way by construction.**
+- The node only dials out; nothing listens for the host.
+- The send path is generic over `AsyncWrite` only, so it cannot read the socket; right after connect the read side is shut down, so the kernel discards anything the host sends.
+- Connect plus write are bounded by a 2 s timeout, on the exporter's own task. A failed or slow send drops that sample and bumps `export_failures`; nothing is queued or retried.
+- The measured code paths (listener, mesh, Raft serve, join, state machine) only bump atomics; the exporter reads those, openraft's metrics watch and lock-free size counters, and never takes a lock the apply path uses. The clock probe (one own NSM attestation) runs at most once at a time, so a wedged `/dev/nsm` cannot pile up blocking threads.
+
+**Content.** Only aggregates, labelled by the node's slot name, peer slot names and fixed enum labels. No volume or enclave ids, keys, commitments, PCRs, Raft node ids (they derive from instance keys) or addresses; a unit test pins the exact field set.
+
+| Group | Series (Prometheus names, prefix `enclavia_synchronizer_`) |
+|---|---|
+| Sample | `sample_received_timestamp_seconds` (host clock; alert on staleness), `sample_version`, `sample_seq`, `uptime_seconds`, `export_failures_total` |
+| Raft | `raft_role{role}` (one-hot: leader, follower, candidate, learner, shutdown), `raft_term`, `raft_last_log_index`, `raft_last_applied_index`, `raft_snapshot_index`, `raft_voters`, `raft_learners`, `raft_has_leader`, `raft_quorum_ack_age_seconds` (leader only), `raft_peer_matched_index{peer}` (leader only) |
+| Join | `join_phase{phase}` (one-hot: starting, discovering, initializing, voter, evicted), `join_probes_total`, `join_admissions_total`, `join_evictions_total` (leader-side replacements) |
+| Mesh | `mesh_peer_connected{peer}`, `mesh_peer_channels_established_total{peer}` (first connect plus reconnects), `mesh_peer_dial_failures_total{peer}`, `mesh_peer_pings_total{peer}`, `mesh_peer_pong_timeouts_total{peer}`, `mesh_peer_last_ping_rtt_seconds{peer}` |
+| RPC | `rpc_requests_total{kind,outcome}` (kind: get, pin, register, transition; outcome: ok or the `RpcError` label), `rpc_duration_seconds{kind}` histogram (1 ms to 5 s buckets), `rpc_routed_total{route}` (local, forwarded, unavailable), `rpc_forwarded_served_total` |
+| Attestation | `attestation_rejections_total{source,reason}` (source: client, peer, transition_link; reason: the `RejectionReason` label or `other`) |
+| Clock | `clock_offset_seconds` (enclave wall clock minus a fresh NSM timestamp; `enclave` builds only) |
+| Resources | `state_keys{state}` (live, retired), `snapshot_bytes`, `process_resident_memory_bytes` |
+
+RPCs are counted on the node that holds the customer session; a request forwarded to the leader is counted there once more only as `rpc_forwarded_served_total`. A `pin` that registered its key (response version 0) counts as `register`. Ping RTT is only measured on a channel idle for 5 s, which in practice means followers' channels to the leader (Raft heartbeats keep the leader's own channels busy). The age of the last nitro-timesync step is not visible to the synchronizer process; the offset is exported instead.
+
+**Versioning.** `version` is 1. New fields are added with `#[serde(default)]` and do not change the version; receivers ignore fields they do not know. The version changes only when an existing field's meaning changes, and a receiver rejects versions it does not implement. Label values travel as strings, so a new enum value does not break an older receiver.
+
+**Reference receiver.** `synchronizer-metrics-host` (this workspace) listens on vsock port 5014 (or `--uds PATH`), reads one frame per connection within 5 s, never writes back, validates the node name and every label (`[A-Za-z0-9._-]{1,64}` for slot names, `[a-z0-9_]{1,32}` for enum labels), drops duplicate series, and atomically replaces `/var/lib/prometheus-node-exporter-text/enclavia_synchronizer.prom` (`--output`). Oversized, zero-length, truncated, non-CBOR, wrong-shape or unknown-version frames are dropped and the previous file is kept. If no valid sample arrives for `--stale-after-secs` (default 60) it removes the file, so a dead node shows up as absent series.
+
 ## License
 
 Dual-licensed under Apache-2.0 OR MIT. See [`../LICENSE-APACHE`](../LICENSE-APACHE) and [`../LICENSE-MIT`](../LICENSE-MIT).

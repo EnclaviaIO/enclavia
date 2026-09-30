@@ -59,6 +59,9 @@ pub mod raft;
 #[cfg(feature = "mesh")]
 pub mod trusted_time;
 
+#[cfg(feature = "mesh")]
+pub mod metrics;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "serde")]
@@ -421,6 +424,16 @@ impl StateMachine {
     /// currently registered (never registered, or retired).
     pub fn get(&self, key: &PcrKey) -> Option<&KeyState> {
         self.state.get(key)
+    }
+
+    /// Number of currently-registered (non-retired) keys.
+    pub fn head_len(&self) -> usize {
+        self.state.len()
+    }
+
+    /// Number of retired keys.
+    pub fn retired_len(&self) -> usize {
+        self.retired.len()
     }
 
     /// Iterator over all currently-registered (non-retired) keys.

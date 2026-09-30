@@ -15,6 +15,7 @@ members = [
     "mock-kms",
     "nbd-client",
     "synchronizer",
+    "synchronizer-metrics-host",
     "synchronizer-names-init",
 ]
 # `enclavia-dart/native` is the per-language UniFFI codegen wrapper (like

@@ -3999,6 +3999,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "synchronizer-metrics-host"
+version = "0.2.0"
+dependencies = [
+ "enclavia-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "synchronizer-names-init"
 version = "0.2.0"
 dependencies = [

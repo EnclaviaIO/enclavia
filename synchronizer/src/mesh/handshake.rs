@@ -374,12 +374,17 @@ where
     )
     .map_err(|e| {
         tracing::warn!(reason = %e.reason(), error = %e, "mesh peer attestation rejected");
+        crate::metrics::record_rejection(crate::metrics::RejectionSource::Peer, e.reason());
         HandshakeError::PeerAttestation(e)
     })?;
     let pcr_digest = PcrKey(extracted.pcrs.digest());
 
     // 4. Self-PCR allowlist: the peer must be running our image.
     if !allowlist.admits(&pcr_digest) {
+        crate::metrics::record_rejection(
+            crate::metrics::RejectionSource::Peer,
+            attestation::RejectionReason::PcrMismatch,
+        );
         tracing::warn!(
             reason = %attestation::RejectionReason::PcrMismatch,
             "mesh peer attestation rejected: PCR digest not in the self-PCR allowlist"
@@ -397,6 +402,10 @@ where
         &handshake_hash,
     )
     .map_err(|e| {
+        crate::metrics::record_rejection(
+            crate::metrics::RejectionSource::Peer,
+            attestation::RejectionReason::Signature,
+        );
         tracing::warn!(
             reason = %attestation::RejectionReason::Signature,
             error = %e,

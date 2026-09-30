@@ -32,6 +32,8 @@
 //! [`MeshMessage`](super::network::MeshMessage) enum so the same handler
 //! dispatches both Raft RPCs and forwarded client requests cleanly.
 
+use std::sync::atomic::Ordering;
+
 use serde::{Deserialize, Serialize};
 
 use crate::raft::RaftHandle;
@@ -113,6 +115,7 @@ pub async fn route_client_request(
             // is_leader check and the write/read; retry (we may now know a new
             // leader to forward to).
             if !is_transient(&resp) {
+                routes().local.fetch_add(1, Ordering::Relaxed);
                 return resp;
             }
             tokio::time::sleep(FORWARD_RETRY_DELAY).await;
@@ -130,15 +133,22 @@ pub async fn route_client_request(
                 forward_to(mesh, &leader, session_key, control_pubkey, request.clone()).await
             {
                 if !is_transient(&resp) {
+                    routes().forwarded.fetch_add(1, Ordering::Relaxed);
                     return resp;
                 }
             }
         }
         tokio::time::sleep(FORWARD_RETRY_DELAY).await;
     }
+    routes().unavailable.fetch_add(1, Ordering::Relaxed);
     Response::Err {
         error: RpcError::Unavailable,
     }
+}
+
+/// The process-wide routing counters.
+fn routes() -> &'static crate::metrics::RouteStats {
+    &crate::metrics::global().routes
 }
 
 /// Whether a response is a transient failure worth retrying (re-resolve the

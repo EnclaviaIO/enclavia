@@ -64,9 +64,10 @@ use crate::mesh::handshake::{
 use crate::mesh::identity::MeshIdentity;
 use crate::mesh::rpc::{
     AbortOnDrop, ClientChannel, MeshPayload, PeerContext, RequestHandler, RpcError, serve,
-    spawn_client,
+    spawn_client_with_stats,
 };
 use crate::mesh::transport::{BoxedStream, MeshAcceptor, MeshDialer};
+use crate::metrics::PeerLinkStats;
 
 /// Initial reconnect backoff after a dropped peer connection.
 pub const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
@@ -141,6 +142,9 @@ pub struct Mesh {
     /// Instance pubkeys observed over inbound (accept-side) attested channels,
     /// keyed by the peer's `Hello` name. See [`ObservedPeers`].
     observed: ObservedPeers,
+    /// Per-peer outbound channel counters, sorted by peer name. Read by the
+    /// metrics exporter.
+    link_stats: Vec<(PeerName, Arc<PeerLinkStats>)>,
     /// Spawned tasks (dial loops + accept loop). Aborted on shutdown/drop.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -182,6 +186,7 @@ impl Mesh {
 
         let mut peers = HashMap::new();
         let mut tasks = Vec::new();
+        let mut link_stats = Vec::new();
 
         // Instance pubkeys observed over ANY attested channel (inbound accept
         // OR outbound dial). Created before the dial loops so they can record
@@ -193,6 +198,8 @@ impl Mesh {
         for peer in &config.peers {
             let slot: PeerSlot = Arc::new(Mutex::new(None));
             peers.insert(peer.clone(), Arc::clone(&slot));
+            let stats = Arc::new(PeerLinkStats::default());
+            link_stats.push((peer.clone(), Arc::clone(&stats)));
             // Supervised, not a bare spawn: a dial loop that panics or returns
             // must be restarted, not silently lost (a lost loop means the peer
             // is never re-dialed and every durable write fails cluster-wide).
@@ -213,6 +220,7 @@ impl Mesh {
                     debug_mode,
                     Arc::clone(&slot),
                     Arc::clone(&observed),
+                    Arc::clone(&stats),
                 )
             }));
             tasks.push(handle);
@@ -230,9 +238,11 @@ impl Mesh {
         ));
         tasks.push(accept_handle);
 
+        link_stats.sort_by(|a, b| a.0.cmp(&b.0));
         Mesh {
             peers,
             observed,
+            link_stats,
             tasks,
         }
     }
@@ -265,6 +275,12 @@ impl Mesh {
                 peer: peer.to_string(),
                 source,
             })
+    }
+
+    /// Counters for each configured peer's outbound channel, sorted by peer
+    /// name.
+    pub fn peer_link_stats(&self) -> Vec<(PeerName, Arc<PeerLinkStats>)> {
+        self.link_stats.clone()
     }
 
     /// The logical names of the configured peers.
@@ -363,6 +379,7 @@ async fn dial_loop<D, A>(
     debug_mode: bool,
     slot: PeerSlot,
     observed: ObservedPeers,
+    stats: Arc<PeerLinkStats>,
 ) where
     D: MeshDialer + ?Sized,
     A: AttestationProvider + ?Sized,
@@ -378,10 +395,12 @@ async fn dial_loop<D, A>(
             debug_mode,
             &slot,
             &observed,
+            &stats,
         )
         .await
         {
             Ok(()) => {
+                stats.channel_down();
                 // Connection ran and then ended cleanly (peer closed). Clear
                 // the slot, reset backoff, and reconnect after a short pause so
                 // a flapping peer does not spin us.
@@ -392,6 +411,12 @@ async fn dial_loop<D, A>(
             }
             Err(e) => {
                 *slot.lock().await = None;
+                // Still marked up means the channel was established and then
+                // failed; otherwise the dial or handshake itself failed.
+                if !stats.is_connected() {
+                    stats.dial_failed();
+                }
+                stats.channel_down();
                 warn!(peer = %peer, error = %e, backoff_ms = backoff.as_millis(), "dial/handshake failed, backing off");
                 sleep_with_jitter(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -414,6 +439,7 @@ async fn dial_once<D, A>(
     debug_mode: bool,
     slot: &PeerSlot,
     observed: &ObservedPeers,
+    stats: &Arc<PeerLinkStats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     D: MeshDialer + ?Sized,
@@ -490,8 +516,9 @@ where
     // Stand up the RPC client over the established transport. Publish the live
     // channel so `Mesh::call` can use it, then drive the connection until it
     // ends.
-    let (channel, driver) = spawn_client(stream, transport);
+    let (channel, driver) = spawn_client_with_stats(stream, transport, Some(Arc::clone(stats)));
     *slot.lock().await = Some(channel);
+    stats.channel_up();
     driver.await?;
     Ok(())
 }
@@ -688,6 +715,7 @@ mod robustness_tests {
             true,
             &slot,
             &observed,
+            &Arc::new(PeerLinkStats::default()),
         )
         .await;
 
