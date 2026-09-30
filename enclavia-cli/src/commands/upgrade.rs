@@ -22,6 +22,7 @@ use enclavia_protocol::chain::{
     BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
     UpgradePayload, validate_chain,
 };
+use enclavia_protocol::pin_identity::PinIdentity;
 pub use enclavia_protocol::staging::{StagedUpgradeJson, StagedUpgradeStatus};
 use serde::Serialize;
 use uuid::Uuid;
@@ -63,7 +64,7 @@ pub enum VerificationOk {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DecodedPayload {
     Boot(BootPayload),
-    Upgrade(UpgradePayload),
+    Upgrade(Box<UpgradePayload>),
     Revocation(RevocationPayload),
 }
 
@@ -216,7 +217,7 @@ fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> 
             .map(DecodedPayload::Boot),
         ChainLinkKind::Upgrade => ciborium::de::from_reader::<UpgradePayload, _>(bytes)
             .ok()
-            .map(DecodedPayload::Upgrade),
+            .map(|p| DecodedPayload::Upgrade(Box::new(p))),
         ChainLinkKind::Revocation => {
             ciborium::de::from_reader::<RevocationPayload, _>(bytes)
                 .ok()
@@ -471,14 +472,37 @@ pub struct RevocationTarget {
     pub upgrade: UpgradePayload,
 }
 
+/// Display lines for a pin identity: PCR0-2, then each nonzero user PCR, or
+/// one line saying user PCRs 16-31 are all zero. `label` prefixes each
+/// name (e.g. `to.`); names are padded to line values up in a column.
+pub fn identity_lines(label: &str, identity: &PinIdentity) -> Vec<String> {
+    let to_hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let row = |name: String, value: String| format!("{:<13}{value}", name + ":");
+    let mut lines: Vec<String> = identity
+        .image()
+        .iter()
+        .enumerate()
+        .map(|(i, v)| row(format!("{label}PCR{i}"), to_hex(v)))
+        .collect();
+    let mut any_user = false;
+    for (index, value) in identity.nonzero_user_pcrs() {
+        any_user = true;
+        lines.push(row(format!("{label}PCR{index}"), to_hex(value)));
+    }
+    if !any_user {
+        lines.push(row(format!("{label}PCR16-31"), "all zero".into()));
+    }
+    lines
+}
+
 fn print_revocation_target(t: &RevocationTarget) {
     let hash: String = t.link_hash.iter().map(|b| format!("{b:02x}")).collect();
     eprintln!("This revocation cancels the upgrade link signed by your control key:");
     eprintln!("  link hash:   {hash}");
     eprintln!("  target:      {}", t.upgrade.image_digest);
-    eprintln!("  to.PCR0:     {}", t.upgrade.to_pcrs.pcr0);
-    eprintln!("  to.PCR1:     {}", t.upgrade.to_pcrs.pcr1);
-    eprintln!("  to.PCR2:     {}", t.upgrade.to_pcrs.pcr2);
+    for line in identity_lines("to.", &t.upgrade.to) {
+        eprintln!("  {line}");
+    }
     eprintln!(
         "  valid_from:  {}",
         t.upgrade.valid_from.format("%Y-%m-%d %H:%M:%S UTC")
@@ -551,10 +575,11 @@ pub fn check_revocation_target(
         return refuse("the upgrade link it references is for another enclave");
     }
     let staged_pcrs = staged.pcrs.as_ref();
+    let to_image = upgrade.to.image_pcrs_hex();
     let pcrs_match = staged_pcrs.is_some_and(|p| {
-        p.pcr0 == upgrade.to_pcrs.pcr0
-            && p.pcr1 == upgrade.to_pcrs.pcr1
-            && p.pcr2 == upgrade.to_pcrs.pcr2
+        p.pcr0.eq_ignore_ascii_case(&to_image.pcr0)
+            && p.pcr1.eq_ignore_ascii_case(&to_image.pcr1)
+            && p.pcr2.eq_ignore_ascii_case(&to_image.pcr2)
     });
     if !pcrs_match
         || staged.image_digest.as_deref() != Some(upgrade.image_digest.as_str())
@@ -579,6 +604,13 @@ mod tests {
             pcr1: "11".repeat(48),
             pcr2: "22".repeat(48),
         }
+    }
+
+    fn identity_fixture() -> PinIdentity {
+        PinIdentity::new(
+            [[0x00; 48], [0x11; 48], [0x22; 48]],
+            enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+        )
     }
 
     fn boot_payload_fixture() -> BootPayload {
@@ -613,11 +645,26 @@ mod tests {
     }
 
     #[test]
+    fn identity_lines_show_user_pcrs_only_when_set() {
+        let plain = identity_fixture();
+        let lines = identity_lines("to.", &plain);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], format!("to.PCR0:     {}", "00".repeat(48)));
+        assert_eq!(lines[3], "to.PCR16-31: all zero");
+
+        let mut user = enclavia_protocol::pin_identity::ZERO_USER_PCRS;
+        user[1] = [0xab; 48];
+        let lines = identity_lines("to.", &plain.with_user_pcrs(user));
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[3], format!("to.PCR17:    {}", "ab".repeat(48)));
+    }
+
+    #[test]
     fn decode_payload_round_trips_upgrade() {
         let payload = UpgradePayload {
             enclave_id: Uuid::nil(),
-            from_pcrs: pcrs_fixture(),
-            to_pcrs: pcrs_fixture(),
+            from: identity_fixture(),
+            to: identity_fixture(),
             image_digest: "sha256:next".into(),
             valid_from: Utc.with_ymd_and_hms(2026, 6, 9, 11, 0, 0).unwrap(),
             issued_at: Utc.with_ymd_and_hms(2026, 6, 9, 10, 15, 22).unwrap(),
@@ -826,8 +873,8 @@ mod tests {
         fn upgrade(sk: &SigningKey, id: Uuid, issued_at: DateTime<Utc>) -> ChainLink {
             let payload = UpgradePayload {
                 enclave_id: enclave(),
-                from_pcrs: pcrs_fixture(),
-                to_pcrs: pcrs_fixture(),
+                from: identity_fixture(),
+                to: identity_fixture(),
                 image_digest: "sha256:next".into(),
                 valid_from: now() + chrono::Duration::days(2),
                 issued_at,

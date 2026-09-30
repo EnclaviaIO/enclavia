@@ -12,7 +12,8 @@
 //!   The listener calls
 //!   [`enclavia_protocol::attestation::verify_and_extract`] with the
 //!   Noise handshake hash as the expected nonce, derives
-//!   `PcrKey = SHA-256(PCR0||PCR1||PCR2)` from the verified document,
+//!   `PcrKey = PinIdentity::key()` (PCR0-2 plus user PCRs 16-31, see
+//!   [`enclavia_protocol::pin_identity`]) from the verified document,
 //!   pulls the 65-byte SEC1 P-256 control pubkey out of the doc's
 //!   `user_data` (`AttestedIdentity::control_pubkey`), and binds the
 //!   session to that key for life.
@@ -331,7 +332,7 @@ where
                 );
                 ConnError::Attestation(e)
             })?;
-            let key = PcrKey(identity.pcrs.digest());
+            let key = PcrKey(identity.identity.key());
             (key, identity.control_pubkey)
         }
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
@@ -469,9 +470,10 @@ mod tests {
     use crate::node::Node;
     use crate::wire::{ChainLink, ChainLinkKind, UpgradePayload};
     use crate::{Commitment, Version};
-    use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
+    use enclavia_protocol::attestation::test_utils::{
+        FakeAttestation, FakeChainAttestation, identity_from_seed,
+    };
     use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
-    use enclavia_protocol::chain::PcrsHex;
     use enclavia_protocol::perform_handshake_as_initiator;
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use std::sync::Arc;
@@ -501,30 +503,18 @@ mod tests {
         (sk, pk)
     }
 
-    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-        PcrsHex {
-            pcr0: hex::encode(vec![seed; 48]),
-            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-        }
-    }
-
-    /// The PcrKey a seed's PcrsHex hashes to. Matches both `FakeAttestation::
-    /// with_seed(seed)`'s PCRs and `verify_transition_link`'s derivation.
+    /// The PcrKey of a seed's identity. Matches both `FakeAttestation::
+    /// with_seed(seed)` (no user PCRs) and `verify_transition_link`'s
+    /// derivation.
     fn key_from_seed(seed: u8) -> PcrKey {
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        PcrKey(raw.digest())
+        PcrKey(identity_from_seed(seed).key())
     }
 
     /// Build a [`Frame::Authenticate`] from a [`FakeAttestation`] whose
     /// nonce is the supplied handshake hash and whose `user_data` carries a
     /// real 65-byte SEC1 P-256 pubkey, so a Transition link signed by the
-    /// matching key verifies. The session key is `sha256` over the seed's
-    /// PCR triple, equal to `key_from_seed(seed)`.
+    /// matching key verifies. The session key is the seed identity's key,
+    /// `key_from_seed(seed)`.
     fn auth_frame(
         seed: u8,
         handshake_hash: &[u8],
@@ -542,8 +532,8 @@ mod tests {
     fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from: chrono::Utc::now(),
             issued_at: chrono::Utc::now(),
@@ -970,6 +960,98 @@ mod tests {
 
         drop(client);
         let _ = server_task.await.unwrap();
+    }
+
+    /// Open a session on `node` as an enclave with image `seed` and PCR16 =
+    /// `pcr16`, send one RPC and return the response and the session key.
+    async fn rpc_as_user_pcr_enclave(
+        node: &Arc<Node>,
+        seed: u8,
+        pcr16: u8,
+        request: impl FnOnce(PcrKey) -> Request,
+    ) -> (Response, PcrKey) {
+        let (mut client, mut ct, hash, server_task) = connect_with_node(node.clone()).await;
+        let (_, pk) = keypair(pcr16);
+        let fake = FakeAttestation::with_seed_and_pubkey(seed, hash.clone(), pk)
+            .with_user_pcr(16, vec![pcr16; 48]);
+        let mut user = enclavia_protocol::pin_identity::ZERO_USER_PCRS;
+        user[0] = [pcr16; 48];
+        let key = PcrKey(identity_from_seed(seed).with_user_pcrs(user).key());
+        write_frame(&mut client, &mut ct, &Frame::authenticate(fake.encode())).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
+        write_frame(
+            &mut client,
+            &mut ct,
+            &Frame::Rpc {
+                request: request(key),
+            },
+        )
+        .await;
+        let resp = read_response(&mut client, &mut ct).await;
+        drop(client);
+        let _ = server_task.await.unwrap();
+        (resp, key)
+    }
+
+    /// Two enclaves built from the same image (identical PCR0-2) but with
+    /// different PCR16 get different pin slots: one's pin is invisible to,
+    /// and unreachable from, the other.
+    #[tokio::test]
+    async fn same_image_different_user_pcr_gets_its_own_pin_slot() {
+        let node = Arc::new(Node::with_debug_mode(true));
+        let pin = |commitment: Commitment| {
+            move |key| Request::Pin {
+                key,
+                expected_version: Version(0),
+                commitment,
+            }
+        };
+
+        let (resp, key_a) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, pin(c(0xaa))).await;
+        assert_eq!(
+            resp,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+
+        // Enclave B: same image, other PCR16. Its own slot is empty...
+        let (resp, key_b) =
+            rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, |key| Request::Get { key }).await;
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_b, key_from_seed(0x5c));
+        assert_eq!(
+            resp,
+            Response::Err {
+                error: RpcError::NotFound
+            }
+        );
+        // ...it cannot read A's...
+        let (resp, _) =
+            rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, |_| Request::Get { key: key_a }).await;
+        assert_eq!(
+            resp,
+            Response::Err {
+                error: RpcError::Unauthorized
+            }
+        );
+        // ...and pinning its own first version does not touch A's.
+        let (resp, _) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, pin(c(0xbb))).await;
+        assert_eq!(
+            resp,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+        let (resp, _) =
+            rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, |key| Request::Get { key }).await;
+        assert_eq!(
+            resp,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
+            }
+        );
     }
 
     /// End-to-end success: the OLD enclave (0x77) is already registered

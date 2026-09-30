@@ -92,7 +92,7 @@ impl Node {
     ///
     /// When `key` later registers (`Pin` of an unseen key), this pubkey is
     /// frozen into its `KeyState.control_pubkey`. A `Transition` link that
-    /// names this `key` as its `old_key` (via `from_pcrs`) is checked
+    /// names this `key` as its `old_key` (via `from`) is checked
     /// against that frozen pubkey, even though the submitting session is a
     /// different (new) enclave. If `key` is already committed in the state
     /// machine, its frozen `KeyState.control_pubkey` wins, this method only
@@ -211,10 +211,10 @@ impl Node {
         // Phase one: structurally decode the (still-untrusted) link to
         // learn the derived old_key / new_key. The NEW enclave submits a
         // Transition, so the session is bound to new_key; the OLD key is
-        // whatever the payload's from_pcrs hashes to, and is the key whose
+        // the key of the payload's `from` identity, and is the key whose
         // FROZEN control pubkey must have authorized the link. Any
         // structural failure (wrong kind, missing signature, undecodable
-        // payload, malformed PCRs) folds to TransitionRejected.
+        // payload, malformed identity) folds to TransitionRejected.
         let decoded = match decode_transition_link(&link) {
             Ok(d) => d,
             Err(_) => return err(RpcError::TransitionRejected),
@@ -232,11 +232,11 @@ impl Node {
         };
 
         // Phase two: cryptographically verify the link. This enforces the
-        // full contract: new_key (derived from to_pcrs) equals the
+        // full contract: new_key (the key of `to`) equals the
         // submitting session, it is not a self-transition, the link's
         // control signature verifies under old_key's frozen pubkey, and
         // the chain attestation binds `user_data == sha256(payload)` and
-        // the OLD enclave's PCRs (from_pcrs). Both keys are re-derived
+        // the OLD enclave's full identity (`from`). Both keys are re-derived
         // from the signed payload, never from an untrusted wire field, and
         // the payload's `valid_from` has been reached. Any failure folds to
         // a single TransitionRejected.
@@ -323,9 +323,8 @@ fn err(error: RpcError) -> Response {
 mod tests {
     use super::*;
     use crate::{Commitment, Version};
-    use enclavia_protocol::attestation::Pcrs;
-    use enclavia_protocol::attestation::test_utils::FakeChainAttestation;
-    use enclavia_protocol::chain::{ChainLinkKind, PcrsHex, UpgradePayload};
+    use enclavia_protocol::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
+    use enclavia_protocol::chain::{ChainLinkKind, UpgradePayload};
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 
     /// Arbitrary PcrKey for the Pin/Get/session-binding tests that never
@@ -339,23 +338,10 @@ mod tests {
         Commitment([b; 32])
     }
 
-    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-        PcrsHex {
-            pcr0: hex::encode(vec![seed; 48]),
-            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-        }
-    }
-
-    /// The PcrKey a seed's PcrsHex hashes to, matching `Pcrs::digest()`
-    /// and `verify_transition_link`'s key derivation.
+    /// The PcrKey of a seed's identity (no user PCRs), matching
+    /// `verify_transition_link`'s key derivation.
     fn key_from_seed(seed: u8) -> PcrKey {
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        PcrKey(raw.digest())
+        PcrKey(identity_from_seed(seed).key())
     }
 
     /// Deterministic P-256 keypair; returns the signing key and the
@@ -403,8 +389,8 @@ mod tests {
     ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from,
             issued_at: chrono::Utc::now(),
@@ -597,7 +583,7 @@ mod tests {
 
     /// Session-binding fires inside the link verifier: even with a valid
     /// link for (from=A -> to=C), a session authenticated as B (not the
-    /// link's to=C) can't drive it. The link's to_pcrs hashes to C, not B,
+    /// link's to=C) can't drive it. The link's `to` has key C, not B,
     /// so the SessionKeyMismatch path rejects it as TransitionRejected.
     #[tokio::test]
     async fn session_binding_rejects_transition_for_someone_else() {
@@ -920,8 +906,8 @@ mod tests {
     ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
             issued_at,

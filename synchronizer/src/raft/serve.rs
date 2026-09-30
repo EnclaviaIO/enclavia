@@ -198,7 +198,7 @@ async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Answ
 ///
 /// ## The concurrent-first-pin race
 ///
-/// Two enclaves cannot share a `PcrKey` (it is the SHA-256 of their PCR triple),
+/// Two enclaves cannot share a `PcrKey` (it is the hash of their pin identity),
 /// so a key is only ever pinned by one identity. But the SAME enclave can hold
 /// two sessions (e.g. a client retry that overlaps the original), and both can
 /// observe the key as unregistered and submit `Register`. Only one such

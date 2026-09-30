@@ -297,8 +297,10 @@ fn violates_min_upgrade_delay(
 /// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
 /// 2. Validate the CBOR payload decodes as `UpgradePayload`.
 /// 3. Enforce the measured minimum upgrade delay on `valid_from`.
-/// 4. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
-/// 5. Get a chain attestation binding `sha256(payload)`.
+/// 4. Get a chain attestation binding `sha256(payload)`, and require the pin
+///    identity it carries (PCR0-2 plus user PCRs 16-31) to equal the
+///    payload's `from`.
+/// 5. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
 /// 6. Submit the `Upgrade` chain link to `chain-host`; wait for ACK.
 ///
 /// The chain link is submitted BEFORE returning success so the backend sees
@@ -368,15 +370,38 @@ async fn run_prepare_upgrade(
         }
     }
 
-    // Storage re-key (only for storage enclaves). The signed payload's
-    // `to_pcrs` is forwarded so `enclavia-crypto` can verify the NEW KMS
-    // key's policy gates Decrypt to exactly the enclave version being
-    // upgraded to (see the binary's `--expected-pcr*` args).
+    // Chain attestation, taken before the storage re-key: the synchronizer
+    // and the chain validator only honour an upgrade link whose attestation
+    // carries exactly the payload's `from` identity, so a payload naming any
+    // other identity is refused here, before storage is touched.
+    let attestation = match build_chain_attestation(chain_payload) {
+        Ok(a) => a,
+        Err(e) => return (false, format!("chain attestation failed: {e}")),
+    };
+    match enclavia_protocol::attestation::extract_own_identity(&attestation) {
+        Ok(own) if own == payload.from => {}
+        Ok(own) => {
+            return (
+                false,
+                format!(
+                    "upgrade payload `from` identity does not match this enclave: \
+                     payload {:?}, attested {:?}",
+                    payload.from, own
+                ),
+            );
+        }
+        Err(e) => return (false, format!("cannot read own pin identity: {e}")),
+    }
+
+    // Storage re-key (only for storage enclaves). The PCR0-2 of the signed
+    // payload's `to` identity are forwarded so `enclavia-crypto` can verify
+    // the NEW KMS key's policy gates Decrypt to exactly the enclave version
+    // being upgraded to (see the binary's `--expected-pcr*` args).
     if let Some(rk) = rekey {
         let (ok, msg) = run_enclavia_crypto_prepare_upgrade(
             &rk.new_public_key,
             &rk.new_key_id,
-            &payload.to_pcrs,
+            &payload.to.image_pcrs_hex(),
             bin,
         )
         .await;
@@ -386,12 +411,6 @@ async fn run_prepare_upgrade(
         }
         info!("storage re-key succeeded");
     }
-
-    // Get chain attestation.
-    let attestation = match build_chain_attestation(chain_payload) {
-        Ok(a) => a,
-        Err(e) => return (false, format!("chain attestation failed: {e}")),
-    };
 
     let link = ChainLink {
         id: None,
@@ -671,8 +690,8 @@ fn format_enclavia_crypto_failure(subcommand: &str, output: &std::process::Outpu
 
 /// Spawn `enclavia-crypto prepare-upgrade` and translate its exit status into
 /// a user-visible result. The new public key is base64-encoded for the CLI;
-/// the key id is passed through unchanged. `to_pcrs` (from the signed
-/// `UpgradePayload`) is forwarded so the binary can require the NEW KMS key's
+/// the key id is passed through unchanged. `to_pcrs` (PCR0-2 of the signed
+/// `UpgradePayload`'s `to` identity) is forwarded so the binary can require the NEW KMS key's
 /// policy to gate `kms:Decrypt` to exactly those measurements before it seals
 /// anything under the key (the upgrade-time counterpart of the boot-time
 /// policy check; without it a compromised control key could seal the fresh
@@ -1412,16 +1431,13 @@ mod tests {
     }
 
     fn sample_upgrade_payload(nonce_seed: u8) -> Vec<u8> {
-        use enclavia_protocol::chain::{PcrsHex, UpgradePayload};
-        let pcrs = PcrsHex {
-            pcr0: "aa".repeat(24),
-            pcr1: "bb".repeat(24),
-            pcr2: "cc".repeat(24),
-        };
+        use enclavia_protocol::chain::UpgradePayload;
+        use enclavia_protocol::pin_identity::{PinIdentity, ZERO_USER_PCRS};
+        let identity = PinIdentity::new([[0xaa; 48], [0xbb; 48], [0xcc; 48]], ZERO_USER_PCRS);
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs.clone(),
-            to_pcrs: pcrs,
+            from: identity.clone(),
+            to: identity,
             image_digest: "sha256:test".into(),
             valid_from: chrono::Utc::now() + chrono::Duration::days(1),
             issued_at: chrono::Utc::now(),

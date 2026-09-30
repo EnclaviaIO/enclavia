@@ -14,9 +14,10 @@
 //!
 //! The own-PCR digest is HARDWARE-derived at startup, not host-supplied. The
 //! node requests a fresh attestation document from its OWN `/dev/nsm` and reads
-//! back its PCR0/1/2 via
-//! [`enclavia_protocol::attestation::extract_own_pcrs`] (see `read_mesh_env` in
-//! the binary). This works identically in production and under QEMU: QEMU's
+//! back its pin identity (PCR0-2 plus user PCRs 16-31, keyed exactly like a
+//! customer's) via
+//! [`enclavia_protocol::attestation::extract_own_identity`] (see `read_mesh_env`
+//! in the binary). This works identically in production and under QEMU: QEMU's
 //! nitro-enclave machine emulates `/dev/nsm` and measures the real PCR0/1/2 of
 //! the running VM (self-signed chain), and because the node is reading its OWN
 //! local device, inside its trusted computing base, no cert-chain trust is
