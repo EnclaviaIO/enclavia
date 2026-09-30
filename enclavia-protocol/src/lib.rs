@@ -12,6 +12,7 @@ pub mod mesh;
 mod nitro_verify;
 mod noise;
 pub mod staging;
+pub mod synchronizer_metrics;
 
 pub use noise::*;
 

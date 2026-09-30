@@ -400,8 +400,50 @@ async fn start_replicated_from_env(host_cid: u32) -> Option<(
     Some((mesh, raft, dispatch))
 }
 
+/// Start the one-way metrics exporter (see [`synchronizer::metrics`]).
+///
+/// `enclave` builds deliver to the parent on vsock
+/// [`SYNCHRONIZER_METRICS_PORT`](enclavia_protocol::synchronizer_metrics::SYNCHRONIZER_METRICS_PORT).
+/// The `debug` dev listener delivers to the Unix socket named by
+/// `METRICS_UDS_PATH`, and exports nothing when it is unset. The exporter
+/// runs on its own task for the life of the process; a missing receiver only
+/// drops samples.
+#[cfg(feature = "raft")]
+fn start_metrics_exporter(
+    raft: &synchronizer::raft::RaftHandle,
+    mesh: &Arc<synchronizer::mesh::Mesh>,
+    host_cid: u32,
+    started: std::time::Instant,
+) {
+    use synchronizer::metrics::{MetricsSink, ReplicatedCollector, spawn_replicated_exporter};
+
+    #[cfg(feature = "enclave")]
+    let sink = Some(MetricsSink::Vsock {
+        cid: host_cid,
+        port: enclavia_protocol::synchronizer_metrics::SYNCHRONIZER_METRICS_PORT,
+    });
+    #[cfg(feature = "debug")]
+    let sink = {
+        let _ = host_cid;
+        std::env::var_os("METRICS_UDS_PATH").map(|p| MetricsSink::Uds(p.into()))
+    };
+
+    match sink {
+        Some(sink) => {
+            info!(sink = ?sink, "starting metrics exporter");
+            let collector = ReplicatedCollector::new(raft.clone(), Arc::clone(mesh), started);
+            // Detached: the task runs for the life of the runtime.
+            drop(spawn_replicated_exporter(collector, sink));
+        }
+        None => info!("metrics exporter disabled (no sink configured)"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "raft")]
+    let started = std::time::Instant::now();
+
     // Cap `openraft` at WARN, even when RUST_LOG is set (the enclave init
     // exports RUST_LOG=info): stdout is the emulated serial console inside
     // the guest, where a write is a vmexit storm. openraft's snapshot path
@@ -444,6 +486,7 @@ async fn main() {
         match start_replicated_from_env(host_cid).await {
             Some((mesh, raft, replicated)) => {
                 info!("serving customer RPC through the replicated cluster");
+                start_metrics_exporter(&raft, &mesh, host_cid, started);
                 (Arc::new(replicated), mesh, raft)
             }
             None => {
