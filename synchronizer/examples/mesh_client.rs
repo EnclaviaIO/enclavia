@@ -10,7 +10,7 @@
 //!      `connect <port>\n`; expect `OK <port>\n`. The socket is then a
 //!      byte stream to the guest's customer vsock port (5010).
 //!   2. `Noise_NN_25519_ChaChaPoly_BLAKE2s` handshake (initiator).
-//!   3. Send `Frame::Authenticate { nsm_doc }`, a synthetic
+//!   3. Send `Frame::authenticate(nsm_doc)`, a synthetic
 //!      `FakeAttestation` whose nonce binds to the handshake hash and
 //!      whose `user_data` carries a real 65-byte SEC1 P-256 control
 //!      pubkey. The node runs in skip-cert-chain (debug) mode, so the
@@ -235,7 +235,7 @@ async fn read_and_verify_server_auth<S>(
     let pt = read_plaintext(stream, t).await;
     let frame: Frame = ciborium::from_reader(pt.as_slice()).expect("cbor decode server frame");
     let nsm_doc = match frame {
-        Frame::Authenticate { nsm_doc } => nsm_doc,
+        Frame::Authenticate { nsm_doc, .. } => nsm_doc,
         other => panic!("expected the node's Authenticate frame, got {other:?}"),
     };
     let pcrs = verify_server_attestation(
@@ -283,9 +283,7 @@ async fn main() {
     write_frame(
         &mut stream,
         &mut transport,
-        &Frame::Authenticate {
-            nsm_doc: fake.encode(),
-        },
+        &Frame::authenticate(fake.encode()),
     )
     .await;
     eprintln!(

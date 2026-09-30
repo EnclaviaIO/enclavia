@@ -145,6 +145,12 @@ async fn pin_register_then_bump_then_get() {
     let node = Arc::new(Node::with_debug_mode(true));
     let (mut client, key, task) = connect_as(node, 0x42).await;
 
+    // The server advertised this build's protocol version.
+    assert_eq!(
+        client.server_protocol().version,
+        synchronizer::wire::PROTOCOL_VERSION
+    );
+
     let v0 = client
         .pin(key, Version(0), c(0xaa))
         .await
@@ -463,9 +469,7 @@ fn encode_frame(frame: &Frame) -> Vec<u8> {
 async fn garbled_server_attestation_is_rejected() {
     let (client_stream, server_stream) = duplex(64 * 1024);
     let host = tokio::spawn(scripted_server(server_stream, |_hash| {
-        encode_frame(&Frame::Authenticate {
-            nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
-        })
+        encode_frame(&Frame::authenticate(vec![0xde, 0xad, 0xbe, 0xef]))
     }));
 
     let hs = Handshake::start(client_stream)
@@ -489,9 +493,9 @@ async fn replayed_server_attestation_is_rejected() {
     let (client_stream, server_stream) = duplex(64 * 1024);
     let host = tokio::spawn(scripted_server(server_stream, |_hash| {
         // Bound to some other session, NOT the live hash.
-        encode_frame(&Frame::Authenticate {
-            nsm_doc: FakeAttestation::with_seed(SERVER_SEED, vec![0xab; 32]).encode(),
-        })
+        encode_frame(&Frame::authenticate(
+            FakeAttestation::with_seed(SERVER_SEED, vec![0xab; 32]).encode(),
+        ))
     }));
 
     let hs = Handshake::start(client_stream)

@@ -315,9 +315,7 @@ impl Client {
         let mut stream = UnixStream::connect(&node.client_sock).await.unwrap();
         let (mut transport, hash) = perform_handshake_as_initiator(&mut stream).await.unwrap();
         let fake = FakeAttestation::with_seed_and_pubkey(seed, hash.clone(), pubkey);
-        let auth = Frame::Authenticate {
-            nsm_doc: fake.encode(),
-        };
+        let auth = Frame::authenticate(fake.encode());
         write_frame(&mut stream, &mut transport, &auth).await;
         // Mutual auth (#208): the node answers with its own session-bound
         // attestation. Verify it against the cluster's shared image PCRs
@@ -330,7 +328,7 @@ impl Client {
         let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
         let frame: Frame = ciborium::from_reader(&plaintext[..pt_len]).unwrap();
         let server_doc = match frame {
-            Frame::Authenticate { nsm_doc } => nsm_doc,
+            Frame::Authenticate { nsm_doc, .. } => nsm_doc,
             other => panic!("expected the node's Authenticate, got {other:?}"),
         };
         let expected = Pcrs {
