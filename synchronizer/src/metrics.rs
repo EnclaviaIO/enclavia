@@ -82,15 +82,18 @@ pub enum RpcKind {
     Register,
     /// `Request::Transition`.
     Transition,
+    /// `Request::Revoke`.
+    Revoke,
 }
 
 impl RpcKind {
     /// Every kind, in label order.
-    pub const ALL: [RpcKind; 4] = [
+    pub const ALL: [RpcKind; 5] = [
         RpcKind::Get,
         RpcKind::Pin,
         RpcKind::Register,
         RpcKind::Transition,
+        RpcKind::Revoke,
     ];
 
     /// Metric label.
@@ -100,6 +103,7 @@ impl RpcKind {
             RpcKind::Pin => "pin",
             RpcKind::Register => "register",
             RpcKind::Transition => "transition",
+            RpcKind::Revoke => "revoke",
         }
     }
 
@@ -109,6 +113,7 @@ impl RpcKind {
             Request::Get { .. } => RpcKind::Get,
             Request::Pin { .. } => RpcKind::Pin,
             Request::Transition { .. } => RpcKind::Transition,
+            Request::Revoke { .. } => RpcKind::Revoke,
         }
     }
 
@@ -143,11 +148,15 @@ pub enum RpcOutcome {
     /// a quorum (see [`Answered::timed_out`]). For a write the outcome is
     /// unknown: the entry may still commit.
     Timeout,
+    /// [`RpcError::TransitionRevoked`].
+    TransitionRevoked,
+    /// [`RpcError::RevocationRejected`].
+    RevocationRejected,
 }
 
 impl RpcOutcome {
     /// Every outcome, in label order.
-    pub const ALL: [RpcOutcome; 8] = [
+    pub const ALL: [RpcOutcome; 10] = [
         RpcOutcome::Ok,
         RpcOutcome::Unauthorized,
         RpcOutcome::NotFound,
@@ -156,6 +165,8 @@ impl RpcOutcome {
         RpcOutcome::VersionConflict,
         RpcOutcome::Unavailable,
         RpcOutcome::Timeout,
+        RpcOutcome::TransitionRevoked,
+        RpcOutcome::RevocationRejected,
     ];
 
     /// Metric label.
@@ -169,6 +180,8 @@ impl RpcOutcome {
             RpcOutcome::VersionConflict => "version_conflict",
             RpcOutcome::Unavailable => "unavailable",
             RpcOutcome::Timeout => "timeout",
+            RpcOutcome::TransitionRevoked => "transition_revoked",
+            RpcOutcome::RevocationRejected => "revocation_rejected",
         }
     }
 
@@ -192,6 +205,8 @@ impl RpcOutcome {
                 RpcError::OperationRejected => RpcOutcome::OperationRejected,
                 RpcError::VersionConflict => RpcOutcome::VersionConflict,
                 RpcError::Unavailable => RpcOutcome::Unavailable,
+                RpcError::TransitionRevoked => RpcOutcome::TransitionRevoked,
+                RpcError::RevocationRejected => RpcOutcome::RevocationRejected,
             },
             _ => RpcOutcome::Ok,
         }

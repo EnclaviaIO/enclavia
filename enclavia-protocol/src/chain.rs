@@ -202,6 +202,24 @@ pub struct RevocationPayload {
     pub issued_at: DateTime<Utc>,
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+    /// [`upgrade_link_hash`] of the cancelled upgrade link's payload. The
+    /// signature covers it, so a revocation cancels exactly one signed
+    /// upgrade, whatever the backend-assigned `revokes` id or the
+    /// timestamps say. A signer must check it against a link it verified
+    /// itself before signing.
+    #[serde(with = "serde_bytes")]
+    pub revokes_link: [u8; 32],
+}
+
+/// Canonical identity of an upgrade link: SHA-256 of its CBOR payload bytes.
+///
+/// These are the exact bytes the control key signs and the attestation binds
+/// (`user_data == sha256(payload)`), so the hash names one signed upgrade and
+/// nothing else: a different upgrade (even to the same target, e.g. a
+/// re-approval with a later `valid_from`) has a different payload and hash.
+pub fn upgrade_link_hash(payload: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(payload).into()
 }
 
 /// Failure decoding a [`ChainLinkJson`] wire link into a [`ChainLink`].
@@ -475,6 +493,11 @@ pub enum ChainValidationError {
     /// upgrade.
     #[error("upgrade has already been revoked")]
     AlreadyRevoked,
+    /// A revocation's `revokes_link` is not the [`upgrade_link_hash`] of the
+    /// upgrade link its `revokes` id resolves to: the signed payload cancels a
+    /// different upgrade than the chain entry it points at.
+    #[error("revocation revokes_link does not match the payload of the upgrade it references")]
+    RevokeLinkHashMismatch,
     /// Walker-level rule: a signed (upgrade / revocation) link whose
     /// payload is byte-identical to an earlier signed link's payload.
     /// Ingest dedups such replays ([`Outcome::Dedup`]), so a chain a
@@ -671,6 +694,9 @@ fn validate_signed(
                 .ok_or(ChainValidationError::RevokeTargetMissing)?;
             if target.kind != ChainLinkKind::Upgrade {
                 return Err(ChainValidationError::RevokeTargetWrongKind(target.kind));
+            }
+            if revoke.revokes_link != upgrade_link_hash(&target.payload) {
+                return Err(ChainValidationError::RevokeLinkHashMismatch);
             }
             let target_upgrade: UpgradePayload = ciborium::from_reader(target.payload.as_slice())
                 .map_err(|e| {
@@ -1243,9 +1269,27 @@ mod tests {
         }
     }
 
+    /// A revocation of `target` (by its chain id and payload hash).
     fn revocation_link(
         enclave_id: Uuid,
+        target: &ChainLink,
+        pcr_seed: u8,
+        signing: &SigningKey,
+    ) -> ChainLink {
+        revocation_link_to(
+            enclave_id,
+            target.id.unwrap(),
+            upgrade_link_hash(&target.payload),
+            pcr_seed,
+            signing,
+        )
+    }
+
+    /// A revocation naming chain id `revokes` and link hash `revokes_link`.
+    fn revocation_link_to(
+        enclave_id: Uuid,
         revokes: Uuid,
+        revokes_link: [u8; 32],
         pcr_seed: u8,
         signing: &SigningKey,
     ) -> ChainLink {
@@ -1254,6 +1298,7 @@ mod tests {
             revokes,
             issued_at: chrono::Utc::now(),
             nonce: vec![0x44; 32],
+            revokes_link,
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
@@ -1546,7 +1591,7 @@ mod tests {
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
 
-        let link = revocation_link(id, upgrade.id.unwrap(), 0x1a, &sk);
+        let link = revocation_link(id, &upgrade, 0x1a, &sk);
         let outcome = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1567,7 +1612,7 @@ mod tests {
         genesis.sequence = Some(0);
         let chain = vec![genesis];
 
-        let link = revocation_link(id, Uuid::new_v4(), 0x1b, &sk);
+        let link = revocation_link_to(id, Uuid::new_v4(), [0; 32], 0x1b, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1597,7 +1642,7 @@ mod tests {
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
 
-        let link = revocation_link(id, upgrade.id.unwrap(), 0x1c, &sk);
+        let link = revocation_link(id, &upgrade, 0x1c, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1625,12 +1670,12 @@ mod tests {
         );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut prior_revoke = revocation_link(id, upgrade.id.unwrap(), 0x1d, &sk);
+        let mut prior_revoke = revocation_link(id, &upgrade, 0x1d, &sk);
         prior_revoke.id = Some(Uuid::new_v4());
         prior_revoke.sequence = Some(2);
         let chain = vec![genesis, upgrade.clone(), prior_revoke];
 
-        let link = revocation_link(id, upgrade.id.unwrap(), 0x1d, &sk);
+        let link = revocation_link(id, &upgrade, 0x1d, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1721,7 +1766,7 @@ mod tests {
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
 
-        let link = revocation_link(other, upgrade.id.unwrap(), 0x24, &sk);
+        let link = revocation_link(other, &upgrade, 0x24, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1758,7 +1803,7 @@ mod tests {
         );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x25, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x25, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         let chain = vec![genesis, upgrade.clone(), revoke];
@@ -1798,7 +1843,7 @@ mod tests {
         );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x26, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x26, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         let chain = vec![genesis, upgrade, revoke.clone()];
@@ -1976,7 +2021,7 @@ mod tests {
             transition_upgrade_link(id, "sha256:v2", 0x22, 0x32, &sk, now + Duration::days(7));
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x22, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x22, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         let mut rogue = boot_link(id, "sha256:v2", 0x32);
@@ -2028,7 +2073,7 @@ mod tests {
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         // ...but the revocation was recorded 30 minutes BEFORE that.
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x23, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x23, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
 
@@ -2100,7 +2145,7 @@ mod tests {
             transition_upgrade_link(id, "sha256:v2", 0x40, 0x50, &sk, now + Duration::days(7));
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x40, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x40, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         // The replayed copy: identical payload/attestation/signature,
@@ -2627,5 +2672,85 @@ mod tests {
             "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
         });
         assert!(serde_json::from_value::<EnclaveChainRow>(row).is_err());
+    }
+
+    // --- revokes_link ----------------------------------------------------
+
+    /// Genesis plus one pending upgrade, and the upgrade.
+    fn chain_with_pending_upgrade(id: Uuid, sk: &SigningKey) -> (Vec<ChainLink>, ChainLink) {
+        let mut genesis = boot_link(id, "sha256:v1", 0x1e);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x1e,
+            sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        (vec![genesis, upgrade.clone()], upgrade)
+    }
+
+    /// A revocation whose hash names some other payload than the upgrade its
+    /// id points at is rejected: it would not cancel what the chain shows it
+    /// cancelling.
+    #[test]
+    fn revocation_with_other_link_hash_is_rejected() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, upgrade) = chain_with_pending_upgrade(id, &sk);
+        let link = revocation_link_to(id, upgrade.id.unwrap(), [0x99; 32], 0x1e, &sk);
+        let err = validate_chain_link(
+            &link,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ChainValidationError::RevokeLinkHashMismatch),
+            "{err:?}"
+        );
+    }
+
+    /// The link hash round-trips as a 32-byte CBOR byte string, and a
+    /// payload without it does not decode.
+    #[test]
+    fn revocation_payload_requires_the_link_hash() {
+        let payload = RevocationPayload {
+            enclave_id: Uuid::nil(),
+            revokes: Uuid::nil(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![1; 32],
+            revokes_link: [7; 32],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes).unwrap();
+        let back: RevocationPayload = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.revokes_link, [7; 32]);
+
+        #[derive(Serialize)]
+        struct WithoutHash {
+            enclave_id: Uuid,
+            revokes: Uuid,
+            issued_at: DateTime<Utc>,
+            #[serde(with = "serde_bytes")]
+            nonce: Vec<u8>,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &WithoutHash {
+                enclave_id: Uuid::nil(),
+                revokes: Uuid::nil(),
+                issued_at: chrono::Utc::now(),
+                nonce: vec![1; 32],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(ciborium::from_reader::<RevocationPayload, _>(bytes.as_slice()).is_err());
     }
 }

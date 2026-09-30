@@ -145,6 +145,32 @@ pub enum Op {
         /// Successor key adopting the retired key's state. Equals
         /// `sha256(payload.to_pcrs.PCR0||PCR1||PCR2)`.
         new_key: PcrKey,
+        /// SHA-256 of the authorizing link's payload bytes (the bytes the
+        /// control key signed; `enclavia_protocol::chain::upgrade_link_hash`).
+        /// The op is refused when a committed [`Op::Revoke`] for `old_key`
+        /// names this hash.
+        link_hash: [u8; 32],
+    },
+    /// Revoke ONE upgrade link out of `key`, named by its payload hash: from
+    /// now on a `Transition` out of `key` presenting that exact link is
+    /// refused ([`ValidationError::TransitionRevoked`]). Any other link, for
+    /// example a re-approval of the same target, has a different hash and is
+    /// unaffected.
+    ///
+    /// The caller verifies the credential first: a revocation chain link
+    /// signed by `key`'s frozen control key, submitted by a session attested
+    /// as `key` (see `wire::verify_revocation_link`). Revoked hashes are only
+    /// ever added, so a revocation is permanent and a replay changes nothing.
+    /// `key` must be current: once the pin has moved (the upgrade activated),
+    /// revoking is too late and is refused.
+    ///
+    /// Not part of the TLA+ specification this module mirrors; it only adds a
+    /// guard to `Transition` and never changes a key's pinned state.
+    Revoke {
+        /// The key whose outgoing upgrade link is revoked.
+        key: PcrKey,
+        /// Payload hash of the revoked link (`RevocationPayload.revokes_link`).
+        link_hash: [u8; 32],
     },
 }
 
@@ -250,6 +276,10 @@ pub enum ValidationError {
     /// `Transition` named the same key for `old_key` and `new_key`.
     #[error("transition old_key equals new_key")]
     OldKeyEqualsNew,
+    /// `Transition` presented an upgrade link that a committed `Revoke` for
+    /// `old_key` names (same payload hash).
+    #[error("the upgrade link authorizing this transition has been revoked")]
+    TransitionRevoked,
 }
 
 /// Synchronizer state machine.
@@ -286,6 +316,10 @@ pub struct StateMachine {
     /// upgrade chain link authorizing the transition. Append-only.
     transition_authorizations: BTreeSet<(PcrKey, PcrKey)>,
     retired: BTreeSet<PcrKey>,
+    /// Per-key revoked upgrade links, by payload hash. A `Transition` out of
+    /// the key presenting one of them is refused. Only ever added to, never
+    /// removed, so a revocation is permanent.
+    revoked_links: BTreeMap<PcrKey, BTreeSet<[u8; 32]>>,
 }
 
 impl StateMachine {
@@ -337,7 +371,12 @@ impl StateMachine {
                 expected_version,
                 commitment,
             } => self.apply_pin(key, expected_version, commitment),
-            Op::Transition { old_key, new_key } => self.apply_transition(old_key, new_key),
+            Op::Transition {
+                old_key,
+                new_key,
+                link_hash,
+            } => self.apply_transition(old_key, new_key, link_hash),
+            Op::Revoke { key, link_hash } => self.apply_revoke(key, link_hash),
         }
     }
 
@@ -390,12 +429,16 @@ impl StateMachine {
         &mut self,
         old_key: PcrKey,
         new_key: PcrKey,
+        link_hash: [u8; 32],
     ) -> Result<KeyState, ValidationError> {
         if old_key == new_key {
             return Err(ValidationError::OldKeyEqualsNew);
         }
         if !self.state.contains_key(&old_key) {
             return Err(ValidationError::KeyNotCurrent);
+        }
+        if self.is_revoked(&old_key, &link_hash) {
+            return Err(ValidationError::TransitionRevoked);
         }
         if self.state.contains_key(&new_key) {
             return Err(ValidationError::NewKeyAlreadyExists);
@@ -418,6 +461,37 @@ impl StateMachine {
         self.retired.insert(old_key);
         self.state.insert(new_key, carried);
         Ok(carried)
+    }
+
+    fn apply_revoke(
+        &mut self,
+        key: PcrKey,
+        link_hash: [u8; 32],
+    ) -> Result<KeyState, ValidationError> {
+        if self.retired.contains(&key) {
+            return Err(ValidationError::KeyRetired);
+        }
+        let state = *self.state.get(&key).ok_or(ValidationError::KeyNotCurrent)?;
+        self.revoked_links.entry(key).or_default().insert(link_hash);
+        Ok(state)
+    }
+
+    /// Whether the upgrade link out of `key` with payload hash `link_hash`
+    /// has been revoked.
+    pub fn is_revoked(&self, key: &PcrKey, link_hash: &[u8; 32]) -> bool {
+        self.revoked_links
+            .get(key)
+            .is_some_and(|hashes| hashes.contains(link_hash))
+    }
+
+    /// The revoked link hashes of `key`, in sorted order.
+    pub fn revoked_links(&self, key: &PcrKey) -> impl Iterator<Item = &[u8; 32]> {
+        self.revoked_links.get(key).into_iter().flatten()
+    }
+
+    /// Number of keys with at least one revoked link.
+    pub fn revoked_len(&self) -> usize {
+        self.revoked_links.len()
     }
 
     /// Lookup the current state of `key`. Returns `None` if `key` is not
@@ -472,6 +546,7 @@ impl StateMachine {
                 .collect(),
             transition_authorizations: self.transition_authorizations.clone(),
             retired: self.retired.clone(),
+            revoked_links: self.revoked_links.clone(),
         }
     }
 
@@ -488,6 +563,7 @@ impl StateMachine {
             .collect();
         self.transition_authorizations = snapshot.transition_authorizations;
         self.retired = snapshot.retired;
+        self.revoked_links = snapshot.revoked_links;
     }
 }
 
@@ -506,6 +582,8 @@ pub struct StateMachineSnapshot {
     attested: BTreeMap<PcrKey, ControlPubkeyBytes>,
     transition_authorizations: BTreeSet<(PcrKey, PcrKey)>,
     retired: BTreeSet<PcrKey>,
+    /// Revoked link hashes per key.
+    revoked_links: BTreeMap<PcrKey, BTreeSet<[u8; 32]>>,
 }
 
 /// Newtype wrapping the 65-byte SEC1 control pubkey so it can live inside a
@@ -622,6 +700,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(2),
+                link_hash: [0; 32],
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::NoTransitionAuthorization);
@@ -641,6 +720,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(2),
+                link_hash: [0; 32],
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::NewKeyNotAttested);
@@ -667,6 +747,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(2),
+                link_hash: [0; 32],
             })
             .unwrap();
         assert_eq!(state.commitment, c(0xbb));
@@ -689,6 +770,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(1),
+                link_hash: [0; 32],
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::OldKeyEqualsNew);
@@ -703,6 +785,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(2),
+                link_hash: [0; 32],
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::KeyNotCurrent);
@@ -728,6 +811,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(2),
+                link_hash: [0; 32],
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::NewKeyAlreadyExists);
@@ -755,6 +839,7 @@ mod tests {
         sm.apply(Op::Transition {
             old_key: k(2),
             new_key: k(3),
+            link_hash: [0; 32],
         })
         .unwrap();
         for key in sm.head_keys() {
@@ -875,6 +960,7 @@ mod tests {
         sm.apply(Op::Transition {
             old_key: k(1),
             new_key: k(2),
+            link_hash: [0; 32],
         })
         .unwrap();
         let err = sm
@@ -900,6 +986,7 @@ mod tests {
         sm.apply(Op::Transition {
             old_key: k(1),
             new_key: k(2),
+            link_hash: [0; 32],
         })
         .unwrap();
         let err = sm
@@ -927,6 +1014,7 @@ mod tests {
         sm.apply(Op::Transition {
             old_key: k(1),
             new_key: k(2),
+            link_hash: [0; 32],
         })
         .unwrap();
         sm.observe_transition(k(1), k(3));
@@ -934,6 +1022,7 @@ mod tests {
             .apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(3),
+                link_hash: [0; 32],
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::KeyNotCurrent);
@@ -991,6 +1080,7 @@ mod tests {
         sm.apply(Op::Transition {
             old_key: k(1),
             new_key: k(2),
+            link_hash: [0; 32],
         })
         .unwrap();
         let post = *sm.get(&k(2)).unwrap();
@@ -1068,6 +1158,7 @@ mod tests {
             Op::Transition {
                 old_key: k(2),
                 new_key: k(3),
+                link_hash: [0; 32],
             },
             Op::Pin {
                 key: k(3),
@@ -1146,6 +1237,7 @@ mod tests {
         sm.apply(Op::Transition {
             old_key: k(2),
             new_key: k(3),
+            link_hash: [0; 32],
         })
         .unwrap();
 
@@ -1179,13 +1271,163 @@ mod tests {
             a.apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(4),
+                link_hash: [0; 32],
             }),
             b.apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(4),
+                link_hash: [0; 32],
             }),
             "post-restore Transition diverged from the original"
         );
         assert_eq!(b.get(&k(4)).unwrap().control_pubkey, pk(4));
+    }
+
+    // --- revocations ------------------------------------------------------
+
+    /// `k(1)` registered, `k(2)` attested, and the (k1, k2) authorization
+    /// observed: everything a Transition needs.
+    fn upgrade_ready() -> StateMachine {
+        let mut sm = StateMachine::new();
+        sm.observe_attestation(k(1), pk(1));
+        sm.observe_attestation(k(2), pk(2));
+        sm.apply(Op::Register {
+            key: k(1),
+            commitment: c(0xaa),
+        })
+        .unwrap();
+        sm.observe_transition(k(1), k(2));
+        sm
+    }
+
+    /// A link's payload hash, for tests: any distinct 32 bytes.
+    fn h(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    fn transition(
+        sm: &mut StateMachine,
+        link_hash: [u8; 32],
+    ) -> Result<KeyState, ValidationError> {
+        sm.apply(Op::Transition {
+            old_key: k(1),
+            new_key: k(2),
+            link_hash,
+        })
+    }
+
+    fn revoke(
+        sm: &mut StateMachine,
+        key: PcrKey,
+        link_hash: [u8; 32],
+    ) -> Result<KeyState, ValidationError> {
+        sm.apply(Op::Revoke { key, link_hash })
+    }
+
+    /// The revoked link is refused, and the pin stays where it was.
+    #[test]
+    fn revoked_link_cannot_transition() {
+        let mut sm = upgrade_ready();
+        revoke(&mut sm, k(1), h(0xa1)).unwrap();
+        assert_eq!(
+            transition(&mut sm, h(0xa1)),
+            Err(ValidationError::TransitionRevoked)
+        );
+        assert_eq!(sm.get(&k(1)).unwrap().commitment, c(0xaa));
+        assert!(sm.get(&k(2)).is_none());
+        assert_eq!(sm.retired_len(), 0);
+    }
+
+    /// Revoke, then re-approve the same target: the new link has another
+    /// payload hash, so it goes through; nothing about the revoked link's
+    /// timestamps matters.
+    #[test]
+    fn a_different_link_to_the_same_target_still_transitions() {
+        let mut sm = upgrade_ready();
+        revoke(&mut sm, k(1), h(0xa1)).unwrap();
+        let moved = transition(&mut sm, h(0xa2)).unwrap();
+        assert_eq!(moved.commitment, c(0xaa));
+        assert!(sm.get(&k(1)).is_none());
+    }
+
+    /// Revoking a hash that names no link of ours (a revocation built for
+    /// another link) leaves the real link usable: only the named link is
+    /// revoked.
+    #[test]
+    fn revoking_another_hash_does_not_block_the_link() {
+        let mut sm = upgrade_ready();
+        revoke(&mut sm, k(1), h(0xb0)).unwrap();
+        assert!(transition(&mut sm, h(0xa1)).is_ok());
+    }
+
+    /// Revocations are permanent and replay-safe: repeating one, or adding
+    /// more, never removes a revoked hash.
+    #[test]
+    fn revocation_is_permanent_and_replay_safe() {
+        let mut sm = upgrade_ready();
+        for hash in [h(0xa1), h(0xa1), h(0xa3), h(0xa1)] {
+            revoke(&mut sm, k(1), hash).unwrap();
+        }
+        assert_eq!(sm.revoked_links(&k(1)).count(), 2);
+        assert_eq!(
+            transition(&mut sm, h(0xa1)),
+            Err(ValidationError::TransitionRevoked)
+        );
+        assert_eq!(
+            transition(&mut sm, h(0xa3)),
+            Err(ValidationError::TransitionRevoked)
+        );
+        assert_eq!(sm.revoked_len(), 1);
+    }
+
+    /// A revocation only covers its own key's outgoing links.
+    #[test]
+    fn revocation_is_scoped_to_its_key() {
+        let mut sm = upgrade_ready();
+        sm.observe_attestation(k(3), pk(3));
+        sm.apply(Op::Register {
+            key: k(3),
+            commitment: c(0xcc),
+        })
+        .unwrap();
+        revoke(&mut sm, k(3), h(0xa1)).unwrap();
+        assert!(transition(&mut sm, h(0xa1)).is_ok());
+    }
+
+    /// Revoking needs a live pin: unknown and retired keys are refused, and
+    /// nothing is recorded for them.
+    #[test]
+    fn revocation_requires_a_current_key() {
+        let mut sm = upgrade_ready();
+        assert_eq!(
+            revoke(&mut sm, k(9), h(1)),
+            Err(ValidationError::KeyNotCurrent)
+        );
+        transition(&mut sm, h(0xa1)).unwrap();
+        assert_eq!(
+            revoke(&mut sm, k(1), h(0xa1)),
+            Err(ValidationError::KeyRetired)
+        );
+        assert_eq!(sm.revoked_len(), 0);
+    }
+
+    /// The revoked set survives a snapshot round trip, so a node hydrated
+    /// from a snapshot refuses the revoked link exactly like one that
+    /// replayed the log.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_carries_revocations() {
+        let mut sm = upgrade_ready();
+        revoke(&mut sm, k(1), h(0xa1)).unwrap();
+        let mut buf = Vec::new();
+        ciborium::into_writer(&sm.snapshot(), &mut buf).unwrap();
+        let mut restored = StateMachine::new();
+        restored.restore_from_snapshot(ciborium::from_reader(&buf[..]).unwrap());
+        assert!(restored.is_revoked(&k(1), &h(0xa1)));
+        assert_eq!(
+            transition(&mut restored, h(0xa1)),
+            Err(ValidationError::TransitionRevoked)
+        );
+        assert!(transition(&mut restored, h(0xa2)).is_ok());
     }
 }

@@ -258,6 +258,12 @@ impl StateMachineStore {
         sm.head_keys().map(|k| (*k, *sm.get(k).unwrap())).collect()
     }
 
+    /// `key`'s revoked link hashes on this replica, sorted (leader-local,
+    /// NOT linearized). For tests comparing replicas.
+    pub async fn revoked_links(&self, key: &PcrKey) -> Vec<[u8; 32]> {
+        self.state.read().await.0.revoked_links(key).copied().collect()
+    }
+
     /// The set of retired keys. Used by the NodeViewConsistent harness.
     pub async fn retired_view(&self) -> std::collections::BTreeSet<PcrKey> {
         self.state.read().await.0.retired_keys().copied().collect()
@@ -292,19 +298,27 @@ impl StateMachineStore {
                 old_key,
                 new_key,
                 new_control_pubkey,
+                link_hash,
             } => {
                 // The new key's attestation was observed by the leader from the
                 // submitting session; record it so the pure core's
                 // NewKeyNotAttested check passes. The old key's attestation is
                 // already present from its earlier Register entry. Then record
-                // the (verified) transition authorization and apply.
+                // the (verified) transition authorization and apply; the apply
+                // refuses a link covered by a revocation committed earlier in
+                // the log.
                 sm.observe_attestation(*new_key, *new_control_pubkey);
                 sm.observe_transition(*old_key, *new_key);
                 sm.apply(Op::Transition {
                     old_key: *old_key,
                     new_key: *new_key,
+                    link_hash: *link_hash,
                 })
             }
+            ReplicatedOp::Revoke { key, link_hash } => sm.apply(Op::Revoke {
+                key: *key,
+                link_hash: *link_hash,
+            }),
         };
         match result {
             Ok(state) => ReplicatedOpResult::Applied(state),

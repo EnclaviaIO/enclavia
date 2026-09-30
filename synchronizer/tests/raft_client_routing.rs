@@ -43,7 +43,9 @@ use std::time::Duration;
 
 use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
 use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
-use enclavia_protocol::chain::{ChainLink, ChainLinkKind, PcrsHex, UpgradePayload};
+use enclavia_protocol::chain::{
+    ChainLink, ChainLinkKind, PcrsHex, RevocationPayload, UpgradePayload, upgrade_link_hash,
+};
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -306,6 +308,8 @@ async fn await_leader(nodes: &[Node], timeout: Duration) -> bool {
 struct Client {
     stream: UnixStream,
     transport: NoiseTransport,
+    /// The capabilities the node advertised in its `Authenticate`.
+    server_capabilities: std::collections::BTreeSet<String>,
 }
 
 impl Client {
@@ -328,8 +332,12 @@ impl Client {
         let mut plaintext = vec![0u8; MAX_FRAME_SIZE as usize];
         let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
         let frame: Frame = ciborium::from_reader(&plaintext[..pt_len]).unwrap();
-        let server_doc = match frame {
-            Frame::Authenticate { nsm_doc, .. } => nsm_doc,
+        let (server_doc, server_capabilities) = match frame {
+            Frame::Authenticate {
+                nsm_doc,
+                capabilities,
+                ..
+            } => (nsm_doc, capabilities),
             other => panic!("expected the node's Authenticate, got {other:?}"),
         };
         let expected = Pcrs {
@@ -340,7 +348,11 @@ impl Client {
         let policy = synchronizer::wire::ServerPcrPolicy::Expected(vec![expected]);
         synchronizer::wire::verify_server_attestation(&server_doc, &hash, &policy, true)
             .expect("node's server attestation must verify");
-        Client { stream, transport }
+        Client {
+            stream,
+            transport,
+            server_capabilities,
+        }
     }
 
     /// Send one RPC and read the response.
@@ -1840,6 +1852,472 @@ async fn timed_out_write_that_commits_does_not_break_the_next_cas() {
     assert_all_nodes_have(&nodes, key, next).await;
     assert_eq!(assert_all_nodes_agree(&nodes, key).await, next);
 
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+// --- upgrade-link revocation ------------------------------------------------
+
+/// An upgrade link `from_seed -> to_seed` stamped `issued_at` and already
+/// valid. Every call builds a distinct link (fresh enclave id in the payload).
+fn upgrade_link_issued_at(
+    from_seed: u8,
+    to_seed: u8,
+    signing: &SigningKey,
+    issued_at: chrono::DateTime<chrono::Utc>,
+) -> ChainLink {
+    let payload = UpgradePayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        from_pcrs: pcrs_hex_from_seed(from_seed),
+        to_pcrs: pcrs_hex_from_seed(to_seed),
+        image_digest: "sha256:to".into(),
+        valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
+        issued_at,
+        nonce: vec![0x5a; 32],
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+    let sig: Signature = signing.sign(&payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Upgrade,
+        payload: payload_bytes,
+        attestation,
+        signature: Some(sig.to_bytes().to_vec()),
+    }
+}
+
+/// A revocation link signed by `signing`, naming `revokes_link`.
+fn revocation_link(signing: &SigningKey, revokes_link: [u8; 32]) -> ChainLink {
+    let payload = RevocationPayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        revokes: uuid::Uuid::new_v4(),
+        issued_at: chrono::Utc::now() - chrono::Duration::days(365),
+        nonce: vec![0x6b; 32],
+        revokes_link,
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let attestation = FakeChainAttestation::for_payload(0, &payload_bytes).encode();
+    let sig: Signature = signing.sign(&payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Revocation,
+        payload: payload_bytes,
+        attestation,
+        signature: Some(sig.to_bytes().to_vec()),
+    }
+}
+
+/// A v2 revocation of exactly `target`.
+fn revocation_of(signing: &SigningKey, target: &ChainLink) -> ChainLink {
+    revocation_link(signing, upgrade_link_hash(&target.payload))
+}
+
+/// Send `request` through `node` until the answer is not `Unavailable`
+/// (an election may be in progress right after a partition).
+async fn rpc_until_available(
+    node: &Node,
+    seed: u8,
+    pk: [u8; CONTROL_PUBKEY_LEN],
+    request: Request,
+) -> Response {
+    let mut client = Client::connect(node, seed, pk).await;
+    for _ in 0..40 {
+        let resp = client.rpc(request.clone()).await;
+        if resp
+            != (Response::Err {
+                error: RpcError::Unavailable,
+            })
+        {
+            return resp;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("{request:?} via {} stayed Unavailable", node.name);
+}
+
+/// Wait until every node in `nodes` holds exactly `expected` as `key`'s
+/// revoked links.
+async fn assert_all_nodes_revoked(nodes: &[&Node], key: PcrKey, expected: &[[u8; 32]]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut sets = Vec::new();
+        for n in nodes {
+            sets.push(n.raft.state_machine().revoked_links(&key).await);
+        }
+        if sets.iter().all(|s| s.as_slice() == expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "revocation not applied everywhere: {sets:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The attack this closes: the host kept a signed upgrade link, the customer
+/// revoked it during the delay, and after `valid_from` the host boots the new
+/// image and submits the Transition anyway. The link carries a far-future
+/// `issued_at` (a hostile backend's stamp), which does not matter: the
+/// revocation names the link's payload hash. With the revocation committed
+/// (through a follower, so on the forwarded path), the Transition is refused
+/// on the leader-local path and the forwarded path, and still after the
+/// leader is lost. Replaying the revocation changes nothing. A
+/// re-approved (different) link to the same target then goes through, and
+/// revoking after that is refused as too late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_link_is_refused_everywhere_and_survives_a_leader_change() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    let old_seed = 0x81;
+    let new_seed = 0x82;
+    let (sk_old, pk_old) = keypair(old_seed);
+    let (_, pk_new) = keypair(new_seed);
+    let old_key = key_from_seed(old_seed);
+    let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
+    let revoked = upgrade_link_issued_at(old_seed, new_seed, &sk_old, far_future);
+
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let leader = find(&nodes, &leader_name);
+    let followers: Vec<&Node> = nodes.iter().filter(|n| n.name != leader_name).collect();
+
+    pin_until_acked(leader, old_seed, pk_old, old_key, Version(0), c(0x81)).await;
+
+    // The node advertises the capability.
+    let mut old_session = Client::connect(followers[0], old_seed, pk_old).await;
+    assert!(
+        old_session
+            .server_capabilities
+            .contains(synchronizer::wire::CAPABILITY_REVOCATION),
+        "node does not advertise revocation: {:?}",
+        old_session.server_capabilities
+    );
+
+    // The old enclave revokes, through a follower (forwarded to the leader),
+    // twice: the replay is idempotent.
+    for _ in 0..2 {
+        assert_eq!(
+            old_session
+                .rpc(Request::Revoke {
+                    link: revocation_of(&sk_old, &revoked),
+                })
+                .await,
+            Response::RevokeOk
+        );
+    }
+    let all: Vec<&Node> = nodes.iter().collect();
+    assert_all_nodes_revoked(&all, old_key, &[upgrade_link_hash(&revoked.payload)]).await;
+
+    // The host submits the revoked link from the new image: refused on the
+    // leader-local path and on the forwarded path.
+    let revoked_err = Response::Err {
+        error: RpcError::TransitionRevoked,
+    };
+    let mut via_leader = Client::connect(leader, new_seed, pk_new).await;
+    assert_eq!(
+        via_leader
+            .rpc(Request::Transition {
+                link: revoked.clone()
+            })
+            .await,
+        revoked_err
+    );
+    let mut via_follower = Client::connect(followers[1], new_seed, pk_new).await;
+    assert_eq!(
+        via_follower
+            .rpc(Request::Transition {
+                link: revoked.clone()
+            })
+            .await,
+        revoked_err
+    );
+    // Lose the leader. The survivors elect a new one, which still refuses.
+    host.block(leader_name.clone());
+    assert!(
+        await_leader_among(&followers, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "survivors never elected a leader"
+    );
+    assert_eq!(
+        rpc_until_available(
+            followers[0],
+            new_seed,
+            pk_new,
+            Request::Transition {
+                link: revoked.clone()
+            }
+        )
+        .await,
+        revoked_err
+    );
+    // The pin never moved.
+    assert_eq!(
+        rpc_until_available(followers[0], old_seed, pk_old, Request::Get { key: old_key }).await,
+        Response::GetOk {
+            commitment: c(0x81),
+            version: Version(0),
+        }
+    );
+
+    // Re-approval: a NEW link to the same target (another payload, even one
+    // stamped earlier than the revoked link) goes through.
+    let reapproved = upgrade_link_issued_at(
+        old_seed,
+        new_seed,
+        &sk_old,
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    );
+    assert_eq!(
+        rpc_until_available(
+            followers[1],
+            new_seed,
+            pk_new,
+            Request::Transition { link: reapproved }
+        )
+        .await,
+        Response::TransitionOk {
+            version: Version(0)
+        }
+    );
+
+    // Revoking once the pin has moved is too late, and says so.
+    assert_eq!(
+        rpc_until_available(
+            followers[0],
+            old_seed,
+            pk_old,
+            Request::Revoke {
+                link: revocation_of(&sk_old, &revoked),
+            }
+        )
+        .await,
+        Response::Err {
+            error: RpcError::RevocationRejected
+        }
+    );
+
+    host.unblock(&leader_name);
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// Who may revoke, and what: only the enclave that holds the pin, only with
+/// the control key's signature, and only by naming a link. A revocation
+/// signed by any other key (the host holds no control key), one from a
+/// session of another image (anything the host can boot), and an upgrade
+/// link sent as a revocation are all refused and record nothing. A validly
+/// signed revocation of ANOTHER link (what a hostile backend would get
+/// signed if the signer did not check) commits but does not block the real
+/// link. So the genuine link still works at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthorized_or_mistargeted_revocations_do_not_block_the_link() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    let old_seed = 0x83;
+    let new_seed = 0x84;
+    let stranger_seed = 0x85;
+    let (sk_old, pk_old) = keypair(old_seed);
+    let (host_sk, _) = keypair(0x86);
+    let (_, pk_new) = keypair(new_seed);
+    let old_key = key_from_seed(old_seed);
+    let issued = chrono::Utc::now() - chrono::Duration::hours(3);
+    let target = upgrade_link_issued_at(old_seed, new_seed, &sk_old, issued);
+
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let leader = find(&nodes, &leader_name);
+    pin_until_acked(leader, old_seed, pk_old, old_key, Version(0), c(0x83)).await;
+
+    let rejected = Response::Err {
+        error: RpcError::RevocationRejected,
+    };
+    let mut old_session = Client::connect(leader, old_seed, pk_old).await;
+    // The pin holder's session, but a signature by a key other than the
+    // frozen control key.
+    assert_eq!(
+        old_session
+            .rpc(Request::Revoke {
+                link: revocation_of(&host_sk, &target),
+            })
+            .await,
+        rejected
+    );
+    // A validly signed revocation, but from a session of another image (whose
+    // key holds no pin), announcing the old control key as its own.
+    let mut stranger = Client::connect(leader, stranger_seed, pk_old).await;
+    assert_eq!(
+        stranger
+            .rpc(Request::Revoke {
+                link: revocation_of(&sk_old, &target),
+            })
+            .await,
+        rejected
+    );
+    // An upgrade link is not a revocation, even from the right session.
+    assert_eq!(
+        old_session
+            .rpc(Request::Revoke {
+                link: target.clone(),
+            })
+            .await,
+        rejected
+    );
+    for n in &nodes {
+        assert!(n.raft.state_machine().revoked_links(&old_key).await.is_empty());
+    }
+
+    // A genuine revocation of a DIFFERENT link to the same target.
+    let decoy = upgrade_link_issued_at(old_seed, new_seed, &sk_old, issued);
+    assert_eq!(
+        old_session
+            .rpc(Request::Revoke {
+                link: revocation_of(&sk_old, &decoy),
+            })
+            .await,
+        Response::RevokeOk
+    );
+
+    let mut new_session = Client::connect(leader, new_seed, pk_new).await;
+    assert_eq!(
+        new_session
+            .rpc(Request::Transition { link: target })
+            .await,
+        Response::TransitionOk {
+            version: Version(0)
+        }
+    );
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// A node that lost everything hydrates from a snapshot (the log is purged
+/// past the revocation) and holds the revocation, and a Transition routed
+/// through it once the old leader is gone is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_survives_snapshot_install() {
+    let aggressive = synchronizer::raft::Config {
+        heartbeat_interval: 150,
+        election_timeout_min: 300,
+        election_timeout_max: 600,
+        snapshot_policy: synchronizer::raft::SnapshotPolicy::LogsSinceLast(4),
+        max_in_snapshot_log_to_keep: 0,
+        ..Default::default()
+    };
+    let host = MeshHostStub::new();
+    let mut nodes = cluster_with_config(&host, aggressive.clone()).await;
+
+    let old_seed = 0x87;
+    let new_seed = 0x88;
+    let (sk_old, pk_old) = keypair(old_seed);
+    let (_, pk_new) = keypair(new_seed);
+    let old_key = key_from_seed(old_seed);
+    let revoked = upgrade_link_issued_at(
+        old_seed,
+        new_seed,
+        &sk_old,
+        chrono::Utc::now() - chrono::Duration::hours(3),
+    );
+
+    let ld = current_leader(&nodes).await.unwrap();
+    pin_until_acked(ld, old_seed, pk_old, old_key, Version(0), c(0x87)).await;
+    let mut old_session = Client::connect(ld, old_seed, pk_old).await;
+    assert_eq!(
+        old_session
+            .rpc(Request::Revoke {
+                link: revocation_of(&sk_old, &revoked),
+            })
+            .await,
+        Response::RevokeOk
+    );
+
+    // Push the log well past the snapshot threshold so it is purged.
+    for i in 0..12u8 {
+        let seed = 0x90 + i;
+        let (_, pk) = keypair(seed);
+        let ld = current_leader(&nodes).await.expect("leader for setup");
+        let mut client = Client::connect(ld, seed, pk).await;
+        assert_eq!(
+            client
+                .rpc(Request::Pin {
+                    key: key_from_seed(seed),
+                    expected_version: Version(0),
+                    commitment: c(i),
+                })
+                .await,
+            Response::PinOk {
+                version: Version(0)
+            }
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Restart a non-leader with empty state; it can only catch up through an
+    // InstallSnapshot.
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let victim_idx = nodes.iter().position(|n| n.name != leader_name).unwrap();
+    let victim_name = nodes[victim_idx].name.clone();
+    let old = nodes.remove(victim_idx);
+    old.raft.shutdown().await;
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    nodes.insert(
+        victim_idx,
+        spawn_node_with_config(&victim_name, &host, aggressive.clone()).await,
+    );
+    let victim = &nodes[victim_idx];
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while victim.raft.state_machine().head_view().await.len() < 13 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restarted node never hydrated"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        victim.raft.raft().metrics().borrow().snapshot.is_some(),
+        "the restarted node caught up without a snapshot; the test proves nothing"
+    );
+    assert_eq!(
+        victim.raft.state_machine().revoked_links(&old_key).await,
+        vec![upgrade_link_hash(&revoked.payload)],
+        "the snapshot did not carry the revocation"
+    );
+
+    // Lose the old leader: the new leader is the hydrated node or the other
+    // survivor, and the Transition routed through the hydrated node is
+    // refused either way.
+    host.block(leader_name.clone());
+    let survivors: Vec<&Node> = nodes.iter().filter(|n| n.name != leader_name).collect();
+    assert!(
+        await_leader_among(&survivors, Duration::from_secs(10))
+            .await
+            .is_some()
+    );
+    assert_eq!(
+        rpc_until_available(
+            victim,
+            new_seed,
+            pk_new,
+            Request::Transition { link: revoked }
+        )
+        .await,
+        Response::Err {
+            error: RpcError::TransitionRevoked
+        }
+    );
+
+    host.unblock(&leader_name);
     for n in &nodes {
         n.raft.shutdown().await;
     }

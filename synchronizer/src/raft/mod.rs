@@ -33,9 +33,18 @@
 //!   carries `new_control_pubkey`. A follower replays
 //!   `observe_attestation(new_key, new_control_pubkey)` then
 //!   `observe_transition(old_key, new_key)` then
-//!   `apply(Op::Transition { old_key, new_key })`. (The old key was attested by
-//!   an earlier `Register`/`Pin` entry, already replicated, so its observation
-//!   is already present on every replica.)
+//!   `apply(Op::Transition { old_key, new_key, link_hash })`. (The old
+//!   key was attested by an earlier `Register`/`Pin` entry, already
+//!   replicated, so its observation is already present on every replica.)
+//! * [`ReplicatedOp::Revoke`]: `apply(Op::Revoke { key, link_hash })`. The
+//!   leader verified the revocation link's control signature against `key`'s
+//!   frozen pubkey and that the submitting session IS `key`.
+//!
+//! The revocation check sits in the pure core's `apply` of the Transition, not
+//! in a leader pre-check, so it is decided at the entry's position in the
+//! committed log: a `Revoke` committed before a `Transition` refuses it on
+//! every replica, including one hydrated from a snapshot (the revoked hashes are
+//! part of it).
 //!
 //! Followers never re-verify crypto. The trust argument is the same one Raft
 //! itself rests on: openraft assumes non-Byzantine members, and mesh membership
@@ -76,7 +85,7 @@
 //!
 //! The state-machine snapshot serializes the ENTIRE pure-core state, the
 //! committed `(PcrKey -> KeyState)` projection AND the observation sets
-//! (`attested`, `transition_authorizations`), via
+//! (`attested`, `transition_authorizations`) and the revoked link hashes, via
 //! [`StateMachine::snapshot`](crate::StateMachine::snapshot). A node hydrated
 //! from a snapshot then applies subsequent `Transition` entries identically to
 //! one that replayed the whole log, because the observation a post-snapshot
@@ -221,6 +230,18 @@ pub enum ReplicatedOp {
         /// observed it from the submitting (new-enclave) session.
         #[serde(with = "control_pubkey_bytes")]
         new_control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+        /// Payload hash of the presented link (`upgrade_link_hash`), checked
+        /// against `old_key`'s revoked links at apply.
+        link_hash: [u8; 32],
+    },
+    /// Revocation of one upgrade link out of `key`. The leader verified the
+    /// revocation link's control signature against `key`'s frozen pubkey, and
+    /// that the submitting session is authenticated as `key`.
+    Revoke {
+        /// The key whose outgoing upgrade links are revoked.
+        key: PcrKey,
+        /// The revocation's signed `RevocationPayload.revokes_link`.
+        link_hash: [u8; 32],
     },
 }
 
@@ -1009,6 +1030,11 @@ mod tests {
                 old_key: k(3),
                 new_key: k(4),
                 new_control_pubkey: pk(4),
+                link_hash: [0x4c; 32],
+            },
+            ReplicatedOp::Revoke {
+                key: k(3),
+                link_hash: [0x4d; 32],
             },
         ] {
             let mut buf = Vec::new();

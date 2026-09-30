@@ -2,6 +2,8 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use enclavia_protocol::attestation::Pcrs;
+use enclavia_protocol::chain::PcrsHex;
 use p256::ecdsa::VerifyingKey;
 use serde::Deserialize;
 
@@ -27,6 +29,33 @@ struct RawConfig {
     /// behavior.
     #[serde(default)]
     min_upgrade_delay_secs: u64,
+    /// The synchronizer section the builder stamps into the measured
+    /// config (`--synchronizer-enabled` / `--synchronizer-pcrs`), the same
+    /// one nbd-client reads its oracle trust anchors from.
+    #[serde(default)]
+    synchronizer: Option<RawSynchronizerSection>,
+}
+
+#[derive(Deserialize)]
+struct RawSynchronizerSection {
+    /// Whether this enclave pins its storage to the synchronizer.
+    #[serde(default)]
+    enabled: bool,
+    /// Hex PCR triples the synchronizer cluster may present.
+    #[serde(default)]
+    expected_pcrs: Vec<PcrsHex>,
+    /// Skip-cert-chain verification of the synchronizer's document (QEMU).
+    #[serde(default)]
+    debug_attestation: bool,
+}
+
+/// Trust anchors for a session with the synchronizer, from the measured
+/// config. Present only when the enclave pins its storage there.
+pub struct SynchronizerTrust {
+    /// Measurements the synchronizer must attest to. Never empty.
+    pub expected_pcrs: Vec<Pcrs>,
+    /// Skip-cert-chain verification of the synchronizer's document.
+    pub debug_attestation: bool,
 }
 
 #[derive(Default)]
@@ -34,6 +63,9 @@ pub struct ServerConfig {
     pub control_public_key: Option<VerifyingKey>,
     /// See `RawConfig::min_upgrade_delay_secs`. 0 = no floor.
     pub min_upgrade_delay_secs: u64,
+    /// `Some` exactly when the measured config says the synchronizer is
+    /// enabled: the revoke flow must then commit the revocation there.
+    pub synchronizer: Option<SynchronizerTrust>,
 }
 
 pub fn load(path: &Path) -> Result<ServerConfig, Box<dyn std::error::Error>> {
@@ -59,9 +91,35 @@ pub fn load(path: &Path) -> Result<ServerConfig, Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // An enabled synchronizer without measurements to check it against is a
+    // configuration error: failing the whole load disables the control
+    // channel, so no revocation can be reported done without the
+    // synchronizer committing it.
+    let synchronizer = match raw.synchronizer {
+        Some(section) if section.enabled => {
+            if section.expected_pcrs.is_empty() {
+                return Err(
+                    "synchronizer.enabled is set but synchronizer.expected_pcrs is empty".into(),
+                );
+            }
+            let mut expected_pcrs = Vec::with_capacity(section.expected_pcrs.len());
+            for (i, hex_triple) in section.expected_pcrs.iter().enumerate() {
+                expected_pcrs.push(hex_triple.to_pcrs().map_err(|e| {
+                    format!("synchronizer.expected_pcrs[{i}] is malformed: {e}")
+                })?);
+            }
+            Some(SynchronizerTrust {
+                expected_pcrs,
+                debug_attestation: section.debug_attestation,
+            })
+        }
+        _ => None,
+    };
+
     Ok(ServerConfig {
         control_public_key,
         min_upgrade_delay_secs: raw.min_upgrade_delay_secs,
+        synchronizer,
     })
 }
 
@@ -101,5 +159,57 @@ mod tests {
     fn missing_file_defaults_to_zero() {
         let cfg = load(Path::new("/nonexistent/enclavia-config.json")).unwrap();
         assert_eq!(cfg.min_upgrade_delay_secs, 0);
+    }
+
+    fn write_tmp(name: &str, json: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "enclavia-server-config-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn hex48(b: &str) -> String {
+        b.repeat(48)
+    }
+
+    #[test]
+    fn enabled_synchronizer_section_parses() {
+        let json = format!(
+            r#"{{"synchronizer": {{"enabled": true, "debug_attestation": true,
+                "expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]}}}}"#,
+            hex48("aa"),
+            hex48("bb"),
+            hex48("cc")
+        );
+        let cfg = load(&write_tmp("sync-on", &json)).unwrap();
+        let trust = cfg.synchronizer.expect("enabled synchronizer");
+        assert!(trust.debug_attestation);
+        assert_eq!(trust.expected_pcrs.len(), 1);
+        assert_eq!(trust.expected_pcrs[0].pcr0, vec![0xaa; 48]);
+    }
+
+    /// Present but not enabled (and absent): no synchronizer, so the revoke
+    /// flow has nothing to commit there.
+    #[test]
+    fn disabled_or_absent_synchronizer_is_none() {
+        let json = format!(
+            r#"{{"synchronizer": {{"enabled": false,
+                "expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]}}}}"#,
+            hex48("aa"),
+            hex48("bb"),
+            hex48("cc")
+        );
+        assert!(load(&write_tmp("sync-off", &json)).unwrap().synchronizer.is_none());
+        assert!(load_str("{}").synchronizer.is_none());
+    }
+
+    #[test]
+    fn enabled_synchronizer_without_pcrs_is_an_error() {
+        let path = write_tmp("sync-empty", r#"{"synchronizer": {"enabled": true}}"#);
+        assert!(load(&path).is_err());
     }
 }

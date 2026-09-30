@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
 use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
-use enclavia_protocol::chain::PcrsHex;
+use enclavia_protocol::chain::{PcrsHex, RevocationPayload};
 use enclavia_protocol::perform_handshake_as_responder;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use synchronizer::client::{ClientError, Handshake, ServerPcrPolicy};
@@ -560,5 +560,135 @@ async fn server_closing_instead_of_attesting_is_rejected() {
             .encode();
     let err = expect_auth_err(hs, doc, &server_policy()).await;
     assert!(matches!(err, ClientError::ConnectionClosed), "{err:?}");
+    host.await.unwrap();
+}
+
+// --- revocation (client half) -----------------------------------------------
+
+/// An upgrade link like [`upgrade_link`] but issued (and valid) at an
+/// explicit time.
+fn upgrade_link_issued_at(
+    from_seed: u8,
+    to_seed: u8,
+    signing: &SigningKey,
+    issued_at: chrono::DateTime<chrono::Utc>,
+) -> ChainLink {
+    let payload = UpgradePayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        from_pcrs: pcrs_hex_from_seed(from_seed),
+        to_pcrs: pcrs_hex_from_seed(to_seed),
+        image_digest: "sha256:to".into(),
+        valid_from: issued_at,
+        issued_at,
+        nonce: vec![0x5a; 32],
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+    let sig: Signature = signing.sign(&payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Upgrade,
+        payload: payload_bytes,
+        attestation,
+        signature: Some(sig.to_bytes().to_vec()),
+    }
+}
+
+/// A #47 v2 revocation link of exactly `target`, signed by `signing`.
+fn revocation_link(signing: &SigningKey, target: &ChainLink) -> ChainLink {
+    let payload = RevocationPayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        revokes: uuid::Uuid::new_v4(),
+        issued_at: chrono::Utc::now(),
+        nonce: vec![0x6b; 32],
+        revokes_link: synchronizer::wire::upgrade_link_hash(&target.payload),
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let sig: Signature = signing.sign(&payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Revocation,
+        payload: payload_bytes,
+        attestation: vec![],
+        signature: Some(sig.to_bytes().to_vec()),
+    }
+}
+
+/// `Client::revoke` round trip: the old enclave (holding the pin) commits
+/// the revocation; the new enclave's Transition with the revoked link then
+/// surfaces as the typed `TransitionRevoked` (this client negotiated the
+/// capability), and the pin stays under the old key.
+#[tokio::test]
+async fn revoke_then_the_revoked_link_cannot_transition() {
+    let node = Arc::new(Node::with_debug_mode(true));
+    let (sk_old, pk_old) = keypair(0x70);
+    let old_key = register_old(&node, 0x70, pk_old).await;
+    let issued = chrono::Utc::now() - chrono::Duration::hours(2);
+    let revoked = upgrade_link_issued_at(0x70, 0x71, &sk_old, issued);
+
+    let (mut old_session, _, _task) = connect_as(Arc::clone(&node), 0x70).await;
+    assert!(
+        old_session
+            .server_protocol()
+            .supports(synchronizer::wire::CAPABILITY_REVOCATION)
+    );
+    old_session
+        .revoke(revocation_link(&sk_old, &revoked))
+        .await
+        .expect("revocation committed");
+
+    let (mut new_session, _, _task) = connect_as(Arc::clone(&node), 0x71).await;
+    let err = new_session
+        .transition(revoked)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc(RpcError::TransitionRevoked)),
+        "{err:?}"
+    );
+    let (commitment, _) = old_session.get(old_key).await.expect("pin still there");
+    assert_eq!(commitment, c(0xee));
+}
+
+/// A server that does not advertise the revocation capability would not
+/// enforce a revocation, so `Client::revoke` refuses up front, without
+/// sending anything (the scripted server answers only the handshake).
+#[tokio::test]
+async fn revoke_without_the_server_capability_fails_loudly() {
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let host = tokio::spawn(scripted_server(server_stream, |hash| {
+        encode_frame(&Frame::Authenticate {
+            nsm_doc: FakeAttestation::with_seed(SERVER_SEED, hash.to_vec()).encode(),
+            protocol_version: 1,
+            capabilities: Default::default(),
+        })
+    }));
+    let hs = Handshake::start(client_stream)
+        .await
+        .expect("noise handshake");
+    let doc =
+        FakeAttestation::with_seed_and_pubkey(0x72, hs.handshake_hash().to_vec(), pubkey(0x72))
+            .encode();
+    let mut client = hs
+        .authenticate(doc, &server_policy(), true)
+        .await
+        .expect("mutual authenticate");
+    let (sk, _) = keypair(0x72);
+    let target = upgrade_link_issued_at(0x72, 0x73, &sk, chrono::Utc::now());
+    let err = client
+        .revoke(revocation_link(&sk, &target))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ClientError::MissingCapability(synchronizer::wire::CAPABILITY_REVOCATION)
+        ),
+        "{err:?}"
+    );
     host.await.unwrap();
 }

@@ -37,6 +37,10 @@ tokio-vsock = { workspace = true }
 # Re-enable the `nix` feature: enclavia-server is the one place that
 # actually drives `/dev/nsm` to produce attestations.
 aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
+# Customer-side synchronizer client: the RevokeUpgrade flow commits the
+# revocation to the synchronizer (for enclaves that pin storage there)
+# before reporting it done. The `client` feature carries no mesh / openraft.
+synchronizer = { path = "../synchronizer", features = ["client"] }
 
 [[bin]]
 name = "enclavia-server"
@@ -44,3 +48,6 @@ path = "src/main.rs"
 
 [dev-dependencies]
 uuid = { workspace = true }
+# Fake attestation documents for the revoke-flow tests' scripted
+# synchronizer.
+enclavia-protocol = { path = "../enclavia-protocol", features = ["test-utils"] }

@@ -64,7 +64,7 @@ pub const MAX_PEERS: usize = 16;
 pub const MAX_REJECTION_CELLS: usize = 48;
 
 /// Most RPC kinds, and outcomes per kind, a sample carries.
-pub const MAX_RPC_CELLS: usize = 8;
+pub const MAX_RPC_CELLS: usize = 12;
 
 /// Longest node / peer slot name accepted, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
@@ -458,7 +458,7 @@ mod tests {
                 .collect(),
             rpc: RpcSample {
                 latency_bounds_ms: bounds.clone(),
-                kinds: ["get", "pin", "register", "transition"]
+                kinds: ["get", "pin", "register", "transition", "revoke"]
                     .into_iter()
                     .map(kind)
                     .collect(),
