@@ -248,7 +248,11 @@ impl Node {
         ) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "transition link rejected");
+                tracing::warn!(
+                    reason = e.attestation_reason().map(|r| r.as_str()),
+                    error = %e,
+                    "transition link rejected"
+                );
                 return err(RpcError::TransitionRejected);
             }
         };
