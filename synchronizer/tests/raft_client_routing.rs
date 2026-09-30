@@ -55,7 +55,8 @@ use synchronizer::mesh::attestation::FakeAttestor;
 use synchronizer::mesh::config::MeshConfig;
 use synchronizer::mesh::identity::MeshIdentity;
 use synchronizer::mesh::transport::{MeshHostStub, UdsMeshAcceptor};
-use synchronizer::raft::{RaftHandle, RaftRequestHandler, ReplicatedDispatch};
+use synchronizer::raft::forward::ROUTE_DEADLINE;
+use synchronizer::raft::{COMMIT_TIMEOUT, RaftHandle, RaftRequestHandler, ReplicatedDispatch};
 use synchronizer::wire::{Request, Response, RpcError};
 use synchronizer::{Commitment, PcrKey, Version};
 
@@ -1615,8 +1616,10 @@ async fn double_loss_halts_and_refuses_a_fresh_joiner() {
         let (_, pk) = keypair(seed);
         let key = key_from_seed(seed);
         let mut client = Client::connect(survivor, seed, pk).await;
+        // The answer is a structured Unavailable inside the routing deadline,
+        // never a hang up to the customer's own RPC timeout.
         let r = tokio::time::timeout(
-            Duration::from_secs(8),
+            ROUTE_DEADLINE + Duration::from_secs(2),
             client.rpc(Request::Pin {
                 key,
                 expected_version: Version(0),
@@ -1624,14 +1627,12 @@ async fn double_loss_halts_and_refuses_a_fresh_joiner() {
             }),
         )
         .await;
-        assert!(
-            matches!(
-                r,
-                Ok(Response::Err {
-                    error: RpcError::Unavailable
-                }) | Err(_)
-            ),
-            "a write succeeded without quorum (the cluster did not halt): {r:?}"
+        assert_eq!(
+            r.ok(),
+            Some(Response::Err {
+                error: RpcError::Unavailable
+            }),
+            "a write without quorum must be answered Unavailable within the routing deadline"
         );
     }
 
@@ -1695,6 +1696,140 @@ async fn fresh_cluster_initializes_exactly_once() {
             n.name
         );
     }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+// --- bounded client writes (no quorum) -------------------------------------
+
+/// Two nodes lost: the leader keeps believing it leads but cannot commit. A
+/// Pin through it is answered `Unavailable` once the commit timeout elapses,
+/// well inside the routing deadline, instead of hanging until the customer's
+/// own RPC timeout. The node stays up and answers the next request too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_without_quorum_is_unavailable_within_the_bound() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    let seed = 0x71;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let v0 = pin_until_acked(
+        find(&nodes, &leader_name),
+        seed,
+        pk,
+        key,
+        Version(0),
+        c(0x01),
+    )
+    .await;
+    assert_eq!(v0, Version(0));
+
+    // Cut the leader off from both followers.
+    for n in &nodes {
+        if n.name != leader_name {
+            host.block(n.name.clone());
+        }
+    }
+
+    let mut client = Client::connect(find(&nodes, &leader_name), seed, pk).await;
+    for commitment in [c(0x02), c(0x03)] {
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            ROUTE_DEADLINE + Duration::from_secs(2),
+            client.rpc(Request::Pin {
+                key,
+                expected_version: Version(0),
+                commitment,
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            r.ok(),
+            Some(Response::Err {
+                error: RpcError::Unavailable
+            }),
+            "a write without quorum must be answered Unavailable"
+        );
+        assert!(
+            elapsed <= ROUTE_DEADLINE + Duration::from_secs(1),
+            "Unavailable took {elapsed:?}, over the {ROUTE_DEADLINE:?} routing deadline"
+        );
+    }
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// "Timed out but committed": the leader's commit wait times out (forced here
+/// with a near-zero commit timeout on a clone of the leader's handle), so the
+/// customer is told `Unavailable`, and the entry commits anyway a moment
+/// later. The customer's recovery (the nbd-client's: retry with the same CAS
+/// version, and on `VersionConflict` a `Get`) must see its own commitment and
+/// continue, and its NEXT compare-and-swap must succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_out_write_that_commits_does_not_break_the_next_cas() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    let seed = 0x72;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let leader = find(&nodes, &leader_name);
+    let v0 = pin_until_acked(leader, seed, pk, key, Version(0), c(0x01)).await;
+    assert_eq!(v0, Version(0));
+    assert_eq!(leader.raft.commit_timeout(), COMMIT_TIMEOUT);
+
+    // The write is submitted, the wait gives up at once, and the answer is
+    // the timed-out Unavailable.
+    let impatient = leader
+        .raft
+        .clone()
+        .with_commit_timeout(Duration::from_micros(1));
+    let answered = synchronizer::raft::serve::handle_on_leader(
+        &impatient,
+        key,
+        pk,
+        Request::Pin {
+            key,
+            expected_version: Version(0),
+            commitment: c(0x02),
+        },
+        true,
+    )
+    .await;
+    assert!(answered.timed_out, "expected a timed-out answer: {answered:?}");
+    assert_eq!(
+        answered.response,
+        Response::Err {
+            error: RpcError::Unavailable
+        }
+    );
+
+    // It commits anyway, on every node.
+    assert_all_nodes_have(&nodes, key, Version(1)).await;
+
+    // The customer retries the same pin (same CAS version): VersionConflict,
+    // then a Get that shows its own commitment, so the pin counts as landed
+    // at version 1.
+    let mut client = Client::connect(leader, seed, pk).await;
+    assert_eq!(
+        client.pin_cas(key, Version(0), c(0x02)).await,
+        Ok(Version(1))
+    );
+    // The next CAS, from the committed version, succeeds.
+    assert_eq!(
+        client.pin_cas(key, Version(1), c(0x03)).await,
+        Ok(Version(2))
+    );
+    assert_all_nodes_have(&nodes, key, Version(2)).await;
+    assert_eq!(assert_all_nodes_agree(&nodes, key).await, Version(2));
 
     for n in &nodes {
         n.raft.shutdown().await;
