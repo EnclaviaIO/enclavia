@@ -12,6 +12,8 @@
 #      keeps parity with the other enclaves and costs nothing).
 #   2. Mount /dev (devtmpfs) so /dev/nsm from the in-tree NSM driver is
 #      present for self-attestation, and /proc for diagnostics.
+#   2b. Start nitro-timesync (best effort) so the wall clock follows
+#      the Nitro hypervisor time for the life of the enclave.
 #   3. Fetch this node's identity (MESH_SELF_NAME + MESH_PEERS) from the
 #      host over the UNMEASURED vsock side-channel (port 5011) via
 #      synchronizer-names-init, and source it. Identity MUST NOT be baked
@@ -39,6 +41,17 @@ if [ -c /dev/nsm ]; then
 else
     echo "synchronizer-init: WARNING /dev/nsm missing; self-attestation will fail" >&2
 fi
+
+# 2b. Wall clock. The enclave has no time sync of its own, so
+#     nitro-timesync keeps CLOCK_REALTIME on the Nitro hypervisor time
+#     carried in /dev/nsm attestation documents. It forks: the foreground
+#     process waits (bounded, a few seconds at most) for the first
+#     correction, so the node starts on a corrected clock, then returns
+#     while the daemon carries on under init. Best effort: the node does
+#     not depend on it (Raft and mesh timers run on CLOCK_MONOTONIC), so a
+#     failure here must never stop the boot.
+/bin/nitro-timesync \
+    || echo "synchronizer-init: WARNING nitro-timesync failed; clock will drift" >&2
 
 # 3. Runtime identity over the unmeasured vsock side-channel.
 MESH_ENV_FILE=/tmp/mesh-env

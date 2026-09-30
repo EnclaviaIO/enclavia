@@ -34,6 +34,8 @@
   nitroLib,
   synchronizerPkg,
   namesInitPkg,
+  # In-enclave clock-sync daemon (nitro-timesync, static build).
+  timesyncPkg,
   builderSrc,
   # Derivation/image name. The two instantiations differ only in the baked-in
   # synchronizer binary, so the name is the one thing keeping their store
@@ -70,6 +72,9 @@ let
     # The synchronizer node + its runtime identity fetcher.
     cp ${synchronizerPkg}/bin/enclavia-synchronizer $out/bin/
     cp ${namesInitPkg}/bin/synchronizer-names-init $out/bin/
+    # Keeps the wall clock on the Nitro hypervisor time (see
+    # nitro-timesync); started by the init script before the node.
+    cp ${timesyncPkg}/bin/nitro-timesync $out/bin/
 
     # Minimal busybox for the init script (sh, mount, mkdir, ip; echo and
     # read are sh builtins).
