@@ -376,6 +376,15 @@ fn submitting(verb: &str) {
 
 /// Two-phase revoke; same retry-once-on-409 contract as
 /// [`confirm_self_hosted`].
+///
+/// The backend builds the `RevocationPayload`, and in self-hosted custody
+/// the backend is not trusted. Before signing, every prepared payload goes
+/// through [`check_revocation_target`], which verifies that it names (by
+/// `revokes_link`) an upgrade link carrying OUR control key's signature and
+/// matching the staged upgrade being revoked. Without that check the backend
+/// could get a revocation of some other link signed, the synchronizer would
+/// accept it, and the upgrade the user meant to cancel would still go
+/// through.
 async fn revoke_self_hosted(
     client: &ApiClient,
     enclave: &serde_json::Value,
@@ -383,7 +392,20 @@ async fn revoke_self_hosted(
     upgrade_id: &str,
 ) -> Result<StagedUpgradeJson, CliError> {
     let signer = signer_for_enclave(enclave)?;
-    let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
+    // `signer_for_enclave` only succeeds when a LOCAL key has this public
+    // key, so it is our own key, not merely what the backend's row says.
+    let control_pubkey = enclave
+        .get("control_public_key")
+        .and_then(|v| v.as_str())
+        .map(crate::keys::decode_public_key)
+        .transpose()?
+        .ok_or_else(|| CliError::Other("enclave has no control_public_key".into()))?;
+    let enclave_uuid = Uuid::parse_str(enclave_id)
+        .map_err(|e| CliError::Other(format!("invalid enclave id {enclave_id:?}: {e}")))?;
+
+    let prep =
+        prepare_checked_revocation(client, enclave_id, upgrade_id, enclave_uuid, &control_pubkey)
+            .await?;
     eprintln!("Revoking upgrade {upgrade_id}. Two signatures are required.");
     let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
     submitting("Revoking");
@@ -392,13 +414,158 @@ async fn revoke_self_hosted(
             eprintln!(
                 "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
             );
-            let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
+            let prep = prepare_checked_revocation(
+                client,
+                enclave_id,
+                upgrade_id,
+                enclave_uuid,
+                &control_pubkey,
+            )
+            .await?;
             let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
             submitting("Revoking");
             client.revoke_submit(enclave_id, upgrade_id, &submission).await
         }
         other => other,
     }
+}
+
+/// `revoke/prepare`, then [`check_revocation_target`] against the staged
+/// upgrade and the enclave's chain, printing what will be cancelled. Only a
+/// payload that passes is returned for signing.
+async fn prepare_checked_revocation(
+    client: &ApiClient,
+    enclave_id: &str,
+    upgrade_id: &str,
+    enclave_uuid: Uuid,
+    control_pubkey: &[u8; 65],
+) -> Result<enclavia_protocol::custody::RevokePrepareResponse, CliError> {
+    let prep = client.revoke_prepare(enclave_id, upgrade_id).await?;
+    let staged = client.get_upgrade(enclave_id, upgrade_id).await?;
+    let chain = client
+        .get_enclave_chain(enclave_id)
+        .await?
+        .iter()
+        .map(|l| l.into_chain_link())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CliError::Other(format!("upgrade chain link does not decode: {e}")))?;
+    let target = check_revocation_target(
+        &prep.payload,
+        enclave_uuid,
+        control_pubkey,
+        &staged,
+        &chain,
+        Utc::now(),
+    )?;
+    print_revocation_target(&target);
+    Ok(prep)
+}
+
+/// The upgrade a self-hosted revocation cancels, as verified by
+/// [`check_revocation_target`].
+#[derive(Debug)]
+pub struct RevocationTarget {
+    /// `upgrade_link_hash` of the link, the value the revocation signs.
+    pub link_hash: [u8; 32],
+    /// The link's verified payload.
+    pub upgrade: UpgradePayload,
+}
+
+fn print_revocation_target(t: &RevocationTarget) {
+    let hash: String = t.link_hash.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!("This revocation cancels the upgrade link signed by your control key:");
+    eprintln!("  link hash:   {hash}");
+    eprintln!("  target:      {}", t.upgrade.image_digest);
+    eprintln!("  to.PCR0:     {}", t.upgrade.to_pcrs.pcr0);
+    eprintln!("  to.PCR1:     {}", t.upgrade.to_pcrs.pcr1);
+    eprintln!("  to.PCR2:     {}", t.upgrade.to_pcrs.pcr2);
+    eprintln!(
+        "  valid_from:  {}",
+        t.upgrade.valid_from.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+}
+
+/// Check a backend-built `RevocationPayload` before signing it (self-hosted
+/// custody, where the backend is untrusted).
+///
+/// Accepts only when ALL of these hold:
+/// 1. The payload is for this enclave.
+/// 2. The chain entry its `revokes` id points at is an `Upgrade` link whose
+///    signature verifies over its payload under OUR control key. The backend
+///    cannot forge that signature, so this is an upgrade we approved.
+/// 3. `revokes_link` equals `upgrade_link_hash` of that link's payload: the
+///    signature we are about to make cancels exactly that link.
+/// 4. The link matches the staged upgrade being revoked (its chain id,
+///    target image and PCRs, `valid_from`), and it is still pending
+///    (`valid_from` in the future).
+///
+/// The staged row and the chain both come from the backend. Within them
+/// the backend can at most choose between upgrades we signed ourselves; the
+/// returned target is printed so the user sees which one is cancelled.
+pub fn check_revocation_target(
+    revocation_payload: &[u8],
+    enclave_id: Uuid,
+    control_pubkey: &[u8; 65],
+    staged: &StagedUpgradeJson,
+    chain: &[enclavia_protocol::chain::ChainLink],
+    now: DateTime<Utc>,
+) -> Result<RevocationTarget, CliError> {
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    let refuse = |why: &str| {
+        Err(CliError::Other(format!(
+            "refusing to sign the revocation the backend prepared: {why}"
+        )))
+    };
+
+    let revocation: RevocationPayload = ciborium::from_reader(revocation_payload)
+        .map_err(|e| CliError::Other(format!("prepared payload is not a RevocationPayload: {e}")))?;
+    if revocation.enclave_id != enclave_id {
+        return refuse("it is for another enclave");
+    }
+    if staged.upgrade_link_id != Some(revocation.revokes) {
+        return refuse("it references a different chain entry than the staged upgrade");
+    }
+    let Some(link) = chain.iter().find(|l| l.id == Some(revocation.revokes)) else {
+        return refuse("the upgrade link it references is not on the enclave's chain");
+    };
+    if link.kind != ChainLinkKind::Upgrade {
+        return refuse("the chain entry it references is not an upgrade link");
+    }
+    let verifying = VerifyingKey::from_sec1_bytes(control_pubkey)
+        .map_err(|e| CliError::Other(format!("control public key does not decode: {e}")))?;
+    let signature_ok = link
+        .signature
+        .as_deref()
+        .and_then(|s| Signature::from_slice(s).ok())
+        .is_some_and(|sig| verifying.verify(&link.payload, &sig).is_ok());
+    if !signature_ok {
+        return refuse("the upgrade link it references is not signed by your control key");
+    }
+    let link_hash = enclavia_protocol::chain::upgrade_link_hash(&link.payload);
+    if link_hash != revocation.revokes_link {
+        return refuse("its revokes_link names a different link than the upgrade it references");
+    }
+    let upgrade: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
+        .map_err(|e| CliError::Other(format!("upgrade link payload does not decode: {e}")))?;
+    if upgrade.enclave_id != enclave_id {
+        return refuse("the upgrade link it references is for another enclave");
+    }
+    let staged_pcrs = staged.pcrs.as_ref();
+    let pcrs_match = staged_pcrs.is_some_and(|p| {
+        p.pcr0 == upgrade.to_pcrs.pcr0
+            && p.pcr1 == upgrade.to_pcrs.pcr1
+            && p.pcr2 == upgrade.to_pcrs.pcr2
+    });
+    if !pcrs_match
+        || staged.image_digest.as_deref() != Some(upgrade.image_digest.as_str())
+        || staged.valid_from != Some(upgrade.valid_from)
+    {
+        return refuse("the upgrade link it references does not match the staged upgrade");
+    }
+    if upgrade.valid_from <= now {
+        return refuse("the upgrade link it references is already active; too late to revoke");
+    }
+    Ok(RevocationTarget { link_hash, upgrade })
 }
 
 #[cfg(test)]
@@ -475,6 +642,7 @@ mod tests {
             revokes: Uuid::from_u128(0x42),
             issued_at: Utc.with_ymd_and_hms(2026, 6, 9, 10, 18, 1).unwrap(),
             nonce: vec![0x44; 32],
+            revokes_link: [0x45; 32],
         };
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&payload, &mut bytes).unwrap();
@@ -626,6 +794,184 @@ mod tests {
             let got: StagedUpgradeStatus =
                 serde_json::from_str(&format!("\"{s}\"")).unwrap();
             assert_eq!(got, *expected, "variant {s}");
+        }
+    }
+
+    // --- self-hosted revocation target check ------------------------------
+
+    mod revocation_target {
+        use super::*;
+        use enclavia_protocol::chain::{ChainLink, upgrade_link_hash};
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+        fn key(seed: u8) -> (SigningKey, [u8; 65]) {
+            let mut scalar = [0u8; 32];
+            scalar[0] = 0x01;
+            scalar[1] = seed;
+            let sk = SigningKey::from_slice(&scalar).unwrap();
+            let mut pk = [0u8; 65];
+            pk.copy_from_slice(sk.verifying_key().to_encoded_point(false).as_bytes());
+            (sk, pk)
+        }
+
+        fn now() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap()
+        }
+
+        fn enclave() -> Uuid {
+            Uuid::from_u128(0xe1)
+        }
+
+        /// A signed upgrade link on the chain, with chain id `id`.
+        fn upgrade(sk: &SigningKey, id: Uuid, issued_at: DateTime<Utc>) -> ChainLink {
+            let payload = UpgradePayload {
+                enclave_id: enclave(),
+                from_pcrs: pcrs_fixture(),
+                to_pcrs: pcrs_fixture(),
+                image_digest: "sha256:next".into(),
+                valid_from: now() + chrono::Duration::days(2),
+                issued_at,
+                nonce: id.as_bytes().to_vec(),
+            };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&payload, &mut bytes).unwrap();
+            let sig: Signature = sk.sign(&bytes);
+            ChainLink {
+                id: Some(id),
+                sequence: Some(1),
+                kind: ChainLinkKind::Upgrade,
+                payload: bytes,
+                attestation: vec![],
+                signature: Some(sig.to_bytes().to_vec()),
+            }
+        }
+
+        fn staged(link_id: Uuid) -> StagedUpgradeJson {
+            StagedUpgradeJson {
+                id: Uuid::from_u128(0x5a),
+                enclave_id: enclave(),
+                status: StagedUpgradeStatus::Confirmed,
+                docker_image: "img".into(),
+                image_digest: Some("sha256:next".into()),
+                pcrs: Some(pcrs_fixture()),
+                valid_from: Some(now() + chrono::Duration::days(2)),
+                upgrade_link_id: Some(link_id),
+                revocation_link_id: None,
+                error_message: None,
+                builder_rev: None,
+                crates_rev: None,
+                synchronizer_pcrs: None,
+                synchronizer_enabled: true,
+                created_at: now(),
+            }
+        }
+
+        fn revocation(revokes: Uuid, revokes_link: [u8; 32]) -> Vec<u8> {
+            let payload = RevocationPayload {
+                enclave_id: enclave(),
+                revokes,
+                issued_at: now(),
+                nonce: vec![0x46; 32],
+                revokes_link,
+            };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&payload, &mut bytes).unwrap();
+            bytes
+        }
+
+        fn check(
+            payload: &[u8],
+            pk: &[u8; 65],
+            staged: &StagedUpgradeJson,
+            chain: &[ChainLink],
+        ) -> Result<RevocationTarget, CliError> {
+            check_revocation_target(payload, enclave(), pk, staged, chain, now())
+        }
+
+        #[test]
+        fn names_the_verified_link() {
+            let (sk, pk) = key(1);
+            let id = Uuid::from_u128(0x11);
+            let link = upgrade(&sk, id, now());
+            let hash = upgrade_link_hash(&link.payload);
+            let t = check(&revocation(id, hash), &pk, &staged(id), &[link]).unwrap();
+            assert_eq!(t.link_hash, hash);
+        }
+
+        /// Hostile backend: the link carries a far-future `issued_at`. That
+        /// does not matter any more; the revocation names the link's hash.
+        #[test]
+        fn far_future_issued_at_is_still_the_named_link() {
+            let (sk, pk) = key(1);
+            let id = Uuid::from_u128(0x12);
+            let link = upgrade(&sk, id, now() + chrono::Duration::days(36500));
+            let hash = upgrade_link_hash(&link.payload);
+            assert!(check(&revocation(id, hash), &pk, &staged(id), &[link]).is_ok());
+        }
+
+        /// Hostile backend: the payload's `revokes_link` names another link
+        /// (even another genuine one of ours) than the upgrade it references.
+        #[test]
+        fn mismatched_revokes_link_is_refused() {
+            let (sk, pk) = key(1);
+            let id = Uuid::from_u128(0x13);
+            let other = upgrade(&sk, Uuid::from_u128(0x14), now());
+            let link = upgrade(&sk, id, now());
+            let payload = revocation(id, upgrade_link_hash(&other.payload));
+            let err = check(&payload, &pk, &staged(id), &[other, link]).unwrap_err();
+            assert!(err.to_string().contains("different link"), "{err}");
+        }
+
+        /// A link the backend made up (not signed by our key) is not an
+        /// upgrade we approved: refused.
+        #[test]
+        fn link_not_signed_by_our_key_is_refused() {
+            let (_, pk) = key(1);
+            let (backend_sk, _) = key(2);
+            let id = Uuid::from_u128(0x16);
+            let link = upgrade(&backend_sk, id, now());
+            let hash = upgrade_link_hash(&link.payload);
+            let err = check(&revocation(id, hash), &pk, &staged(id), &[link]).unwrap_err();
+            assert!(err.to_string().contains("not signed by your control key"), "{err}");
+        }
+
+        /// The revocation must reference the staged upgrade being revoked.
+        #[test]
+        fn revocation_of_another_chain_entry_is_refused() {
+            let (sk, pk) = key(1);
+            let id = Uuid::from_u128(0x17);
+            let other_id = Uuid::from_u128(0x18);
+            let link = upgrade(&sk, id, now());
+            let other = upgrade(&sk, other_id, now());
+            let payload = revocation(other_id, upgrade_link_hash(&other.payload));
+            let err = check(&payload, &pk, &staged(id), &[link, other]).unwrap_err();
+            assert!(err.to_string().contains("different chain entry"), "{err}");
+        }
+
+        /// A link that does not match the staged row (another target) is
+        /// refused, as is one that is already active.
+        #[test]
+        fn link_must_match_the_staged_upgrade_and_be_pending() {
+            let (sk, pk) = key(1);
+            let id = Uuid::from_u128(0x19);
+            let link = upgrade(&sk, id, now());
+            let hash = upgrade_link_hash(&link.payload);
+            let mut other_target = staged(id);
+            other_target.image_digest = Some("sha256:elsewhere".into());
+            let err = check(&revocation(id, hash), &pk, &other_target, &[link.clone()])
+                .unwrap_err();
+            assert!(err.to_string().contains("does not match"), "{err}");
+
+            let late = check_revocation_target(
+                &revocation(id, hash),
+                enclave(),
+                &pk,
+                &staged(id),
+                &[link],
+                now() + chrono::Duration::days(3),
+            )
+            .unwrap_err();
+            assert!(late.to_string().contains("too late"), "{late}");
         }
     }
 }

@@ -42,7 +42,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::wire::{
-    ChainLink, Request, Response, RpcError, decode_transition_link, verify_transition_link,
+    ChainLink, Request, Response, RpcError, decode_transition_link, verify_revocation_link,
+    verify_transition_link,
 };
 use crate::{CONTROL_PUBKEY_LEN, Op, PcrKey, StateMachine, ValidationError};
 
@@ -140,6 +141,7 @@ impl Node {
                     .await
             }
             Request::Transition { link } => self.handle_transition(session_key, link).await,
+            Request::Revoke { link } => self.handle_revoke(session_key, link).await,
         }
     }
 
@@ -271,6 +273,7 @@ impl Node {
         match inner.apply(Op::Transition {
             old_key: verified.old_key,
             new_key: verified.new_key,
+            link_hash: verified.link_hash,
         }) {
             Ok(state) => Response::TransitionOk {
                 version: state.version,
@@ -281,6 +284,33 @@ impl Node {
             // NotFound (the Pin/Get sense), so we override here.
             Err(ValidationError::KeyNotCurrent) => err(RpcError::TransitionRejected),
             Err(e) => err(RpcError::from(e)),
+        }
+    }
+
+    /// Revoke the upgrade links out of the session's own key. The session
+    /// must hold the pin (its key registered); the link must carry the
+    /// control signature of that key's FROZEN pubkey
+    /// ([`verify_revocation_link`]). Any failure is `RevocationRejected`,
+    /// meaning the revocation did NOT take effect.
+    async fn handle_revoke(&self, session_key: PcrKey, link: ChainLink) -> Response {
+        let mut inner = self.inner.lock().await;
+        let control_pubkey = match inner.get(&session_key) {
+            Some(state) => state.control_pubkey,
+            None => return err(RpcError::RevocationRejected),
+        };
+        let verified = match verify_revocation_link(&link, &control_pubkey) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "revocation link rejected");
+                return err(RpcError::RevocationRejected);
+            }
+        };
+        match inner.apply(Op::Revoke {
+            key: session_key,
+            link_hash: verified.link_hash,
+        }) {
+            Ok(_) => Response::RevokeOk,
+            Err(_) => err(RpcError::RevocationRejected),
         }
     }
 }
@@ -876,5 +906,184 @@ mod tests {
                 version: Version(0),
             }
         );
+    }
+
+    // --- revocation --------------------------------------------------------
+
+    /// An upgrade link with an explicit `issued_at` (and `valid_from` in the
+    /// past, so only a revocation can stop it).
+    fn upgrade_link_issued_at(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        issued_at: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from_pcrs: pcrs_hex_from_seed(from_seed),
+            to_pcrs: pcrs_hex_from_seed(to_seed),
+            image_digest: "sha256:to".into(),
+            valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
+            issued_at,
+            nonce: vec![0x5a; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation,
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    /// A revocation of `target` signed by `signing`, stamped `issued_at`.
+    fn revocation_of(
+        signing: &SigningKey,
+        target: &ChainLink,
+        issued_at: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
+        let payload = enclavia_protocol::chain::RevocationPayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            revokes: uuid::Uuid::new_v4(),
+            issued_at,
+            nonce: vec![0x6b; 32],
+            revokes_link: crate::wire::upgrade_link_hash(&target.payload),
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Revocation,
+            payload: payload_bytes,
+            attestation: vec![],
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    fn hours_ago(h: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::hours(h)
+    }
+
+    /// The old enclave revokes a link; that exact link can never move the
+    /// pin, even when a hostile backend stamped it with a far-future
+    /// `issued_at` and the revocation with an old one. A different
+    /// (re-approved) link to the same target still works.
+    #[tokio::test]
+    async fn revoked_link_is_refused_whatever_its_timestamps() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x51);
+        let key_old = register_old(&node, 0x51, pk).await;
+        let key_new = key_from_seed(0x52);
+        node.observe_attestation(key_new, dummy_pubkey(0x52)).await;
+
+        let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let revoked = upgrade_link_issued_at(0x51, 0x52, &sk, far_future);
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Revoke {
+                    link: revocation_of(&sk, &revoked, hours_ago(1000)),
+                },
+            )
+            .await;
+        assert_eq!(resp, Response::RevokeOk);
+
+        let resp = node
+            .handle_request(key_new, Request::Transition { link: revoked })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRevoked));
+        let resp = node
+            .handle_request(key_old, Request::Get { key: key_old })
+            .await;
+        assert!(matches!(resp, Response::GetOk { .. }), "{resp:?}");
+
+        let reapproved = upgrade_link_issued_at(0x51, 0x52, &sk, hours_ago(1));
+        let resp = node
+            .handle_request(key_new, Request::Transition { link: reapproved })
+            .await;
+        assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
+    }
+
+    /// A revocation naming ANOTHER link (what a hostile backend would hand
+    /// the signer) does not block the real one: only the named link is
+    /// revoked, which is why the signer must check the name.
+    #[tokio::test]
+    async fn revocation_of_another_link_does_not_block_the_target() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x58);
+        let key_old = register_old(&node, 0x58, pk).await;
+        let key_new = key_from_seed(0x59);
+        node.observe_attestation(key_new, dummy_pubkey(0x59)).await;
+        let target = upgrade_link_issued_at(0x58, 0x59, &sk, hours_ago(2));
+        let decoy = upgrade_link_issued_at(0x58, 0x59, &sk, hours_ago(3));
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Revoke {
+                    link: revocation_of(&sk, &decoy, hours_ago(1)),
+                },
+            )
+            .await;
+        assert_eq!(resp, Response::RevokeOk);
+        let resp = node
+            .handle_request(key_new, Request::Transition { link: target })
+            .await;
+        assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
+    }
+
+    /// A revocation signed by anything but the key's frozen control key is
+    /// refused and records nothing: the link still works afterwards.
+    #[tokio::test]
+    async fn revocation_signed_by_another_key_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x53);
+        let (host_sk, _) = keypair(0x54);
+        let key_old = register_old(&node, 0x53, pk).await;
+        let link = upgrade_link_issued_at(0x53, 0x55, &sk, hours_ago(2));
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Revoke {
+                    link: revocation_of(&host_sk, &link, hours_ago(1)),
+                },
+            )
+            .await;
+        assert_eq!(resp, err(RpcError::RevocationRejected));
+
+        let key_new = key_from_seed(0x55);
+        node.observe_attestation(key_new, dummy_pubkey(0x55)).await;
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
+    }
+
+    /// Only the enclave holding the pin can revoke: a session whose key is
+    /// not registered (any other image the host can boot) is refused, even
+    /// with a validly signed revocation.
+    #[tokio::test]
+    async fn revocation_from_a_session_without_a_pin_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x56);
+        register_old(&node, 0x56, pk).await;
+        let stranger = key_from_seed(0x57);
+        node.observe_attestation(stranger, pk).await;
+        let link = upgrade_link_issued_at(0x56, 0x57, &sk, hours_ago(2));
+        let resp = node
+            .handle_request(
+                stranger,
+                Request::Revoke {
+                    link: revocation_of(&sk, &link, hours_ago(1)),
+                },
+            )
+            .await;
+        assert_eq!(resp, err(RpcError::RevocationRejected));
     }
 }
