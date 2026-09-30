@@ -130,8 +130,8 @@ pub const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time allowed for one synchronizer interaction: the Noise handshake +
 /// NSM attest + Authenticate at session setup, and each Get / Pin RPC
 /// afterwards. Generous because a Pin in the replicated deployment only
-/// ACKs after full replication (which may wait out a follower hiccup),
-/// but finite: expiry is treated exactly like the oracle being
+/// ACKs once a quorum has committed it (which may ride out a leader
+/// re-election), but finite: expiry is treated exactly like the oracle being
 /// unreachable, i.e. fail-stop.
 pub const SYNC_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -739,24 +739,23 @@ pub fn pin_error_is_retryable(e: &ClientError) -> bool {
 
 /// Whether the oracle answered the documented transient "no durable
 /// quorum right now" refusal. This is the ONE structured `Rpc` error the
-/// client retries: the synchronizer returns it while a Raft node is
-/// rejoining (the leader waits for all voters, and a node that is
-/// rejoining is not yet a voter), a condition that clears on its own in
-/// seconds to minutes without any state having changed.
+/// client retries: the synchronizer returns it while it cannot commit
+/// (no leader during an election, or quorum lost while nodes rejoin), a
+/// condition that clears on its own in seconds to minutes without any
+/// state having changed.
 pub fn pin_error_is_unavailable(e: &ClientError) -> bool {
     matches!(e, ClientError::Rpc(RpcError::Unavailable))
 }
 
 /// Wall-clock ceiling for tolerating `Rpc(Unavailable)` on one pin.
 ///
-/// A single oracle-node restart makes every durable write answer
-/// `Unavailable` until the rejoining node is re-admitted as a voter,
-/// which is observed to take up to several minutes. The pre-existing
-/// budget (3 reconnects x [`SYNC_RECONNECT_BACKOFF`] + RPC timeouts,
-/// ~96 s worst case) is shorter than that, so an entirely healthy
-/// cluster undergoing a planned restart used to fail-stop the device.
+/// The oracle answers `Unavailable` while it has no quorum to commit
+/// with, for example while restarted nodes are being re-admitted as
+/// voters, which can take minutes. The reconnect budget alone
+/// (3 reconnects x [`SYNC_RECONNECT_BACKOFF`] + RPC timeouts, ~96 s worst
+/// case) is shorter than that.
 ///
-/// Five minutes covers an observed rejoin with slack while keeping the
+/// Five minutes covers a rejoin with slack while keeping the
 /// fail-stop policy intact: the budget is a DEADLINE checked against the
 /// wall clock, not an attempt count, so the 30 s [`SYNC_RPC_TIMEOUT`]
 /// cannot inflate it, and once it expires the pin fails exactly as
