@@ -21,6 +21,11 @@
 //! 4. Subsequent frames: [`Frame::Rpc`] requests, each answered with one
 //!    CBOR [`Response`].
 //!
+//! Both `Authenticate` frames also carry the sender's protocol version and
+//! capability set; [`Client::server_protocol`] exposes what the server
+//! advertised and what the session negotiated (see the `wire` module's
+//! "Versioning and capabilities").
+//!
 //! ## SECURITY: where the expected server PCRs MUST come from
 //!
 //! The [`ServerPcrPolicy`] is the trust anchor of the whole oracle
@@ -67,7 +72,7 @@
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::wire::{ChainLink, Frame, MAX_FRAME_SIZE, Request, Response, RpcError};
+use crate::wire::{ChainLink, Frame, MAX_FRAME_SIZE, PeerProtocol, Request, Response, RpcError};
 use crate::{Commitment, PcrKey, Version};
 
 // Re-exported so callers (nbd-client) construct the policy and match its
@@ -196,7 +201,7 @@ where
         write_frame(
             &mut self.stream,
             &mut self.transport,
-            &Frame::Authenticate { nsm_doc },
+            &Frame::authenticate(nsm_doc),
         )
         .await?;
 
@@ -206,8 +211,15 @@ where
         let plaintext = read_plaintext_frame(&mut self.stream, &mut self.transport).await?;
         let frame: Frame = ciborium::from_reader(plaintext.as_slice())
             .map_err(|e| ClientError::Cbor(e.to_string()))?;
-        let server_doc = match frame {
-            Frame::Authenticate { nsm_doc } => nsm_doc,
+        let (server_doc, server_protocol) = match frame {
+            Frame::Authenticate {
+                nsm_doc,
+                protocol_version,
+                capabilities,
+            } => (
+                nsm_doc,
+                PeerProtocol::from_advertised(protocol_version, &capabilities),
+            ),
             _ => return Err(ClientError::ServerAuthMissing),
         };
         verify_server_attestation(&server_doc, &self.handshake_hash, server_policy, debug_mode)
@@ -219,6 +231,7 @@ where
         Ok(Client {
             stream: self.stream,
             transport: self.transport,
+            server_protocol,
         })
     }
 }
@@ -230,12 +243,20 @@ where
 pub struct Client<S> {
     stream: S,
     transport: NoiseTransport,
+    server_protocol: PeerProtocol,
 }
 
 impl<S> Client<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    /// The server's advertised protocol version and the capabilities this
+    /// session negotiated. Optional features may only be used when
+    /// [`PeerProtocol::supports`] says so.
+    pub fn server_protocol(&self) -> &PeerProtocol {
+        &self.server_protocol
+    }
+
     /// Pin `commitment` under `key` (which must equal the session's
     /// attested key). Returns the resulting per-key version:
     /// `Version(0)` means this Pin REGISTERED the key (first pin for an

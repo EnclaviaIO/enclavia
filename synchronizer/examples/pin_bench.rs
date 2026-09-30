@@ -221,16 +221,14 @@ async fn open_session(args: &Args, expected: &Pcrs, seed: u8) -> Session {
     write_frame(
         &mut stream,
         &mut transport,
-        &Frame::Authenticate {
-            nsm_doc: fake.encode(),
-        },
+        &Frame::authenticate(fake.encode()),
     )
     .await;
 
     let pt = read_plaintext(&mut stream, &mut transport).await;
     let frame: Frame = ciborium::from_reader(pt.as_slice()).expect("cbor decode server frame");
     let nsm_doc = match frame {
-        Frame::Authenticate { nsm_doc } => nsm_doc,
+        Frame::Authenticate { nsm_doc, .. } => nsm_doc,
         other => panic!("expected the node's Authenticate frame, got {other:?}"),
     };
     verify_server_attestation(
