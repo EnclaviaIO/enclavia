@@ -14,8 +14,8 @@
 //!   get  - each op is a linearizable `Get` (the key must exist, so the
 //!          session issues ONE untimed Pin first). This isolates the
 //!          ReadIndex quorum round from the write path: on the current
-//!          serve path a Pin is roughly Get + commit + full-replication
-//!          wait, so (pin - get) attributes the write-side cost.
+//!          serve path a Pin is roughly a local registration check + a
+//!          quorum commit, so (pin - get) attributes the write-side cost.
 //!
 //! Usage:
 //!   pin_bench <proxy-uds> --server-pcrs <pcr.json> \
@@ -39,7 +39,7 @@ use tokio::net::UnixStream;
 
 const MAX_FRAME_SIZE: usize = 65535;
 
-/// Per-RPC ceiling. Generous: the serve path's replication_wait is 2s
+/// Per-RPC ceiling. Generous: a commit can ride out a leader election
 /// and a retryable client would reconnect, but the bench treats any op
 /// this slow as a failure worth counting, not retrying.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
