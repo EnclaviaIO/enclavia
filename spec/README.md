@@ -285,22 +285,22 @@ Results (TLC 2.19, `-deadlock`, beta, see `runs/`):
 | Config | Expected | Observed | Result | Wall clock (TLC workers) |
 |---|---|---|---|---|
 | `Current_Cluster` | pass | pass | 5,007,205 distinct states, depth 36 | 01min 22s (4) |
-| `Current_HostileBackend_Revocation` | pass | (running) | | |
+| `Current_HostileBackend_Revocation` | pass | pass | 802,210,331 distinct states, depth 34 | 01h 15min (24) |
 | `Current_HostileBackend_Target` | violation TransitionAuthorized | violation TransitionAuthorized | counterexample, 15 states | 07s (4) |
 | `Current_HostileBackend_ValidFrom` | violation TransitionAuthorized | violation TransitionAuthorized | counterexample, 14 states | 07s (4) |
 | `Current_HostShadow_Fork` | violation NoFork | violation NoFork | counterexample, 16 states | 07s (4) |
 | `Current_HostShadow_Stale` | violation NoStaleRestore | violation NoStaleRestore | counterexample, 16 states | 12s (4) |
 | `Current_HostTotalLoss` | violation NoRollback | violation NoRollback | counterexample, 18 states | 09s (4) |
-| `Current_HostTotalLoss_Revocation` | violation RevocationPermanentData | (running) | | |
-| `Current_HostTotalLoss_Stale` | pass | (running) | | |
+| `Current_HostTotalLoss_Revocation` | violation RevocationPermanentData | violation RevocationPermanentData | counterexample, 28 states | 25min 48s (4) |
+| `Current_HostTotalLoss_Stale` | pass | pass | 45,747,078 distinct states, depth 39 | 24min 37s (4) |
 | `Current_PolyglotRevocation` | violation TransitionAuthorized | violation TransitionAuthorized | counterexample, 16 states | 17s (4) |
-| `Current_UpgradeAuth` | pass | (running) | | |
+| `Current_UpgradeAuth` | pass | pass | 41,847,648 distinct states, depth 37 | 18min 40s (4) |
 | `Current_Upgrade` | violation NoRollback | violation NoRollback | counterexample, 20 states | 16s (4) |
-| `Fix_ExplicitRegister_Shadow_Stale` | pass | (running) | | |
-| `Fix_ExplicitRegister_TotalLoss_Revocation` | violation RevocationPermanent | (running) | | |
-| `Fix_ExplicitRegister_TotalLoss_RevocationData` | pass | (running) | | |
-| `Fix_Payloads_HostileBackend` | pass | (running) | | |
-| `Fix_Upgrade` | pass | (running) | | |
+| `Fix_ExplicitRegister_Shadow_Stale` | pass | pass | 122,581,074 distinct states, depth 38 | 53min 25s (4) |
+| `Fix_ExplicitRegister_TotalLoss_Revocation` | violation RevocationPermanent | violation RevocationPermanent | counterexample, 23 states | 29min 01s (4) |
+| `Fix_ExplicitRegister_TotalLoss_RevocationData` | pass | pass | 30,655,327 distinct states, depth 38 | 16min 12s (4) |
+| `Fix_Payloads_HostileBackend` | pass | pass | 119,523,648 distinct states, depth 34 | 47min 49s (4) |
+| `Fix_Upgrade` | pass | pass | 116,628,713 distinct states, depth 37 | 48min 56s (4) |
 | `Fix_VersionCheck_Shadow_Rollback` | violation NoRollback | violation NoRollback | counterexample, 14 states | 02s (4) |
 | `Fix_VersionCheck_Shadow_Stale` | violation NoStaleRestore | violation NoStaleRestore | counterexample, 18 states | 33s (4) |
 | `Neg_DevSync` | violation NoRollback | violation NoRollback | counterexample, 10 states | 01s (4) |
@@ -318,7 +318,7 @@ Results (TLC 2.19, `-deadlock`, beta, see `runs/`):
 | `Opt_AllVoterReseed_Current` | pass | pass | 3,690,879 distinct states, depth 37 | 54s (4) |
 | `WhatIf_SuperblockCollision` | violation NoFork | violation NoFork | counterexample, 20 states | 07s (4) |
 
-"(running)": exhaustive run still in progress when this was written; see the PR for the final numbers.
+All 33 configurations match their `EXPECT` line. Wall clock is on the beta builder (48 cores, shared), with the TLC worker count in parentheses.
 <!-- RESULTS-END -->
 
 ---
@@ -596,6 +596,6 @@ Each `models/*.cfg` starts with an `\* EXPECT:` line (`pass` or
 `violation <Invariant>`); `check.sh` fails if TLC disagrees. It uses `tlc` from
 `PATH` or `nix shell nixpkgs#tlaplus`. The default set (every counterexample
 and the smaller positive models) runs in a few minutes and is meant for CI;
-models marked `\* TIER: heavy` explore 40-500 million states and take from
+models marked `\* TIER: heavy` explore 30-800 million distinct states and take from
 tens of minutes to hours each (see the wall-clock column in section 7).
 TLC output of the recorded runs is in `runs/` (progress lines stripped).
