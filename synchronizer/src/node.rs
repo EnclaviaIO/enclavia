@@ -193,6 +193,17 @@ impl Node {
     }
 
     async fn handle_transition(&self, session_key: PcrKey, link: ChainLink) -> Response {
+        // Trusted time for the link's `valid_from` gate, read before taking
+        // the state-machine lock. No trusted time means the gate cannot be
+        // evaluated, so the transition is refused (retryable).
+        let now_ms = match crate::trusted_time::now_ms().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "transition refused: trusted time unavailable");
+                return err(RpcError::Unavailable);
+            }
+        };
+
         let mut inner = self.inner.lock().await;
 
         // Phase one: structurally decode the (still-untrusted) link to
@@ -224,17 +235,22 @@ impl Node {
         // control signature verifies under old_key's frozen pubkey, and
         // the chain attestation binds `user_data == sha256(payload)` and
         // the OLD enclave's PCRs (from_pcrs). Both keys are re-derived
-        // from the signed payload, never from an untrusted wire field.
-        // Any failure folds to a single TransitionRejected.
+        // from the signed payload, never from an untrusted wire field, and
+        // the payload's `valid_from` has been reached. Any failure folds to
+        // a single TransitionRejected.
         let verified = match verify_transition_link(
             &link,
             decoded,
             session_key,
             &old_control_pubkey,
             self.debug_mode,
+            now_ms,
         ) {
             Ok(v) => v,
-            Err(_) => return err(RpcError::TransitionRejected),
+            Err(e) => {
+                tracing::warn!(error = %e, "transition link rejected");
+                return err(RpcError::TransitionRejected);
+            }
         };
 
         // Link verified, record the observation and apply the op through
@@ -335,12 +351,22 @@ mod tests {
     /// its PrepareUpgrade flow, so it attests its own PCRs. Mirrors what
     /// `enclavia-server::run_prepare_upgrade` / `chain-host` produce.
     fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+        upgrade_link_valid_from(from_seed, to_seed, signing, chrono::Utc::now())
+    }
+
+    /// [`upgrade_link`] with an explicit `valid_from`.
+    fn upgrade_link_valid_from(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
             from_pcrs: pcrs_hex_from_seed(from_seed),
             to_pcrs: pcrs_hex_from_seed(to_seed),
             image_digest: "sha256:to".into(),
-            valid_from: chrono::Utc::now(),
+            valid_from,
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
@@ -718,6 +744,37 @@ mod tests {
             .handle_request(key_new, Request::Transition { link })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A link scheduled an hour from now is refused (the `valid_from` gate),
+    /// and the old key keeps its state: the early attempt changes nothing.
+    #[tokio::test]
+    async fn transition_before_valid_from_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x18);
+        let key_old = register_old(&node, 0x18, pk).await;
+        let key_new = key_from_seed(0x28);
+        node.observe_attestation(key_new, dummy_pubkey(0x28)).await;
+        let link = upgrade_link_valid_from(
+            0x18,
+            0x28,
+            &sk,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        let resp = node
+            .handle_request(key_new, Request::Transition { link })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+        let resp = node
+            .handle_request(key_old, Request::Get { key: key_old })
+            .await;
+        assert_eq!(
+            resp,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
+            }
+        );
     }
 
     /// Once a key transitions, any further session bound to it is dead.

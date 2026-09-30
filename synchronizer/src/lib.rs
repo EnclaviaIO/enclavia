@@ -56,6 +56,9 @@ pub mod mesh;
 #[cfg(feature = "raft")]
 pub mod raft;
 
+#[cfg(feature = "mesh")]
+pub mod trusted_time;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "serde")]

@@ -199,7 +199,8 @@ pub enum Request {
     /// `sha256(payload)` (so its PCRs equal `from_pcrs`). The synchronizer
     /// derives `old_key`/`new_key` from the payload, verifies the link via
     /// [`verify_transition_link`] against the control pubkey frozen for the
-    /// derived `old_key` at its registration, then retires `old_key`,
+    /// derived `old_key` at its registration (which also refuses the link
+    /// before the payload's `valid_from`), then retires `old_key`,
     /// registers `new_key` (which must itself have produced an attestation
     /// in this session, the submitting session does), and carries the
     /// existing commitment + version forward.
@@ -485,7 +486,30 @@ pub enum TransitionLinkError {
     /// (`from_pcrs == to_pcrs`): a self-transition is never legitimate.
     #[error("transition link to_pcrs equals from_pcrs (self-transition)")]
     SelfTransition,
+    /// The payload's `valid_from` is still in the future: the verifier's
+    /// trusted `now` is earlier than `valid_from` minus
+    /// [`TRANSITION_VALID_FROM_TOLERANCE_MS`].
+    #[error(
+        "transition link is not valid yet (valid_from {valid_from_ms} ms, now {now_ms} ms, \
+         tolerance {TRANSITION_VALID_FROM_TOLERANCE_MS} ms)"
+    )]
+    NotYetValid {
+        /// The payload's `valid_from`, milliseconds since the Unix epoch.
+        valid_from_ms: i64,
+        /// The verifier's trusted `now`, milliseconds since the Unix epoch.
+        now_ms: u64,
+    },
 }
+
+/// How far ahead of the payload's `valid_from` a `Transition` is still
+/// accepted, in milliseconds.
+///
+/// Matches `CLOCK_SKEW_TOLERANCE_SECS` (60 s) in `enclavia-server`, which
+/// applies the same gate on the enclave side before it swaps images. The
+/// synchronizer's `now` is its own NSM attestation timestamp (hypervisor
+/// time), so the tolerance only has to absorb the difference between two
+/// Nitro hosts' clocks and the whole-second stamps of QEMU's emulated NSM.
+pub const TRANSITION_VALID_FROM_TOLERANCE_MS: u64 = 60_000;
 
 impl From<TransitionLinkError> for RpcError {
     fn from(_: TransitionLinkError) -> Self {
@@ -604,6 +628,19 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    matching `enclavia_protocol::chain`'s "attested by the enclave
 ///    version running at the time" rule). `debug_mode` selects the
 ///    skip-cert-chain (QEMU / test) vs full-Nitro-CA path.
+/// 5. **Activation time.** The payload's `valid_from` must not be later
+///    than `now_ms + TRANSITION_VALID_FROM_TOLERANCE_MS`. The chain
+///    attestation is validated at the document's own timestamp, so without
+///    this gate a link would be usable from the moment it is emitted, not
+///    from the time its owner scheduled. `valid_from` is covered by the
+///    control signature (step 3), so it is trusted once that passes. The
+///    gate applies in both verification modes: it reads a signed payload
+///    field, not the attestation envelope.
+///
+/// `now_ms` is the verifier's trusted current time in milliseconds since
+/// the Unix epoch. The node reads it from its own NSM attestation document
+/// (hypervisor time, see `crate::trusted_time`), never from the system
+/// clock, so correctness does not depend on the enclave's clock sync.
 ///
 /// On success returns the `(old_key, new_key)` the caller should observe
 /// and apply. The state machine still enforces the remaining structural
@@ -615,6 +652,7 @@ pub fn verify_transition_link(
     session_key: PcrKey,
     old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
     debug_mode: bool,
+    now_ms: u64,
 ) -> Result<VerifiedTransition, TransitionLinkError> {
     use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
@@ -641,11 +679,25 @@ pub fn verify_transition_link(
         .verify(&link.payload, &sig)
         .map_err(|_| TransitionLinkError::SignatureInvalid)?;
 
+    let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
+        .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
+
+    // 5. Activation time. Checked ahead of the attestation (step 4) so the
+    //    outcome does not depend on the verification mode. The payload is
+    //    authenticated by the signature above, so `valid_from` is the
+    //    owner's schedule.
+    let valid_from_ms = payload.valid_from.timestamp_millis();
+    let earliest_ms = i128::from(valid_from_ms) - i128::from(TRANSITION_VALID_FROM_TOLERANCE_MS);
+    if i128::from(now_ms) < earliest_ms {
+        return Err(TransitionLinkError::NotYetValid {
+            valid_from_ms,
+            now_ms,
+        });
+    }
+
     // 4. Chain attestation binds the document to sha256(payload) and to
     //    the OLD enclave's measurements (from_pcrs): the old enclave
     //    emitted the link, so it attested its own PCRs.
-    let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
-        .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
     let expected_pcrs = payload
         .from_pcrs
         .to_pcrs()
@@ -734,12 +786,22 @@ mod tests {
     /// the OLD measurements (`from_seed`): the old enclave emits the link
     /// during its PrepareUpgrade flow, so it attests its own PCRs.
     fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+        upgrade_link_valid_from(from_seed, to_seed, signing, chrono::Utc::now())
+    }
+
+    /// [`upgrade_link`] with an explicit `valid_from`.
+    fn upgrade_link_valid_from(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
             from_pcrs: pcrs_hex_from_seed(from_seed),
             to_pcrs: pcrs_hex_from_seed(to_seed),
             image_digest: "sha256:to".into(),
-            valid_from: chrono::Utc::now(),
+            valid_from,
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
@@ -769,8 +831,39 @@ mod tests {
         old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
         debug_mode: bool,
     ) -> Result<VerifiedTransition, TransitionLinkError> {
+        decode_and_verify_at(link, session_key, old_control_pubkey, debug_mode, now_ms())
+    }
+
+    /// [`decode_and_verify`] at an explicit trusted `now`.
+    fn decode_and_verify_at(
+        link: &ChainLink,
+        session_key: PcrKey,
+        old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
+        debug_mode: bool,
+        now_ms: u64,
+    ) -> Result<VerifiedTransition, TransitionLinkError> {
         let decoded = decode_transition_link(link)?;
-        verify_transition_link(link, decoded, session_key, old_control_pubkey, debug_mode)
+        verify_transition_link(
+            link,
+            decoded,
+            session_key,
+            old_control_pubkey,
+            debug_mode,
+            now_ms,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap()
+    }
+
+    /// Fixed instant for the `valid_from` gate tests.
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(1_790_000_000_000).unwrap()
+    }
+
+    fn ms(t: chrono::DateTime<chrono::Utc>) -> u64 {
+        u64::try_from(t.timestamp_millis()).unwrap()
     }
 
     // --- wire round-trips ---------------------------------------------
@@ -1133,6 +1226,104 @@ mod tests {
         let err = decode_and_verify(&link, session_key, &pk, true).unwrap_err();
         assert!(
             matches!(err, TransitionLinkError::Attestation(_)),
+            "{err:?}"
+        );
+    }
+
+    // --- valid_from gate ------------------------------------------------
+
+    const TOL: u64 = TRANSITION_VALID_FROM_TOLERANCE_MS;
+
+    /// A link whose valid_from is an hour ahead of the trusted `now` is
+    /// refused, even though every other check would pass.
+    #[test]
+    fn transition_link_before_valid_from_rejected() {
+        let (sk, pk) = keypair(0x60);
+        let link = upgrade_link_valid_from(0x60, 0x61, &sk, t0());
+        let now = ms(t0()) - 3_600_000;
+        let err = decode_and_verify_at(&link, key_from_seed(0x61), &pk, true, now).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransitionLinkError::NotYetValid { valid_from_ms, now_ms }
+                    if valid_from_ms == t0().timestamp_millis() && now_ms == now
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// At and after valid_from the link is accepted.
+    #[test]
+    fn transition_link_at_or_after_valid_from_accepted() {
+        let (sk, pk) = keypair(0x62);
+        let link = upgrade_link_valid_from(0x62, 0x63, &sk, t0());
+        for now in [ms(t0()), ms(t0()) + 1, ms(t0()) + 30 * 86_400_000] {
+            decode_and_verify_at(&link, key_from_seed(0x63), &pk, true, now)
+                .unwrap_or_else(|e| panic!("now = {now}: {e:?}"));
+        }
+    }
+
+    /// The tolerance edge: exactly `valid_from - tolerance` is accepted,
+    /// one millisecond earlier is not.
+    #[test]
+    fn transition_link_valid_from_tolerance_edge() {
+        let (sk, pk) = keypair(0x64);
+        let link = upgrade_link_valid_from(0x64, 0x65, &sk, t0());
+        let edge = ms(t0()) - TOL;
+        decode_and_verify_at(&link, key_from_seed(0x65), &pk, true, edge)
+            .expect("exactly at valid_from - tolerance");
+        let err =
+            decode_and_verify_at(&link, key_from_seed(0x65), &pk, true, edge - 1).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::NotYetValid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The gate is independent of the verification mode: an early link is
+    /// refused as `NotYetValid` in production mode too, before the
+    /// (here fake, so otherwise failing) chain attestation is looked at.
+    #[test]
+    fn transition_link_valid_from_gate_in_both_modes() {
+        let (sk, pk) = keypair(0x66);
+        let link = upgrade_link_valid_from(0x66, 0x67, &sk, t0());
+        let early = ms(t0()) - TOL - 1;
+        for debug_mode in [true, false] {
+            let err = decode_and_verify_at(&link, key_from_seed(0x67), &pk, debug_mode, early)
+                .unwrap_err();
+            assert!(
+                matches!(err, TransitionLinkError::NotYetValid { .. }),
+                "debug_mode = {debug_mode}: {err:?}"
+            );
+        }
+        // On time, skip-chain mode accepts; production mode now gets as far
+        // as the attestation and rejects the fake document there.
+        decode_and_verify_at(&link, key_from_seed(0x67), &pk, true, ms(t0())).expect("on time");
+        let err =
+            decode_and_verify_at(&link, key_from_seed(0x67), &pk, false, ms(t0())).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::Attestation(_)),
+            "{err:?}"
+        );
+    }
+
+    /// The gate reads the SIGNED payload: a forged link that moves
+    /// valid_from without a valid signature fails on the signature.
+    #[test]
+    fn transition_link_valid_from_is_signature_covered() {
+        let (sk, pk) = keypair(0x68);
+        let mut link = upgrade_link_valid_from(0x68, 0x69, &sk, t0());
+        // Re-encode the payload with an earlier valid_from, keep the old
+        // signature.
+        let mut payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice()).unwrap();
+        payload.valid_from = t0() - chrono::Duration::days(30);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes).unwrap();
+        link.payload = bytes;
+        let err = decode_and_verify_at(&link, key_from_seed(0x69), &pk, true, ms(t0()) - 3_600_000)
+            .unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::SignatureInvalid),
             "{err:?}"
         );
     }
