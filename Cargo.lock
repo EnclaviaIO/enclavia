@@ -1407,6 +1407,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synchronizer",
  "tokio",
  "tokio-vsock",
  "tracing",

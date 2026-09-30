@@ -18,6 +18,7 @@ use tracing::{error, info, instrument, trace, warn};
 
 mod attestation;
 mod config;
+mod sync_revoke;
 
 use tokio_vsock::VsockListener;
 use tokio_vsock::VsockStream;
@@ -412,12 +413,32 @@ async fn run_prepare_upgrade(
     )
 }
 
+/// The measured config's synchronizer trust anchors, set once in `main`.
+/// `None` inside means this enclave does not pin its storage to the
+/// synchronizer; unset (tests) is treated the same.
+static SYNCHRONIZER: std::sync::OnceLock<Option<config::SynchronizerTrust>> =
+    std::sync::OnceLock::new();
+
+fn synchronizer_trust() -> Option<&'static config::SynchronizerTrust> {
+    SYNCHRONIZER.get().and_then(Option::as_ref)
+}
+
 /// Execute the `RevokeUpgrade` flow:
 /// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
 /// 2. Validate the CBOR payload decodes as `RevocationPayload`.
-/// 3. Optionally run `enclavia-crypto revoke-upgrade` (storage enclaves).
-/// 4. Get a chain attestation.
-/// 5. Submit the `Revocation` chain link to `chain-host`; wait for ACK.
+/// 3. Get a chain attestation and build the `Revocation` chain link.
+/// 4. If this enclave pins its storage to the synchronizer, commit the
+///    revocation there and wait for its acknowledgement.
+/// 5. Optionally run `enclavia-crypto revoke-upgrade` (storage enclaves).
+/// 6. Submit the `Revocation` chain link to `chain-host`; wait for ACK.
+///
+/// Step 4 comes before anything else changes: the host keeps a copy of the
+/// signed upgrade link, and only the synchronizer refusing it stops the host
+/// from restoring the pre-upgrade LUKS header and completing the upgrade
+/// anyway once `valid_from` passes. If the synchronizer does not commit the
+/// revocation (including a synchronizer that does not support revocations),
+/// the command fails and nothing is reported as revoked; the revocation is
+/// idempotent there, so the operator's retry is safe.
 async fn run_revoke_upgrade(
     pubkey: &VerifyingKey,
     chain_payload: &[u8],
@@ -445,14 +466,6 @@ async fn run_revoke_upgrade(
         );
     }
 
-    if rollback {
-        let (ok, msg) = run_enclavia_crypto_revoke_upgrade(bin).await;
-        if !ok {
-            return (false, format!("storage rollback failed: {msg}"));
-        }
-        info!("storage rollback succeeded");
-    }
-
     let attestation = match build_chain_attestation(chain_payload) {
         Ok(a) => a,
         Err(e) => return (false, format!("chain attestation failed: {e}")),
@@ -466,6 +479,27 @@ async fn run_revoke_upgrade(
         attestation,
         signature: Some(payload_signature.to_vec()),
     };
+
+    if let Some(trust) = synchronizer_trust() {
+        let mut control_pubkey = [0u8; 65];
+        control_pubkey.copy_from_slice(pubkey.to_encoded_point(false).as_bytes());
+        if let Err(e) = sync_revoke::commit_revocation(trust, control_pubkey, &link).await {
+            return (
+                false,
+                format!("synchronizer did not commit the revocation, upgrade NOT revoked: {e}"),
+            );
+        }
+    } else {
+        info!("storage is not pinned to a synchronizer; no revocation to commit there");
+    }
+
+    if rollback {
+        let (ok, msg) = run_enclavia_crypto_revoke_upgrade(bin).await;
+        if !ok {
+            return (false, format!("storage rollback failed: {msg}"));
+        }
+        info!("storage rollback succeeded");
+    }
 
     if let Err(e) = submit_chain_link_to_host(&link).await {
         return (false, format!("chain-host submission failed: {e}"));
@@ -1220,6 +1254,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let control_pubkey = server_config.control_public_key.map(Arc::new);
     let min_upgrade_delay_secs = server_config.min_upgrade_delay_secs;
+    let synchronizer_enabled = server_config.synchronizer.is_some();
+    let _ = SYNCHRONIZER.set(server_config.synchronizer);
     let nonce: ControlNonce = Arc::new(Mutex::new(fresh_nonce()));
     // The re-key binary path is a fixed, compiled-in constant: it receives
     // the freshly injected KMS creds and drives the LUKS re-key, so it must
@@ -1232,6 +1268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_clients,
         control_enabled = control_pubkey.is_some(),
         min_upgrade_delay_secs,
+        synchronizer_enabled,
         crypto_bin = %crypto_bin,
         "Starting enclavia server",
     );
@@ -1402,6 +1439,7 @@ mod tests {
             revokes: uuid::Uuid::new_v4(),
             issued_at: chrono::Utc::now(),
             nonce: vec![nonce_seed; 32],
+            revokes_link: [nonce_seed; 32],
         };
         let mut out = Vec::new();
         ciborium::into_writer(&payload, &mut out).unwrap();

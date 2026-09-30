@@ -1512,6 +1512,10 @@ fn print_chain_link(link: &upgrade::VerifiedLink) {
         }
         Some(upgrade::DecodedPayload::Revocation(p)) => {
             println!("      revokes:     {}", p.revokes);
+            println!(
+                "      link hash:   {}",
+                p.revokes_link.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
             println!("      issued_at:   {}", p.issued_at.format("%Y-%m-%d %H:%M:%S UTC"));
         }
         None => {

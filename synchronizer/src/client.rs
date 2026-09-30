@@ -72,7 +72,10 @@
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::wire::{ChainLink, Frame, MAX_FRAME_SIZE, PeerProtocol, Request, Response, RpcError};
+use crate::wire::{
+    CAPABILITY_REVOCATION, ChainLink, Frame, MAX_FRAME_SIZE, PeerProtocol, Request, Response,
+    RpcError,
+};
 use crate::{Commitment, PcrKey, Version};
 
 // Re-exported so callers (nbd-client) construct the policy and match its
@@ -135,6 +138,10 @@ pub enum ClientError {
     /// far end does not speak the mutual-authentication protocol.
     #[error("server's first frame was not its Authenticate")]
     ServerAuthMissing,
+    /// The server did not advertise a capability this operation requires
+    /// (see [`crate::wire::SUPPORTED_CAPABILITIES`]). Nothing was sent.
+    #[error("the synchronizer does not support `{0}`")]
+    MissingCapability(&'static str),
 }
 
 /// A completed Noise handshake, waiting for the caller to produce the
@@ -323,6 +330,30 @@ where
             Response::TransitionOk { version } => Ok(version),
             Response::Err { error } => Err(ClientError::Rpc(error)),
             _ => Err(ClientError::UnexpectedResponse("expected TransitionOk")),
+        }
+    }
+
+    /// Commit a #47 revocation [`ChainLink`] for this session's own key:
+    /// afterwards the server refuses every `Transition` out of the key whose
+    /// upgrade link was issued at or before the revocation's `issued_at`.
+    /// Submitted by the enclave that holds the pin (the OLD image, during the
+    /// upgrade delay); the server verifies the link's control signature
+    /// against the pubkey it froze for the key.
+    ///
+    /// Fails with [`ClientError::MissingCapability`] WITHOUT sending anything
+    /// when the server did not advertise [`CAPABILITY_REVOCATION`]: such a
+    /// server would not enforce the revocation, and the caller must not
+    /// report it as done. [`RpcError::RevocationRejected`] means it did not
+    /// take effect; [`RpcError::Unavailable`] means the outcome is unknown,
+    /// and since a revocation is idempotent the caller retries.
+    pub async fn revoke(&mut self, link: ChainLink) -> Result<(), ClientError> {
+        if !self.server_protocol.supports(CAPABILITY_REVOCATION) {
+            return Err(ClientError::MissingCapability(CAPABILITY_REVOCATION));
+        }
+        match self.rpc(Request::Revoke { link }).await? {
+            Response::RevokeOk => Ok(()),
+            Response::Err { error } => Err(ClientError::Rpc(error)),
+            _ => Err(ClientError::UnexpectedResponse("expected RevokeOk")),
         }
     }
 

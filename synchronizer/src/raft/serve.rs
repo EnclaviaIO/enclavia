@@ -61,7 +61,10 @@
 
 use crate::metrics::Answered;
 use crate::raft::{RaftHandle, RaftHandleError, ReplicatedOp};
-use crate::wire::{Request, Response, RpcError, decode_transition_link, verify_transition_link};
+use crate::wire::{
+    Request, Response, RpcError, decode_transition_link, verify_revocation_link,
+    verify_transition_link,
+};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
 
 /// Run one client [`Request`] from a session authenticated as `session_key`
@@ -108,6 +111,53 @@ pub async fn handle_on_leader(
         Request::Transition { link } => {
             handle_transition(raft, session_key, control_pubkey, link, debug_mode).await
         }
+        Request::Revoke { link } => handle_revoke(raft, session_key, link).await,
+    }
+}
+
+/// Verify a `Revoke`'s revocation chain link and submit a
+/// [`ReplicatedOp::Revoke`] for the session's own key.
+///
+/// The session must hold the pin: its key must be registered in the replicated
+/// state, and the link must carry the control signature of that key's FROZEN
+/// pubkey ([`verify_revocation_link`]). The lookup reads the leader-local state
+/// for the pubkey only; the committed `apply` checks again that the key is
+/// still current. Anything but `RevokeOk` means the revocation did not take
+/// effect, except a timed-out `Unavailable`, whose outcome is unknown (a
+/// revocation is idempotent, so the client simply retries).
+async fn handle_revoke(
+    raft: &RaftHandle,
+    session_key: PcrKey,
+    link: crate::wire::ChainLink,
+) -> Answered {
+    let control_pubkey = match raft.state_machine().get(&session_key).await {
+        Some(state) => state.control_pubkey,
+        None => return err(RpcError::RevocationRejected),
+    };
+    let verified = match verify_revocation_link(&link, &control_pubkey) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "revocation link rejected");
+            return err(RpcError::RevocationRejected);
+        }
+    };
+    match raft
+        .client_write(ReplicatedOp::Revoke {
+            key: session_key,
+            link_hash: verified.link_hash,
+        })
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                link_hash = %hex_of(&verified.link_hash),
+                "upgrade link out of the session key revoked"
+            );
+            Answered::new(Response::RevokeOk)
+        }
+        Err(RaftHandleError::Rejected(_)) => err(RpcError::RevocationRejected),
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("revoke"),
+        Err(_) => err(RpcError::Unavailable),
     }
 }
 
@@ -348,6 +398,7 @@ async fn handle_transition(
             old_key: verified.old_key,
             new_key: verified.new_key,
             new_control_pubkey: control_pubkey,
+            link_hash: verified.link_hash,
         })
         .await
     {
@@ -380,4 +431,9 @@ fn timed_out(op: &'static str) -> Answered {
         "no quorum within the commit timeout; answering Unavailable (a write may still commit)"
     );
     Answered::deadline_elapsed()
+}
+
+/// Lowercase hex, for logging a link hash.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

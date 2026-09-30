@@ -306,8 +306,7 @@ where
             protocol_version,
             capabilities,
         }) => {
-            // What the client advertised. Nothing optional exists yet, so
-            // the negotiated set only gates future features; see the wire
+            // What the client advertised, logged for diagnosis; see the wire
             // module's "Versioning and capabilities".
             let client_protocol = PeerProtocol::from_advertised(protocol_version, &capabilities);
             tracing::debug!(
