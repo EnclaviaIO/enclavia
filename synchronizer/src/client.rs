@@ -119,7 +119,7 @@ pub enum ClientError {
     /// handshake hash (a replayed capture). Whoever is on the other end,
     /// it has not proven it is an enclave on THIS channel; fail-stop.
     #[error("server attestation invalid: {0}")]
-    ServerAttestation(String),
+    ServerAttestation(enclavia_protocol::attestation::AttestationError),
     /// The server's attestation verified but its PCRs are not admitted
     /// by the caller's [`ServerPcrPolicy`]: the other end is a real,
     /// channel-bound enclave, but NOT the synchronizer the caller
@@ -212,7 +212,7 @@ where
         };
         verify_server_attestation(&server_doc, &self.handshake_hash, server_policy, debug_mode)
             .map_err(|e| match e {
-                ServerAuthError::Attestation(msg) => ClientError::ServerAttestation(msg),
+                ServerAuthError::Attestation(e) => ClientError::ServerAttestation(e),
                 ServerAuthError::PcrRejected => ClientError::ServerPcrRejected,
             })?;
 
