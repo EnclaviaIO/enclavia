@@ -1786,50 +1786,59 @@ async fn timed_out_write_that_commits_does_not_break_the_next_cas() {
     assert_eq!(v0, Version(0));
     assert_eq!(leader.raft.commit_timeout(), COMMIT_TIMEOUT);
 
-    // The write is submitted, the wait gives up at once, and the answer is
-    // the timed-out Unavailable.
+    // The write is submitted and the wait gives up almost at once, so the
+    // answer is the timed-out Unavailable. A commit that completes within the
+    // first poll still ACKs; then pin again from the new version until one
+    // attempt does time out.
     let impatient = leader
         .raft
         .clone()
         .with_commit_timeout(Duration::from_micros(1));
-    let answered = synchronizer::raft::serve::handle_on_leader(
-        &impatient,
-        key,
-        pk,
-        Request::Pin {
+    let mut expected = Version(0);
+    let mut commitment = 0x02u8;
+    loop {
+        let answered = synchronizer::raft::serve::handle_on_leader(
+            &impatient,
             key,
-            expected_version: Version(0),
-            commitment: c(0x02),
-        },
-        true,
-    )
-    .await;
-    assert!(answered.timed_out, "expected a timed-out answer: {answered:?}");
-    assert_eq!(
-        answered.response,
-        Response::Err {
-            error: RpcError::Unavailable
+            pk,
+            Request::Pin {
+                key,
+                expected_version: expected,
+                commitment: c(commitment),
+            },
+            true,
+        )
+        .await;
+        match answered.response {
+            Response::PinOk { version } if !answered.timed_out => {
+                assert_eq!(version.0, expected.0 + 1);
+                expected = version;
+                commitment += 1;
+                assert!(commitment < 0x40, "no attempt ever timed out");
+            }
+            Response::Err {
+                error: RpcError::Unavailable,
+            } if answered.timed_out => break,
+            other => panic!("unexpected answer: {other:?} (timed_out {})", answered.timed_out),
         }
-    );
+    }
+    let landed = Version(expected.0 + 1);
 
     // It commits anyway, on every node.
-    assert_all_nodes_have(&nodes, key, Version(1)).await;
+    assert_all_nodes_have(&nodes, key, landed).await;
 
     // The customer retries the same pin (same CAS version): VersionConflict,
-    // then a Get that shows its own commitment, so the pin counts as landed
-    // at version 1.
+    // then a Get that shows its own commitment, so the pin counts as landed.
     let mut client = Client::connect(leader, seed, pk).await;
     assert_eq!(
-        client.pin_cas(key, Version(0), c(0x02)).await,
-        Ok(Version(1))
+        client.pin_cas(key, expected, c(commitment)).await,
+        Ok(landed)
     );
     // The next CAS, from the committed version, succeeds.
-    assert_eq!(
-        client.pin_cas(key, Version(1), c(0x03)).await,
-        Ok(Version(2))
-    );
-    assert_all_nodes_have(&nodes, key, Version(2)).await;
-    assert_eq!(assert_all_nodes_agree(&nodes, key).await, Version(2));
+    let next = Version(landed.0 + 1);
+    assert_eq!(client.pin_cas(key, landed, c(0x7f)).await, Ok(next));
+    assert_all_nodes_have(&nodes, key, next).await;
+    assert_eq!(assert_all_nodes_agree(&nodes, key).await, next);
 
     for n in &nodes {
         n.raft.shutdown().await;
