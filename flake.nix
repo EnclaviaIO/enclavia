@@ -83,9 +83,10 @@
         # in-enclave crates are pure Rust (TLS is rustls/ring, no
         # openssl/pcsclite -- those belong to the native CLI), so the
         # musl build only needs a musl C compiler for ring's C sources.
-        # Derived from the host platform: the in-enclave binaries build on
-        # x86_64 (customer enclaves) AND aarch64 (the Graviton
-        # synchronizer EIF), each targeting its own musl triple.
+        # Derived from the host platform, so these builds target the
+        # host's own musl triple. The Graviton (aarch64) synchronizer EIF
+        # does not use them: its binaries are cross-built from x86_64-linux
+        # further below.
         muslTarget = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-musl";
         muslTargetEnv = builtins.replaceStrings [ "-" ] [ "_" ] muslTarget;
         muslCc = pkgs.pkgsStatic.stdenv.cc;
@@ -270,6 +271,9 @@
         # share one PCR set — but a DIFFERENT one from the qemu build (the
         # measured payload differs), which is why customer configs'
         # `synchronizer.expected_pcrs` must pin THIS build's measurements.
+        # The production EIF carries the aarch64 cross build of it
+        # (`synchronizerNitroAarch64` below); this host-arch build stays
+        # available as the `synchronizer-nitro` package.
         synchronizerNitro = craneLibMusl.buildPackage (
           individualMuslSyncNitroCrateArgs
           // {
@@ -297,6 +301,75 @@
         # nitro-timesync flake): keeps CLOCK_REALTIME on the Nitro hypervisor
         # time read from /dev/nsm attestation documents.
         nitroTimesync = nitro-timesync.packages.${system}.nitro-timesync-static;
+
+        # --- aarch64 (Graviton) cross builds ------------------------------
+        #
+        # The production synchronizer runs on Graviton, so every binary in
+        # `synchronizer-eif-nitro` is a static aarch64-unknown-linux-musl
+        # binary cross-built on x86_64-linux. The cross build is the
+        # canonical one: it is what third parties run to reproduce the
+        # production PCRs, on ordinary x86_64 machines. Only used by the
+        # x86_64-linux outputs (see the EIF section below).
+        aarch64Cross = pkgs.pkgsCross.aarch64-multiplatform;
+        muslTargetAarch64 = "aarch64-unknown-linux-musl";
+        muslCcAarch64 = aarch64Cross.pkgsStatic.stdenv.cc;
+        craneLibMuslAarch64 = (crane.mkLib pkgs).overrideToolchain (p:
+          p.rust-bin.stable."1.88.0".default.override {
+            targets = [ muslTargetAarch64 ];
+          });
+
+        # Cross C compiler and archiver for ring's C sources, and the
+        # linker for the final binaries.
+        muslCrossArgsAarch64 = {
+          strictDeps = true;
+          doCheck = false;
+          CARGO_BUILD_TARGET = muslTargetAarch64;
+          CC_aarch64_unknown_linux_musl = "${muslCcAarch64}/bin/${muslCcAarch64.targetPrefix}cc";
+          AR_aarch64_unknown_linux_musl = "${muslCcAarch64.bintools.bintools}/bin/${muslCcAarch64.targetPrefix}ar";
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "${muslCcAarch64}/bin/${muslCcAarch64.targetPrefix}cc";
+        };
+
+        muslCommonArgsAarch64 = muslCrossArgsAarch64 // {
+          src = rustSrc;
+          inherit (craneLibMuslAarch64.crateNameFromCargoToml { src = rustSrc; }) version;
+        };
+
+        # Production synchronizer node (`--features enclave,raft`, see
+        # `synchronizerNitro` above), for aarch64. Own deps-only build for
+        # the same reason as the x86_64 one: no qemu-feature fingerprint in
+        # the production build graph.
+        synchronizerNitroAarch64 = craneLibMuslAarch64.buildPackage (muslCommonArgsAarch64 // {
+          pname = "enclavia-synchronizer-nitro-aarch64";
+          cargoArtifacts = craneLibMuslAarch64.buildDepsOnly (muslCommonArgsAarch64 // {
+            pname = "enclavia-synchronizer-nitro-musl-aarch64";
+            cargoExtraArgs = "-p synchronizer --features synchronizer/enclave,synchronizer/raft";
+          });
+          cargoExtraArgs = "-p synchronizer --features enclave,raft";
+        });
+
+        synchronizerNamesInitAarch64 = craneLibMuslAarch64.buildPackage (muslCommonArgsAarch64 // {
+          pname = "synchronizer-names-init-aarch64";
+          cargoArtifacts = craneLibMuslAarch64.buildDepsOnly (muslCommonArgsAarch64 // {
+            pname = "synchronizer-names-init-musl-aarch64";
+            cargoExtraArgs = "-p synchronizer-names-init";
+          });
+          cargoExtraArgs = "-p synchronizer-names-init";
+        });
+
+        # nitro-timesync's flake only builds for its own host, so the
+        # aarch64 binary is cross-built here from the same pinned source,
+        # the same way (static musl, same Rust version, no C dependencies).
+        # Unlike the x86_64 binary it is not byte-identical to one the
+        # builder ships.
+        nitroTimesyncSrcAarch64 = craneLibMuslAarch64.cleanCargoSource nitro-timesync;
+        nitroTimesyncArgsAarch64 = muslCrossArgsAarch64 // {
+          src = nitroTimesyncSrcAarch64;
+          pname = "nitro-timesync-aarch64";
+          inherit (craneLibMuslAarch64.crateNameFromCargoToml { src = nitroTimesyncSrcAarch64; }) version;
+        };
+        nitroTimesyncAarch64 = craneLibMuslAarch64.buildPackage (nitroTimesyncArgsAarch64 // {
+          cargoArtifacts = craneLibMuslAarch64.buildDepsOnly nitroTimesyncArgsAarch64;
+        });
 
         # --- enclavia-wasm: the client SDK compiled to wasm --------------
         #
@@ -380,44 +453,53 @@
           ldflags = [ "-s" "-w" ];
         };
 
-        # x86_64 image base: the builder's minimal non-storage kernel.
-        synchronizerEifX86 = {
+        # Two REAL, distinct EIFs, one per synchronizer binary variant
+        # above, with separate PCRs. They are not interchangeable, and the
+        # difference is the whole security boundary:
+        #
+        # * `synchronizer-eif` (qemu binary, x86_64): DEV/TEST ONLY, for the
+        #   local QEMU cluster (QEMU's nitro-enclave machine is x86_64-only).
+        #   Attestation verification skips the AWS Nitro CA chain / COSE
+        #   signature so it can run under QEMU's self-signing NSM. On real
+        #   Nitro it would accept forged attestation documents, letting a
+        #   malicious host join the Raft mesh and fabricate committed
+        #   anti-rollback state.
+        # * `synchronizer-eif-nitro` (enclave binary, aarch64): PRODUCTION,
+        #   for Graviton Nitro Enclaves. Full AWS Nitro CA chain
+        #   verification; this is the only EIF a real deployment may run.
+        #
+        # The two images measure DIFFERENTLY (different binaries and
+        # architectures -> different PCR0/1/2), so customer configs'
+        # `synchronizer.expected_pcrs` must pin the NITRO build's
+        # measurements; pinning the dev build's PCRs would re-open the
+        # forged-attestation hole above.
+        synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix {
           inherit pkgs nitroLib;
           arch = "x86_64";
+          # The builder's minimal non-storage kernel.
           kernel = "${builderPkgs.enclave-kernel}/bzImage";
           kernelConfig = "${builderPkgs.enclave-kernel-config}/config";
           init = "${synchronizerEifInitX86}/bin/init";
+          synchronizerPkg = synchronizer;
           namesInitPkg = synchronizerNamesInit;
           timesyncPkg = nitroTimesync;
           busyboxPkg = pkgs.pkgsStatic.busybox;
         };
 
-        # Two REAL, distinct EIFs, one per synchronizer binary variant
-        # above. The patched init heartbeats both CIDs (3 + 2), so each EIF
-        # BOOTS on either transport — but they are not interchangeable, and
-        # the difference is the whole security boundary:
-        #
-        # * `synchronizer-eif` (qemu binary): DEV/TEST ONLY. Attestation
-        #   verification skips the AWS Nitro CA chain / COSE signature so it
-        #   can run under QEMU's self-signing NSM. On real Nitro it would
-        #   accept forged attestation documents, letting a malicious host
-        #   join the Raft mesh and fabricate committed anti-rollback state.
-        # * `synchronizer-eif-nitro` (enclave binary): PRODUCTION. Full AWS
-        #   Nitro CA chain verification; this is the only EIF a real
-        #   deployment may run.
-        #
-        # The two images measure DIFFERENTLY (different binaries -> different
-        # PCR0/1/2), so customer configs' `synchronizer.expected_pcrs` must
-        # pin the NITRO build's measurements; pinning the dev build's PCRs
-        # would re-open the forged-attestation hole above.
-        synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix (synchronizerEifX86 // {
-          synchronizerPkg = synchronizer;
-        });
-
-        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix (synchronizerEifX86 // {
+        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix {
+          inherit pkgs nitroLib;
           eifName = "synchronizer-enclave-nitro";
-          synchronizerPkg = synchronizerNitro;
-        });
+          arch = "aarch64";
+          # The builder's minimal aarch64 kernel (base profile) and its
+          # static aarch64 init, both cross-built on x86_64-linux.
+          kernel = "${builderPkgs.enclave-kernel-aarch64}/Image";
+          kernelConfig = "${builderPkgs.enclave-kernel-config-aarch64}/config";
+          init = "${builderPkgs.eif-init-aarch64}/bin/init";
+          synchronizerPkg = synchronizerNitroAarch64;
+          namesInitPkg = synchronizerNamesInitAarch64;
+          timesyncPkg = nitroTimesyncAarch64;
+          busyboxPkg = aarch64Cross.pkgsStatic.busybox;
+        };
 
       in
       {
@@ -492,8 +574,14 @@
           synchronizer-names-init = synchronizerNamesInit;
         } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # Built from the builder's x86_64-linux outputs (see above).
+          # `synchronizer-eif` is x86_64 (QEMU dev cluster);
+          # `synchronizer-eif-nitro` is aarch64 (Graviton production),
+          # cross-built here, as are the aarch64 binaries it carries.
           synchronizer-eif = synchronizerEif;
           synchronizer-eif-nitro = synchronizerEifNitro;
+          synchronizer-nitro-aarch64 = synchronizerNitroAarch64;
+          synchronizer-names-init-aarch64 = synchronizerNamesInitAarch64;
+          nitro-timesync-aarch64 = nitroTimesyncAarch64;
         };
 
         # `nix run` shorthand and `nix profile install` default.

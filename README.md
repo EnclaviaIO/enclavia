@@ -78,6 +78,24 @@ nix build .#enclavia-wasm
 
 The in-enclave binaries only really run inside an enclave or QEMU. To exercise them end-to-end you also need the builder (which constructs the EIF). See https://github.com/EnclaviaIO/builder.
 
+### Synchronizer EIFs
+
+The synchronizer is the one enclave whose image is built in this repo. There are two images. They are separate builds with separate PCRs:
+
+| Output | Architecture | Runs on | Synchronizer build |
+|---|---|---|---|
+| `synchronizer-eif-nitro` | aarch64 | Graviton Nitro Enclaves (production) | `enclave`: full AWS Nitro CA chain checks |
+| `synchronizer-eif` | x86_64 | the local QEMU cluster (dev and CI only) | `qemu`: skips the CA chain; never for production |
+
+Both are defined only for `x86_64-linux`. The production image is cross-built on x86_64, kernel and init included, so anyone can reproduce its PCRs on an ordinary x86_64 machine:
+
+```sh
+nix build .#synchronizer-eif-nitro
+cat result/pcr.json
+```
+
+Both images use the builder's minimal kernel (non-storage profile, no modules, NSM driver built in) and the builder's patched init, taken from the pinned `builder` flake input. Everything else in the image is static: the synchronizer, `synchronizer-names-init`, `nitro-timesync` and busybox. The init script runs under busybox `sh`. The build fails if any binary in the image is not a static ELF for the image's architecture. See `nix/synchronizer-eif.nix`.
+
 ## Reproducibility
 
 The whole point of this repo being open source is that anything PCR-measured inside the EIF must be buildable from sources you can audit. Every crate here is part of that perimeter (or is consumed by code that is, via `enclavia-protocol`).
