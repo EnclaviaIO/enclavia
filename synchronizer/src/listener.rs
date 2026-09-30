@@ -79,7 +79,7 @@
 use enclavia_protocol::{NoiseTransport, attestation, perform_handshake_as_responder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::wire::{Request, Response, RpcError};
+use crate::wire::{PeerProtocol, Request, Response, RpcError};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 
 // Frame + MAX_FRAME_SIZE moved to `crate::wire` so the customer client
@@ -298,7 +298,20 @@ where
     //    credential IS the #47 upgrade link, so one P-256 key serves
     //    throughout.
     let (session_key, control_pubkey) = match read_frame(&mut stream, &mut transport).await? {
-        Some(Frame::Authenticate { nsm_doc }) => {
+        Some(Frame::Authenticate {
+            nsm_doc,
+            protocol_version,
+            capabilities,
+        }) => {
+            // What the client advertised. Nothing optional exists yet, so
+            // the negotiated set only gates future features; see the wire
+            // module's "Versioning and capabilities".
+            let client_protocol = PeerProtocol::from_advertised(protocol_version, &capabilities);
+            tracing::debug!(
+                client_version = client_protocol.version,
+                capabilities = ?client_protocol.capabilities,
+                "customer session protocol"
+            );
             let identity = attestation::verify_and_extract(
                 &nsm_doc,
                 &handshake_hash,
@@ -334,12 +347,7 @@ where
         .attest(&handshake_hash)
         .await
         .map_err(ConnError::LocalAttestation)?;
-    write_cbor_frame(
-        &mut stream,
-        &mut transport,
-        &Frame::Authenticate { nsm_doc: own_doc },
-    )
-    .await?;
+    write_cbor_frame(&mut stream, &mut transport, &Frame::authenticate(own_doc)).await?;
 
     // 2. Subsequent frames: RPC dispatch. The dispatcher owns observing the
     //    attestation (single-node) / carrying the verified facts to the leader
@@ -513,12 +521,7 @@ mod tests {
     ) -> (Frame, PcrKey) {
         let fake = FakeAttestation::with_seed_and_pubkey(seed, handshake_hash.to_vec(), pubkey);
         let key = key_from_seed(seed);
-        (
-            Frame::Authenticate {
-                nsm_doc: fake.encode(),
-            },
-            key,
-        )
+        (Frame::authenticate(fake.encode()), key)
     }
 
     /// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by the
@@ -624,7 +627,14 @@ mod tests {
         let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
         let frame: Frame = ciborium::from_reader(&plaintext[..pt_len]).unwrap();
         match frame {
-            Frame::Authenticate { nsm_doc } => {
+            Frame::Authenticate {
+                nsm_doc,
+                protocol_version,
+                capabilities,
+            } => {
+                // The server always advertises its version and capabilities.
+                assert_eq!(protocol_version, crate::wire::PROTOCOL_VERSION);
+                assert_eq!(capabilities, crate::wire::supported_capabilities());
                 let expected = Pcrs {
                     pcr0: vec![SERVER_SEED; 48],
                     pcr1: vec![SERVER_SEED.wrapping_add(1); 48],
@@ -807,9 +817,7 @@ mod tests {
         write_frame(
             &mut client,
             &mut ct,
-            &Frame::Authenticate {
-                nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
-            },
+            &Frame::authenticate(vec![0xde, 0xad, 0xbe, 0xef]),
         )
         .await;
         drop(client);
@@ -907,9 +915,7 @@ mod tests {
         write_frame(
             &mut client,
             &mut ct,
-            &Frame::Authenticate {
-                nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
-            },
+            &Frame::authenticate(vec![0xde, 0xad, 0xbe, 0xef]),
         )
         .await;
 
