@@ -25,9 +25,17 @@
       url = "github:EnclaviaIO/builder";
       flake = false;
     };
+
+    # In-enclave clock-sync daemon (keeps CLOCK_REALTIME on the NSM
+    # attestation timestamp), baked into the synchronizer EIFs. Pinned by
+    # rev. Its inputs are deliberately NOT made to follow ours: the binary
+    # is then byte-identical to the one the builder puts in customer EIFs,
+    # and its own lock already pins the same toolchain revisions as this
+    # flake.
+    nitro-timesync.url = "github:EnclaviaIO/nitro-timesync/2486fce026c593bb0512351aa06a0027cf1cbd64";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src, nitro-timesync }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -284,6 +292,11 @@
           }
         );
 
+        # In-enclave clock-sync daemon (static musl build from the standalone
+        # nitro-timesync flake): keeps CLOCK_REALTIME on the Nitro hypervisor
+        # time read from /dev/nsm attestation documents.
+        nitroTimesync = nitro-timesync.packages.${system}.nitro-timesync-static;
+
         # --- enclavia-wasm: the client SDK compiled to wasm --------------
         #
         # ring's C sources must be compiled by a wasm-capable clang; without
@@ -372,6 +385,7 @@
           inherit pkgs nitroLib;
           synchronizerPkg = synchronizer;
           namesInitPkg = synchronizerNamesInit;
+          timesyncPkg = nitroTimesync;
           builderSrc = builder-src;
         };
 
@@ -380,6 +394,7 @@
           eifName = "synchronizer-enclave-nitro";
           synchronizerPkg = synchronizerNitro;
           namesInitPkg = synchronizerNamesInit;
+          timesyncPkg = nitroTimesync;
           builderSrc = builder-src;
         };
 
