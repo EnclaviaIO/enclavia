@@ -7,6 +7,9 @@
 # has no OCI bundle, no crun, no enclavia-server: the synchronizer IS the
 # whole in-enclave payload.
 #
+# Interpreter: the image's busybox sh (/bin/sh). The image carries no
+# bash, so this script must stay POSIX sh.
+#
 # Boot steps:
 #   1. Bring up loopback (harmless; the synchronizer only uses vsock, but
 #      keeps parity with the other enclaves and costs nothing).
