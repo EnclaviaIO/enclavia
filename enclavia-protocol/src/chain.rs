@@ -15,10 +15,12 @@
 //!   `sha256(payload)` (checked by [`super::attestation::verify_chain_attestation`]).
 //! * [`ChainLinkKind::Upgrade`] — emitted by the OLD enclave after the
 //!   backend signs and ships a `PrepareUpgrade` control command.
-//!   Payload binds `from_pcrs / to_pcrs / image_digest / valid_from /
-//!   issued_at / nonce`. The link's `signature` is the backend's
-//!   ECDSA P-256 sig over the payload, verifiable against the enclave's
-//!   baked-in control pubkey.
+//!   Payload binds `from / to / image_digest / valid_from / issued_at /
+//!   nonce`, where `from` and `to` are full pin identities (PCR0-2 and
+//!   user PCRs 16-31, see [`crate::pin_identity`]); the link's
+//!   attestation must carry exactly `from`. The link's `signature` is the
+//!   backend's ECDSA P-256 sig over the payload, verifiable against the
+//!   enclave's baked-in control pubkey.
 //! * [`ChainLinkKind::Revocation`] — emitted by the OLD enclave on a
 //!   pre-activation revoke. Payload binds the chain entry id being
 //!   cancelled + `issued_at / nonce`. Same signature treatment as
@@ -58,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
+use crate::pin_identity::PinIdentity;
 
 /// Kind of a chain entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,8 +187,13 @@ pub struct BootPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradePayload {
     pub enclave_id: Uuid,
-    pub from_pcrs: PcrsHex,
-    pub to_pcrs: PcrsHex,
+    /// Full pin identity (PCR0-2 and user PCRs 16-31, see
+    /// [`crate::pin_identity`]) of the enclave that emits the link. The
+    /// link's attestation must carry exactly this identity.
+    pub from: PinIdentity,
+    /// Full pin identity the upgraded enclave will attest as. The
+    /// synchronizer moves the pin held under `from`'s key to this key.
+    pub to: PinIdentity,
     pub image_digest: String,
     pub valid_from: DateTime<Utc>,
     pub issued_at: DateTime<Utc>,
@@ -448,6 +456,10 @@ pub enum ChainValidationError {
     /// recorded post-build.
     #[error("boot payload PCRs do not match the enclave's recorded PCRs")]
     PcrMismatch,
+    /// Upgrade link whose `from` identity is not the identity its own
+    /// attestation carries (PCR0-2 or any user PCR 16-31 differ).
+    #[error("upgrade payload `from` identity does not match the link's attestation")]
+    UpgradeFromMismatch,
     /// Boot link's `image_digest` disagrees with `enclaves.image_digest`.
     #[error("boot payload image_digest does not match the enclave's pinned digest")]
     ImageDigestMismatch,
@@ -544,7 +556,7 @@ pub fn validate_chain_link(
         return Err(ChainValidationError::EmptyAttestation);
     }
     let recorded_pcrs = ctx.enclave_pcrs.to_pcrs()?;
-    verify_chain_attestation(
+    let attested = verify_chain_attestation(
         &link.attestation,
         &link.payload,
         &recorded_pcrs,
@@ -553,7 +565,9 @@ pub fn validate_chain_link(
 
     match link.kind {
         ChainLinkKind::Boot => validate_boot(link, ctx),
-        ChainLinkKind::Upgrade | ChainLinkKind::Revocation => validate_signed(link, ctx, now),
+        ChainLinkKind::Upgrade | ChainLinkKind::Revocation => {
+            validate_signed(link, ctx, &attested, now)
+        }
     }
 }
 
@@ -620,6 +634,7 @@ fn validate_boot(
 fn validate_signed(
     link: &ChainLink,
     ctx: &ChainContext<'_>,
+    attested: &PinIdentity,
     now: DateTime<Utc>,
 ) -> Result<Outcome, ChainValidationError> {
     if !ctx.upgradable {
@@ -654,6 +669,12 @@ fn validate_signed(
                 })?;
             if parsed.enclave_id != *ctx.enclave_id {
                 return Err(ChainValidationError::EnclaveIdMismatch);
+            }
+            // The link names the identity whose pin it moves (`from`), so
+            // the enclave that emitted it must have attested exactly that
+            // identity, user PCRs included.
+            if parsed.from != *attested {
+                return Err(ChainValidationError::UpgradeFromMismatch);
             }
             // Replayed-upgrade guard: a byte-identical payload already
             // on the chain is a captured re-submission (e.g. of a
@@ -812,7 +833,7 @@ pub struct ChainWalk {
 ///   that payload in hardware.
 /// - Upgrade / revocation links validate against the in-force state:
 ///   they are attested by the enclave version running at the time.
-/// - A boot whose PCRs match the `to_pcrs` of a prior unrevoked
+/// - A boot whose PCRs match the PCR0-2 of the `to` identity of a prior unrevoked
 ///   upgrade link (with the same target image digest) is a promotion:
 ///   it validates against that upgrade's target state, and on success
 ///   the in-force state advances to it.
@@ -929,7 +950,7 @@ pub fn validate_chain(
                                 prior.push(link.clone());
                                 continue;
                             }
-                            (target.to_pcrs, target.image_digest, true)
+                            (target.to.image_pcrs_hex(), target.image_digest, true)
                         } else {
                             // No signed upgrade explains these PCRs;
                             // validate against the in-force state and
@@ -978,7 +999,7 @@ pub fn validate_chain(
     }
 }
 
-/// Most recent prior unrevoked upgrade link whose `to_pcrs` and target
+/// Most recent prior unrevoked upgrade link whose `to` PCR0-2 and target
 /// image digest match the boot being explained. `None` when no signed
 /// upgrade accounts for a boot with these measurements.
 ///
@@ -1018,7 +1039,7 @@ fn promotion_target(
         let Ok(p) = ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()) else {
             continue;
         };
-        if p.to_pcrs == *boot_pcrs && p.image_digest == boot_image_digest {
+        if p.to.image_pcrs_hex() == *boot_pcrs && p.image_digest == boot_image_digest {
             return Some(p);
         }
     }
@@ -1183,7 +1204,7 @@ pub fn verify_pcr_descent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attestation::test_utils::FakeChainAttestation;
+    use crate::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
     use chrono::Duration;
     use p256::ecdsa::{SigningKey, signature::Signer};
 
@@ -1245,11 +1266,10 @@ mod tests {
         signing: &SigningKey,
         valid_from: DateTime<Utc>,
     ) -> ChainLink {
-        let pcrs = pcrs_hex_from_seed(pcr_seed);
         let payload = UpgradePayload {
             enclave_id,
-            from_pcrs: pcrs.clone(),
-            to_pcrs: pcrs,
+            from: identity_from_seed(pcr_seed),
+            to: identity_from_seed(pcr_seed),
             image_digest: image_digest.into(),
             valid_from,
             issued_at: chrono::Utc::now(),
@@ -1745,6 +1765,118 @@ mod tests {
         assert!(matches!(err, ChainValidationError::EnclaveIdMismatch));
     }
 
+    /// An upgrade link built with a user-PCR-bearing identity, attested by
+    /// a document whose PCR16 is `doc_pcr16` (absent when `None`).
+    fn upgrade_link_with_user_pcr(
+        enclave_id: Uuid,
+        seed: u8,
+        from_pcr16: Option<u8>,
+        doc_pcr16: Option<u8>,
+        signing: &SigningKey,
+    ) -> ChainLink {
+        let mut user = crate::pin_identity::ZERO_USER_PCRS;
+        if let Some(b) = from_pcr16 {
+            user[0] = [b; 48];
+        }
+        let from = identity_from_seed(seed).with_user_pcrs(user);
+        let payload = UpgradePayload {
+            enclave_id,
+            to: from.clone(),
+            from,
+            image_digest: "sha256:v2".into(),
+            valid_from: chrono::Utc::now() + Duration::days(7),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x46; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let mut fake = FakeChainAttestation::for_payload(seed, &payload_bytes);
+        if let Some(b) = doc_pcr16 {
+            fake = fake.with_user_pcr(16, vec![b; 48]);
+        }
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation: fake.encode(),
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    /// The upgrade link's `from` must be exactly the identity its own
+    /// attestation carries, user PCRs included; the image PCRs matching
+    /// is not enough.
+    #[test]
+    fn upgrade_from_identity_must_match_attested_user_pcrs() {
+        let pcrs = pcrs_hex_from_seed(0x2c);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x2c);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let prior = std::slice::from_ref(&genesis);
+        let check = |link: &ChainLink| {
+            validate_chain_link(
+                link,
+                &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, prior),
+                chrono::Utc::now(),
+                true,
+            )
+        };
+
+        let ok = upgrade_link_with_user_pcr(id, 0x2c, Some(0x16), Some(0x16), &sk);
+        assert!(matches!(check(&ok), Ok(Outcome::Append { sequence: 1 })));
+
+        // Document PCR16 differs from the payload's.
+        let wrong = upgrade_link_with_user_pcr(id, 0x2c, Some(0x16), Some(0x17), &sk);
+        assert!(matches!(
+            check(&wrong),
+            Err(ChainValidationError::UpgradeFromMismatch)
+        ));
+        // Payload claims PCR16, document has it absent (zero).
+        let absent = upgrade_link_with_user_pcr(id, 0x2c, Some(0x16), None, &sk);
+        assert!(matches!(
+            check(&absent),
+            Err(ChainValidationError::UpgradeFromMismatch)
+        ));
+        // Document locked PCR16, payload leaves it zero.
+        let unclaimed = upgrade_link_with_user_pcr(id, 0x2c, None, Some(0x16), &sk);
+        assert!(matches!(
+            check(&unclaimed),
+            Err(ChainValidationError::UpgradeFromMismatch)
+        ));
+    }
+
+    /// An upgrade payload in the old PCR0-2-only shape does not decode.
+    #[test]
+    fn upgrade_payload_without_full_identities_does_not_decode() {
+        #[derive(Serialize)]
+        struct Old {
+            enclave_id: Uuid,
+            from_pcrs: PcrsHex,
+            to_pcrs: PcrsHex,
+            image_digest: String,
+            valid_from: DateTime<Utc>,
+            issued_at: DateTime<Utc>,
+            #[serde(with = "serde_bytes")]
+            nonce: Vec<u8>,
+        }
+        let old = Old {
+            enclave_id: Uuid::new_v4(),
+            from_pcrs: pcrs_hex_from_seed(1),
+            to_pcrs: pcrs_hex_from_seed(2),
+            image_digest: "sha256:v2".into(),
+            valid_from: chrono::Utc::now(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0; 32],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        assert!(ciborium::from_reader::<UpgradePayload, _>(bytes.as_slice()).is_err());
+    }
+
     /// And for a revocation link.
     #[test]
     fn revocation_rejects_enclave_id_mismatch() {
@@ -1880,8 +2012,8 @@ mod tests {
     ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id,
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: target_digest.into(),
             valid_from,
             issued_at: chrono::Utc::now(),

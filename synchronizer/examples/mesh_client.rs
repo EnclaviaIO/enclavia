@@ -33,8 +33,8 @@
 //! cross-node forwarding + linearizable read.
 //!
 //! Usage:
-//!   mesh_client <proxy-uds> pin <commitment-hex-byte> --server-pcrs <pcr.json> [--port P] [--seed S]
-//!   mesh_client <proxy-uds> get --server-pcrs <pcr.json> [--port P] [--seed S]
+//!   mesh_client <proxy-uds> pin <commitment-hex-byte> --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]
+//!   mesh_client <proxy-uds> get --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]
 
 use std::time::Duration;
 
@@ -59,10 +59,13 @@ struct Args {
     seed: u8,
     /// Path to the built EIF's `pcr.json`, the expected server PCRs.
     server_pcrs: String,
+    /// Fill byte of a locked PCR16 in the synthetic document; `None`
+    /// leaves PCR16 absent (unlocked).
+    user_pcr16: Option<u8>,
 }
 
 fn parse_args() -> Args {
-    let usage = "usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] --server-pcrs <pcr.json> [--port P] [--seed S]";
+    let usage = "usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]";
     let mut a = std::env::args().skip(1);
     let proxy = a.next().expect(usage);
     let cmd = a.next().expect("missing command (pin|get)");
@@ -70,6 +73,7 @@ fn parse_args() -> Args {
     let mut port = 5010u32;
     let mut seed = 0x42u8;
     let mut server_pcrs: Option<String> = None;
+    let mut user_pcr16: Option<u8> = None;
     let rest: Vec<String> = a.collect();
     let mut i = 0;
     // Positional commitment byte for `pin`.
@@ -89,6 +93,11 @@ fn parse_args() -> Args {
                 seed = parse_hex_byte(v);
                 i += 2;
             }
+            "--user-pcr16" => {
+                let v = rest.get(i + 1).expect("--user-pcr16 requires a value");
+                user_pcr16 = Some(parse_hex_byte(v));
+                i += 2;
+            }
             "--server-pcrs" => {
                 let v = rest.get(i + 1).expect("--server-pcrs requires a path");
                 server_pcrs = Some(v.clone());
@@ -105,6 +114,7 @@ fn parse_args() -> Args {
         seed,
         server_pcrs: server_pcrs
             .expect("--server-pcrs <pcr.json> is required (the expected oracle PCRs)"),
+        user_pcr16,
     }
 }
 
@@ -140,16 +150,17 @@ fn parse_hex_byte(s: &str) -> u8 {
     u8::from_str_radix(s, 16).unwrap_or_else(|_| s.parse().expect("bad byte value"))
 }
 
-/// `key_from_seed`, matching `FakeAttestation::with_seed`'s PCRs and the
-/// listener's `PcrKey(identity.pcrs.digest())` derivation.
-fn key_from_seed(seed: u8) -> PcrKey {
-    use enclavia_protocol::attestation::Pcrs;
-    let raw = Pcrs {
-        pcr0: vec![seed; 48],
-        pcr1: vec![seed.wrapping_add(1); 48],
-        pcr2: vec![seed.wrapping_add(2); 48],
-    };
-    PcrKey(raw.digest())
+/// The session key of a `FakeAttestation::with_seed(seed)` document with an
+/// optional locked PCR16, matching the listener's
+/// `PcrKey(identity.identity.key())` derivation.
+fn session_key_for(seed: u8, user_pcr16: Option<u8>) -> PcrKey {
+    let mut user = enclavia_protocol::pin_identity::ZERO_USER_PCRS;
+    if let Some(b) = user_pcr16 {
+        user[0] = [b; 48];
+    }
+    let identity =
+        enclavia_protocol::attestation::test_utils::identity_from_seed(seed).with_user_pcrs(user);
+    PcrKey(identity.key())
 }
 
 async fn proxy_connect(proxy: &str, port: u32) -> UnixStream {
@@ -246,8 +257,8 @@ async fn read_and_verify_server_auth<S>(
     )
     .expect("server attestation must verify (doc + session nonce binding + expected PCRs)");
     eprintln!(
-        "[client] server attested back; verified PCR digest = {}",
-        hex(&pcrs.digest())
+        "[client] server attested back; verified PCR0 = {}",
+        hex(&pcrs.pcr0)
     );
 }
 
@@ -278,8 +289,11 @@ async fn main() {
     let mut pubkey = [0u8; 65];
     pubkey.copy_from_slice(pk_pt.as_bytes());
 
-    let fake = FakeAttestation::with_seed_and_pubkey(args.seed, handshake_hash.clone(), pubkey);
-    let session_key = key_from_seed(args.seed);
+    let mut fake = FakeAttestation::with_seed_and_pubkey(args.seed, handshake_hash.clone(), pubkey);
+    if let Some(b) = args.user_pcr16 {
+        fake = fake.with_user_pcr(16, vec![b; 48]);
+    }
+    let session_key = session_key_for(args.seed, args.user_pcr16);
     write_frame(
         &mut stream,
         &mut transport,

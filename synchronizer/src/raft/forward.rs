@@ -68,7 +68,7 @@ pub(crate) const FORWARD_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// docs' trust argument).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardedClientRequest {
-    /// The session's attested [`PcrKey`] (SHA-256 of its verified PCR triple).
+    /// The session's attested [`PcrKey`] (the key of its verified pin identity).
     pub session_key: PcrKey,
     /// The session's 65-byte SEC1 P-256 control pubkey (from the attestation
     /// document's `user_data`). Needed for a `Register` (frozen into `KeyState`)

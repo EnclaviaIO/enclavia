@@ -127,13 +127,10 @@ fn load_expected_pcrs(path: &str) -> Pcrs {
     }
 }
 
+/// The session key of a `FakeAttestation::with_seed(seed)` document (no user
+/// PCRs), as the listener derives it.
 fn key_from_seed(seed: u8) -> PcrKey {
-    let raw = Pcrs {
-        pcr0: vec![seed; 48],
-        pcr1: vec![seed.wrapping_add(1); 48],
-        pcr2: vec![seed.wrapping_add(2); 48],
-    };
-    PcrKey(raw.digest())
+    PcrKey(enclavia_protocol::attestation::test_utils::identity_from_seed(seed).key())
 }
 
 async fn proxy_connect(proxy: &str, port: u32) -> UnixStream {

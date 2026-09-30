@@ -69,7 +69,7 @@ pub enum AttestationProviderError {
 ///   a peer to verify).
 /// * the node's startup self-attestation, with an arbitrary `nonce` /
 ///   `user_data`, to read back its OWN hardware-measured PCRs and derive its
-///   self-PCR allowlist (see `enclavia_protocol::attestation::extract_own_pcrs`).
+///   self-PCR allowlist (see `enclavia_protocol::attestation::extract_own_identity`).
 ///   The local NSM device is inside the node's TCB and emulated identically by
 ///   QEMU's nitro-enclave machine, so this works on both QEMU and real Nitro
 ///   with no cert-chain trust required.
@@ -172,17 +172,11 @@ impl FakeAttestor {
         }
     }
 
-    /// The SHA-256 of this attestor's PCR0/1/2 triple: the [`crate::PcrKey`]
+    /// The pin-identity key of this attestor's documents: the [`crate::PcrKey`]
     /// a peer derives when it verifies a document from this attestor, and the
     /// value a node configures into its own self-PCR allowlist.
     pub fn pcr_digest(seed: u8) -> crate::PcrKey {
-        use enclavia_protocol::attestation::Pcrs;
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        crate::PcrKey(raw.digest())
+        crate::PcrKey(enclavia_protocol::attestation::test_utils::identity_from_seed(seed).key())
     }
 }
 
@@ -217,7 +211,7 @@ mod tests {
         let doc = attestor.attest(&hh).await.unwrap();
         // The peer side: verify with the same handshake hash, in debug mode.
         let extracted = verify_and_extract(&doc, &hh, VerificationMode::DangerousSkipChain).expect("verify");
-        let digest = crate::PcrKey(extracted.pcrs.digest());
+        let digest = crate::PcrKey(extracted.identity.key());
         assert_eq!(digest, FakeAttestor::pcr_digest(0x42));
         assert_eq!(extracted.control_pubkey, identity.pubkey());
     }

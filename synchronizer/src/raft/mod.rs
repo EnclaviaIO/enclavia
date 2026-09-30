@@ -221,10 +221,10 @@ pub enum ReplicatedOp {
     /// before applying. The old key's attestation is already present on every
     /// replica from its earlier Register entry.
     Transition {
-        /// Key being retired. `sha256(payload.from_pcrs)`.
+        /// Key being retired. `payload.from.key()`.
         old_key: PcrKey,
         /// Successor key adopting the retired key's state.
-        /// `sha256(payload.to_pcrs)`.
+        /// `payload.to.key()`.
         new_key: PcrKey,
         /// 65-byte SEC1 P-256 control pubkey of the new key, as the leader
         /// observed it from the submitting (new-enclave) session.

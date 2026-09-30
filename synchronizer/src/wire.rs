@@ -20,7 +20,8 @@
 //! enclave over `old_key || new_key`) was impossible as built: enclaves
 //! verify control signatures but never hold the private key. The credential
 //! is now a #47 upgrade [`ChainLink`] (kind [`ChainLinkKind::Upgrade`])
-//! whose CBOR [`UpgradePayload`] already binds `from_pcrs -> to_pcrs` under
+//! whose CBOR [`UpgradePayload`] already binds `from -> to` (full pin
+//! identities, see [`enclavia_protocol::pin_identity`]) under
 //! the OLD enclave's control-key signature and carries the OLD enclave's
 //! own hardware attestation. See [`verify_transition_link`] for the exact
 //! verification contract.
@@ -40,7 +41,7 @@
 //! `PrepareUpgrade` flow (enclavia#30, `enclavia-server::run_prepare_upgrade`
 //! calling `build_chain_attestation`): its `signature` is the OLD control
 //! key's signature over the payload, and its `attestation` is the OLD
-//! enclave's NSM document, so the link's PCRs equal `from_pcrs`. This
+//! enclave's NSM document, so the link's identity equals `from`. This
 //! mirrors `enclavia_protocol::chain`'s rule that upgrade / revocation
 //! links validate against the in-force state, attested by the enclave
 //! version running at the time.
@@ -121,8 +122,9 @@ pub enum Frame {
     /// rejected).
     ///
     /// Client→server (first client frame): the listener verifies the doc,
-    /// extracts PCR0/1/2, and binds the session to
-    /// `PcrKey = SHA-256(PCR0||PCR1||PCR2)`.
+    /// reads its pin identity (PCR0-2 and user PCRs 16-31, see
+    /// [`enclavia_protocol::pin_identity`]), and binds the session to
+    /// `PcrKey = PinIdentity::key()`.
     ///
     /// Server→client (first server frame, sent only after the client's
     /// `Authenticate` verified): the client verifies the doc and checks
@@ -305,17 +307,17 @@ pub enum Request {
     /// Authorize and execute a PCR transition for an enclave upgrade.
     ///
     /// Submitted by the NEW enclave: the session that sends this RPC is
-    /// authenticated as `new_key` (`sha256(payload.to_pcrs)`), the
+    /// authenticated as `new_key` (`payload.to.key()`), the
     /// successor adopting the old key's pinned state. The old enclave is
     /// gone by cutover and could never submit it itself.
     ///
     /// `link` is a #47 upgrade [`ChainLink`] (kind
     /// [`ChainLinkKind::Upgrade`]) the new enclave read out of its own
-    /// chain. Its CBOR-decoded [`UpgradePayload`] names `from_pcrs ->
-    /// to_pcrs`; the link's `signature` is the OLD enclave's 64-byte raw
+    /// chain. Its CBOR-decoded [`UpgradePayload`] names `from ->
+    /// to`; the link's `signature` is the OLD enclave's 64-byte raw
     /// r||s ECDSA P-256 control signature over the payload, and its
     /// `attestation` is the OLD enclave's NSM document bound to
-    /// `sha256(payload)` (so its PCRs equal `from_pcrs`). The synchronizer
+    /// `sha256(payload)` (so its identity equals `from`). The synchronizer
     /// derives `old_key`/`new_key` from the payload, verifies the link via
     /// [`verify_transition_link`] against the control pubkey frozen for the
     /// derived `old_key` at its registration (which also refuses the link
@@ -527,6 +529,11 @@ pub enum ServerPcrPolicy {
     /// triples exactly. The list normally has one entry (the deployed
     /// synchronizer cluster runs a single image) and only changes when a
     /// new cluster is stood up. An EMPTY list admits nothing.
+    ///
+    /// The server's user PCRs (16-31) are not part of the anchor: only the
+    /// synchronizer's own measured code could extend them, that code is
+    /// pinned by PCR0-2, and it extends none. See
+    /// [`enclavia_protocol::attestation::verify_and_extract_pcrs`].
     Expected(Vec<Pcrs>),
 }
 
@@ -634,23 +641,19 @@ pub enum TransitionLinkError {
     /// The link's `payload` did not CBOR-decode as an [`UpgradePayload`].
     #[error("transition link payload is not a decodable UpgradePayload: {0}")]
     PayloadDecode(String),
-    /// `verify_chain_attestation` rejected the link (attestation invalid,
-    /// or `user_data != sha256(payload)`, or PCRs disagree with
-    /// `from_pcrs`).
+    /// The link's attestation was rejected: invalid document,
+    /// `user_data != sha256(payload)`, or an identity (PCR0-2 or any user
+    /// PCR 16-31) other than the payload's `from`.
     #[error("transition link attestation failed: {0}")]
     Attestation(enclavia_protocol::attestation::AttestationError),
-    /// A PCR string inside `from_pcrs` / `to_pcrs` was not valid hex / not
-    /// a usable length.
-    #[error("transition link payload carries a malformed PCR set: {0}")]
-    BadPayloadPcrs(String),
-    /// `sha256(payload.to_pcrs)` (the derived `new_key`) did not equal the
+    /// `payload.to.key()` (the derived `new_key`) did not equal the
     /// submitting session's bound key. The NEW enclave submits the
     /// transition, so the session must authenticate as `new_key`.
-    #[error("transition link to_pcrs does not hash to the submitting session key")]
+    #[error("transition link `to` identity is not the submitting session's identity")]
     SessionKeyMismatch,
     /// The derived `new_key` equals the derived `old_key`
-    /// (`from_pcrs == to_pcrs`): a self-transition is never legitimate.
-    #[error("transition link to_pcrs equals from_pcrs (self-transition)")]
+    /// (`from == to`): a self-transition is never legitimate.
+    #[error("transition link `to` equals `from` (self-transition)")]
     SelfTransition,
     /// The payload's `valid_from` is still in the future: the verifier's
     /// trusted `now` is earlier than `valid_from` minus
@@ -701,15 +704,15 @@ impl From<TransitionLinkError> for RpcError {
 /// The node uses [`Self::old_key`] to look up the frozen control pubkey it
 /// must verify the link's signature against, before calling
 /// [`verify_transition_link`]. Both keys are re-derived from the payload's
-/// own PCR triples (`sha256(PCR0||PCR1||PCR2)`), never taken from an
-/// untrusted wire field.
+/// own pin identities ([`enclavia_protocol::pin_identity::PinIdentity::key`]),
+/// never taken from an untrusted wire field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedTransition {
-    /// `sha256(payload.from_pcrs)`, the retiring (OLD) enclave's key. The
+    /// `payload.from.key()`, the retiring (OLD) enclave's key. The
     /// link's signature is verified against the control pubkey frozen for
     /// THIS key at its registration.
     pub old_key: PcrKey,
-    /// `sha256(payload.to_pcrs)`, the successor (NEW) enclave's key. Must
+    /// `payload.to.key()`, the successor (NEW) enclave's key. Must
     /// equal the submitting session's bound key.
     pub new_key: PcrKey,
 }
@@ -721,25 +724,14 @@ pub struct DecodedTransition {
 /// and then applies [`crate::Op::Transition`] with the same pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedTransition {
-    /// `sha256(payload.from_pcrs)`, the retiring (OLD) enclave's key.
+    /// `payload.from.key()`, the retiring (OLD) enclave's key.
     pub old_key: PcrKey,
-    /// `sha256(payload.to_pcrs)`, the successor key adopted by the
+    /// `payload.to.key()`, the successor key adopted by the
     /// transition. Equals the submitting session's bound key.
     pub new_key: PcrKey,
     /// [`upgrade_link_hash`] of the link's payload: the identity a
     /// committed revocation of `old_key` names to refuse this link.
     pub link_hash: [u8; 32],
-}
-
-/// Derive a [`PcrKey`] from a chain payload's hex-PCR triple, matching
-/// `Pcrs::digest()` (SHA-256 over the raw `PCR0 || PCR1 || PCR2` bytes).
-fn pcr_key_from_hex(
-    pcrs: &enclavia_protocol::chain::PcrsHex,
-) -> Result<PcrKey, TransitionLinkError> {
-    let raw = pcrs
-        .to_pcrs()
-        .map_err(|e| TransitionLinkError::BadPayloadPcrs(e.to_string()))?;
-    Ok(PcrKey(raw.digest()))
 }
 
 /// Phase one of transition-link verification: structural checks plus the
@@ -758,7 +750,7 @@ fn pcr_key_from_hex(
 /// derived `old_key` only to *look up* a frozen pubkey, and
 /// [`verify_transition_link`] then verifies the 64-byte signature over the
 /// exact payload bytes against that pubkey. A payload that lies about
-/// `from_pcrs` would have to carry a signature valid under some OTHER key's
+/// `from` would have to carry a signature valid under some OTHER key's
 /// frozen pubkey, which it cannot.
 pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, TransitionLinkError> {
     if link.kind != ChainLinkKind::Upgrade {
@@ -771,9 +763,10 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
     }
     let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
         .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
-    let old_key = pcr_key_from_hex(&payload.from_pcrs)?;
-    let new_key = pcr_key_from_hex(&payload.to_pcrs)?;
-    Ok(DecodedTransition { old_key, new_key })
+    Ok(DecodedTransition {
+        old_key: PcrKey(payload.from.key()),
+        new_key: PcrKey(payload.to.key()),
+    })
 }
 
 /// Phase two: cryptographically verify a [`Request::Transition`]'s #47
@@ -791,7 +784,7 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    session, this is why the credential, not a live old-key session,
 ///    authorizes the move.)
 /// 2. **Not a self-transition.** `decoded.new_key != decoded.old_key`
-///    (`from_pcrs != to_pcrs`). The state machine also rejects this, but a
+///    (`from != to`). The state machine also rejects this, but a
 ///    self-transition link is never legitimate.
 /// 3. **Control signature.** The link's 64-byte raw r||s ECDSA P-256
 ///    `signature` must verify over the payload bytes against
@@ -801,13 +794,15 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    enclave authorized this exact `from -> to` pair; control-pubkey
 ///    substitution is defeated because the pubkey is frozen, and the
 ///    decode-before-verify ordering is safe because the signature covers
-///    `from_pcrs`.
-/// 4. **Chain attestation.** `verify_chain_attestation` must accept the
-///    link's `attestation` against its `payload`, i.e. the attestation's
-///    `user_data == sha256(payload)` and its PCRs equal `from_pcrs` (the
-///    OLD enclave emitted the link, so it attested its OWN measurements,
-///    matching `enclavia_protocol::chain`'s "attested by the enclave
-///    version running at the time" rule). `debug_mode` selects the
+///    `from`.
+/// 4. **Chain attestation.** `verify_chain_attestation_identity` must accept
+///    the link's `attestation` against its `payload`, i.e. the attestation's
+///    `user_data == sha256(payload)` and its full pin identity (PCR0-2 and
+///    every user PCR 16-31) equals `from` (the OLD enclave emitted the
+///    link, so it attested its OWN identity, matching
+///    `enclavia_protocol::chain`'s "attested by the enclave version
+///    running at the time" rule). Since `old_key` is `from.key()`, this
+///    ties the moved pin to the enclave that emitted the link. `debug_mode` selects the
 ///    skip-cert-chain (QEMU / test) vs full-Nitro-CA path.
 /// 5. **Activation time.** The payload's `valid_from` must not be later
 ///    than `now_ms + TRANSITION_VALID_FROM_TOLERANCE_MS`. The chain
@@ -877,16 +872,12 @@ pub fn verify_transition_link(
     }
 
     // 4. Chain attestation binds the document to sha256(payload) and to
-    //    the OLD enclave's measurements (from_pcrs): the old enclave
-    //    emitted the link, so it attested its own PCRs.
-    let expected_pcrs = payload
-        .from_pcrs
-        .to_pcrs()
-        .map_err(|e| TransitionLinkError::BadPayloadPcrs(e.to_string()))?;
-    enclavia_protocol::attestation::verify_chain_attestation(
+    //    the OLD enclave's full identity (`from`, user PCRs included): the
+    //    old enclave emitted the link, so it attested its own identity.
+    enclavia_protocol::attestation::verify_chain_attestation_identity(
         &link.attestation,
         &link.payload,
-        &expected_pcrs,
+        &payload.from,
         enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
     )
     .map_err(TransitionLinkError::Attestation)?;
@@ -1004,9 +995,8 @@ pub fn verify_revocation_link(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enclavia_protocol::attestation::Pcrs;
-    use enclavia_protocol::attestation::test_utils::FakeChainAttestation;
-    use enclavia_protocol::chain::PcrsHex;
+    use enclavia_protocol::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
+    use enclavia_protocol::pin_identity::{PinIdentity, ZERO_USER_PCRS};
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 
     fn k(b: u8) -> PcrKey {
@@ -1029,22 +1019,17 @@ mod tests {
 
     // --- shared transition-link fixtures ------------------------------
 
-    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-        PcrsHex {
-            pcr0: hex::encode(vec![seed; 48]),
-            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-        }
+    /// The PcrKey of `identity_from_seed(seed)`: PCR0-2 from the seed, no
+    /// user PCRs.
+    fn key_from_seed(seed: u8) -> PcrKey {
+        PcrKey(identity_from_seed(seed).key())
     }
 
-    /// The PcrKey a seed's PcrsHex hashes to, matching `Pcrs::digest()`.
-    fn key_from_seed(seed: u8) -> PcrKey {
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        PcrKey(raw.digest())
+    /// `identity_from_seed(seed)` with PCR16 set to `pcr16`.
+    fn identity_with_pcr16(seed: u8, pcr16: u8) -> PinIdentity {
+        let mut user = ZERO_USER_PCRS;
+        user[0] = [pcr16; 48];
+        identity_from_seed(seed).with_user_pcrs(user)
     }
 
     /// Deterministic P-256 keypair; returns the signing key and the
@@ -1083,8 +1068,8 @@ mod tests {
     ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from,
             issued_at: chrono::Utc::now(),
@@ -1506,13 +1491,13 @@ mod tests {
         );
     }
 
-    /// to_pcrs hashes to something other than the submitting session's
+    /// `to` hashes to something other than the submitting session's
     /// key: the NEW enclave isn't the one presenting the link.
     #[test]
     fn transition_link_session_key_mismatch_rejected() {
         let (sk, pk) = keypair(0x33);
         let link = upgrade_link(0x33, 0x43, &sk);
-        // Caller's session is bound to a key the payload's to_pcrs does
+        // Caller's session is bound to a key the payload's `to` does
         // not hash to.
         let wrong_session = key_from_seed(0x99);
         let err = decode_and_verify(&link, wrong_session, &pk, true).unwrap_err();
@@ -1522,7 +1507,7 @@ mod tests {
         );
     }
 
-    /// to_pcrs equals from_pcrs (self-transition) is rejected.
+    /// `to` equals `from` (self-transition) is rejected.
     #[test]
     fn transition_link_to_equals_from_rejected() {
         let (sk, pk) = keypair(0x34);
@@ -1562,12 +1547,11 @@ mod tests {
         );
     }
 
-    /// The OLD bug shape: the link is attested with the TARGET (to_pcrs)
-    /// measurements instead of the source (from_pcrs). The corrected
-    /// verifier checks the attestation against from_pcrs, so this is now
-    /// rejected by `verify_chain_attestation`.
+    /// The link is attested with the TARGET (`to`) measurements instead of
+    /// the source (`from`). The verifier checks the attestation against
+    /// `from`, so this is rejected.
     #[test]
-    fn transition_link_attested_with_to_pcrs_rejected() {
+    fn transition_link_attested_with_to_identity_rejected() {
         let (sk, pk) = keypair(0x36);
         // upgrade_link attests with from_seed (correct); rebuild the
         // attestation with the to_seed (0x46) to reproduce the old bug.
@@ -1589,7 +1573,7 @@ mod tests {
         let (sk, pk) = keypair(0x38);
         let mut link = upgrade_link(0x38, 0x48, &sk);
         // Re-attest the same payload under PCRs (0x77) that match neither
-        // from_pcrs (0x38) nor to_pcrs (0x48). user_data still binds the
+        // `from` (0x38) nor `to` (0x48). user_data still binds the
         // payload, so this isolates the PCR-equality check.
         let payload_bytes = link.payload.clone();
         link.attestation = FakeChainAttestation::for_payload(0x77, &payload_bytes).encode();
@@ -1604,6 +1588,94 @@ mod tests {
         assert_eq!(
             TransitionLinkError::SelfTransition.attestation_reason(),
             None
+        );
+    }
+
+    /// An upgrade link between two identities that carry a PCR16, attested
+    /// by a document whose PCR16 is `doc_pcr16`.
+    fn user_pcr_upgrade_link(
+        from: &PinIdentity,
+        to: &PinIdentity,
+        doc_seed: u8,
+        doc_pcr16: Option<u8>,
+        signing: &SigningKey,
+    ) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from: from.clone(),
+            to: to.clone(),
+            image_digest: "sha256:to".into(),
+            valid_from: chrono::Utc::now(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x5b; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let mut fake = FakeChainAttestation::for_payload(doc_seed, &payload_bytes);
+        if let Some(b) = doc_pcr16 {
+            fake = fake.with_user_pcr(16, vec![b; 48]);
+        }
+        let sig: Signature = signing.sign(&payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation: fake.encode(),
+            signature: Some(sig.to_bytes().to_vec()),
+        }
+    }
+
+    /// Keys come from the full identities: a link between two enclaves'
+    /// identities that share PCR0-2 with other enclaves names only the
+    /// PCR16-specific keys, and verifies when the attestation carries the
+    /// same PCR16.
+    #[test]
+    fn transition_link_keys_include_user_pcrs() {
+        let (sk, pk) = keypair(0x39);
+        let from = identity_with_pcr16(0x39, 0xa1);
+        let to = identity_with_pcr16(0x49, 0xa1);
+        let link = user_pcr_upgrade_link(&from, &to, 0x39, Some(0xa1), &sk);
+
+        let decoded = decode_transition_link(&link).unwrap();
+        assert_eq!(decoded.old_key, PcrKey(from.key()));
+        assert_eq!(decoded.new_key, PcrKey(to.key()));
+        assert_ne!(decoded.old_key, key_from_seed(0x39));
+        assert_ne!(decoded.new_key, key_from_seed(0x49));
+
+        let verified = decode_and_verify(&link, PcrKey(to.key()), &pk, true).unwrap();
+        assert_eq!(verified.old_key, PcrKey(from.key()));
+        // A session of the same image without the PCR16 is another enclave.
+        let err = decode_and_verify(&link, key_from_seed(0x49), &pk, true).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::SessionKeyMismatch),
+            "{err:?}"
+        );
+    }
+
+    /// The link's attestation must carry the user PCRs its `from` claims:
+    /// same PCR0-2 but a different (or missing) PCR16 is refused.
+    #[test]
+    fn transition_link_with_mismatching_user_pcrs_rejected() {
+        let (sk, pk) = keypair(0x3a);
+        let from = identity_with_pcr16(0x3a, 0xa1);
+        let to = identity_with_pcr16(0x4a, 0xa1);
+        for doc_pcr16 in [Some(0xb2), None] {
+            let link = user_pcr_upgrade_link(&from, &to, 0x3a, doc_pcr16, &sk);
+            let err = decode_and_verify(&link, PcrKey(to.key()), &pk, true).unwrap_err();
+            assert!(
+                matches!(err, TransitionLinkError::Attestation(_)),
+                "{doc_pcr16:?}: {err:?}"
+            );
+            assert_eq!(err.attestation_reason(), Some(RejectionReason::PcrMismatch));
+        }
+        // And a document that locked a PCR16 the payload leaves at zero.
+        let plain_from = identity_from_seed(0x3a);
+        let link = user_pcr_upgrade_link(&plain_from, &to, 0x3a, Some(0xa1), &sk);
+        let err = decode_and_verify(&link, PcrKey(to.key()), &pk, true).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::Attestation(_)),
+            "{err:?}"
         );
     }
 

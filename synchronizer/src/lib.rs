@@ -83,7 +83,10 @@ pub const CONTROL_PUBKEY_LEN: usize = 65;
 /// the two never drift apart.
 pub const MIN_CLUSTER_NODES: usize = 3;
 
-/// SHA-256 hash of `PCR0 || PCR1 || PCR2` from a Nitro attestation.
+/// Pin-slot key of an enclave: [`enclavia_protocol::pin_identity::PinIdentity::key`],
+/// the SHA-256 of the canonical encoding of PCR0-2 plus user PCRs 16-31
+/// from its Nitro attestation. Two enclaves built from the same image but
+/// with different user PCRs have different keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PcrKey(pub [u8; 32]);
@@ -130,7 +133,7 @@ pub enum Op {
     /// the existing commitment forward.
     ///
     /// The credential that authorizes this op is a #47 upgrade chain link
-    /// whose `UpgradePayload` binds `from_pcrs -> to_pcrs`, signed under
+    /// whose `UpgradePayload` binds `from -> to` (full pin identities), signed under
     /// the OLD key's control private key and carrying the new enclave's
     /// hardware attestation. The pure state machine does NOT see or verify
     /// that link: the caller verifies it with
@@ -139,11 +142,10 @@ pub enum Op {
     /// The op itself names only the derived `(old_key, new_key)` pair so
     /// the replicated log stays compact and verification-free on replay.
     Transition {
-        /// Current key being retired. Equals
-        /// `sha256(payload.from_pcrs.PCR0||PCR1||PCR2)`.
+        /// Current key being retired. Equals `payload.from.key()`.
         old_key: PcrKey,
         /// Successor key adopting the retired key's state. Equals
-        /// `sha256(payload.to_pcrs.PCR0||PCR1||PCR2)`.
+        /// `payload.to.key()`.
         new_key: PcrKey,
         /// SHA-256 of the authorizing link's payload bytes (the bytes the
         /// control key signed; `enclavia_protocol::chain::upgrade_link_hash`).
@@ -352,8 +354,8 @@ impl StateMachine {
     /// calling this (see [`wire::verify_transition_link`]): the link's
     /// P-256 control signature verifies against `old_key`'s registered
     /// pubkey, the chain attestation validates with `user_data ==
-    /// sha256(payload)`, and the payload's `from_pcrs`/`to_pcrs` hash to
-    /// `old_key`/`new_key`. Repeat calls are idempotent.
+    /// sha256(payload)` and carries the full `from` identity, and the payload's
+    /// `from`/`to` identities have the keys `old_key`/`new_key`. Repeat calls are idempotent.
     pub fn observe_transition(&mut self, old_key: PcrKey, new_key: PcrKey) {
         self.transition_authorizations.insert((old_key, new_key));
     }

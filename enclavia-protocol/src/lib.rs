@@ -11,6 +11,7 @@ pub mod kms_recipient;
 pub mod mesh;
 mod nitro_verify;
 mod noise;
+pub mod pin_identity;
 pub mod staging;
 pub mod synchronizer_metrics;
 
