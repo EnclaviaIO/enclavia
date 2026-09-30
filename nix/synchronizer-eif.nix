@@ -63,10 +63,26 @@ let
 
   initBinary = "${patchedInit}/bin/init";
 
-  initScript = pkgs.writeShellScript "synchronizer-enclave-init"
-    (builtins.readFile ./synchronizer-init.sh);
+  # A plain `#!/bin/sh` script, run by the image's own busybox. Not
+  # `pkgs.writeShellScript`: its shebang names the BUILD host's bash by
+  # store path, and the closure of that path (bash + glibc) would then be
+  # packed into the measured image.
+  initScript = pkgs.writeTextFile {
+    name = "synchronizer-enclave-init";
+    text = builtins.readFile ./synchronizer-init.sh;
+    executable = true;
+  };
 
-  rootfs = pkgs.runCommand "synchronizer-rootfs" {} ''
+  # `readelf -h` spelling of the machine every binary in the image must
+  # be built for.
+  elfMachine = {
+    x86_64 = "Advanced Micro Devices X86-64";
+    aarch64 = "AArch64";
+  }.${arch};
+
+  rootfs = pkgs.runCommand "synchronizer-rootfs" {
+    nativeBuildInputs = [ pkgs.binutils-unwrapped ];
+  } ''
     mkdir -p $out/bin $out/dev $out/proc $out/tmp
 
     # The synchronizer node + its runtime identity fetcher.
@@ -88,6 +104,41 @@ let
     # chroots to /rootfs before exec'ing the entrypoint.
     cp ${initScript} $out/bin/enclave-init
     chmod +x $out/bin/enclave-init
+
+    # Gate: every binary that ends up in the image (the rootfs plus the
+    # init, which buildEif packs into the system ramdisk) must be a static
+    # ELF for the EIF's architecture: right machine, no PT_INTERP, no
+    # NEEDED entries. The image has no dynamic loader and no libc, so
+    # nothing else could run. The only non-ELF file allowed is the init
+    # script, which must run under the image's own /bin/sh.
+    fail() { echo "synchronizer-rootfs: $*" >&2; exit 1; }
+    check_static_elf() {
+      machine=$(readelf -hW "$1" | sed -n 's/^ *Machine: *//p')
+      [ "$machine" = "${elfMachine}" ] \
+        || fail "$1: machine '$machine', expected '${elfMachine}'"
+      if readelf -lW "$1" | grep -q INTERP; then
+        fail "$1: has a PT_INTERP program header (not static)"
+      fi
+      if readelf -dW "$1" | grep -q NEEDED; then
+        fail "$1: has NEEDED shared-library entries (not static)"
+      fi
+      echo "synchronizer-rootfs: $1: static, $machine"
+    }
+    check_static_elf ${initBinary}
+    for f in $out/bin/*; do
+      if [ -L "$f" ]; then
+        [ "$(readlink "$f")" = busybox ] || fail "$f: unexpected symlink"
+      elif readelf -h "$f" >/dev/null 2>&1; then
+        check_static_elf "$f"
+      elif [ "$f" = "$out/bin/enclave-init" ]; then
+        [ "$(head -n 1 "$f")" = "#!/bin/sh" ] \
+          || fail "$f: shebang is not #!/bin/sh"
+      else
+        fail "$f: unexpected non-ELF file"
+      fi
+    done
+    extra=$(find $out -mindepth 1 -not -path "$out/bin/*" -not -type d)
+    [ -z "$extra" ] || fail "unexpected files outside /bin: $extra"
   '';
 in
 nitroLib.buildEif {
