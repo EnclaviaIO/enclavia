@@ -510,6 +510,24 @@ pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationErro
     })
 }
 
+/// Read the NSM `timestamp` (milliseconds since the Unix epoch) from an
+/// attestation document the caller JUST obtained from its OWN `/dev/nsm`,
+/// WITHOUT verifying the certificate chain or the signature.
+///
+/// # This is NOT a verification function
+///
+/// Same contract as [`extract_own_pcrs`]: the only acceptable input is a
+/// document the caller requested from its own local NSM device a moment
+/// ago. The Nitro hypervisor stamps `timestamp`, and neither the parent
+/// instance nor the enclave's own (unsynchronised) wall clock can move it,
+/// so a node can use it as a trusted "now" for time-gated decisions without
+/// trusting its system clock. Never feed it a document received over the
+/// network: a remote party chooses whatever timestamp it likes there.
+pub fn extract_own_timestamp_ms(attestation_data: &[u8]) -> Result<u64, AttestationError> {
+    let doc = parse_and_validate(attestation_data, VerificationMode::DangerousSkipChain)?;
+    Ok(doc.timestamp)
+}
+
 /// Verify a chain-link attestation document.
 ///
 /// Used by the backend's `POST /enclaves/{id}/chain-links` ingest
@@ -1081,6 +1099,15 @@ mod tests {
             matches!(err, AttestationError::Validation(_)),
             "expected Validation, got {err:?}"
         );
+    }
+
+    #[test]
+    fn extract_own_timestamp_reads_the_doc_timestamp() {
+        // FakeAttestation stamps timestamp = 0; the point is that the value
+        // comes out of the document, with no nonce or chain check.
+        let fake = test_utils::FakeAttestation::with_seed(0x21, vec![0xde; 32]);
+        assert_eq!(extract_own_timestamp_ms(&fake.encode()).unwrap(), 0);
+        assert!(extract_own_timestamp_ms(b"not a cose document").is_err());
     }
 
     #[test]

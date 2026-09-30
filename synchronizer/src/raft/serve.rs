@@ -251,7 +251,8 @@ async fn handle_pin(
 /// 2. Look up `old_key`'s FROZEN control pubkey in the replicated state machine
 ///    (`state_machine().get(old_key)`); a transition can only retire a live key.
 /// 3. `verify_transition_link` against that frozen pubkey + the session key
-///    (the NEW enclave submits, so `new_key == session_key`).
+///    (the NEW enclave submits, so `new_key == session_key`), with the
+///    leader's own NSM time as `now` for the payload's `valid_from` gate.
 /// 4. Submit `ReplicatedOp::Transition { old_key, new_key, new_control_pubkey:
 ///    control_pubkey }`, where `control_pubkey` is the submitting (new-enclave)
 ///    session's announced key. The verifier requires `new_key == session_key`,
@@ -288,17 +289,33 @@ async fn handle_transition(
         None => return err(RpcError::TransitionRejected),
     };
 
+    // Trusted time for the link's `valid_from` gate: the leader's own NSM
+    // timestamp, never its system clock. Without it the gate cannot be
+    // evaluated, so the transition is refused (retryable).
+    let now_ms = match crate::trusted_time::now_ms().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "transition refused: trusted time unavailable");
+            return err(RpcError::Unavailable);
+        }
+    };
+
     // Phase two: cryptographically verify the link against old_key's frozen
-    // pubkey and the submitting session key.
+    // pubkey and the submitting session key, and check that its `valid_from`
+    // has been reached.
     let verified = match verify_transition_link(
         &link,
         decoded,
         session_key,
         &old_control_pubkey,
         debug_mode,
+        now_ms,
     ) {
         Ok(v) => v,
-        Err(_) => return err(RpcError::TransitionRejected),
+        Err(e) => {
+            tracing::warn!(error = %e, "transition link rejected");
+            return err(RpcError::TransitionRejected);
+        }
     };
 
     // The submitting (NEW enclave) session's announced control pubkey: the
