@@ -217,7 +217,7 @@ enum Command {
         #[arg(long)]
         new_key_id: String,
         /// Hex-encoded PCR0 the new enclave version is expected to measure
-        /// (the signed UpgradePayload's `to_pcrs`). The new key's policy is
+        /// (PCR0-2 of the signed UpgradePayload's `to`). The new key's policy is
         /// verified to gate `kms:Decrypt` to exactly these PCRs before the
         /// new passphrase is sealed under it.
         #[arg(long)]
@@ -362,7 +362,7 @@ async fn prepare_upgrade(
     }
 
     // Parse the expected PCRs of the enclave version being upgraded to (the
-    // signed UpgradePayload's `to_pcrs`, forwarded by enclavia-server).
+    // PCR0-2 of the signed UpgradePayload's `to`, forwarded by enclavia-server).
     // Nitro PCR0/1/2 are 48 bytes (SHA-384); requiring the exact length
     // catches a truncated/empty value here instead of relying on the
     // policy check to mismatch downstream.
@@ -419,7 +419,7 @@ async fn prepare_upgrade(
     //        returns for `new_key_id` — never seal to a key KMS doesn't
     //        recognise as that id's.
     //     c. The new key's policy must gate `kms:Decrypt` to the NEW
-    //        enclave version's PCR0/1/2 (the signed payload's `to_pcrs`),
+    //        enclave version's PCR0/1/2 (from the signed payload's `to`),
     //        and grant no principal a way to loosen that gate.
     let new_pubkey_der = B64.decode(new_pubkey_b64.as_bytes())?;
     verify_key_policy_for(new_key_id, &expected_pcrs).await?;
@@ -921,7 +921,7 @@ async fn kms_key_origin(key_id: &str) -> Result<String, Box<dyn std::error::Erro
 ///
 /// The "expected" PCRs differ per caller: `init` passes this enclave's own
 /// PCRs (the running image recovers the passphrase); `prepare_upgrade`
-/// passes the NEW version's `to_pcrs` (the successor must be able to
+/// passes the NEW version's PCR0-2 (`to`; the successor must be able to
 /// recover it — and nobody else).
 ///
 /// Both checks are only as trustworthy as the channel to KMS: see the

@@ -1506,9 +1506,9 @@ fn print_chain_link(link: &upgrade::VerifiedLink) {
             println!("      target:      {}", p.image_digest);
             println!("      valid_from:  {}", p.valid_from.format("%Y-%m-%d %H:%M:%S UTC"));
             println!("      issued_at:   {}", p.issued_at.format("%Y-%m-%d %H:%M:%S UTC"));
-            println!("      to.PCR0:     {}", p.to_pcrs.pcr0);
-            println!("      to.PCR1:     {}", p.to_pcrs.pcr1);
-            println!("      to.PCR2:     {}", p.to_pcrs.pcr2);
+            for line in upgrade::identity_lines("to.", &p.to) {
+                println!("      {line}");
+            }
         }
         Some(upgrade::DecodedPayload::Revocation(p)) => {
             println!("      revokes:     {}", p.revokes);

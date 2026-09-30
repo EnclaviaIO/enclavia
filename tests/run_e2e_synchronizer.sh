@@ -284,6 +284,18 @@ else
     exit 3
 fi
 
+# Same image (same PCR0-2), but a locked PCR16: a different enclave, so a
+# different pin slot. Its Get must not see the pin above.
+echo "--- Get on node-b as another enclave of the same image (PCR16 locked) ---"
+OTHER_OUT="$("$CLIENT" "${DIR[node-b]}/proxy.sock" get --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED" --user-pcr16 0x16 || true)"
+echo "$OTHER_OUT"
+if echo "$OTHER_OUT" | grep -q "RESULT error NotFound"; then
+    echo "PASS: same image, different user PCR16 has its own (empty) pin slot"
+else
+    echo "BLOCKER: an enclave with a different PCR16 did not get its own pin slot. Output: $OTHER_OUT" >&2
+    exit 3
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Optional: restart a node and show it re-joins + serves a Get (#209).
 # ---------------------------------------------------------------------------

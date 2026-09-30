@@ -17,9 +17,11 @@
 
 use std::sync::Arc;
 
-use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
+use enclavia_protocol::attestation::test_utils::{
+    FakeAttestation, FakeChainAttestation, identity_from_seed,
+};
 use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
-use enclavia_protocol::chain::{PcrsHex, RevocationPayload};
+use enclavia_protocol::chain::RevocationPayload;
 use enclavia_protocol::perform_handshake_as_responder;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use synchronizer::client::{ClientError, Handshake, ServerPcrPolicy};
@@ -65,9 +67,9 @@ fn pubkey(seed: u8) -> [u8; CONTROL_PUBKEY_LEN] {
 }
 
 /// The PcrKey a seed's FakeAttestation binds the session to, matching
-/// the listener's `PcrKey(identity.pcrs.digest())` derivation.
+/// the listener's `PcrKey(identity.identity.key())` derivation.
 fn key_from_seed(seed: u8) -> PcrKey {
-    PcrKey(pcrs_from_seed(seed).digest())
+    PcrKey(identity_from_seed(seed).key())
 }
 
 /// The PCR triple `FakeAttestation::with_seed(seed)` (and
@@ -218,24 +220,14 @@ async fn second_session_reads_first_sessions_pin() {
     assert_eq!(version, Version(0));
 }
 
-/// The PcrsHex triple `FakeAttestation::with_seed(seed)` measures, in
-/// the hex form transition-link payloads carry.
-fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-    PcrsHex {
-        pcr0: hex::encode(vec![seed; 48]),
-        pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-        pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-    }
-}
-
 /// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by the
 /// OLD enclave's control key and attested for the OLD measurements
 /// (mirrors the in-crate listener test fixture).
 fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
     let payload = UpgradePayload {
         enclave_id: uuid::Uuid::new_v4(),
-        from_pcrs: pcrs_hex_from_seed(from_seed),
-        to_pcrs: pcrs_hex_from_seed(to_seed),
+        from: identity_from_seed(from_seed),
+        to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: chrono::Utc::now(),
         issued_at: chrono::Utc::now(),
@@ -575,8 +567,8 @@ fn upgrade_link_issued_at(
 ) -> ChainLink {
     let payload = UpgradePayload {
         enclave_id: uuid::Uuid::new_v4(),
-        from_pcrs: pcrs_hex_from_seed(from_seed),
-        to_pcrs: pcrs_hex_from_seed(to_seed),
+        from: identity_from_seed(from_seed),
+        to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: issued_at,
         issued_at,

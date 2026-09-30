@@ -47,6 +47,8 @@ use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
+use crate::pin_identity::{PinIdentity, PinIdentityError};
+
 /// PCR (Platform Configuration Register) measurements that identify a
 /// specific enclave image and configuration:
 ///
@@ -96,16 +98,6 @@ impl Pcrs {
             pcr1: decode(1, pcr1)?,
             pcr2: decode(2, pcr2)?,
         })
-    }
-
-    /// SHA-256 over `PCR0 || PCR1 || PCR2`. The synchronizer uses this
-    /// 32-byte digest as the per-enclave session key.
-    pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(&self.pcr0);
-        hasher.update(&self.pcr1);
-        hasher.update(&self.pcr2);
-        hasher.finalize().into()
     }
 }
 
@@ -218,8 +210,8 @@ pub enum AttestationError {
     #[error("attestation document validation failed: {0}")]
     Validation(ValidationFailure),
     /// A PCR value coming out of the validated document hex-decoded to
-    /// something other than 32/48/64 bytes, which would break PcrKey
-    /// derivation. Should be unreachable for real Nitro docs.
+    /// something other than 32/48/64 bytes. Should be unreachable for real
+    /// Nitro docs.
     #[error("attestation document PCR {idx} has unexpected length {len}")]
     InvalidPcrLength {
         /// The PCR index (0, 1, or 2).
@@ -261,6 +253,11 @@ pub enum AttestationError {
     /// (server authentication).
     #[error("attestation document PCRs match none of the expected values")]
     PcrsNotExpected,
+    /// The document's PCR map is not a valid pin identity (a missing
+    /// PCR0-2, a value that is not 48 bytes, or an index of 32 or more).
+    /// See [`crate::pin_identity`].
+    #[error("attestation document PCRs are not a valid pin identity: {0}")]
+    InvalidIdentity(#[from] PinIdentityError),
 }
 
 impl AttestationError {
@@ -271,7 +268,8 @@ impl AttestationError {
             AttestationError::InvalidPcrLength { .. }
             | AttestationError::InvalidPcrHex(_)
             | AttestationError::InvalidControlPubkey
-            | AttestationError::InvalidControlNonce => RejectionReason::Malformed,
+            | AttestationError::InvalidControlNonce
+            | AttestationError::InvalidIdentity(_) => RejectionReason::Malformed,
             AttestationError::PayloadBindingMismatch => RejectionReason::PayloadBindingMismatch,
             AttestationError::PcrsNotExpected => RejectionReason::PcrMismatch,
         }
@@ -342,16 +340,17 @@ pub const NON_UPGRADABLE_CONTROL_KEY: [u8; CONTROL_PUBKEY_LEN] = [
 /// Verified enclave identity extracted from an NSM attestation document.
 ///
 /// Returned by [`verify_and_extract`] when the document validates and the
-/// caller wants both the PCRs (for deriving a session key) and the
+/// caller wants both the pin identity (for deriving a session key) and the
 /// enclave's ECDSA P-256 control pubkey (for verifying future
 /// `Transition` signatures from this key).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedIdentity {
-    /// PCR0/1/2 from the validated document.
-    pub pcrs: Pcrs,
+    /// PCR0-2 and user PCRs 16-31 from the validated document, read by
+    /// the rules in [`crate::pin_identity`].
+    pub identity: PinIdentity,
     /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key extracted
     /// from the doc's `user_data` field. The synchronizer registers
-    /// this alongside the [`Pcrs::digest`]-derived key on first
+    /// this alongside the [`PinIdentity::key`]-derived key on first
     /// attestation, and uses it to verify raw r||s signatures on
     /// subsequent `Transition` RPCs.
     pub control_pubkey: [u8; CONTROL_PUBKEY_LEN],
@@ -480,10 +479,10 @@ pub fn verify_control_nonce_attestation(
 ///
 /// Synchronizer entry point. The caller does not know in advance which
 /// enclave is connecting — the verified document's PCRs *are* the
-/// identity, and the doc's `user_data` carries the enclave's Ed25519
-/// control pubkey. The caller typically passes the returned
-/// [`AttestedIdentity::pcrs`] through [`Pcrs::digest`] to derive a stable
-/// session key, and registers
+/// identity, and the doc's `user_data` carries the enclave's ECDSA P-256
+/// control pubkey. The caller derives a stable session key from the
+/// returned [`AttestedIdentity::identity`] with [`PinIdentity::key`]
+/// (PCR0-2 plus user PCRs 16-31), and registers
 /// [`AttestedIdentity::control_pubkey`] for verifying future
 /// `Transition` RPCs from this key.
 ///
@@ -500,14 +499,7 @@ pub fn verify_and_extract(
 ) -> Result<AttestedIdentity, AttestationError> {
     let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
 
-    let hex_pcrs = att_get_pcrs(&doc)
-        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
-
-    let pcrs = Pcrs {
-        pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
-        pcr1: decode_pcr(&hex_pcrs.pcr_1, 1)?,
-        pcr2: decode_pcr(&hex_pcrs.pcr_2, 2)?,
-    };
+    let identity = PinIdentity::from_doc_pcrs(&doc.pcrs)?;
 
     let user_data = doc
         .user_data
@@ -526,7 +518,7 @@ pub fn verify_and_extract(
     }
 
     Ok(AttestedIdentity {
-        pcrs,
+        identity,
         control_pubkey,
     })
 }
@@ -558,6 +550,15 @@ pub fn verify_and_extract(
 ///    document without committing to an identity; a bare
 ///    verify-and-return-PCRs form would be passable by ANY enclave,
 ///    including a reflection of the caller's own document.
+///
+/// The server's user PCRs (16-31) are deliberately not compared. A user
+/// PCR holds only what the enclave's own measured code extends into it,
+/// and that code is already pinned by PCR0-2; the synchronizer extends
+/// none. So they carry nothing the PCR0-2 anchor does not already fix,
+/// and the anchors (measured configs, the backend's list, `enclavia
+/// reproduce`) stay PCR0-2 triples. Customer enclaves are different:
+/// their per-enclave data lives in user PCRs, which is why their pin
+/// identity (see [`crate::pin_identity`]) includes them.
 ///
 /// Differs from [`verify_against`] in accepting a SET of valid triples
 /// (a deployment may roll between two cluster images), and from
@@ -631,6 +632,23 @@ pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationErro
     })
 }
 
+/// Read the pin identity (PCR0-2 and user PCRs 16-31, see
+/// [`crate::pin_identity`]) from an attestation document the caller JUST
+/// obtained from its OWN `/dev/nsm`, WITHOUT verifying the certificate
+/// chain or the nonce.
+///
+/// # This is NOT a verification function
+///
+/// Same contract as [`extract_own_pcrs`]: the only acceptable input is a
+/// document the caller requested from its own local NSM device. A node uses
+/// it to learn the identity (and so the synchronizer key) a peer derives
+/// from the same document with [`verify_and_extract`]. Never feed it a
+/// document received over the network.
+pub fn extract_own_identity(attestation_data: &[u8]) -> Result<PinIdentity, AttestationError> {
+    let doc = parse_and_validate(attestation_data, VerificationMode::DangerousSkipChain)?;
+    Ok(PinIdentity::from_doc_pcrs(&doc.pcrs)?)
+}
+
 /// Read the NSM `timestamp` (milliseconds since the Unix epoch) from an
 /// attestation document the caller JUST obtained from its OWN `/dev/nsm`,
 /// WITHOUT verifying the certificate chain or the signature.
@@ -664,6 +682,12 @@ pub fn extract_own_timestamp_ms(attestation_data: &[u8]) -> Result<u64, Attestat
 /// 3. PCR0/1/2 in the doc equal `expected_pcrs` (the backend's recorded
 ///    PCRs for this enclave, post-build).
 ///
+/// Returns the document's full pin identity (PCR0-2 plus user PCRs 16-31,
+/// see [`crate::pin_identity`]) so a caller that holds a claimed identity,
+/// such as an upgrade link's `from`, can compare all of it. Use
+/// [`verify_chain_attestation_identity`] when the whole identity is
+/// expected.
+///
 /// In [`VerificationMode::Production`], the AWS Nitro CA chain is
 /// validated and the COSE signature is verified, same as the
 /// session-bound entry points. The chain is validated at the document's
@@ -691,7 +715,7 @@ pub fn verify_chain_attestation(
     payload: &[u8],
     expected_pcrs: &Pcrs,
     mode: VerificationMode,
-) -> Result<(), AttestationError> {
+) -> Result<PinIdentity, AttestationError> {
     let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
     let doc = parse_and_validate(attestation_data, mode)?;
 
@@ -711,6 +735,31 @@ pub fn verify_chain_attestation(
     validate_expected_pcrs(&doc, &pcrs_hex)
         .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
 
+    Ok(PinIdentity::from_doc_pcrs(&doc.pcrs)?)
+}
+
+/// [`verify_chain_attestation`] against a full pin identity: the document
+/// must carry exactly `expected`, user PCRs 16-31 included (absent ones
+/// read as zero, see [`crate::pin_identity`]).
+///
+/// Used wherever a link's claimed identity decides something, e.g. the
+/// synchronizer's `Transition`, which moves the pin held by the key of an
+/// upgrade link's `from` identity: the link's attestation must prove the
+/// enclave that emitted it had exactly that identity.
+pub fn verify_chain_attestation_identity(
+    attestation_data: &[u8],
+    payload: &[u8],
+    expected: &PinIdentity,
+    mode: VerificationMode,
+) -> Result<(), AttestationError> {
+    let attested =
+        verify_chain_attestation(attestation_data, payload, &expected.image_pcrs(), mode)?;
+    if attested != *expected {
+        return Err(AttestationError::validation(
+            RejectionReason::PcrMismatch,
+            "attestation document user PCRs (16-31) differ from the expected identity",
+        ));
+    }
     Ok(())
 }
 
@@ -894,6 +943,20 @@ pub mod test_utils {
     use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
     use ciborium::value::Value as CborValue;
 
+    /// The pin identity a [`FakeAttestation::with_seed`] /
+    /// [`FakeChainAttestation::for_payload`] document with no user PCRs
+    /// carries: PCR0-2 = `seed`, `seed + 1`, `seed + 2`, user PCRs zero.
+    pub fn identity_from_seed(seed: u8) -> crate::pin_identity::PinIdentity {
+        crate::pin_identity::PinIdentity::new(
+            [
+                [seed; 48],
+                [seed.wrapping_add(1); 48],
+                [seed.wrapping_add(2); 48],
+            ],
+            crate::pin_identity::ZERO_USER_PCRS,
+        )
+    }
+
     /// Builder for synthetic attestation documents accepted by
     /// [`verify_against`](super::verify_against) /
     /// [`verify_and_extract`](super::verify_and_extract) in debug mode.
@@ -915,6 +978,10 @@ pub mod test_utils {
         /// requires this to be a 65-byte pubkey with the SEC1 prefix
         /// `0x04`.
         pub control_pubkey: [u8; super::CONTROL_PUBKEY_LEN],
+        /// Extra PCRs to put in the document, by index (normally user PCRs
+        /// 16-31, see [`crate::pin_identity`]). Empty by default: an enclave
+        /// that locked no user PCR, as the emulated NSM reports it.
+        pub user_pcrs: BTreeMap<usize, Vec<u8>>,
     }
 
     impl FakeAttestation {
@@ -936,6 +1003,7 @@ pub mod test_utils {
                 pcr2: vec![seed.wrapping_add(2); 48],
                 handshake_hash,
                 control_pubkey,
+                user_pcrs: BTreeMap::new(),
             }
         }
 
@@ -950,6 +1018,12 @@ pub mod test_utils {
             let mut fake = Self::with_seed(seed, handshake_hash);
             fake.control_pubkey = control_pubkey;
             fake
+        }
+
+        /// Put `value` in PCR `index` of the document (a locked user PCR).
+        pub fn with_user_pcr(mut self, index: usize, value: Vec<u8>) -> Self {
+            self.user_pcrs.insert(index, value);
+            self
         }
 
         /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
@@ -967,6 +1041,7 @@ pub mod test_utils {
             // (signing-cert measurement). Synchronizer doesn't use it,
             // but the doc has to include it to deserialize.
             pcrs.insert(8usize, vec![0u8; 48]);
+            pcrs.extend(self.user_pcrs.clone());
 
             let doc = AttestationDoc::new(
                 "test-module".to_string(),
@@ -1094,6 +1169,9 @@ pub mod test_utils {
         /// [`Self::for_payload`]; tests that want to exercise a
         /// `user_data` mismatch can override after construction.
         pub user_data: Vec<u8>,
+        /// Extra PCRs to put in the document, by index (normally user PCRs
+        /// 16-31). Empty by default: an enclave that locked no user PCR.
+        pub user_pcrs: BTreeMap<usize, Vec<u8>>,
     }
 
     impl FakeChainAttestation {
@@ -1110,7 +1188,14 @@ pub mod test_utils {
                 pcr1: vec![seed.wrapping_add(1); 48],
                 pcr2: vec![seed.wrapping_add(2); 48],
                 user_data,
+                user_pcrs: BTreeMap::new(),
             }
+        }
+
+        /// Put `value` in PCR `index` of the document (a locked user PCR).
+        pub fn with_user_pcr(mut self, index: usize, value: Vec<u8>) -> Self {
+            self.user_pcrs.insert(index, value);
+            self
         }
 
         /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
@@ -1125,6 +1210,7 @@ pub mod test_utils {
             pcrs.insert(1usize, self.pcr1.clone());
             pcrs.insert(2usize, self.pcr2.clone());
             pcrs.insert(8usize, vec![0u8; 48]);
+            pcrs.extend(self.user_pcrs.clone());
 
             let doc = AttestationDoc::new(
                 "test-module".to_string(),
@@ -1178,9 +1264,18 @@ mod tests {
         let bytes = fake.encode();
 
         let identity = verify_and_extract(&bytes, &hh(), DM).expect("verify");
-        assert_eq!(identity.pcrs.pcr0, fake.pcr0);
-        assert_eq!(identity.pcrs.pcr1, fake.pcr1);
-        assert_eq!(identity.pcrs.pcr2, fake.pcr2);
+        assert_eq!(
+            identity.identity.image()[0].as_slice(),
+            fake.pcr0.as_slice()
+        );
+        assert_eq!(
+            identity.identity.image()[1].as_slice(),
+            fake.pcr1.as_slice()
+        );
+        assert_eq!(
+            identity.identity.image()[2].as_slice(),
+            fake.pcr2.as_slice()
+        );
         assert_eq!(identity.control_pubkey, fake.control_pubkey);
     }
 
@@ -1202,7 +1297,11 @@ mod tests {
         // i.e. it is the SAME identity a peer would compute, just without the
         // verification a peer document requires.
         let verified = verify_and_extract(&bytes, &hh(), DM).expect("verify");
-        assert_eq!(pcrs.digest(), verified.pcrs.digest());
+        assert_eq!(pcrs, verified.identity.image_pcrs());
+        assert_eq!(
+            extract_own_identity(&bytes).expect("extract own identity"),
+            verified.identity
+        );
     }
 
     #[test]
@@ -1528,19 +1627,64 @@ mod tests {
         );
     }
 
+    /// Two documents with the same PCR0-2 but a different locked PCR16 are
+    /// two identities, so two synchronizer keys.
     #[test]
-    fn digest_is_sha256_of_concatenated_pcrs() {
-        let pcrs = Pcrs {
-            pcr0: vec![0x01; 48],
-            pcr1: vec![0x02; 48],
-            pcr2: vec![0x03; 48],
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(&pcrs.pcr0);
-        hasher.update(&pcrs.pcr1);
-        hasher.update(&pcrs.pcr2);
-        let expected: [u8; 32] = hasher.finalize().into();
-        assert_eq!(pcrs.digest(), expected);
+    fn verify_and_extract_reads_user_pcrs_into_the_identity() {
+        let plain = test_utils::FakeAttestation::with_seed(0x21, hh());
+        let a =
+            test_utils::FakeAttestation::with_seed(0x21, hh()).with_user_pcr(16, vec![0xa1; 48]);
+        let b =
+            test_utils::FakeAttestation::with_seed(0x21, hh()).with_user_pcr(16, vec![0xb2; 48]);
+
+        let plain = verify_and_extract(&plain.encode(), &hh(), DM)
+            .expect("plain")
+            .identity;
+        let a = verify_and_extract(&a.encode(), &hh(), DM)
+            .expect("a")
+            .identity;
+        let b = verify_and_extract(&b.encode(), &hh(), DM)
+            .expect("b")
+            .identity;
+
+        assert_eq!(a.image_pcrs(), b.image_pcrs());
+        assert_eq!(a.pcr(16), Some(&[0xa1; 48]));
+        assert_eq!(
+            plain.pcr(16),
+            Some(&[0u8; 48]),
+            "absent user PCR reads as zero"
+        );
+        assert_ne!(a.key(), b.key());
+        assert_ne!(a.key(), plain.key());
+    }
+
+    /// A user PCR of the wrong length makes the document malformed.
+    #[test]
+    fn verify_and_extract_rejects_a_short_user_pcr() {
+        let fake =
+            test_utils::FakeAttestation::with_seed(0x22, hh()).with_user_pcr(17, vec![1; 47]);
+        let err = verify_and_extract(&fake.encode(), &hh(), DM).unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::Malformed, "{err:?}");
+    }
+
+    /// `verify_chain_attestation_identity` compares the user PCRs too.
+    #[test]
+    fn chain_attestation_identity_checks_user_pcrs() {
+        let payload = b"payload";
+        let doc = test_utils::FakeChainAttestation::for_payload(0x30, payload)
+            .with_user_pcr(16, vec![0x16; 48])
+            .encode();
+        let image = pcrs_from_seed(0x30);
+        let mut user = crate::pin_identity::ZERO_USER_PCRS;
+        user[0] = [0x16; 48];
+        let right = PinIdentity::from_image_pcrs(&image, user).unwrap();
+        let wrong = right.with_user_pcrs(crate::pin_identity::ZERO_USER_PCRS);
+
+        let attested = verify_chain_attestation(&doc, payload, &image, DM).expect("image match");
+        assert_eq!(attested, right);
+        verify_chain_attestation_identity(&doc, payload, &right, DM).expect("full match");
+        let err = verify_chain_attestation_identity(&doc, payload, &wrong, DM).unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::PcrMismatch);
     }
 
     fn pcrs_from_seed(seed: u8) -> Pcrs {

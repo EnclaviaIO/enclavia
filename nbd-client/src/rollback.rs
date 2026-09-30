@@ -2025,7 +2025,8 @@ fn request_nsm_attestation(nonce: Vec<u8>, user_data: Vec<u8>) -> Result<Vec<u8>
 pub struct SyncSession {
     /// RPC-ready client over the vsock relay.
     pub client: Client<tokio_vsock::VsockStream>,
-    /// `SHA-256(PCR0||PCR1||PCR2)` of this enclave.
+    /// This enclave's pin-identity key (PCR0-2 plus user PCRs 16-31, see
+    /// `enclavia_protocol::pin_identity`).
     pub key: PcrKey,
 }
 
@@ -2064,10 +2065,12 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
             .map_err(|e| format!("NSM attestation task panicked: {e}"))??;
         // Derive our own PcrKey from the document we just minted; the
         // listener derives the session key the same way on its side, so
-        // RPC `key` fields match the session binding.
-        let pcrs = enclavia_protocol::attestation::extract_own_pcrs(&doc)
-            .map_err(|e| format!("cannot extract own PCRs from NSM document: {e}"))?;
-        let key = PcrKey(pcrs.digest());
+        // RPC `key` fields match the session binding. Any user PCR a boot
+        // feature uses must already be extended and locked here: it is part
+        // of the key from this first contact on.
+        let identity = enclavia_protocol::attestation::extract_own_identity(&doc)
+            .map_err(|e| format!("cannot extract own pin identity from NSM document: {e}"))?;
+        let key = PcrKey(identity.key());
         // Mutual auth: send our document, then verify the oracle's
         // answering attestation (nonce-bound to this session) against
         // the measured-config policy. A server that cannot prove it is

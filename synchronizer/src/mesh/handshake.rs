@@ -366,7 +366,7 @@ where
     };
 
     // 3. Verify the peer's attestation document (nonce binds it to this
-    //    session, yields PCRs + mesh pubkey).
+    //    session, yields the pin identity + mesh pubkey).
     let extracted = attestation::verify_and_extract(
         &peer_doc,
         &handshake_hash,
@@ -377,7 +377,9 @@ where
         crate::metrics::record_rejection(crate::metrics::RejectionSource::Peer, e.reason());
         HandshakeError::PeerAttestation(e)
     })?;
-    let pcr_digest = PcrKey(extracted.pcrs.digest());
+    // Same identity derivation as for customers (PCR0-2 plus user PCRs
+    // 16-31), so the allowlist compares full identities.
+    let pcr_digest = PcrKey(extracted.identity.key());
 
     // 4. Self-PCR allowlist: the peer must be running our image.
     if !allowlist.admits(&pcr_digest) {

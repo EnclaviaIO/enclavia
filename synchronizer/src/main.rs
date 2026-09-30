@@ -126,12 +126,13 @@ struct MeshEnv {
 ///
 /// ## Self-PCR digest: derived from `/dev/nsm`, never from the host
 ///
-/// The self-PCR allowlist admits a peer only when the peer's attested PCR
-/// digest equals THIS node's own image measurements. Those measurements are
-/// obtained here by requesting a fresh attestation document from the node's own
-/// `/dev/nsm` (with an arbitrary nonce / user_data, since there is no session or
-/// peer to bind to) and reading back PCR0/1/2 with
-/// [`extract_own_pcrs`](enclavia_protocol::attestation::extract_own_pcrs). The
+/// The self-PCR allowlist admits a peer only when the peer's attested identity
+/// key equals THIS node's own. That key is obtained here by requesting a fresh
+/// attestation document from the node's own `/dev/nsm` (with an arbitrary nonce
+/// / user_data, since there is no session or peer to bind to) and reading back
+/// its pin identity (PCR0-2 plus user PCRs 16-31, the same derivation the
+/// listener applies to customers) with
+/// [`extract_own_identity`](enclavia_protocol::attestation::extract_own_identity). The
 /// host is the adversary: a host-supplied digest (the old `MESH_SELF_PCR*` env
 /// vars) would let it choose an allowlist that admits a rogue image into the
 /// mesh and Raft. The local NSM device is inside the node's TCB and measures
@@ -142,7 +143,7 @@ struct MeshEnv {
 /// config is refused with a loud error log (fatal in a `raft` build).
 #[cfg(any(feature = "mesh", feature = "raft"))]
 fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
-    use enclavia_protocol::attestation::extract_own_pcrs;
+    use enclavia_protocol::attestation::extract_own_identity;
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::PcrKey;
     use synchronizer::mesh::attestation::request_own_attestation;
@@ -177,7 +178,7 @@ fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
     }
 
     // Self-attestation: request a document from our own /dev/nsm and read back
-    // our hardware-measured PCRs. nonce/user_data are irrelevant here (no
+    // our hardware-measured identity. nonce/user_data are irrelevant here (no
     // session, no peer to bind to), so we pass placeholders. No env fallback on
     // failure: the host must not be able to pick this digest.
     let self_doc = match request_own_attestation(None, None) {
@@ -187,14 +188,14 @@ fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
             return None;
         }
     };
-    let self_pcrs = match extract_own_pcrs(&self_doc) {
-        Ok(p) => p,
+    let self_identity = match extract_own_identity(&self_doc) {
+        Ok(id) => id,
         Err(e) => {
             error!(error = %e, "failed to parse own /dev/nsm attestation document; refusing the mesh config");
             return None;
         }
     };
-    let self_digest = PcrKey(self_pcrs.digest());
+    let self_digest = PcrKey(self_identity.key());
     info!("derived self-PCR digest from /dev/nsm for the mesh allowlist");
 
     let config = MeshConfig::new(self_name.clone(), peers, self_digest);
