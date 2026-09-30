@@ -37,6 +37,8 @@ use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use der::Decode;
 use p384::ecdsa::signature::hazmat::PrehashVerifier;
 
+use crate::attestation::{RejectionReason, ValidationFailure};
+
 /// The AWS Nitro Enclaves root certificate (`CN=aws.nitro-enclaves`), DER.
 /// Byte-identical to the PEM embedded in `attestation-doc-validation`.
 /// SHA-256 fingerprint, as published by AWS:
@@ -110,20 +112,31 @@ const OID_SECP384R1: spki::ObjectIdentifier = spki::ObjectIdentifier::new_unwrap
 pub(crate) fn validate_at_doc_timestamp(
     attestation_data: &[u8],
     root_der: &[u8],
-) -> Result<AttestationDoc, String> {
+) -> Result<AttestationDoc, ValidationFailure> {
     // Decode + structure checks (module id, SHA384 digest, PCR/cabundle/
     // nonce/user_data bounds). No signature is checked yet, so nothing read
     // from `doc` is trusted until the COSE signature below verifies.
-    let (cose, doc) = decode_attestation_document(attestation_data).map_err(|e| e.to_string())?;
+    let (cose, doc) = decode_attestation_document(attestation_data)
+        .map_err(|e| ValidationFailure::new(RejectionReason::Malformed, e.to_string()))?;
 
     // Chain at the document's timestamp. Integer division floors to the
     // second, which never moves the instant after the true signing time.
     let at = webpki::Time::from_seconds_since_unix_epoch(doc.timestamp / 1000);
     let intermediates: Vec<&[u8]> = doc.cabundle.iter().map(|c| c.as_slice()).collect();
-    let leaf = webpki::EndEntityCert::try_from(doc.certificate.as_slice())
-        .map_err(|e| format!("leaf certificate: {e:?}"))?;
-    let anchor = [webpki::TrustAnchor::try_from_cert_der(root_der)
-        .map_err(|e| format!("trust anchor: {e:?}"))?];
+    let leaf = webpki::EndEntityCert::try_from(doc.certificate.as_slice()).map_err(|e| {
+        ValidationFailure::new(
+            RejectionReason::Malformed,
+            format!("leaf certificate: {e:?}"),
+        )
+    })?;
+    let anchor = [
+        webpki::TrustAnchor::try_from_cert_der(root_der).map_err(|e| {
+            ValidationFailure::new(
+                RejectionReason::UntrustedChain,
+                format!("trust anchor: {e:?}"),
+            )
+        })?,
+    ];
     leaf.verify_is_valid_tls_server_cert(
         SUPPORTED_SIG_ALGS,
         &webpki::TlsServerTrustAnchors(&anchor),
@@ -131,18 +144,42 @@ pub(crate) fn validate_at_doc_timestamp(
         at,
     )
     .map_err(|e| {
-        format!(
-            "certificate chain invalid at document timestamp {} ms: {e:?}",
-            doc.timestamp
+        ValidationFailure::new(
+            chain_rejection_reason(&e),
+            format!(
+                "certificate chain invalid at document timestamp {} ms: {e:?}",
+                doc.timestamp
+            ),
         )
     })?;
 
     // COSE signature under the (now chain-validated) leaf key. This is what
     // authenticates `timestamp`, and with it the instant used above.
-    let key = LeafKey::from_cert_der(&doc.certificate)?;
-    validate_cose_signature::<Sha2>(&key, &cose).map_err(|e| e.to_string())?;
+    let key = LeafKey::from_cert_der(&doc.certificate)
+        .map_err(|e| ValidationFailure::new(RejectionReason::Malformed, e))?;
+    validate_cose_signature::<Sha2>(&key, &cose)
+        .map_err(|e| ValidationFailure::new(RejectionReason::Signature, e.to_string()))?;
 
     Ok(doc)
+}
+
+/// Classify a webpki chain-validation error.
+///
+/// Only the leaf's own validity window surfaces as `CertNotValidYet` /
+/// `CertExpired`: webpki tries each candidate issuer and reports a path that
+/// fails further up (an expired intermediate included) as `UnknownIssuer`,
+/// which lands in [`RejectionReason::UntrustedChain`].
+fn chain_rejection_reason(e: &webpki::Error) -> RejectionReason {
+    match e {
+        webpki::Error::CertNotValidYet => RejectionReason::NotYetValid,
+        webpki::Error::CertExpired => RejectionReason::Expired,
+        webpki::Error::InvalidSignatureForPublicKey
+        | webpki::Error::SignatureAlgorithmMismatch
+        | webpki::Error::UnsupportedSignatureAlgorithm
+        | webpki::Error::UnsupportedSignatureAlgorithmForPublicKey => RejectionReason::Signature,
+        webpki::Error::BadDer | webpki::Error::BadDerTime => RejectionReason::Malformed,
+        _ => RejectionReason::UntrustedChain,
+    }
 }
 
 /// The leaf certificate's P-384 public key, as a COSE verifier. Nitro signs
