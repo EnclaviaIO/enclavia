@@ -16,15 +16,32 @@
     # `synchronizer-eif` output below.
     nitro-util.url = "github:monzo/aws-nitro-util";
 
-    # Source-only input carrying the builder's patched init (CID-2
-    # heartbeat for QEMU's vhost-device-vsock) and kernel/init blobs we
-    # reuse for the synchronizer EIF. `flake = false` so we just get its
-    # source tree; override during local development with
-    # `--override-input builder-src path:../builder`.
+    # The builder's source, for the synchronizer EIFs' minimal kernel,
+    # its config and the patched init. Source only, not a flake input:
+    # the builder flake has an `enclavia` input that points back at this
+    # flake. The backend overrides that input with an enclavia source
+    # when it builds customer EIFs, and if this flake then had the
+    # builder as a flake input, Nix would look for the builder's
+    # relative `path:./dummy-*` inputs inside the enclavia source and
+    # fail. The kernel is built here from this source with the builder's
+    # own nixpkgs pin (`nixpkgs-builder`), the same way the builder's
+    # flake.nix builds it (see nix/builder-kernels.nix), so it is the
+    # exact derivation the builder builds and CI tests.
+    # Pinned by rev (builder master at the merge of EnclaviaIO/builder#76,
+    # which added the aarch64 kernel and static aarch64 init). Override
+    # during local development with
+    # `--override-input builder-src path:../builder`, together with
+    # `nixpkgs-builder` if that checkout pins another nixpkgs.
     builder-src = {
-      url = "github:EnclaviaIO/builder";
+      url = "github:EnclaviaIO/builder/efa534b610b4cb3e90d9141831d60966d719090a";
       flake = false;
     };
+
+    # The nixpkgs rev that the builder's flake.lock pins at the
+    # `builder-src` rev. The kernel is built with it, not with our
+    # nixpkgs. It must move together with `builder-src`: evaluation fails
+    # if the two disagree.
+    nixpkgs-builder.url = "github:NixOS/nixpkgs/643809054d65fdd466a63e3155b8c498cb483c04";
 
     # In-enclave clock-sync daemon (keeps CLOCK_REALTIME on the NSM
     # attestation timestamp), baked into the synchronizer EIFs. Pinned by
@@ -35,7 +52,7 @@
     nitro-timesync.url = "github:EnclaviaIO/nitro-timesync/2486fce026c593bb0512351aa06a0027cf1cbd64";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src, nitro-timesync }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src, nixpkgs-builder, nitro-timesync }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -354,14 +371,46 @@
           cp ${./enclavia-wasm/README.md} $out/README.md
         '';
 
-        # --- Dedicated synchronizer EIF ---------------------------------
+        # --- Dedicated synchronizer EIFs --------------------------------
         #
         # NOT the builder's OCI pipeline: the synchronizer is the entire
         # in-enclave payload, so we assemble a minimal EIF directly with
-        # monzo's nitroLib.buildEif, reusing the builder's prebuilt
-        # kernel/init blobs and its patched (CID-2 heartbeat) init for
-        # QEMU debug. See nix/synchronizer-eif.nix for the rationale.
+        # monzo's nitroLib.buildEif, from the builder's minimal kernel and
+        # its patched (CID 2 + CID 3 heartbeat) init. See
+        # nix/synchronizer-eif.nix for the rationale.
+        #
+        # The builder only builds on x86_64-linux, which is also the one
+        # host the synchronizer EIFs are defined for: that is the build
+        # third parties reproduce the PCRs with.
         nitroLib = nitro-util.lib.${system};
+
+        # nixpkgs as the builder's flake.nix imports it, at the rev the
+        # builder's flake.lock pins. `nixpkgs-builder` must be that rev.
+        builderLock = builtins.fromJSON (builtins.readFile "${builder-src}/flake.lock");
+        builderNixpkgsRev = builderLock.nodes.${builderLock.nodes.root.inputs.nixpkgs}.locked.rev;
+        builderNixpkgs =
+          if (nixpkgs-builder.rev or builderNixpkgsRev) == builderNixpkgsRev
+          then import nixpkgs-builder { system = "x86_64-linux"; }
+          else throw "nixpkgs-builder is at ${nixpkgs-builder.rev}, but builder-src pins nixpkgs ${builderNixpkgsRev}; move them together";
+
+        # The builder's minimal kernel and x86_64 init, built from its
+        # source and nixpkgs.
+        builderKernels = import ./nix/builder-kernels.nix {
+          pkgs = builderNixpkgs;
+          builderSrc = builder-src;
+        };
+
+        # x86_64 image base: the builder's minimal non-storage kernel.
+        synchronizerEifX86 = {
+          inherit pkgs nitroLib;
+          arch = "x86_64";
+          kernel = "${builderKernels.kernel}/bzImage";
+          kernelConfig = "${builderKernels.kernelConfig}/config";
+          init = "${builderKernels.init}/bin/init";
+          namesInitPkg = synchronizerNamesInit;
+          timesyncPkg = nitroTimesync;
+          busyboxPkg = pkgs.pkgsStatic.busybox;
+        };
 
         # Two REAL, distinct EIFs, one per synchronizer binary variant
         # above. The patched init heartbeats both CIDs (3 + 2), so each EIF
@@ -381,22 +430,14 @@
         # PCR0/1/2), so customer configs' `synchronizer.expected_pcrs` must
         # pin the NITRO build's measurements; pinning the dev build's PCRs
         # would re-open the forged-attestation hole above.
-        synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix {
-          inherit pkgs nitroLib;
+        synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix (synchronizerEifX86 // {
           synchronizerPkg = synchronizer;
-          namesInitPkg = synchronizerNamesInit;
-          timesyncPkg = nitroTimesync;
-          builderSrc = builder-src;
-        };
+        });
 
-        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix {
-          inherit pkgs nitroLib;
+        synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix (synchronizerEifX86 // {
           eifName = "synchronizer-enclave-nitro";
           synchronizerPkg = synchronizerNitro;
-          namesInitPkg = synchronizerNamesInit;
-          timesyncPkg = nitroTimesync;
-          builderSrc = builder-src;
-        };
+        });
 
       in
       {
@@ -469,6 +510,9 @@
           synchronizer = synchronizer;
           synchronizer-nitro = synchronizerNitro;
           synchronizer-names-init = synchronizerNamesInit;
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # Built on the builder's kernel, which builds on x86_64-linux
+          # only (see above).
           synchronizer-eif = synchronizerEif;
           synchronizer-eif-nitro = synchronizerEifNitro;
         };

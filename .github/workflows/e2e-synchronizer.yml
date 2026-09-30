@@ -9,7 +9,8 @@
 # and is minutes-slow where ci.yml is the cheap cargo loop.
 #
 # Sibling repos:
-#   - EnclaviaIO/builder (public): init-patched + heartbeat.py. Plain
+#   - EnclaviaIO/builder (public): heartbeat.py (the EIF builds its kernel
+#     and init from the pinned `builder-src` input instead). Plain
 #     HTTPS clone.
 #   - EnclaviaIO/enclavia-crates (PRIVATE): the `mesh-host-debug` flake
 #     output the harness bridges the mesh with. The default

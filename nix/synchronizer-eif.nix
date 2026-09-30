@@ -3,12 +3,12 @@
 # The synchronizer is the entire in-enclave payload: no customer OCI
 # image, no enclavia-server, no crun, no namespace stripping. So instead
 # of routing through the builder's OCI pipeline we assemble a minimal EIF
-# directly with monzo's `nitroLib.buildEif`, using nitro-util's prebuilt
-# kernel/nsm.ko blobs and the builder's patched init for QEMU debug.
+# directly with monzo's `nitroLib.buildEif`, from the builder's minimal
+# kernel (non-storage profile, NSM driver built in, no modules) and the
+# builder's patched init.
 #
 # This file is parameterized over `synchronizerPkg`, and flake.nix
-# instantiates it TWICE (the security boundary lives entirely in which
-# binary is baked in; everything else is byte-identical):
+# instantiates it TWICE, as two separate images with separate PCRs:
 #
 # * `synchronizer-eif` carries the QEMU/dev binary (skip-cert-chain
 #   attestation): for the local QEMU harness ONLY.
@@ -18,10 +18,10 @@
 #   so customer configs' `synchronizer.expected_pcrs` must pin the nitro
 #   build's measurements.
 #
-# Patched init (QEMU debug): the stock Nitro init heartbeats to CID 3
-# (the real Nitro parent), but under QEMU `vhost-device-vsock` only
-# handles CID 2, so we reuse the builder's `init-patched` (heartbeat to
-# CID 2). Same artifact the builder's debug enclaves use.
+# Patched init: the stock Nitro init heartbeats to CID 3 (the real Nitro
+# parent), but under QEMU `vhost-device-vsock` only handles CID 2, so we
+# use the builder's `init-patched`, which heartbeats both. Same init the
+# builder's own enclaves use.
 #
 # Identical PCRs across nodes: this EIF carries NO per-node identity. All
 # three cluster nodes run this one image, so PCR0/1/2 match and the
@@ -32,11 +32,20 @@
 {
   pkgs,
   nitroLib,
+  # EIF architecture: "x86_64" or "aarch64". Every binary below must be
+  # built for it; the rootfs gate checks.
+  arch,
+  # Kernel image file and its .config (the builder's minimal kernel).
+  kernel,
+  kernelConfig,
+  # Static init binary (the builder's init-patched).
+  init,
   synchronizerPkg,
   namesInitPkg,
   # In-enclave clock-sync daemon (nitro-timesync, static build).
   timesyncPkg,
-  builderSrc,
+  # Static busybox providing /bin/sh and the few tools the init script uses.
+  busyboxPkg,
   # Derivation/image name. The two instantiations differ only in the baked-in
   # synchronizer binary, so the name is the one thing keeping their store
   # paths human-distinguishable.
@@ -44,25 +53,6 @@
 }:
 
 let
-  arch = "x86_64";
-  blobs = nitroLib.blobs.${arch};
-
-  # The init for ALL synchronizer EIFs, built from the builder's vendored
-  # Go source (vendorHash = null because the source ships its own vendor/
-  # tree). It heartbeats BOTH CID 3 (Nitro parent) and CID 2
-  # (vhost-device-vsock host), so a single EIF boots on both QEMU and real
-  # Nitro -- never AWS' stock CID-3-only blob init. Same init the builder's
-  # enclave.nix uses.
-  patchedInit = pkgs.buildGoModule {
-    name = "synchronizer-eif-init";
-    src = "${builderSrc}/nix/init-patched";
-    vendorHash = null;
-    env.CGO_ENABLED = 0;
-    ldflags = [ "-s" "-w" ];
-  };
-
-  initBinary = "${patchedInit}/bin/init";
-
   # A plain `#!/bin/sh` script, run by the image's own busybox. Not
   # `pkgs.writeShellScript`: its shebang names the BUILD host's bash by
   # store path, and the closure of that path (bash + glibc) would then be
@@ -94,7 +84,7 @@ let
 
     # Minimal busybox for the init script (sh, mount, mkdir, ip; echo and
     # read are sh builtins).
-    cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox
+    cp ${busyboxPkg}/bin/busybox $out/bin/busybox
     ln -s busybox $out/bin/sh
     ln -s busybox $out/bin/mount
     ln -s busybox $out/bin/mkdir
@@ -124,7 +114,7 @@ let
       fi
       echo "synchronizer-rootfs: $1: static, $machine"
     }
-    check_static_elf ${initBinary}
+    check_static_elf ${init}
     for f in $out/bin/*; do
       if [ -L "$f" ]; then
         [ "$(readlink "$f")" = busybox ] || fail "$f: unexpected symlink"
@@ -143,12 +133,9 @@ let
 in
 nitroLib.buildEif {
   name = eifName;
-  kernel = blobs.kernel;
-  kernelConfig = blobs.kernelConfig;
-  # nitro-util's blob kernel is the AWS-provided one, which predates the
-  # in-tree NSM driver (kernel 6.8+), so monzo's init insmods this nsm.ko
-  # at boot to surface /dev/nsm.
-  nsmKo = blobs.nsmKo;
+  inherit arch kernel kernelConfig init;
+  # The minimal kernel has the NSM driver built in (no module support).
+  nsmKo = null;
   copyToRoot = rootfs;
   # The rootfs is self-contained (static binaries and a /bin/sh script,
   # enforced above), so nothing in the image resolves a /nix/store path.
@@ -156,5 +143,4 @@ nitroLib.buildEif {
   # whole busybox package under /nix/store.
   copyToRootWithClosure = false;
   entrypoint = "/bin/enclave-init";
-  init = initBinary;
 }
