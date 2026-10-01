@@ -23,7 +23,8 @@ use enclavia_protocol::attestation::test_utils::{
 use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
 use enclavia_protocol::chain::RevocationPayload;
 use enclavia_protocol::perform_handshake_as_responder;
-use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use enclavia_protocol::signing::{SignedDomain, sign_control};
+use p256::ecdsa::SigningKey;
 use synchronizer::client::{ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::listener::{FakeSessionAttestor, handle_connection};
 use synchronizer::node::Node;
@@ -236,14 +237,14 @@ fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
     let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: payload_bytes,
         attestation,
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 
@@ -577,14 +578,14 @@ fn upgrade_link_issued_at(
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
     let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: payload_bytes,
         attestation,
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 
@@ -599,14 +600,14 @@ fn revocation_link(signing: &SigningKey, target: &ChainLink) -> ChainLink {
     };
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Revocation,
         payload: payload_bytes,
         attestation: vec![],
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 

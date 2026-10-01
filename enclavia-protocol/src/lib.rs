@@ -12,6 +12,7 @@ pub mod mesh;
 mod nitro_verify;
 mod noise;
 pub mod pin_identity;
+pub mod signing;
 pub mod staging;
 pub mod synchronizer_metrics;
 
@@ -35,8 +36,9 @@ pub enum ClientMessage {
 
     /// Authenticated management command. `payload` is a CBOR-encoded
     /// `ControlCommand`; `signature` is a P-256 ECDSA raw r||s 64-byte
-    /// signature over `payload` produced with the enclave's control private
-    /// key. The server verifies the signature against the control public key
+    /// signature over `payload` in the control-command domain
+    /// ([`signing::SignedDomain::ControlCommand`]) produced with the
+    /// enclave's control private key. The server verifies the signature against the control public key
     /// baked into the EIF and the embedded nonce against its current
     /// single-use nonce.
     Control {
@@ -144,7 +146,9 @@ pub struct RekeyParams {
 
 /// Inner payload of a signed control command. Serialized as CBOR before
 /// signing — the wire-level signature covers the exact bytes the verifier
-/// then deserializes, so re-encoding skew can't break verification.
+/// then deserializes, so re-encoding skew can't break verification. The
+/// signature is made in [`signing::SignedDomain::ControlCommand`], and the
+/// enclave decodes the bytes with [`signing::decode_canonical`].
 ///
 /// # Wire-stability note
 ///
@@ -155,7 +159,7 @@ pub struct RekeyParams {
 /// the enclave can emit the chain link as part of the same atomic operation
 /// as the storage re-key, before replying to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "command")]
+#[serde(tag = "command", deny_unknown_fields)]
 pub enum ControlCommand {
     /// Staged-upgrade confirmation. The enclave verifies the envelope
     /// signature, optionally re-keys storage, emits a chain `Upgrade` link to
@@ -164,9 +168,9 @@ pub enum ControlCommand {
         /// CBOR-encoded [`chain::UpgradePayload`]. Becomes the `payload` field
         /// of the chain link verbatim; the enclave must not re-encode it.
         payload: Vec<u8>,
-        /// 64-byte raw r||s ECDSA P-256 signature over `payload` under the
-        /// enclave's control private key. Becomes the `signature` field of
-        /// the chain link. The enclave MAY also verify this against its own
+        /// 64-byte raw r||s ECDSA P-256 signature over `payload` in the
+        /// upgrade-payload domain under the enclave's control private key.
+        /// Becomes the `signature` field of the chain link. The enclave MAY also verify this against its own
         /// control public key as defence-in-depth (same key signs both the
         /// envelope and the chain payload).
         payload_signature: Vec<u8>,
@@ -186,8 +190,8 @@ pub enum ControlCommand {
         /// CBOR-encoded [`chain::RevocationPayload`]. Becomes the `payload`
         /// field of the chain link verbatim.
         payload: Vec<u8>,
-        /// 64-byte raw r||s ECDSA P-256 signature over `payload`. Becomes the
-        /// chain link signature.
+        /// 64-byte raw r||s ECDSA P-256 signature over `payload` in the
+        /// revocation-payload domain. Becomes the chain link signature.
         payload_signature: Vec<u8>,
         /// When `true`, the enclave runs `enclavia-crypto revoke-upgrade` to
         /// kill the LUKS keyslot added at prepare time and restore the key
@@ -437,6 +441,32 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The command is control-key signed: unknown fields are refused while
+    /// decoding, and the canonical decode accepts the encoder's own bytes.
+    #[test]
+    fn control_command_rejects_unknown_fields() {
+        let cmd = ControlCommand::RevokeUpgrade {
+            payload: vec![1],
+            payload_signature: vec![2; 64],
+            rollback: false,
+            nonce: [3; 32],
+        };
+        let mut value = ciborium::Value::serialized(&cmd).unwrap();
+        match &mut value {
+            ciborium::Value::Map(m) => m.push((
+                ciborium::Value::Text("extra".into()),
+                ciborium::Value::Bool(true),
+            )),
+            other => panic!("not a map: {other:?}"),
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&value, &mut bytes).unwrap();
+        assert!(ciborium::from_reader::<ControlCommand, _>(bytes.as_slice()).is_err());
+
+        let canonical = signing::encode(&cmd);
+        assert!(signing::decode_canonical::<ControlCommand>(&canonical).is_ok());
     }
 
     #[test]

@@ -325,7 +325,8 @@ mod tests {
     use crate::{Commitment, Version};
     use enclavia_protocol::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
     use enclavia_protocol::chain::{ChainLinkKind, UpgradePayload};
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use enclavia_protocol::signing::{SignedDomain, sign_control};
+    use p256::ecdsa::SigningKey;
 
     /// Arbitrary PcrKey for the Pin/Get/session-binding tests that never
     /// go through transition-link verification. These never have to match
@@ -399,14 +400,14 @@ mod tests {
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -916,14 +917,14 @@ mod tests {
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -942,14 +943,14 @@ mod tests {
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Revocation,
             payload: payload_bytes,
             attestation: vec![],
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 

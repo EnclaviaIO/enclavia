@@ -2469,6 +2469,7 @@ version = "0.2.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
+ "chrono",
  "ciborium",
  "enclavia-protocol",
  "enclavia-vsock",
@@ -2481,6 +2482,7 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

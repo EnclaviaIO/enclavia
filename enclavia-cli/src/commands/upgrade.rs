@@ -23,6 +23,7 @@ use enclavia_protocol::chain::{
     UpgradePayload, validate_chain,
 };
 use enclavia_protocol::pin_identity::PinIdentity;
+use enclavia_protocol::signing::{SignedDomain, decode_canonical, verify_control_signature};
 pub use enclavia_protocol::staging::{StagedUpgradeJson, StagedUpgradeStatus};
 use serde::Serialize;
 use uuid::Uuid;
@@ -212,17 +213,15 @@ fn debug_mode_from_enclave_row(enclave: &serde_json::Value) -> bool {
 
 fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> {
     match kind {
-        ChainLinkKind::Boot => ciborium::de::from_reader::<BootPayload, _>(bytes)
+        ChainLinkKind::Boot => decode_canonical::<BootPayload>(bytes)
             .ok()
             .map(DecodedPayload::Boot),
-        ChainLinkKind::Upgrade => ciborium::de::from_reader::<UpgradePayload, _>(bytes)
+        ChainLinkKind::Upgrade => decode_canonical::<UpgradePayload>(bytes)
             .ok()
             .map(|p| DecodedPayload::Upgrade(Box::new(p))),
-        ChainLinkKind::Revocation => {
-            ciborium::de::from_reader::<RevocationPayload, _>(bytes)
-                .ok()
-                .map(DecodedPayload::Revocation)
-        }
+        ChainLinkKind::Revocation => decode_canonical::<RevocationPayload>(bytes)
+            .ok()
+            .map(DecodedPayload::Revocation),
     }
 }
 
@@ -534,14 +533,14 @@ pub fn check_revocation_target(
     chain: &[enclavia_protocol::chain::ChainLink],
     now: DateTime<Utc>,
 ) -> Result<RevocationTarget, CliError> {
-    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use p256::ecdsa::VerifyingKey;
     let refuse = |why: &str| {
         Err(CliError::Other(format!(
             "refusing to sign the revocation the backend prepared: {why}"
         )))
     };
 
-    let revocation: RevocationPayload = ciborium::from_reader(revocation_payload)
+    let revocation: RevocationPayload = decode_canonical(revocation_payload)
         .map_err(|e| CliError::Other(format!("prepared payload is not a RevocationPayload: {e}")))?;
     if revocation.enclave_id != enclave_id {
         return refuse("it is for another enclave");
@@ -557,11 +556,10 @@ pub fn check_revocation_target(
     }
     let verifying = VerifyingKey::from_sec1_bytes(control_pubkey)
         .map_err(|e| CliError::Other(format!("control public key does not decode: {e}")))?;
-    let signature_ok = link
-        .signature
-        .as_deref()
-        .and_then(|s| Signature::from_slice(s).ok())
-        .is_some_and(|sig| verifying.verify(&link.payload, &sig).is_ok());
+    let signature_ok = link.signature.as_deref().is_some_and(|sig| {
+        verify_control_signature(&verifying, SignedDomain::UpgradePayload, &link.payload, sig)
+            .is_ok()
+    });
     if !signature_ok {
         return refuse("the upgrade link it references is not signed by your control key");
     }
@@ -569,7 +567,7 @@ pub fn check_revocation_target(
     if link_hash != revocation.revokes_link {
         return refuse("its revokes_link names a different link than the upgrade it references");
     }
-    let upgrade: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
+    let upgrade: UpgradePayload = decode_canonical(&link.payload)
         .map_err(|e| CliError::Other(format!("upgrade link payload does not decode: {e}")))?;
     if upgrade.enclave_id != enclave_id {
         return refuse("the upgrade link it references is for another enclave");
@@ -849,7 +847,8 @@ mod tests {
     mod revocation_target {
         use super::*;
         use enclavia_protocol::chain::{ChainLink, upgrade_link_hash};
-        use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+        use enclavia_protocol::signing::sign_control;
+        use p256::ecdsa::SigningKey;
 
         fn key(seed: u8) -> (SigningKey, [u8; 65]) {
             let mut scalar = [0u8; 32];
@@ -882,14 +881,14 @@ mod tests {
             };
             let mut bytes = Vec::new();
             ciborium::ser::into_writer(&payload, &mut bytes).unwrap();
-            let sig: Signature = sk.sign(&bytes);
+            let sig = sign_control(sk, SignedDomain::UpgradePayload, &bytes);
             ChainLink {
                 id: Some(id),
                 sequence: Some(1),
                 kind: ChainLinkKind::Upgrade,
                 payload: bytes,
                 attestation: vec![],
-                signature: Some(sig.to_bytes().to_vec()),
+                signature: Some(sig.to_vec()),
             }
         }
 
@@ -977,6 +976,22 @@ mod tests {
             let (backend_sk, _) = key(2);
             let id = Uuid::from_u128(0x16);
             let link = upgrade(&backend_sk, id, now());
+            let hash = upgrade_link_hash(&link.payload);
+            let err = check(&revocation(id, hash), &pk, &staged(id), &[link]).unwrap_err();
+            assert!(err.to_string().contains("not signed by your control key"), "{err}");
+        }
+
+        /// A link carrying our key's signature in another domain (say, a
+        /// revocation signature over bytes that also decode as an upgrade)
+        /// is not an upgrade we approved.
+        #[test]
+        fn link_signed_in_another_domain_is_refused() {
+            let (sk, pk) = key(1);
+            let id = Uuid::from_u128(0x1a);
+            let mut link = upgrade(&sk, id, now());
+            link.signature = Some(
+                sign_control(&sk, SignedDomain::RevocationPayload, &link.payload).to_vec(),
+            );
             let hash = upgrade_link_hash(&link.payload);
             let err = check(&revocation(id, hash), &pk, &staged(id), &[link]).unwrap_err();
             assert!(err.to_string().contains("not signed by your control key"), "{err}");
