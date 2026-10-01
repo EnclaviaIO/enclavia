@@ -19,8 +19,9 @@
 //!   nonce`, where `from` and `to` are full pin identities (PCR0-2 and
 //!   user PCRs 16-31, see [`crate::pin_identity`]); the link's
 //!   attestation must carry exactly `from`. The link's `signature` is the
-//!   backend's ECDSA P-256 sig over the payload, verifiable against the
-//!   enclave's baked-in control pubkey.
+//!   control key's ECDSA P-256 signature over the payload in the
+//!   upgrade-payload domain (see [`crate::signing`]), verifiable against
+//!   the enclave's baked-in control pubkey.
 //! * [`ChainLinkKind::Revocation`] — emitted by the OLD enclave on a
 //!   pre-activation revoke. Payload binds the chain entry id being
 //!   cancelled + `issued_at / nonce`. Same signature treatment as
@@ -55,12 +56,15 @@
 
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
 use crate::pin_identity::PinIdentity;
+use crate::signing::{
+    ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
+};
 
 /// Kind of a chain entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,8 +103,9 @@ pub struct ChainLink {
     #[serde(with = "serde_bytes")]
     pub attestation: Vec<u8>,
     /// 64-byte raw `r || s` ECDSA P-256 signature over `payload` under
-    /// the enclave's control private key. Required for upgrade /
-    /// revocation, absent on boot.
+    /// the enclave's control private key, in the domain of `kind` (see
+    /// [`crate::signing`]). Required for upgrade / revocation, absent on
+    /// boot. `kind`, `id` and `sequence` are outside every signature.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -165,7 +170,11 @@ pub struct ChainLinkJson {
 }
 
 /// Payload shape for a [`ChainLinkKind::Boot`] link.
+///
+/// Hashed into the boot attestation (`user_data = sha256(payload)`), so
+/// readers decode it with [`decode_canonical`]: one value, one encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootPayload {
     /// Enclave identifier. Must equal the expected id in the
     /// validator's context (the URL path id on ingest, the
@@ -184,7 +193,11 @@ pub struct BootPayload {
 }
 
 /// Payload shape for a [`ChainLinkKind::Upgrade`] link.
+///
+/// Signed by the control key in [`SignedDomain::UpgradePayload`] and
+/// decoded with [`decode_canonical`] (see [`crate::signing`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpgradePayload {
     pub enclave_id: Uuid,
     /// Full pin identity (PCR0-2 and user PCRs 16-31, see
@@ -202,7 +215,11 @@ pub struct UpgradePayload {
 }
 
 /// Payload shape for a [`ChainLinkKind::Revocation`] link.
+///
+/// Signed by the control key in [`SignedDomain::RevocationPayload`] and
+/// decoded with [`decode_canonical`] (see [`crate::signing`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationPayload {
     pub enclave_id: Uuid,
     /// Chain entry id of the upgrade link this revocation cancels.
@@ -578,7 +595,7 @@ fn validate_boot(
     if link.signature.is_some() {
         return Err(ChainValidationError::BootHasSignature);
     }
-    let parsed: BootPayload = ciborium::from_reader(link.payload.as_slice()).map_err(|e| {
+    let parsed: BootPayload = decode_canonical(&link.payload).map_err(|e| {
         ChainValidationError::PayloadDecode {
             kind: ChainLinkKind::Boot,
             msg: e.to_string(),
@@ -614,7 +631,7 @@ fn validate_boot(
             })
         }
         Some(prev) => {
-            let prev_payload: BootPayload = ciborium::from_reader(prev.payload.as_slice())
+            let prev_payload: BootPayload = decode_canonical(&prev.payload)
                 .map_err(|e| {
                     ChainValidationError::CorruptStoredPayload(ChainLinkKind::Boot, e.to_string())
                 })?;
@@ -651,17 +668,25 @@ fn validate_signed(
     })?;
     let verifying = VerifyingKey::from_sec1_bytes(pubkey_bytes)
         .map_err(|e| ChainValidationError::BadControlPubkey(e.to_string()))?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| ChainValidationError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| ChainValidationError::SignatureInvalid)?;
+    // The domain is the one of the kind this link is validated as, so a link
+    // whose unsigned `kind` label was changed carries a signature made in
+    // another domain and fails here.
+    let domain = match link.kind {
+        ChainLinkKind::Upgrade => SignedDomain::UpgradePayload,
+        ChainLinkKind::Revocation => SignedDomain::RevocationPayload,
+        ChainLinkKind::Boot => unreachable!("validate_signed not called for boot"),
+    };
+    verify_control_signature(&verifying, domain, &link.payload, sig_bytes).map_err(|e| match e {
+        ControlSignatureError::Shape => ChainValidationError::SignatureShape,
+        ControlSignatureError::Invalid => ChainValidationError::SignatureInvalid,
+    })?;
 
     // Payload-shape sanity, the enclave_id binding, replay dedup, and
     // per-kind cross-link checks.
     match link.kind {
         ChainLinkKind::Upgrade => {
             let parsed: UpgradePayload =
-                ciborium::from_reader(link.payload.as_slice()).map_err(|e| {
+                decode_canonical(&link.payload).map_err(|e| {
                     ChainValidationError::PayloadDecode {
                         kind: ChainLinkKind::Upgrade,
                         msg: e.to_string(),
@@ -691,7 +716,7 @@ fn validate_signed(
             }
         }
         ChainLinkKind::Revocation => {
-            let revoke: RevocationPayload = ciborium::from_reader(link.payload.as_slice())
+            let revoke: RevocationPayload = decode_canonical(&link.payload)
                 .map_err(|e| ChainValidationError::PayloadDecode {
                     kind: ChainLinkKind::Revocation,
                     msg: e.to_string(),
@@ -719,7 +744,7 @@ fn validate_signed(
             if revoke.revokes_link != upgrade_link_hash(&target.payload) {
                 return Err(ChainValidationError::RevokeLinkHashMismatch);
             }
-            let target_upgrade: UpgradePayload = ciborium::from_reader(target.payload.as_slice())
+            let target_upgrade: UpgradePayload = decode_canonical(&target.payload)
                 .map_err(|e| {
                 ChainValidationError::CorruptStoredPayload(ChainLinkKind::Upgrade, e.to_string())
             })?;
@@ -731,7 +756,7 @@ fn validate_signed(
                     continue;
                 }
                 let existing_payload: RevocationPayload =
-                    ciborium::from_reader(existing.payload.as_slice()).map_err(|e| {
+                    decode_canonical(&existing.payload).map_err(|e| {
                         ChainValidationError::CorruptStoredPayload(
                             ChainLinkKind::Revocation,
                             e.to_string(),
@@ -912,7 +937,7 @@ pub fn validate_chain(
         // link validates (genesis anchor, promotion boot).
         let (ctx_pcrs, ctx_digest, promotes): (PcrsHex, String, bool) = match link.kind {
             ChainLinkKind::Boot if prior.is_empty() => {
-                match ciborium::from_reader::<BootPayload, _>(link.payload.as_slice()) {
+                match decode_canonical::<BootPayload>(&link.payload) {
                     Ok(p) => (p.pcrs, p.image_digest, true),
                     // Undecodable genesis: hand the row state to the
                     // validator so it reports the decode error.
@@ -921,7 +946,7 @@ pub fn validate_chain(
             }
             ChainLinkKind::Boot => {
                 match (
-                    ciborium::from_reader::<BootPayload, _>(link.payload.as_slice()),
+                    decode_canonical::<BootPayload>(&link.payload),
                     in_force.as_ref(),
                 ) {
                     (Ok(p), Some((pcrs, digest))) => {
@@ -1021,7 +1046,7 @@ fn promotion_target(
     let revoked: Vec<Uuid> = prior
         .iter()
         .filter(|l| l.kind == ChainLinkKind::Revocation)
-        .filter_map(|l| ciborium::from_reader::<RevocationPayload, _>(l.payload.as_slice()).ok())
+        .filter_map(|l| decode_canonical::<RevocationPayload>(&l.payload).ok())
         .map(|p| p.revokes)
         .collect();
     for (i, l) in prior.iter().enumerate().rev() {
@@ -1036,7 +1061,7 @@ fn promotion_target(
         if signed_payload_seen(l, &prior[..i]) {
             continue;
         }
-        let Ok(p) = ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()) else {
+        let Ok(p) = decode_canonical::<UpgradePayload>(&l.payload) else {
             continue;
         };
         if p.to.image_pcrs_hex() == *boot_pcrs && p.image_digest == boot_image_digest {
@@ -1184,7 +1209,7 @@ pub fn verify_pcr_descent(
         if recorded.link.kind != ChainLinkKind::Boot {
             continue;
         }
-        let payload: BootPayload = ciborium::from_reader(recorded.link.payload.as_slice())
+        let payload: BootPayload = decode_canonical(&recorded.link.payload)
             .map_err(|_| PcrDescentError::BootPayloadUnreadable(position))?;
         let state = payload
             .pcrs
@@ -1206,7 +1231,8 @@ mod tests {
     use super::*;
     use crate::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
     use chrono::Duration;
-    use p256::ecdsa::{SigningKey, signature::Signer};
+    use crate::signing::sign_control;
+    use p256::ecdsa::SigningKey;
 
     fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
         PcrsHex {
@@ -1278,14 +1304,14 @@ mod tests {
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(pcr_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1323,14 +1349,14 @@ mod tests {
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(pcr_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Revocation,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1794,14 +1820,14 @@ mod tests {
         if let Some(b) = doc_pcr16 {
             fake = fake.with_user_pcr(16, vec![b; 48]);
         }
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation: fake.encode(),
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -2022,14 +2048,14 @@ mod tests {
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -2884,5 +2910,86 @@ mod tests {
         )
         .unwrap();
         assert!(ciborium::from_reader::<RevocationPayload, _>(bytes.as_slice()).is_err());
+    }
+
+    // --- domain separation and canonical payloads -------------------------
+
+    /// `kind` is outside the signature, but the signature is made in the
+    /// domain of the kind it was signed for: relabeling a signed link fails
+    /// its signature check in both directions.
+    #[test]
+    fn relabeled_signed_link_fails_its_signature() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, upgrade) = chain_with_pending_upgrade(id, &sk);
+        let check = |link: &ChainLink| {
+            validate_chain_link(
+                link,
+                &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+                chrono::Utc::now(),
+                true,
+            )
+        };
+
+        let mut revocation = revocation_link(id, &upgrade, 0x1e, &sk);
+        assert!(matches!(check(&revocation), Ok(Outcome::Append { .. })));
+        revocation.kind = ChainLinkKind::Upgrade;
+        assert!(matches!(
+            check(&revocation),
+            Err(ChainValidationError::SignatureInvalid)
+        ));
+
+        let mut fresh_upgrade = upgrade_link(
+            id,
+            "sha256:v3",
+            0x1e,
+            &sk,
+            chrono::Utc::now() + Duration::days(8),
+        );
+        assert!(matches!(check(&fresh_upgrade), Ok(Outcome::Append { .. })));
+        fresh_upgrade.kind = ChainLinkKind::Revocation;
+        assert!(matches!(
+            check(&fresh_upgrade),
+            Err(ChainValidationError::SignatureInvalid)
+        ));
+    }
+
+    /// A signed, attested payload that is not the canonical encoding of what
+    /// it decodes to (here: one trailing byte) is refused.
+    #[test]
+    fn non_canonical_signed_payload_is_rejected() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, _) = chain_with_pending_upgrade(id, &sk);
+        let mut link = upgrade_link(
+            id,
+            "sha256:v3",
+            0x1e,
+            &sk,
+            chrono::Utc::now() + Duration::days(8),
+        );
+        link.payload.push(0x00);
+        link.attestation = FakeChainAttestation::for_payload(0x1e, &link.payload).encode();
+        link.signature =
+            Some(sign_control(&sk, SignedDomain::UpgradePayload, &link.payload).to_vec());
+        let err = validate_chain_link(
+            &link,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ChainValidationError::PayloadDecode {
+                    kind: ChainLinkKind::Upgrade,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

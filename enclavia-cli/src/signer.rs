@@ -4,7 +4,10 @@
 //! flow and wherever the control private key actually lives. The
 //! contract mirrors what `enclavia-server` verifies: `sign(msg)` must
 //! return a 64-byte raw low-S `r || s` ECDSA P-256 signature such that
-//! `p256::ecdsa::VerifyingKey::verify(msg, sig)` accepts it.
+//! `p256::ecdsa::VerifyingKey::verify(msg, sig)` accepts it. Callers pass
+//! the domain-separated message
+//! ([`enclavia_protocol::signing::signed_message`]), never bare payload
+//! bytes: the signers below are the only place that builds it.
 //! `VerifyingKey::verify` hashes the message with SHA-256 internally,
 //! so hardware backends that sign a caller-provided digest (PIV) must
 //! compute `SHA-256(msg)` themselves and sign that digest.
@@ -21,6 +24,7 @@ use enclavia_protocol::custody::{
     ConfirmPrepareResponse, ConfirmSubmitRequest, RevokePrepareResponse, encode_prepare_upgrade,
     encode_revoke_upgrade,
 };
+use enclavia_protocol::signing::{SignedDomain, signed_message};
 
 use crate::error::CliError;
 use crate::keys::{KeyBackend, KeyEntry};
@@ -71,16 +75,17 @@ pub fn signer_for_entry(name: &str, entry: &KeyEntry) -> Result<Box<dyn ControlS
 }
 
 /// Assemble and sign a `PrepareUpgrade` submission from a prepare
-/// response: inner signature over the chain payload, canonical CBOR
-/// command via the shared protocol encoder, envelope signature over the
-/// command bytes. Two `sign` calls (two YubiKey touches).
+/// response: inner signature over the chain payload (upgrade-payload
+/// domain), canonical CBOR command via the shared protocol encoder,
+/// envelope signature over the command bytes (control-command domain).
+/// Two `sign` calls (two YubiKey touches).
 pub fn sign_confirm_submission(
     signer: &dyn ControlSigner,
     prep: &ConfirmPrepareResponse,
 ) -> Result<ConfirmSubmitRequest, CliError> {
-    let inner = signer.sign(&prep.payload)?;
+    let inner = signer.sign(&signed_message(SignedDomain::UpgradePayload, &prep.payload))?;
     let command = encode_prepare_upgrade(&prep.payload, &inner, prep.rekey.clone(), prep.nonce);
-    let envelope = signer.sign(&command)?;
+    let envelope = signer.sign(&signed_message(SignedDomain::ControlCommand, &command))?;
     Ok(ConfirmSubmitRequest { command, envelope_signature: envelope.to_vec() })
 }
 
@@ -90,9 +95,9 @@ pub fn sign_revoke_submission(
     signer: &dyn ControlSigner,
     prep: &RevokePrepareResponse,
 ) -> Result<ConfirmSubmitRequest, CliError> {
-    let inner = signer.sign(&prep.payload)?;
+    let inner = signer.sign(&signed_message(SignedDomain::RevocationPayload, &prep.payload))?;
     let command = encode_revoke_upgrade(&prep.payload, &inner, prep.rollback, prep.nonce);
-    let envelope = signer.sign(&command)?;
+    let envelope = signer.sign(&signed_message(SignedDomain::ControlCommand, &command))?;
     Ok(ConfirmSubmitRequest { command, envelope_signature: envelope.to_vec() })
 }
 
@@ -524,13 +529,22 @@ mod tests {
         }
     }
 
-    /// Verify exactly as `enclavia-server::handle_control` does: parse
-    /// the 64 raw bytes with `Signature::from_slice`, then
-    /// `VerifyingKey::verify` (which hashes the message internally).
-    fn verify_like_enclave(pubkey: &[u8; 65], msg: &[u8], sig: &[u8]) {
+    /// Verify exactly as `enclavia-server::handle_control` does: the 64 raw
+    /// bytes over `msg` in `domain`, which also must not verify in any other
+    /// domain.
+    fn verify_like_enclave(pubkey: &[u8; 65], domain: SignedDomain, msg: &[u8], sig: &[u8]) {
+        use enclavia_protocol::signing::verify_control_signature;
         let vk = VerifyingKey::from_sec1_bytes(pubkey).unwrap();
-        let sig = Signature::from_slice(sig).unwrap();
-        vk.verify(msg, &sig).unwrap();
+        verify_control_signature(&vk, domain, msg, sig).unwrap();
+        for other in [
+            SignedDomain::UpgradePayload,
+            SignedDomain::RevocationPayload,
+            SignedDomain::ControlCommand,
+        ] {
+            if other != domain {
+                assert!(verify_control_signature(&vk, other, msg, sig).is_err());
+            }
+        }
     }
 
     #[test]
@@ -545,7 +559,12 @@ mod tests {
         let req = sign_confirm_submission(&signer, &prep).unwrap();
 
         // Envelope signature over the exact command bytes.
-        verify_like_enclave(&signer.public_key(), &req.command, &req.envelope_signature);
+        verify_like_enclave(
+            &signer.public_key(),
+            SignedDomain::ControlCommand,
+            &req.command,
+            &req.envelope_signature,
+        );
 
         // The command decodes as PrepareUpgrade carrying the prepare
         // response's fields verbatim, and the inner signature verifies
@@ -558,7 +577,12 @@ mod tests {
                 let rk = rk.expect("rekey present");
                 assert_eq!(rk.new_public_key, rekey.new_public_key);
                 assert_eq!(rk.new_key_id, rekey.new_key_id);
-                verify_like_enclave(&signer.public_key(), &payload, &payload_signature);
+                verify_like_enclave(
+                    &signer.public_key(),
+                    SignedDomain::UpgradePayload,
+                    &payload,
+                    &payload_signature,
+                );
             }
             other => panic!("wrong command variant: {other:?}"),
         }
@@ -574,7 +598,12 @@ mod tests {
                 rollback,
             };
             let req = sign_revoke_submission(&signer, &prep).unwrap();
-            verify_like_enclave(&signer.public_key(), &req.command, &req.envelope_signature);
+            verify_like_enclave(
+            &signer.public_key(),
+            SignedDomain::ControlCommand,
+            &req.command,
+            &req.envelope_signature,
+        );
 
             let cmd: ControlCommand = ciborium::from_reader(req.command.as_slice()).unwrap();
             match cmd {
@@ -582,7 +611,12 @@ mod tests {
                     assert_eq!(payload, prep.payload);
                     assert_eq!(nonce, prep.nonce);
                     assert_eq!(rb, rollback);
-                    verify_like_enclave(&signer.public_key(), &payload, &payload_signature);
+                    verify_like_enclave(
+                        &signer.public_key(),
+                        SignedDomain::RevocationPayload,
+                        &payload,
+                        &payload_signature,
+                    );
                 }
                 other => panic!("wrong command variant: {other:?}"),
             }
@@ -614,6 +648,51 @@ mod tests {
         vk.verify(msg, &parsed).unwrap();
         // And the prehash view agrees.
         vk.verify_prehash(&digest, &parsed).unwrap();
+    }
+
+    /// Software stand-in for `YubiKeySigner::sign`: SHA-256 of the message it
+    /// is handed, prehash signature, DER, then the raw re-encoding.
+    struct PivLikeSigner(SigningKey);
+
+    impl ControlSigner for PivLikeSigner {
+        fn public_key(&self) -> [u8; 65] {
+            VerifyingKey::from(&self.0)
+                .to_encoded_point(false)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        }
+
+        fn sign(&self, msg: &[u8]) -> Result<[u8; 64], CliError> {
+            use p256::ecdsa::signature::hazmat::PrehashSigner as _;
+            use sha2::{Digest as _, Sha256};
+            let sig: Signature = self.0.sign_prehash(&Sha256::digest(msg)).unwrap();
+            Ok(enclavia_protocol::custody::der_signature_to_raw(sig.to_der().as_bytes()).unwrap())
+        }
+    }
+
+    /// The PIV path signs the domain-separated messages too: both of its
+    /// signatures verify like the enclave verifies them, each in its own
+    /// domain only.
+    #[test]
+    fn piv_path_signs_in_the_right_domains() {
+        let signer = PivLikeSigner(SigningKey::from_bytes(&[0x2b; 32].into()).unwrap());
+        let req = sign_confirm_submission(&signer, &prepare_fixture(None)).unwrap();
+        verify_like_enclave(
+            &signer.public_key(),
+            SignedDomain::ControlCommand,
+            &req.command,
+            &req.envelope_signature,
+        );
+        match ciborium::from_reader::<ControlCommand, _>(req.command.as_slice()).unwrap() {
+            ControlCommand::PrepareUpgrade { payload, payload_signature, .. } => verify_like_enclave(
+                &signer.public_key(),
+                SignedDomain::UpgradePayload,
+                &payload,
+                &payload_signature,
+            ),
+            other => panic!("wrong command variant: {other:?}"),
+        }
     }
 
     #[test]

@@ -40,7 +40,8 @@
 //! The link itself, however, is emitted by the OLD enclave during its
 //! `PrepareUpgrade` flow (enclavia#30, `enclavia-server::run_prepare_upgrade`
 //! calling `build_chain_attestation`): its `signature` is the OLD control
-//! key's signature over the payload, and its `attestation` is the OLD
+//! key's signature over the payload (upgrade-payload domain, see
+//! `enclavia_protocol::signing`), and its `attestation` is the OLD
 //! enclave's NSM document, so the link's identity equals `from`. This
 //! mirrors `enclavia_protocol::chain`'s rule that upgrade / revocation
 //! links validate against the in-force state, attested by the enclave
@@ -84,6 +85,9 @@ use crate::{Commitment, PcrKey, ValidationError, Version};
 
 // Re-exported so callers of `verify_transition_link` have one import site.
 pub use enclavia_protocol::chain::{ChainLink, ChainLinkKind, UpgradePayload};
+use enclavia_protocol::signing::{
+    ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
+};
 
 /// Maximum size (bytes) of an ENCRYPTED frame on the wire, in either
 /// direction.
@@ -315,7 +319,8 @@ pub enum Request {
     /// [`ChainLinkKind::Upgrade`]) the new enclave read out of its own
     /// chain. Its CBOR-decoded [`UpgradePayload`] names `from ->
     /// to`; the link's `signature` is the OLD enclave's 64-byte raw
-    /// r||s ECDSA P-256 control signature over the payload, and its
+    /// r||s ECDSA P-256 control signature over the payload in the
+    /// upgrade-payload domain, and its
     /// `attestation` is the OLD enclave's NSM document bound to
     /// `sha256(payload)` (so its identity equals `from`). The synchronizer
     /// derives `old_key`/`new_key` from the payload, verifies the link via
@@ -338,7 +343,8 @@ pub enum Request {
     /// key being revoked. `link` is the #47 revocation [`ChainLink`] (kind
     /// [`ChainLinkKind::Revocation`]) the enclave emits for the customer's
     /// revoke command; its `signature` is the control key's 64-byte raw r||s
-    /// P-256 signature over the CBOR `RevocationPayload`, verified against the
+    /// P-256 signature over the CBOR `RevocationPayload` in the
+    /// revocation-payload domain, verified against the
     /// control pubkey frozen for the session's key, and its `revokes_link`
     /// names the revoked link (see [`verify_revocation_link`]).
     ///
@@ -743,7 +749,8 @@ pub struct VerifiedTransition {
 /// 1. The link must be an [`ChainLinkKind::Upgrade`] link.
 /// 2. It must carry a non-empty `signature` (verified later, in
 ///    [`verify_transition_link`]).
-/// 3. Its `payload` must CBOR-decode as an [`UpgradePayload`].
+/// 3. Its `payload` must be the canonical CBOR encoding of an
+///    [`UpgradePayload`] (`enclavia_protocol::signing::decode_canonical`).
 ///
 /// Returns the derived `(old_key, new_key)`. The payload is decoded here
 /// before its signature is verified, which is safe: the node uses the
@@ -761,7 +768,7 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
     if link.signature.is_none() {
         return Err(TransitionLinkError::MissingSignature);
     }
-    let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
+    let payload: UpgradePayload = decode_canonical(&link.payload)
         .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
     Ok(DecodedTransition {
         old_key: PcrKey(payload.from.key()),
@@ -787,7 +794,9 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    (`from != to`). The state machine also rejects this, but a
 ///    self-transition link is never legitimate.
 /// 3. **Control signature.** The link's 64-byte raw r||s ECDSA P-256
-///    `signature` must verify over the payload bytes against
+///    `signature` must verify over the payload bytes, in the upgrade-payload
+///    domain (`enclavia_protocol::signing`, so a signature made for a
+///    revocation or a command never counts), against
 ///    `old_control_pubkey`, the 65-byte SEC1 P-256 key the synchronizer
 ///    froze for `decoded.old_key` at its Register time
 ///    (`AttestedIdentity::control_pubkey`). This proves the retiring
@@ -830,7 +839,7 @@ pub fn verify_transition_link(
     debug_mode: bool,
     now_ms: u64,
 ) -> Result<VerifiedTransition, TransitionLinkError> {
-    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use p256::ecdsa::VerifyingKey;
 
     // 1. The NEW enclave submits; the session must be bound to new_key.
     if decoded.new_key != session_key {
@@ -850,12 +859,13 @@ pub fn verify_transition_link(
         .ok_or(TransitionLinkError::MissingSignature)?;
     let verifying = VerifyingKey::from_sec1_bytes(old_control_pubkey)
         .map_err(|_| TransitionLinkError::BadControlPubkey)?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| TransitionLinkError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| TransitionLinkError::SignatureInvalid)?;
+    verify_control_signature(&verifying, SignedDomain::UpgradePayload, &link.payload, sig_bytes)
+        .map_err(|e| match e {
+            ControlSignatureError::Shape => TransitionLinkError::SignatureShape,
+            ControlSignatureError::Invalid => TransitionLinkError::SignatureInvalid,
+        })?;
 
-    let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
+    let payload: UpgradePayload = decode_canonical(&link.payload)
         .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
 
     // 5. Activation time. Checked ahead of the attestation (step 4) so the
@@ -953,10 +963,10 @@ pub struct VerifiedRevocation {
 /// Checks, in order:
 /// 1. `kind` is [`ChainLinkKind::Revocation`] and a signature is present.
 /// 2. The 64-byte raw r||s P-256 signature verifies over the exact payload
-///    bytes against `control_pubkey`, the key's FROZEN pubkey (never the
-///    session's announced one).
-/// 3. The payload decodes as a [`RevocationPayload`]; its `revokes_link` is
-///    the revoked link.
+///    bytes, in the revocation-payload domain, against `control_pubkey`,
+///    the key's FROZEN pubkey (never the session's announced one).
+/// 3. The payload is the canonical encoding of a [`RevocationPayload`];
+///    its `revokes_link` is the revoked link.
 ///
 /// Not checked, deliberately:
 /// * The link's `attestation`: the old enclave's document for the public
@@ -970,7 +980,7 @@ pub fn verify_revocation_link(
     link: &ChainLink,
     control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
 ) -> Result<VerifiedRevocation, RevocationLinkError> {
-    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use p256::ecdsa::VerifyingKey;
 
     if link.kind != ChainLinkKind::Revocation {
         return Err(RevocationLinkError::NotARevocationLink(link.kind));
@@ -981,11 +991,12 @@ pub fn verify_revocation_link(
         .ok_or(RevocationLinkError::MissingSignature)?;
     let verifying = VerifyingKey::from_sec1_bytes(control_pubkey)
         .map_err(|_| RevocationLinkError::BadControlPubkey)?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| RevocationLinkError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| RevocationLinkError::SignatureInvalid)?;
-    let payload: RevocationPayload = ciborium::from_reader(link.payload.as_slice())
+    verify_control_signature(&verifying, SignedDomain::RevocationPayload, &link.payload, sig_bytes)
+        .map_err(|e| match e {
+            ControlSignatureError::Shape => RevocationLinkError::SignatureShape,
+            ControlSignatureError::Invalid => RevocationLinkError::SignatureInvalid,
+        })?;
+    let payload: RevocationPayload = decode_canonical(&link.payload)
         .map_err(|e| RevocationLinkError::PayloadDecode(e.to_string()))?;
     Ok(VerifiedRevocation {
         link_hash: payload.revokes_link,
@@ -997,7 +1008,8 @@ mod tests {
     use super::*;
     use enclavia_protocol::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
     use enclavia_protocol::pin_identity::{PinIdentity, ZERO_USER_PCRS};
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use enclavia_protocol::signing::sign_control;
+    use p256::ecdsa::SigningKey;
 
     fn k(b: u8) -> PcrKey {
         PcrKey([b; 32])
@@ -1080,14 +1092,14 @@ mod tests {
         // Attestation is the OLD enclave's: PCRs = from_seed, user_data =
         // sha256(payload).
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1615,14 +1627,14 @@ mod tests {
         if let Some(b) = doc_pcr16 {
             fake = fake.with_user_pcr(16, vec![b; 48]);
         }
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation: fake.encode(),
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1792,14 +1804,14 @@ mod tests {
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Revocation,
             payload: payload_bytes,
             attestation: vec![],
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1888,8 +1900,8 @@ mod tests {
         // A signed payload that is not a RevocationPayload.
         let mut garbage = revocation_link(&sk, [9; 32]);
         garbage.payload = vec![0xff, 0x00];
-        let sig: Signature = sk.sign(&garbage.payload);
-        garbage.signature = Some(sig.to_bytes().to_vec());
+        garbage.signature =
+            Some(sign_control(&sk, SignedDomain::RevocationPayload, &garbage.payload).to_vec());
         assert!(matches!(
             verify_revocation_link(&garbage, &pk),
             Err(RevocationLinkError::PayloadDecode(_))
@@ -1899,6 +1911,46 @@ mod tests {
             RpcError::from(RevocationLinkError::SignatureInvalid),
             RpcError::RevocationRejected
         );
+    }
+
+    /// A signature made in another domain does not authorize anything, even
+    /// over bytes that decode as the right payload: an upgrade payload signed
+    /// as a revocation (or as a command) is no transition authority, and a
+    /// revocation payload signed as an upgrade is no revocation.
+    #[test]
+    fn signatures_from_another_domain_are_refused() {
+        let (sk, pk) = keypair(0x39);
+        for domain in [SignedDomain::RevocationPayload, SignedDomain::ControlCommand] {
+            let mut link = upgrade_link(0x42, 0x43, &sk);
+            link.signature = Some(sign_control(&sk, domain, &link.payload).to_vec());
+            assert!(matches!(
+                decode_and_verify(&link, key_from_seed(0x43), &pk, true),
+                Err(TransitionLinkError::SignatureInvalid)
+            ));
+        }
+        let mut revocation = revocation_link(&sk, [9; 32]);
+        revocation.signature =
+            Some(sign_control(&sk, SignedDomain::UpgradePayload, &revocation.payload).to_vec());
+        assert!(matches!(
+            verify_revocation_link(&revocation, &pk),
+            Err(RevocationLinkError::SignatureInvalid)
+        ));
+    }
+
+    /// A transition link whose payload is signed and attested but not the
+    /// canonical encoding of what it decodes to is refused.
+    #[test]
+    fn non_canonical_transition_payload_is_refused() {
+        let (sk, _) = keypair(0x3a);
+        let mut link = upgrade_link(0x44, 0x45, &sk);
+        link.payload.push(0x00);
+        link.attestation = FakeChainAttestation::for_payload(0x44, &link.payload).encode();
+        link.signature =
+            Some(sign_control(&sk, SignedDomain::UpgradePayload, &link.payload).to_vec());
+        assert!(matches!(
+            decode_transition_link(&link),
+            Err(TransitionLinkError::PayloadDecode(_))
+        ));
     }
 
     /// The verified transition carries the hash of the exact signed payload,

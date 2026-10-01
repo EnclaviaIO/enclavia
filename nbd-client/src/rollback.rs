@@ -90,7 +90,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
+use enclavia_protocol::chain::{ChainLink, ChainLinkKind, UpgradePayload};
+use enclavia_protocol::signing::decode_canonical;
 use sha2::{Digest, Sha256};
 use synchronizer::client::{Client, ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::wire::RpcError;
@@ -1666,6 +1667,26 @@ where
         )
         .into());
     }
+    // The oracle verifies the link end to end; this only refuses, before
+    // submitting anything, a link that cannot be ours: not the canonical
+    // encoding of an upgrade payload, or one moving some other identity's pin.
+    match decode_canonical::<UpgradePayload>(&link.payload) {
+        Ok(payload) if PcrKey(payload.to.key()) == key => {}
+        Ok(_) => {
+            return Err(format!(
+                "boot verify: {fail_reason} (chain-host returned an upgrade link whose target \
+                 is not this enclave's identity)"
+            )
+            .into());
+        }
+        Err(e) => {
+            return Err(format!(
+                "boot verify: {fail_reason} (chain-host returned an upgrade link whose payload \
+                 is not a canonical UpgradePayload: {e})"
+            )
+            .into());
+        }
+    }
 
     info!("submitting PCR transition: adopting the pre-upgrade pinned state under this image");
     let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.transition(link))
@@ -2482,26 +2503,56 @@ mod tests {
         }
     }
 
+    /// This enclave's identity in the boot tests.
+    fn test_identity() -> enclavia_protocol::pin_identity::PinIdentity {
+        enclavia_protocol::pin_identity::PinIdentity::new(
+            [[0x42; 48], [0x43; 48], [0x44; 48]],
+            enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+        )
+    }
+
     pub(super) fn test_key() -> PcrKey {
-        PcrKey([0x42; 32])
+        PcrKey(test_identity().key())
     }
 
     pub(super) fn not_found() -> Result<(Commitment, Version), ClientError> {
         Err(ClientError::Rpc(RpcError::NotFound))
     }
 
-    /// A structurally plausible #47 upgrade link. The contents are
-    /// opaque to the client (the ORACLE verifies them), so dummy bytes
-    /// are exactly as good as a real signed link here.
-    fn test_upgrade_link(sequence: u64) -> ChainLink {
+    /// A #47 upgrade link to `to`. The signature and attestation are
+    /// opaque to the client (the ORACLE verifies them), so dummy bytes are
+    /// exactly as good as real ones here; the client only checks that the
+    /// payload is a canonical upgrade payload naming its own identity.
+    fn upgrade_link_to(
+        sequence: u64,
+        to: enclavia_protocol::pin_identity::PinIdentity,
+    ) -> ChainLink {
+        use chrono::TimeZone as _;
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::from_u128(0xe1),
+            from: enclavia_protocol::pin_identity::PinIdentity::new(
+                [[0x52; 48], [0x53; 48], [0x54; 48]],
+                enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+            ),
+            to,
+            image_digest: "sha256:next".into(),
+            valid_from: chrono::Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            issued_at: chrono::Utc.with_ymd_and_hms(2026, 9, 24, 0, 0, 0).unwrap(),
+            nonce: vec![0x5c; 32],
+        };
         ChainLink {
             id: None,
             sequence: Some(sequence),
             kind: ChainLinkKind::Upgrade,
-            payload: vec![0x01, 0x02, 0x03],
+            payload: enclavia_protocol::signing::encode(&payload),
             attestation: vec![0x04, 0x05],
             signature: Some(vec![0xab; 64]),
         }
+    }
+
+    /// An upgrade link to this enclave.
+    fn test_upgrade_link(sequence: u64) -> ChainLink {
+        upgrade_link_to(sequence, test_identity())
     }
 
     /// The staged-upgrade happy path: written region, Get says NotFound,
@@ -2617,6 +2668,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback evidence"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+    }
+
+    /// A link that moves another identity's pin, or whose payload is not
+    /// the canonical encoding of an upgrade payload, is never submitted.
+    #[tokio::test]
+    async fn transition_with_foreign_or_malformed_link_fail_stops() {
+        let region = region_with_data();
+
+        let other = enclavia_protocol::pin_identity::PinIdentity::new(
+            [[0x62; 48], [0x63; 48], [0x64; 48]],
+            enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+        );
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+        let foreign = upgrade_link_to(3, other);
+        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(foreign) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not this enclave"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+        let mut trailing = test_upgrade_link(3);
+        trailing.payload.push(0x00);
+        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(trailing) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("canonical"), "{err}");
         assert!(oracle.seen_transitions.is_empty());
     }
 

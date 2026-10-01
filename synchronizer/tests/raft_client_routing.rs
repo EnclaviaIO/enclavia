@@ -49,7 +49,8 @@ use enclavia_protocol::chain::{
     ChainLink, ChainLinkKind, RevocationPayload, UpgradePayload, upgrade_link_hash,
 };
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
-use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use enclavia_protocol::signing::{SignedDomain, sign_control};
+use p256::ecdsa::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -112,14 +113,14 @@ fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
     let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: payload_bytes,
         attestation,
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 
@@ -1869,14 +1870,14 @@ fn upgrade_link_issued_at(
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
     let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: payload_bytes,
         attestation,
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 
@@ -1892,14 +1893,14 @@ fn revocation_link(signing: &SigningKey, revokes_link: [u8; 32]) -> ChainLink {
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
     let attestation = FakeChainAttestation::for_payload(0, &payload_bytes).encode();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Revocation,
         payload: payload_bytes,
         attestation,
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 

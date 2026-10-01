@@ -475,7 +475,8 @@ mod tests {
     };
     use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
     use enclavia_protocol::perform_handshake_as_initiator;
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use enclavia_protocol::signing::{SignedDomain, sign_control};
+    use p256::ecdsa::SigningKey;
     use std::sync::Arc;
     use tokio::io::duplex;
 
@@ -542,14 +543,14 @@ mod tests {
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 

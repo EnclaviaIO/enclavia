@@ -8,7 +8,10 @@ use enclavia_protocol::{
     CHAIN_LINK_ACK, ClientMessage, ControlCommand, RekeyParams, ServerMessage, StreamHalf,
     perform_cbor_handshake_as_responder,
 };
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use enclavia_protocol::signing::{
+    ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
+};
+use p256::ecdsa::VerifyingKey;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -210,17 +213,20 @@ async fn handle_control(
 
     // Locked-in wire format (#47): 64-byte raw `r || s`, each 32 B
     // big-endian zero-padded. DER signatures from PIV/OpenSSL must be
-    // re-encoded to this shape by the signer before being shipped.
-    let sig = match Signature::from_slice(signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "signature must be 64 bytes raw r||s".into()),
-    };
-
-    if pubkey.verify(payload, &sig).is_err() {
-        return (false, "signature verification failed".into());
+    // re-encoded to this shape by the signer before being shipped. The
+    // envelope is signed in the control-command domain, so no payload
+    // signature can stand in for it.
+    match verify_control_signature(pubkey, SignedDomain::ControlCommand, payload, signature) {
+        Ok(()) => {}
+        Err(ControlSignatureError::Shape) => {
+            return (false, "signature must be 64 bytes raw r||s".into());
+        }
+        Err(ControlSignatureError::Invalid) => {
+            return (false, "signature verification failed".into());
+        }
     }
 
-    let cmd: ControlCommand = match ciborium::from_reader(payload) {
+    let cmd: ControlCommand = match decode_canonical(payload) {
         Ok(c) => c,
         Err(e) => return (false, format!("malformed payload: {e}")),
     };
@@ -262,6 +268,25 @@ async fn handle_control(
                 crypto_bin,
             )
             .await
+        }
+    }
+}
+
+/// Check a chain payload's control-key signature (64-byte raw `r || s`)
+/// in its domain. The error is the user-visible message.
+fn verify_payload_signature(
+    pubkey: &VerifyingKey,
+    domain: SignedDomain,
+    chain_payload: &[u8],
+    payload_signature: &[u8],
+) -> Result<(), String> {
+    match verify_control_signature(pubkey, domain, chain_payload, payload_signature) {
+        Ok(()) => Ok(()),
+        Err(ControlSignatureError::Shape) => {
+            Err("payload_signature must be 64 bytes raw r||s".into())
+        }
+        Err(ControlSignatureError::Invalid) => {
+            Err("payload_signature does not verify under the control pubkey".into())
         }
     }
 }
@@ -319,21 +344,20 @@ async fn run_prepare_upgrade(
     bin: &str,
     min_upgrade_delay_secs: u64,
 ) -> (bool, String) {
-    // Defence-in-depth: verify payload_signature against the control pubkey.
-    let sig = match Signature::from_slice(payload_signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
-    };
-    if pubkey.verify(chain_payload, &sig).is_err() {
-        return (
-            false,
-            "payload_signature does not verify under the control pubkey".into(),
-        );
+    // The inner signature is what the synchronizer and the chain verify:
+    // it must be an upgrade-payload signature under the control key.
+    if let Err(e) = verify_payload_signature(
+        pubkey,
+        SignedDomain::UpgradePayload,
+        chain_payload,
+        payload_signature,
+    ) {
+        return (false, e);
     }
 
     // Validate the chain payload shape. Fail before touching storage.
     let payload =
-        match ciborium::from_reader::<enclavia_protocol::chain::UpgradePayload, _>(chain_payload) {
+        match decode_canonical::<enclavia_protocol::chain::UpgradePayload>(chain_payload) {
             Ok(p) => p,
             Err(e) => {
                 return (
@@ -465,19 +489,17 @@ async fn run_revoke_upgrade(
     rollback: bool,
     bin: &str,
 ) -> (bool, String) {
-    let sig = match Signature::from_slice(payload_signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
-    };
-    if pubkey.verify(chain_payload, &sig).is_err() {
-        return (
-            false,
-            "payload_signature does not verify under the control pubkey".into(),
-        );
+    if let Err(e) = verify_payload_signature(
+        pubkey,
+        SignedDomain::RevocationPayload,
+        chain_payload,
+        payload_signature,
+    ) {
+        return (false, e);
     }
 
     if let Err(e) =
-        ciborium::from_reader::<enclavia_protocol::chain::RevocationPayload, _>(chain_payload)
+        decode_canonical::<enclavia_protocol::chain::RevocationPayload>(chain_payload)
     {
         return (
             false,
@@ -1399,7 +1421,8 @@ mod tests {
     //! chain-host. The nonce rotation and rejection paths don't need it.
     use super::*;
     use enclavia_protocol::ControlCommand;
-    use p256::ecdsa::{SigningKey, signature::Signer};
+    use enclavia_protocol::signing::SignedDomain;
+    use p256::ecdsa::SigningKey;
 
     pub(super) fn fixed_pair() -> (SigningKey, VerifyingKey) {
         // Deterministic 32-byte scalar in (0, n). Seeds with `i+1` so
@@ -1415,13 +1438,9 @@ mod tests {
         (sk, pk)
     }
 
-    /// Type-annotated wrapper around `sk.sign(...)`. `p256::ecdsa::SigningKey`
-    /// implements `Signer<Signature>` and `Signer<DerSignature>`; without
-    /// annotating the return type the compiler can't pick one. Tests
-    /// uniformly want the 64-byte raw r||s form we've locked in (#47).
-    fn sign_raw(sk: &SigningKey, msg: &[u8]) -> Vec<u8> {
-        let sig: p256::ecdsa::Signature = sk.sign(msg);
-        sig.to_bytes().to_vec()
+    /// The 64-byte raw r||s signature (#47) over `msg` in `domain`.
+    fn sign_raw(sk: &SigningKey, domain: SignedDomain, msg: &[u8]) -> Vec<u8> {
+        enclavia_protocol::signing::sign_control(sk, domain, msg).to_vec()
     }
 
     fn cbor_encode<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -1468,7 +1487,7 @@ mod tests {
         chain_payload: Vec<u8>,
         rekey: Option<RekeyParams>,
     ) -> Vec<u8> {
-        let payload_signature = sign_raw(sk, &chain_payload);
+        let payload_signature = sign_raw(sk, SignedDomain::UpgradePayload, &chain_payload);
         cbor_encode(&ControlCommand::PrepareUpgrade {
             payload: chain_payload,
             payload_signature,
@@ -1483,7 +1502,7 @@ mod tests {
         chain_payload: Vec<u8>,
         rollback: bool,
     ) -> Vec<u8> {
-        let payload_signature = sign_raw(sk, &chain_payload);
+        let payload_signature = sign_raw(sk, SignedDomain::RevocationPayload, &chain_payload);
         cbor_encode(&ControlCommand::RevokeUpgrade {
             payload: chain_payload,
             payload_signature,
@@ -1499,7 +1518,7 @@ mod tests {
         let (sk, _) = fixed_pair();
         let chain_payload = sample_upgrade_payload(0x01);
         let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, None, &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
@@ -1535,11 +1554,54 @@ mod tests {
         let wrong_sk = SigningKey::from_slice(&wrong_seed).unwrap();
         let chain_payload = sample_upgrade_payload(0x03);
         let payload = make_prepare_upgrade_command(nonce_value, &wrong_sk, chain_payload, None);
-        let signature = sign_raw(&wrong_sk, &payload);
+        let signature = sign_raw(&wrong_sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("signature verification"), "msg = {msg}");
+    }
+
+    /// Each signature counts only in its own domain: an envelope signed as
+    /// a payload, or an inner payload signed as a revocation, is refused.
+    #[tokio::test]
+    async fn rejects_signatures_from_another_domain() {
+        let nonce_value = [0x51u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let cmd = make_prepare_upgrade_command(nonce_value, &sk, sample_upgrade_payload(0x0a), None);
+        let signature = sign_raw(&sk, SignedDomain::UpgradePayload, &cmd);
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("signature verification"), "msg = {msg}");
+
+        let server_nonce = *nonce.lock().await;
+        let chain_payload = sample_upgrade_payload(0x0b);
+        let cmd = cbor_encode(&ControlCommand::PrepareUpgrade {
+            payload_signature: sign_raw(&sk, SignedDomain::RevocationPayload, &chain_payload),
+            payload: chain_payload,
+            rekey: None,
+            nonce: server_nonce,
+        });
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("payload_signature does not verify"), "msg = {msg}");
+    }
+
+    /// A correctly signed command that is not the canonical encoding of
+    /// what it decodes to is refused before it is executed.
+    #[tokio::test]
+    async fn rejects_non_canonical_command() {
+        let nonce_value = [0x52u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let mut cmd =
+            make_prepare_upgrade_command(nonce_value, &sk, sample_upgrade_payload(0x0c), None);
+        cmd.push(0x00);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("malformed payload"), "msg = {msg}");
     }
 
     #[tokio::test]
@@ -1548,7 +1610,7 @@ mod tests {
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
         let (sk, pk) = fixed_pair();
         let bogus = b"\xff\xff\xff not cbor".to_vec();
-        let signature = sign_raw(&sk, &bogus);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &bogus);
 
         let (ok, msg) = handle_control(&bogus, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
@@ -1564,7 +1626,7 @@ mod tests {
         // Sign a payload bearing the *wrong* nonce — server must reject it.
         let chain_payload = sample_upgrade_payload(0x04);
         let payload = make_prepare_upgrade_command([0u8; 32], &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
@@ -1582,7 +1644,7 @@ mod tests {
         // Nonce rotation does not depend on downstream success.
         let chain_payload = sample_upgrade_payload(0x05);
         let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
         let _ = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
 
         // Server nonce should have rotated to something new.
@@ -1603,7 +1665,7 @@ mod tests {
 
         let chain_payload = sample_upgrade_payload(0x06);
         let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
         // `false` exits 1 — verifies that enclavia-crypto failure is
         // reported back rather than silently masked.
         // Chain attestation (NSM) also fails in unit-test context (no /dev/nsm),
@@ -1626,7 +1688,7 @@ mod tests {
 
         let chain_payload = sample_revocation_payload(0x07);
         let payload = make_revoke_upgrade_command([0u8; 32], &sk, chain_payload, false);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
@@ -1641,14 +1703,14 @@ mod tests {
 
         // Use an UpgradePayload as the chain payload for a RevokeUpgrade command.
         let wrong_payload = sample_upgrade_payload(0x08);
-        let payload_signature = sign_raw(&sk, &wrong_payload);
+        let payload_signature = sign_raw(&sk, SignedDomain::RevocationPayload, &wrong_payload);
         let cmd = cbor_encode(&ControlCommand::RevokeUpgrade {
             payload: wrong_payload,
             payload_signature,
             rollback: false,
             nonce: server_nonce,
         });
-        let signature = sign_raw(&sk, &cmd);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
 
         let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
@@ -1667,14 +1729,14 @@ mod tests {
         let sk2 = SigningKey::from_slice(&wrong_seed).unwrap();
 
         let chain_payload = sample_upgrade_payload(0x09);
-        let wrong_payload_sig = sign_raw(&sk2, &chain_payload);
+        let wrong_payload_sig = sign_raw(&sk2, SignedDomain::UpgradePayload, &chain_payload);
         let cmd = cbor_encode(&ControlCommand::PrepareUpgrade {
             payload: chain_payload,
             payload_signature: wrong_payload_sig,
             rekey: None,
             nonce: server_nonce,
         });
-        let signature = sign_raw(&sk, &cmd);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
 
         let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
@@ -1729,7 +1791,7 @@ mod tests {
         // BEFORE any enclavia-crypto / chain-host dispatch is attempted.
         let chain_payload = sample_upgrade_payload(0x0A);
         let payload = make_prepare_upgrade_command(server_nonce, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) =
             handle_control(&payload, &signature, Some(&pk), &nonce, "true", 2 * 86_400).await;
@@ -1751,7 +1813,7 @@ mod tests {
         // attestation / chain-host (no NSM or daemon in unit tests).
         let chain_payload = sample_upgrade_payload(0x0B);
         let payload = make_prepare_upgrade_command(server_nonce, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) =
             handle_control(&payload, &signature, Some(&pk), &nonce, "true", 3_600).await;
