@@ -389,9 +389,11 @@ async fn run_prepare_upgrade(
     // backend stamps `valid_from = its_now + min_delay` moments before
     // we check); it is negligible against delays measured in hours.
     // Enforced BEFORE the storage re-key and chain submission so a
-    // rejected activation leaves no trace. Caveat (documented in the
-    // issue): the guest clock is host-influenced, so a host that warps
-    // the clock forward can shrink the effective delay.
+    // rejected activation leaves no trace. Caveat: the guest clock is
+    // host-influenced, and a guest clock set BACK admits a `valid_from`
+    // earlier than the delay intends (the floor is computed from it); the
+    // synchronizer's `valid_from` gate on NSM time is the barrier that
+    // does not depend on it.
     if min_upgrade_delay_secs > 0 {
         let now = chrono::Utc::now();
         if violates_min_upgrade_delay(payload.valid_from, now, min_upgrade_delay_secs) {

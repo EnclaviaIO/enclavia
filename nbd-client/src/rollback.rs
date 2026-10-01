@@ -25,8 +25,8 @@
 //! * **Runtime:** every NBD write that covers the region is hashed on
 //!   the way through, a `Pin` RPC is issued, and the corresponding NBD
 //!   reply to the kernel is HELD until the cluster's durable `PinOk`
-//!   arrives (the replicated server only ACKs a Pin after the entry is
-//!   replicated to every voter, see `synchronizer::raft::serve`).
+//!   arrives (the replicated server only ACKs a Pin once the entry is
+//!   committed on a quorum of voters, see `synchronizer::raft::serve`).
 //!   Unrelated requests are never stalled: the reply pump parks only the
 //!   gated reply and keeps forwarding everything else.
 //!

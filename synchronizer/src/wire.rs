@@ -717,8 +717,12 @@ pub enum TransitionLinkError {
 /// How far ahead of the payload's `valid_from`, and how far past its
 /// `valid_until`, a `Transition` is still accepted, in milliseconds.
 ///
-/// Matches `CLOCK_SKEW_TOLERANCE_SECS` (60 s) in `enclavia-server`, which
-/// applies the same gate on the enclave side before it swaps images. The
+/// Equal to `CLOCK_SKEW_TOLERANCE_SECS` (60 s) in `enclavia-server`, the
+/// slack of the only `valid_from` check on the enclave side: the measured
+/// minimum upgrade delay, enforced against the guest clock when the old
+/// enclave processes `PrepareUpgrade`. The enclave does not swap images;
+/// the backend's cutover sweep does, and this gate is what holds a link
+/// to its schedule whatever the backend or host does. The
 /// synchronizer's `now` is its own NSM attestation timestamp (hypervisor
 /// time), so the tolerance only has to absorb the difference between two
 /// Nitro hosts' clocks and the whole-second stamps of QEMU's emulated NSM.
