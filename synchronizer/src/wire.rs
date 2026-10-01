@@ -6,12 +6,13 @@
 //! `ciborium` over its existing Noise transport (the same one
 //! `enclavia-server` already runs).
 //!
-//! Each request maps onto one [`crate::Op`] (with some shaping, `Pin`
-//! distinguishes "first pin" from "subsequent pin" only at the state-machine
-//! level via the [`crate::Op::Register`] / [`crate::Op::Pin`] split, but on
-//! the wire we expose a single `Pin` RPC and let the server decide which
-//! state-machine op to apply based on whether the key is already
-//! registered).
+//! Each request maps onto one [`crate::Op`]. `Register` and `Pin` are
+//! separate RPCs: an enclave registers its key once, from its boot
+//! decision, for a blank volume; a `Pin` on a key the oracle does not know
+//! answers `NotFound` and never registers. A client therefore never takes
+//! "the oracle does not know me" for "register me", which is what would let
+//! a reconnect that lands on another cluster silently start a second
+//! history there.
 //!
 //! ## Transition credential = #47 upgrade chain link
 //!
@@ -282,19 +283,32 @@ pub enum Request {
         key: PcrKey,
     },
 
-    /// Write a new freshness commitment for `key`.
+    /// Create the pin slot for `key`, at version 0, holding `commitment`.
     ///
-    /// On the wire this is a single RPC, internally the synchronizer maps
-    /// it to [`crate::Op::Register`] (first pin for an unseen key) or
-    /// [`crate::Op::Pin`] (subsequent pin) depending on the committed
-    /// state. The result includes the resulting version so the caller can
-    /// distinguish them: `Version(0)` means this was the registration.
+    /// Sent only by an enclave's boot decision, for a volume that is blank
+    /// and unknown to the oracle ([`crate::Op::Register`]). It never stands
+    /// in for a [`Request::Pin`]: a client that finds its key unknown after
+    /// boot has lost its oracle state and must stop, not register again.
+    /// A key already registered answers [`RpcError::AlreadyRegistered`]
+    /// (the client checks with a `Get` whether that registration was its
+    /// own earlier attempt); a retired key answers
+    /// [`RpcError::OperationRejected`].
+    Register {
+        /// PCR set being registered; must be the session's key.
+        key: PcrKey,
+        /// The volume's commitment at registration.
+        commitment: Commitment,
+    },
+
+    /// Write a new freshness commitment for the registered `key`
+    /// ([`crate::Op::Pin`]).
+    ///
+    /// A key the oracle does not know answers [`RpcError::NotFound`]: a Pin
+    /// never registers.
     Pin {
         /// PCR set whose commitment is being updated.
         key: PcrKey,
-        /// Compare-and-swap guard, checked only when the pin maps to
-        /// [`crate::Op::Pin`] (ignored for a first-time `Register`, which
-        /// is inherently a CAS on non-existence): the pin applies only
+        /// Compare-and-swap guard: the pin applies only
         /// when the key's current version equals this. The client learns
         /// the version from the boot `Get` and every `PinOk`. Two live
         /// writers for one key (a host-booted clone pair sharing the
@@ -369,11 +383,13 @@ pub enum Response {
         version: Version,
     },
 
+    /// Successful [`Request::Register`]: the key is registered at version 0.
+    RegisterOk,
+
     /// Successful [`Request::Pin`].
     ///
-    /// `version` is `Version(0)` if this Pin registered the key for the
-    /// first time, `Version(n+1)` if it bumped an existing pin from
-    /// version `n`.
+    /// `version` is `Version(n+1)`: the pin bumped the key from the
+    /// `expected_version` `n`.
     PinOk {
         /// Per-key monotonic version after this pin.
         version: Version,
@@ -419,6 +435,12 @@ pub enum RpcError {
     /// retired by a prior `Transition`).
     #[error("key not found")]
     NotFound,
+
+    /// `Register` for a key that is already registered. The caller's own
+    /// earlier attempt may have committed (outcome unknown after
+    /// `Unavailable`); it tells the two apart with a `Get`.
+    #[error("key already registered")]
+    AlreadyRegistered,
 
     /// `Transition` was rejected: the chain link failed verification
     /// (bad control signature, attestation/payload binding mismatch,
@@ -488,7 +510,7 @@ impl From<ValidationError> for RpcError {
             // run the Get-disambiguation (own lost write vs genuine fork).
             ValidationError::StalePin { .. } => RpcError::VersionConflict,
 
-            ValidationError::AlreadyRegistered => RpcError::OperationRejected,
+            ValidationError::AlreadyRegistered => RpcError::AlreadyRegistered,
             ValidationError::KeyRetired => RpcError::OperationRejected,
         }
     }
@@ -1156,6 +1178,18 @@ mod tests {
     }
 
     #[test]
+    fn request_register_roundtrip() {
+        roundtrip(&Request::Register {
+            key: k(7),
+            commitment: c(0xab),
+        });
+        roundtrip(&Response::RegisterOk);
+        roundtrip(&Response::Err {
+            error: RpcError::AlreadyRegistered,
+        });
+    }
+
+    #[test]
     fn request_pin_roundtrip() {
         roundtrip(&Request::Pin {
             key: k(7),
@@ -1201,6 +1235,7 @@ mod tests {
         for code in [
             RpcError::Unauthorized,
             RpcError::NotFound,
+            RpcError::AlreadyRegistered,
             RpcError::TransitionRejected,
             RpcError::OperationRejected,
             RpcError::VersionConflict,
@@ -1221,7 +1256,7 @@ mod tests {
             (ValidationError::NotAttested, RpcError::TransitionRejected),
             (
                 ValidationError::AlreadyRegistered,
-                RpcError::OperationRejected,
+                RpcError::AlreadyRegistered,
             ),
             (ValidationError::KeyRetired, RpcError::OperationRejected),
             (ValidationError::KeyNotCurrent, RpcError::NotFound),

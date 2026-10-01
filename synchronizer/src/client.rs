@@ -45,13 +45,14 @@
 //! `AsyncRead + AsyncWrite` transport (vsock in production, UDS or
 //! `tokio::io::duplex` in tests).
 //!
-//! ## Wire shape note: there is no separate Register RPC
+//! ## Register and Pin are separate
 //!
-//! On the wire a first-time registration IS a [`Request::Pin`]: the
-//! server maps it to the state machine's `Register` op when the key is
-//! unseen and reports it back as `PinOk { version: Version(0) }`. The
-//! [`Client::pin`] return value carries that version so the caller can
-//! distinguish registration from a subsequent pin.
+//! [`Client::register`] creates the key's pin slot; the customer sends it
+//! only from its boot decision, for a blank volume the oracle does not
+//! know. [`Client::pin`] only ever updates a registered key: on a key the
+//! oracle does not know it fails with [`RpcError::NotFound`], which a
+//! running enclave must treat as fatal (its oracle lost its state, or it
+//! is talking to another cluster), never as a cue to register.
 //!
 //! ## Durability
 //!
@@ -264,17 +265,37 @@ where
         &self.server_protocol
     }
 
-    /// Pin `commitment` under `key` (which must equal the session's
-    /// attested key). Returns the resulting per-key version:
-    /// `Version(0)` means this Pin REGISTERED the key (first pin for an
-    /// unseen key); `Version(n+1)` bumped an existing pin.
+    /// Register `key` (which must equal the session's attested key) at
+    /// version 0 with `commitment`. Only the boot decision calls this, for
+    /// a blank volume the oracle does not know.
     ///
-    /// `expected_version` is the compare-and-swap guard: for a re-pin it
-    /// must equal the key's current version (learned from the boot `Get`
-    /// and every `PinOk`), or the pin fails with
-    /// [`RpcError::VersionConflict`]. It is ignored when the pin maps to
-    /// a first-time Register (which is inherently a CAS on
-    /// non-existence); pass `Version(0)` there by convention.
+    /// [`RpcError::AlreadyRegistered`] means the key exists: a `Get`
+    /// tells whether it holds this registration (an earlier attempt whose
+    /// answer was lost) or someone else's state. A retired key fails with
+    /// [`RpcError::OperationRejected`].
+    ///
+    /// In the replicated deployment the response only arrives after the
+    /// entry is committed on a quorum of voters.
+    pub async fn register(
+        &mut self,
+        key: PcrKey,
+        commitment: Commitment,
+    ) -> Result<(), ClientError> {
+        match self.rpc(Request::Register { key, commitment }).await? {
+            Response::RegisterOk => Ok(()),
+            Response::Err { error } => Err(ClientError::Rpc(error)),
+            _ => Err(ClientError::UnexpectedResponse("expected RegisterOk")),
+        }
+    }
+
+    /// Pin `commitment` under the registered `key` (which must equal the
+    /// session's attested key). Returns the resulting per-key version,
+    /// `expected_version + 1`.
+    ///
+    /// `expected_version` is the compare-and-swap guard: it must equal the
+    /// key's current version (learned from the boot `Get` and every
+    /// `PinOk`), or the pin fails with [`RpcError::VersionConflict`]. A key
+    /// the oracle does not know fails with [`RpcError::NotFound`].
     ///
     /// In the replicated deployment the response only arrives after the
     /// entry is committed on a quorum of voters, so awaiting this is the

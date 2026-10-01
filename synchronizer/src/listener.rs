@@ -555,7 +555,7 @@ mod tests {
     }
 
     /// Register an OLD enclave's key into a shared node: attest it with the
-    /// supplied control pubkey and Pin it so its `KeyState.control_pubkey`
+    /// supplied control pubkey and Register it so its `KeyState.control_pubkey`
     /// is frozen. Models the old enclave's earlier (now-stopped) session.
     async fn register_old(
         node: &Node,
@@ -566,9 +566,8 @@ mod tests {
         node.observe_attestation(key_old, control_pubkey).await;
         node.handle_request(
             key_old,
-            Request::Pin {
+            Request::Register {
                 key: key_old,
-                expected_version: crate::Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -683,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_authenticate_pin_get() {
+    async fn happy_path_authenticate_register_get() {
         let (mut client, mut ct, hash, server_task) = connect().await;
 
         let (_, pk) = keypair(0x11);
@@ -696,21 +695,15 @@ mod tests {
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Pin {
+                request: Request::Register {
                     key,
-                    expected_version: crate::Version(0),
                     commitment: c(0xaa),
                 },
             },
         )
         .await;
         let resp = read_response(&mut client, &mut ct).await;
-        assert_eq!(
-            resp,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
+        assert_eq!(resp, Response::RegisterOk);
 
         write_frame(
             &mut client,
@@ -1000,21 +993,10 @@ mod tests {
     #[tokio::test]
     async fn same_image_different_user_pcr_gets_its_own_pin_slot() {
         let node = Arc::new(Node::with_debug_mode(true));
-        let pin = |commitment: Commitment| {
-            move |key| Request::Pin {
-                key,
-                expected_version: Version(0),
-                commitment,
-            }
-        };
+        let register = |commitment: Commitment| move |key| Request::Register { key, commitment };
 
-        let (resp, key_a) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, pin(c(0xaa))).await;
-        assert_eq!(
-            resp,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
+        let (resp, key_a) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, register(c(0xaa))).await;
+        assert_eq!(resp, Response::RegisterOk);
 
         // Enclave B: same image, other PCR16. Its own slot is empty...
         let (resp, key_b) =
@@ -1036,14 +1018,9 @@ mod tests {
                 error: RpcError::Unauthorized
             }
         );
-        // ...and pinning its own first version does not touch A's.
-        let (resp, _) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, pin(c(0xbb))).await;
-        assert_eq!(
-            resp,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
+        // ...and registering its own first version does not touch A's.
+        let (resp, _) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, register(c(0xbb))).await;
+        assert_eq!(resp, Response::RegisterOk);
         let (resp, _) =
             rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, |key| Request::Get { key }).await;
         assert_eq!(

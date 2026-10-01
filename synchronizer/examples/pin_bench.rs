@@ -8,7 +8,7 @@
 //!
 //! Modes:
 //!   pin  - each op is a `Pin` with a varying commitment. Op 0 of each
-//!          session is the Register (first pin); it is reported in a
+//!          session is the Register; it is reported in a
 //!          separate bucket so registration cost never pollutes the
 //!          steady-state numbers.
 //!   get  - each op is a linearizable `Get` (the key must exist, so the
@@ -252,7 +252,7 @@ async fn timed_op(sess: &mut Session, req: Request) -> (u64, bool) {
     let micros = start.elapsed().as_micros() as u64;
     let ok = matches!(
         resp,
-        Ok(Response::PinOk { .. }) | Ok(Response::GetOk { .. })
+        Ok(Response::RegisterOk) | Ok(Response::PinOk { .. }) | Ok(Response::GetOk { .. })
     );
     if !ok {
         eprintln!("[bench] op failed: {resp:?}");
@@ -264,7 +264,7 @@ async fn timed_op(sess: &mut Session, req: Request) -> (u64, bool) {
 struct SessionResult {
     /// (op index, micros, ok) per timed op.
     ops: Vec<(usize, u64, bool)>,
-    /// Micros for the session's Register (first pin), pin mode only.
+    /// Micros for the session's Register, pin mode only.
     register_micros: Option<u64>,
     setup_micros: u64,
 }
@@ -289,15 +289,13 @@ async fn run_session(args: Args, expected: Pcrs, idx: usize) -> SessionResult {
 
     let key = sess.key;
     if args.mode == "pin" {
-        // Op 0 is the Register: time it into its own bucket. The
-        // expected_version is ignored on a Register (it is inherently a
-        // CAS on non-existence); subsequent pins name the version the
-        // previous PinOk returned (the compare-and-swap guard).
+        // Op 0 is the Register: time it into its own bucket. Subsequent
+        // pins name the version the previous PinOk returned (the
+        // compare-and-swap guard).
         let (us, ok) = timed_op(
             &mut sess,
-            Request::Pin {
+            Request::Register {
                 key,
-                expected_version: Version(0),
                 commitment: commitment_for(seed, 0),
             },
         )

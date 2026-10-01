@@ -581,17 +581,14 @@ async fn pin_then_get_same_node_leader() {
 
     let mut client = Client::connect(leader, seed, pk).await;
     let resp = client
-        .rpc(Request::Pin {
+        .rpc(Request::Register {
             key,
-            expected_version: Version(0),
             commitment: c(0xaa),
         })
         .await;
     assert_eq!(
         resp,
-        Response::PinOk {
-            version: Version(0)
-        }
+        Response::RegisterOk
     );
 
     // Majority ACK: the moment the Pin is ACKed, a quorum's LOG already holds
@@ -632,17 +629,14 @@ async fn pin_then_get_same_node_follower() {
 
     let mut client = Client::connect(follower, seed, pk).await;
     let resp = client
-        .rpc(Request::Pin {
+        .rpc(Request::Register {
             key,
-            expected_version: Version(0),
             commitment: c(0xbb),
         })
         .await;
     assert_eq!(
         resp,
-        Response::PinOk {
-            version: Version(0)
-        }
+        Response::RegisterOk
     );
 
     // Majority ACK holds regardless of which node the client dialed: the
@@ -657,6 +651,65 @@ async fn pin_then_get_same_node_follower() {
         Response::GetOk {
             commitment: c(0xbb),
             version: Version(0),
+        }
+    );
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
+/// A Pin never registers, on the leader or forwarded from a follower: a key
+/// the replicated state does not hold is `NotFound` and stays unknown. Only
+/// `Register` creates it, once; a second `Register` is `AlreadyRegistered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pin_on_unknown_key_is_not_found_and_only_register_creates_it() {
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let follower = nodes.iter().find(|n| n.name != leader_name).unwrap();
+    let seed = 0x13;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    let pin = |expected_version, byte| Request::Pin {
+        key,
+        expected_version,
+        commitment: c(byte),
+    };
+
+    for node in [find(&nodes, &leader_name), follower] {
+        let mut client = Client::connect(node, seed, pk).await;
+        assert_eq!(
+            client.rpc(pin(Version(0), 0xc1)).await,
+            Response::Err {
+                error: RpcError::NotFound
+            }
+        );
+        assert_eq!(
+            client.rpc(Request::Get { key }).await,
+            Response::Err {
+                error: RpcError::NotFound
+            }
+        );
+    }
+
+    let mut client = Client::connect(follower, seed, pk).await;
+    let register = |byte| Request::Register {
+        key,
+        commitment: c(byte),
+    };
+    assert_eq!(client.rpc(register(0xc2)).await, Response::RegisterOk);
+    assert_eq!(
+        client.rpc(register(0xc3)).await,
+        Response::Err {
+            error: RpcError::AlreadyRegistered
+        }
+    );
+    assert_eq!(
+        client.rpc(pin(Version(0), 0xc4)).await,
+        Response::PinOk {
+            version: Version(1)
         }
     );
 
@@ -682,17 +735,14 @@ async fn pin_on_one_node_get_on_another() {
     // forwards to the leader; the committed value is visible either way.
     let mut writer = Client::connect(find(&nodes, "node-a"), seed, pk).await;
     let resp = writer
-        .rpc(Request::Pin {
+        .rpc(Request::Register {
             key,
-            expected_version: Version(0),
             commitment: c(0xcd),
         })
         .await;
     assert_eq!(
         resp,
-        Response::PinOk {
-            version: Version(0)
-        }
+        Response::RegisterOk
     );
 
     let mut reader = Client::connect(find(&nodes, "node-c"), seed, pk).await;
@@ -730,17 +780,14 @@ async fn transition_flow_carries_version_and_retires_old() {
     {
         let mut old = Client::connect(find(&nodes, "node-a"), old_seed, pk_old).await;
         let r = old
-            .rpc(Request::Pin {
+            .rpc(Request::Register {
                 key: old_key,
-                expected_version: Version(0),
                 commitment: c(0xaa),
             })
             .await;
         assert_eq!(
             r,
-            Response::PinOk {
-                version: Version(0)
-            }
+            Response::RegisterOk
         );
         let r = old
             .rpc(Request::Pin {
@@ -829,17 +876,14 @@ async fn restarted_node_hydrates_and_serves_get() {
         let ld = current_leader(&nodes).await.expect("leader for setup");
         let mut client = Client::connect(ld, seed, pk).await;
         let r = client
-            .rpc(Request::Pin {
+            .rpc(Request::Register {
                 key,
-                expected_version: Version(0),
                 commitment: c(0x10 + i),
             })
             .await;
         assert_eq!(
             r,
-            Response::PinOk {
-                version: Version(0)
-            }
+            Response::RegisterOk
         );
     }
     // Let snapshots build + log purge settle.
@@ -905,6 +949,42 @@ async fn restarted_node_hydrates_and_serves_get() {
     }
 }
 
+/// Register `key` through `node` until it is ACKed, riding out the
+/// `Unavailable` answers of a leader election. A retry that finds the key
+/// already registered checks with a Get that it holds this registration.
+async fn register_until_acked(
+    node: &Node,
+    seed: u8,
+    pk: [u8; CONTROL_PUBKEY_LEN],
+    key: PcrKey,
+    commitment: Commitment,
+) {
+    let mut client = Client::connect(node, seed, pk).await;
+    for _ in 0..40 {
+        match client.rpc(Request::Register { key, commitment }).await {
+            Response::RegisterOk => return,
+            Response::Err {
+                error: RpcError::Unavailable,
+            } => tokio::time::sleep(Duration::from_millis(200)).await,
+            Response::Err {
+                error: RpcError::AlreadyRegistered,
+            } => {
+                assert_eq!(
+                    client.rpc(Request::Get { key }).await,
+                    Response::GetOk {
+                        commitment,
+                        version: Version(0),
+                    },
+                    "an AlreadyRegistered retry must find its own registration"
+                );
+                return;
+            }
+            other => panic!("unexpected response to register via {}: {other:?}", node.name),
+        }
+    }
+    panic!("register via {} was never ACKed", node.name);
+}
+
 /// Pin through `node` until it is ACKed, riding out the `Unavailable` answers
 /// of a leader election. Uses the CAS-aware [`Client::pin_cas`], so an attempt
 /// that committed before its ACK was lost is recognised on the retry. Returns
@@ -958,8 +1038,7 @@ async fn writes_continue_through_leader_outage_then_heal() {
     let seed = 0x55;
     let (_, pk) = keypair(seed);
     let key = key_from_seed(seed);
-    let v0 = pin_until_acked(find(&nodes, "node-a"), seed, pk, key, Version(0), c(0x01)).await;
-    assert_eq!(v0, Version(0));
+    register_until_acked(find(&nodes, "node-a"), seed, pk, key, c(0x01)).await;
     assert_all_nodes_logged_committed(&nodes);
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
@@ -1020,16 +1099,14 @@ async fn acked_pin_survives_loss_of_any_single_node() {
 
     // Commit a first version while the cluster is whole.
     let leader_name = current_leader(&nodes).await.unwrap().name.clone();
-    let v0 = pin_until_acked(
+    register_until_acked(
         find(&nodes, &leader_name),
         seed,
         pk,
         key,
-        Version(0),
-        c(0x01),
+        c(0x01)
     )
     .await;
-    assert_eq!(v0, Version(0));
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
     // Partition a follower (the victim). The leader keeps a 2-node quorum with
@@ -1219,15 +1296,12 @@ async fn restart_of_bootstrap_name_node_joins_never_initializes_competitor() {
         let mut client = Client::connect(ld, seed, pk).await;
         assert_eq!(
             client
-                .rpc(Request::Pin {
+                .rpc(Request::Register {
                     key,
-                    expected_version: Version(0),
                     commitment: c(0xb2),
                 })
                 .await,
-            Response::PinOk {
-                version: Version(0)
-            }
+            Response::RegisterOk
         );
     }
 
@@ -1335,15 +1409,12 @@ async fn restart_with_new_identity_is_admitted_via_join() {
         let mut client = Client::connect(ld, seed, pk).await;
         assert_eq!(
             client
-                .rpc(Request::Pin {
+                .rpc(Request::Register {
                     key,
-                    expected_version: Version(0),
                     commitment: c(0xa1),
                 })
                 .await,
-            Response::PinOk {
-                version: Version(0)
-            }
+            Response::RegisterOk
         );
     }
 
@@ -1493,15 +1564,12 @@ async fn clone_race_evicts_original_exactly_one_holder() {
     let mut client = Client::connect(ld, seed, pk).await;
     assert_eq!(
         client
-            .rpc(Request::Pin {
+            .rpc(Request::Register {
                 key,
-                expected_version: Version(0),
                 commitment: c(0xb2),
             })
             .await,
-        Response::PinOk {
-            version: Version(0)
-        }
+        Response::RegisterOk
     );
 
     // Drop the now-orphaned original so it stops contending for the slot route,
@@ -1720,16 +1788,14 @@ async fn write_without_quorum_is_unavailable_within_the_bound() {
     let (_, pk) = keypair(seed);
     let key = key_from_seed(seed);
     let leader_name = current_leader(&nodes).await.unwrap().name.clone();
-    let v0 = pin_until_acked(
+    register_until_acked(
         find(&nodes, &leader_name),
         seed,
         pk,
         key,
-        Version(0),
-        c(0x01),
+        c(0x01)
     )
     .await;
-    assert_eq!(v0, Version(0));
 
     // Cut the leader off from both followers.
     for n in &nodes {
@@ -1785,8 +1851,7 @@ async fn timed_out_write_that_commits_does_not_break_the_next_cas() {
     let key = key_from_seed(seed);
     let leader_name = current_leader(&nodes).await.unwrap().name.clone();
     let leader = find(&nodes, &leader_name);
-    let v0 = pin_until_acked(leader, seed, pk, key, Version(0), c(0x01)).await;
-    assert_eq!(v0, Version(0));
+    register_until_acked(leader, seed, pk, key, c(0x01)).await;
     assert_eq!(leader.raft.commit_timeout(), COMMIT_TIMEOUT);
 
     // The write is submitted and the wait gives up almost at once, so the
@@ -1979,7 +2044,7 @@ async fn revoked_link_is_refused_everywhere_and_survives_a_leader_change() {
     let leader = find(&nodes, &leader_name);
     let followers: Vec<&Node> = nodes.iter().filter(|n| n.name != leader_name).collect();
 
-    pin_until_acked(leader, old_seed, pk_old, old_key, Version(0), c(0x81)).await;
+    register_until_acked(leader, old_seed, pk_old, old_key, c(0x81)).await;
 
     // The node advertises the capability.
     let mut old_session = Client::connect(followers[0], old_seed, pk_old).await;
@@ -2126,7 +2191,7 @@ async fn unauthorized_or_mistargeted_revocations_do_not_block_the_link() {
 
     let leader_name = current_leader(&nodes).await.unwrap().name.clone();
     let leader = find(&nodes, &leader_name);
-    pin_until_acked(leader, old_seed, pk_old, old_key, Version(0), c(0x83)).await;
+    register_until_acked(leader, old_seed, pk_old, old_key, c(0x83)).await;
 
     let rejected = Response::Err {
         error: RpcError::RevocationRejected,
@@ -2221,7 +2286,7 @@ async fn revocation_survives_snapshot_install() {
     );
 
     let ld = current_leader(&nodes).await.unwrap();
-    pin_until_acked(ld, old_seed, pk_old, old_key, Version(0), c(0x87)).await;
+    register_until_acked(ld, old_seed, pk_old, old_key, c(0x87)).await;
     let mut old_session = Client::connect(ld, old_seed, pk_old).await;
     assert_eq!(
         old_session
@@ -2240,15 +2305,12 @@ async fn revocation_survives_snapshot_install() {
         let mut client = Client::connect(ld, seed, pk).await;
         assert_eq!(
             client
-                .rpc(Request::Pin {
+                .rpc(Request::Register {
                     key: key_from_seed(seed),
-                    expected_version: Version(0),
                     commitment: c(i),
                 })
                 .await,
-            Response::PinOk {
-                version: Version(0)
-            }
+            Response::RegisterOk
         );
     }
     tokio::time::sleep(Duration::from_millis(800)).await;

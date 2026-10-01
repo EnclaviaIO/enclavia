@@ -132,6 +132,9 @@ impl Node {
     pub async fn handle_request(&self, session_key: PcrKey, req: Request) -> Response {
         match req {
             Request::Get { key } => self.handle_get(session_key, key).await,
+            Request::Register { key, commitment } => {
+                self.handle_register(session_key, key, commitment).await
+            }
             Request::Pin {
                 key,
                 expected_version,
@@ -159,6 +162,27 @@ impl Node {
         }
     }
 
+    /// Register the session's own key (its control pubkey was recorded by
+    /// `observe_attestation`). An already registered key is
+    /// `AlreadyRegistered`, a retired one `OperationRejected`.
+    async fn handle_register(
+        &self,
+        session_key: PcrKey,
+        key: PcrKey,
+        commitment: crate::Commitment,
+    ) -> Response {
+        if key != session_key {
+            return err(RpcError::Unauthorized);
+        }
+        let mut inner = self.inner.lock().await;
+        match inner.apply(Op::Register { key, commitment }) {
+            Ok(_) => Response::RegisterOk,
+            Err(e) => err(RpcError::from(e)),
+        }
+    }
+
+    /// Compare-and-swap pin of a registered key. An unknown key is
+    /// `NotFound`: a Pin never registers.
     async fn handle_pin(
         &self,
         session_key: PcrKey,
@@ -170,23 +194,11 @@ impl Node {
             return err(RpcError::Unauthorized);
         }
         let mut inner = self.inner.lock().await;
-        // Pin is a single wire RPC; map to Register (first pin) or Pin
-        // (subsequent) based on what's already committed. The caller
-        // distinguishes the two by inspecting the returned version:
-        // Version(0) means this was the registration. The CAS guard is
-        // checked only for the Pin arm: a Register is inherently a
-        // compare-and-swap on non-existence, so `expected_version` is
-        // ignored there.
-        let op = if inner.get(&key).is_some() {
-            Op::Pin {
-                key,
-                expected_version,
-                commitment,
-            }
-        } else {
-            Op::Register { key, commitment }
-        };
-        match inner.apply(op) {
+        match inner.apply(Op::Pin {
+            key,
+            expected_version,
+            commitment,
+        }) {
             Ok(state) => Response::PinOk {
                 version: state.version,
             },
@@ -411,7 +423,7 @@ mod tests {
         }
     }
 
-    /// Register an OLD key (attest + Pin) so it is live with a frozen
+    /// Register an OLD key (attest + Register) so it is live with a frozen
     /// control pubkey, ready to be a transition's `from`. The submitting
     /// session in the corrected flow is the NEW enclave, so the old key is
     /// set up by a separate (earlier) session, modelled here by driving
@@ -425,9 +437,8 @@ mod tests {
         node.observe_attestation(key_old, signing_pubkey).await;
         node.handle_request(
             key_old,
-            Request::Pin {
+            Request::Register {
                 key: key_old,
-                expected_version: Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -450,7 +461,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_registers_unseen_key_at_version_zero() {
+    async fn register_creates_unseen_key_at_version_zero() {
+        let node = Node::new();
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        let resp = node
+            .handle_request(
+                k(1),
+                Request::Register {
+                    key: k(1),
+                    commitment: c(0xaa),
+                },
+            )
+            .await;
+        assert_eq!(resp, Response::RegisterOk);
+        let resp = node.handle_request(k(1), Request::Get { key: k(1) }).await;
+        assert_eq!(
+            resp,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
+            }
+        );
+    }
+
+    /// A Pin never registers: an unknown key is `NotFound`, and stays
+    /// unknown.
+    #[tokio::test]
+    async fn pin_on_unknown_key_is_not_found() {
         let node = Node::new();
         node.observe_attestation(k(1), dummy_pubkey(1)).await;
         let resp = node
@@ -463,10 +500,39 @@ mod tests {
                 },
             )
             .await;
+        assert_eq!(resp, err(RpcError::NotFound));
+        let resp = node.handle_request(k(1), Request::Get { key: k(1) }).await;
+        assert_eq!(resp, err(RpcError::NotFound));
+    }
+
+    /// A second Register of a live key is `AlreadyRegistered` and leaves the
+    /// pinned state alone; a Register for another session's key is refused.
+    #[tokio::test]
+    async fn register_is_once_and_own_key_only() {
+        let node = Node::new();
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        node.observe_attestation(k(2), dummy_pubkey(2)).await;
+        let register = |key, byte| Request::Register {
+            key,
+            commitment: c(byte),
+        };
         assert_eq!(
-            resp,
-            Response::PinOk {
-                version: Version(0)
+            node.handle_request(k(1), register(k(1), 0xaa)).await,
+            Response::RegisterOk
+        );
+        assert_eq!(
+            node.handle_request(k(1), register(k(1), 0xbb)).await,
+            err(RpcError::AlreadyRegistered)
+        );
+        assert_eq!(
+            node.handle_request(k(1), register(k(2), 0xcc)).await,
+            err(RpcError::Unauthorized)
+        );
+        assert_eq!(
+            node.handle_request(k(1), Request::Get { key: k(1) }).await,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
             }
         );
     }
@@ -478,9 +544,8 @@ mod tests {
         let _ = node
             .handle_request(
                 k(1),
-                Request::Pin {
+                Request::Register {
                     key: k(1),
-                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -525,9 +590,8 @@ mod tests {
         node.observe_attestation(k(1), dummy_pubkey(1)).await;
         node.handle_request(
             k(1),
-            Request::Pin {
+            Request::Register {
                 key: k(1),
-                expected_version: Version(0),
                 commitment: c(0xab),
             },
         )
@@ -598,9 +662,8 @@ mod tests {
         node.observe_attestation(key_b, pk_b).await;
         node.handle_request(
             key_b,
-            Request::Pin {
+            Request::Register {
                 key: key_b,
-                expected_version: Version(0),
                 commitment: c(0xbb),
             },
         )
@@ -704,9 +767,8 @@ mod tests {
         node.observe_attestation(key_old, pk).await;
         node.handle_request(
             key_old,
-            Request::Pin {
+            Request::Register {
                 key: key_old,
-                expected_version: Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -815,9 +877,8 @@ mod tests {
         let link = upgrade_link(0x17, 0x27, &sk);
         node.handle_request(key_new, Request::Transition { link })
             .await;
-        // After retirement, old_key tries to Pin. Mapped to Register
-        // (since old_key is not registered), which the state machine
-        // refuses because the key is retired.
+        // After retirement old_key is unknown to Pin, and the state machine
+        // refuses to register it again.
         let resp = node
             .handle_request(
                 key_old,
@@ -828,10 +889,20 @@ mod tests {
                 },
             )
             .await;
+        assert_eq!(resp, err(RpcError::NotFound));
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Register {
+                    key: key_old,
+                    commitment: c(0xee),
+                },
+            )
+            .await;
         assert_eq!(resp, err(RpcError::OperationRejected));
     }
 
-    /// Two sessions pinning their own keys concurrently both succeed ,
+    /// Two sessions registering their own keys concurrently both succeed:
     /// the Mutex serializes them in some order without losing writes.
     #[tokio::test]
     async fn concurrent_pins_on_disjoint_keys_serialize() {
@@ -844,9 +915,8 @@ mod tests {
         let t1 = tokio::spawn(async move {
             n1.handle_request(
                 k(1),
-                Request::Pin {
+                Request::Register {
                     key: k(1),
-                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -855,27 +925,16 @@ mod tests {
         let t2 = tokio::spawn(async move {
             n2.handle_request(
                 k(2),
-                Request::Pin {
+                Request::Register {
                     key: k(2),
-                    expected_version: Version(0),
                     commitment: c(0xbb),
                 },
             )
             .await
         });
         let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
-        assert_eq!(
-            r1,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
-        assert_eq!(
-            r2,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
+        assert_eq!(r1, Response::RegisterOk);
+        assert_eq!(r2, Response::RegisterOk);
 
         let g1 = node.handle_request(k(1), Request::Get { key: k(1) }).await;
         let g2 = node.handle_request(k(2), Request::Get { key: k(2) }).await;
