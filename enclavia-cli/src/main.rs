@@ -561,6 +561,8 @@ enum UpgradeCmd {
 
     /// Revoke a confirmed upgrade before it fires. The running enclave
     /// keeps its current version and a Revocation chain link is recorded.
+    /// This is how to call an upgrade off: do not count on it expiring
+    /// (see `upgrade confirm`).
     Revoke {
         /// Target enclave id. Accepts a unique prefix.
         enclave_id: String,
@@ -1592,6 +1594,7 @@ fn print_upgrade_confirm(r: &upgrade::StagedUpgradeJson) {
             "  The enclave will swap to the new version automatically at that time."
         );
     }
+    println!("  {}", upgrade::ABANDON_BY_REVOKING);
 }
 
 fn run_key(cmd: KeyCmd, json: bool) -> Result<(), CliError> {

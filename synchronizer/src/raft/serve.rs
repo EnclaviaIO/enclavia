@@ -270,13 +270,20 @@ async fn handle_pin(
 ///    (`state_machine().get(old_key)`); a transition can only retire a live key.
 /// 3. `verify_transition_link` against that frozen pubkey + the session key
 ///    (the NEW enclave submits, so `new_key == session_key`), with the
-///    leader's own NSM time as `now` for the payload's `valid_from` gate.
+///    leader's own NSM time as `now` for the payload's `valid_from` and
+///    `valid_until` gates.
 /// 4. Submit `ReplicatedOp::Transition { old_key, new_key, new_control_pubkey:
-///    control_pubkey }`, where `control_pubkey` is the submitting (new-enclave)
-///    session's announced key. The verifier requires `new_key == session_key`,
-///    so the session's `control_pubkey` IS the new key's attested pubkey;
-///    followers record it before applying so the pure core's `NewKeyNotAttested`
-///    check passes.
+///    control_pubkey, link_hash, valid_until_ms }`, where `control_pubkey` is
+///    the submitting (new-enclave) session's announced key. The verifier
+///    requires `new_key == session_key`, so the session's `control_pubkey` IS
+///    the new key's attested pubkey; followers record it before applying so the
+///    pure core's `NewKeyNotAttested` check passes.
+///
+/// The time gates hold at submission only. The entry commits whenever a quorum
+/// holds it, possibly after `valid_until` (for example after this call answered
+/// a timed-out `Unavailable`); the leader that applies it then flags the late
+/// commit (see `StateMachineStore`), but the pin moves. See
+/// [`verify_transition_link`]'s "What the window guarantees".
 ///
 /// The `old_key` lookup reads the leader-local state machine directly rather
 /// than through `linearizable_get`: a Transition is a write, and `client_write`
@@ -307,9 +314,9 @@ async fn handle_transition(
         None => return err(RpcError::TransitionRejected),
     };
 
-    // Trusted time for the link's `valid_from` gate: the leader's own NSM
-    // timestamp, never its system clock. Without it the gate cannot be
-    // evaluated, so the transition is refused (retryable).
+    // Trusted time for the link's `valid_from` / `valid_until` gates: the
+    // leader's own NSM timestamp, never its system clock. Without it the gates
+    // cannot be evaluated, so the transition is refused (retryable).
     let now_ms = match crate::trusted_time::now_ms().await {
         Ok(t) => t,
         Err(e) => {
@@ -319,8 +326,8 @@ async fn handle_transition(
     };
 
     // Phase two: cryptographically verify the link against old_key's frozen
-    // pubkey and the submitting session key, and check that its `valid_from`
-    // has been reached.
+    // pubkey and the submitting session key, and check that `now` is inside its
+    // `valid_from` / `valid_until` window.
     let verified = match verify_transition_link(
         &link,
         decoded,
@@ -357,6 +364,7 @@ async fn handle_transition(
             new_key: verified.new_key,
             new_control_pubkey: control_pubkey,
             link_hash: verified.link_hash,
+            valid_until_ms: verified.valid_until_ms,
         })
         .await
     {

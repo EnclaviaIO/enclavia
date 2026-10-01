@@ -239,6 +239,12 @@ pub enum ReplicatedOp {
         /// Payload hash of the presented link (`upgrade_link_hash`), checked
         /// against `old_key`'s revoked links at apply.
         link_hash: [u8; 32],
+        /// The link's `valid_until`, milliseconds since the Unix epoch. Not
+        /// an input to apply (which must not depend on any replica's
+        /// clock): the leader that applies the committed entry compares it
+        /// with its trusted time and flags a commit past the deadline (see
+        /// `StateMachineStore`).
+        valid_until_ms: i64,
     },
     /// Revocation of one upgrade link out of `key`. The leader verified the
     /// revocation link's control signature against `key`'s frozen pubkey, and
@@ -561,6 +567,9 @@ impl RaftHandle {
         // Install the live Raft into the deferred handler the mesh already
         // serves, so inbound peer RPCs now reach this instance.
         handler.set_raft(raft.clone());
+        // The store's late-commit check needs to know whether this node
+        // leads when it applies a Transition.
+        sm.set_raft_metrics(raft.metrics());
 
         Ok(Self {
             raft,
@@ -1037,6 +1046,7 @@ mod tests {
                 new_key: k(4),
                 new_control_pubkey: pk(4),
                 link_hash: [0x4c; 32],
+                valid_until_ms: 1_800_000_000_000,
             },
             ReplicatedOp::Revoke {
                 key: k(3),

@@ -206,6 +206,11 @@ pub struct RpcSample {
     pub routed_unavailable: u64,
     /// Requests other nodes forwarded to this node, served as leader.
     pub forwarded_served: u64,
+    /// Transitions this node, as leader, applied after their upgrade link's
+    /// `valid_until` plus the clock tolerance: verified in time, committed
+    /// late. Any increase is an anomaly to investigate.
+    #[serde(default)]
+    pub transitions_committed_after_deadline: u64,
 }
 
 /// Counters for one RPC kind.
@@ -466,6 +471,7 @@ mod tests {
                 routed_forwarded: u64::MAX,
                 routed_unavailable: u64::MAX,
                 forwarded_served: u64::MAX,
+                transitions_committed_after_deadline: u64::MAX,
             },
             rejections: (0..MAX_REJECTION_CELLS)
                 .map(|_| RejectionCount {
@@ -693,6 +699,7 @@ mod tests {
             "rpc.routed_forwarded",
             "rpc.routed_unavailable",
             "rpc.forwarded_served",
+            "rpc.transitions_committed_after_deadline",
             "rejections",
             "rejections[].source",
             "rejections[].reason",

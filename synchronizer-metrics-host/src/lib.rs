@@ -361,6 +361,11 @@ pub fn render(sample: &SynchronizerSample, received_unix_ms: u64) -> String {
         "Customer RPCs other nodes forwarded to this node, served as leader.",
         rpc.forwarded_served,
     );
+    o.counter(
+        "transitions_committed_after_deadline_total",
+        "Transitions this node, as leader, applied after their upgrade link's valid_until plus the clock tolerance (verified in time, committed late).",
+        rpc.transitions_committed_after_deadline,
+    );
 
     o.family(
         "attestation_rejections_total",
@@ -475,6 +480,7 @@ mod tests {
                 routed_forwarded: 2,
                 routed_unavailable: 0,
                 forwarded_served: 3,
+                transitions_committed_after_deadline: 1,
             },
             rejections: vec![RejectionCount {
                 source: "peer".into(),
@@ -545,6 +551,14 @@ mod tests {
         assert_eq!(
             value(&text, &format!("{p}clock_offset_seconds{{node=\"az-a\"}}")).as_deref(),
             Some("-0.25")
+        );
+        assert_eq!(
+            value(
+                &text,
+                &format!("{p}transitions_committed_after_deadline_total{{node=\"az-a\"}}")
+            )
+            .as_deref(),
+            Some("1")
         );
         assert_eq!(
             value(

@@ -537,6 +537,7 @@ mod tests {
             to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from: chrono::Utc::now(),
+            valid_until: chrono::Utc::now() + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };

@@ -554,6 +554,9 @@ pub struct Metrics {
     pub join: JoinStats,
     /// Samples that could not be built or delivered.
     pub export_failures: AtomicU64,
+    /// Transitions this node, as leader, applied after their link's
+    /// `valid_until` plus the tolerance (see `raft::StateMachineStore`).
+    pub transitions_committed_after_deadline: AtomicU64,
 }
 
 impl Metrics {
@@ -565,6 +568,7 @@ impl Metrics {
             routes: RouteStats::new(),
             join: JoinStats::new(),
             export_failures: AtomicU64::new(0),
+            transitions_committed_after_deadline: AtomicU64::new(0),
         }
     }
 
@@ -576,6 +580,9 @@ impl Metrics {
             routed_forwarded: self.routes.forwarded.load(Ordering::Relaxed),
             routed_unavailable: self.routes.unavailable.load(Ordering::Relaxed),
             forwarded_served: self.routes.forwarded_served.load(Ordering::Relaxed),
+            transitions_committed_after_deadline: self
+                .transitions_committed_after_deadline
+                .load(Ordering::Relaxed),
         }
     }
 }

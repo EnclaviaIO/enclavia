@@ -107,6 +107,7 @@ fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
         to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: chrono::Utc::now(),
+        valid_until: chrono::Utc::now() + chrono::Duration::days(7),
         issued_at: chrono::Utc::now(),
         nonce: vec![0x5a; 32],
     };
@@ -1913,6 +1914,85 @@ async fn timed_out_write_that_commits_does_not_break_the_next_cas() {
     }
 }
 
+/// A Transition that commits after its link's `valid_until` plus the
+/// tolerance still applies (apply cannot read a clock), but the leader that
+/// applies it counts it in `transitions_committed_after_deadline`, exactly
+/// once: the followers, which apply the same entry, do not. One that commits
+/// in time is not counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transition_committed_after_its_deadline_is_counted_by_the_leader() {
+    use std::sync::atomic::Ordering;
+    use synchronizer::raft::ReplicatedOp;
+    use synchronizer::wire::TRANSITION_CLOCK_TOLERANCE_MS;
+
+    let host = MeshHostStub::new();
+    let nodes = cluster(&host).await;
+    let late = || {
+        synchronizer::metrics::global()
+            .transitions_committed_after_deadline
+            .load(Ordering::Relaxed)
+    };
+
+    let (old_seed, mid_seed, new_seed) = (0x73, 0x74, 0x75);
+    let (_, old_pk) = keypair(old_seed);
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let leader = find(&nodes, &leader_name);
+    register_until_acked(leader, old_seed, old_pk, key_from_seed(old_seed), c(0x01)).await;
+
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let tolerance = i64::try_from(TRANSITION_CLOCK_TOLERANCE_MS).unwrap();
+    let before = late();
+
+    // Submitted straight to Raft, as a leader that verified the link in time
+    // would have, with a deadline already past by the time it commits.
+    leader
+        .raft
+        .client_write(ReplicatedOp::Transition {
+            old_key: key_from_seed(old_seed),
+            new_key: key_from_seed(mid_seed),
+            new_control_pubkey: keypair(mid_seed).1,
+            link_hash: [0x51; 32],
+            valid_until_ms: now_ms - tolerance - 1_000,
+        })
+        .await
+        .expect("a late commit still applies");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while late() == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the late commit was never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_all_nodes_have(&nodes, key_from_seed(mid_seed), Version(0)).await;
+
+    // In time: applied, not counted.
+    leader
+        .raft
+        .client_write(ReplicatedOp::Transition {
+            old_key: key_from_seed(mid_seed),
+            new_key: key_from_seed(new_seed),
+            new_control_pubkey: keypair(new_seed).1,
+            link_hash: [0x52; 32],
+            valid_until_ms: now_ms + 60 * 60 * 1000,
+        })
+        .await
+        .expect("an in-time commit applies");
+    assert_all_nodes_have(&nodes, key_from_seed(new_seed), Version(0)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(late(), before + 1, "only the leader counts, and only the late commit");
+
+    for n in &nodes {
+        n.raft.shutdown().await;
+    }
+}
+
 // --- upgrade-link revocation ------------------------------------------------
 
 /// An upgrade link `from_seed -> to_seed` stamped `issued_at` and already
@@ -1929,6 +2009,7 @@ fn upgrade_link_issued_at(
         to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
+        valid_until: (chrono::Utc::now() - chrono::Duration::hours(1)) + chrono::Duration::days(7),
         issued_at,
         nonce: vec![0x5a; 32],
     };

@@ -2,13 +2,14 @@
 //!
 //! Enclaves have no clock synchronisation of their own, so the system clock
 //! is not an input to any security decision. When the node needs the current
-//! time to decide something (today: the `valid_from` gate on a `Transition`
-//! link, see [`crate::wire::verify_transition_link`]), it requests a fresh
-//! attestation document from its OWN `/dev/nsm` and reads the `timestamp` the
-//! Nitro hypervisor stamped into it. Neither the parent instance nor a
-//! drifting enclave clock can move that value. One NSM round trip takes about
-//! a millisecond, and the callers are rare (one per `Transition`), so the
-//! value is read fresh every time and never cached.
+//! time to decide something (the `valid_from` and `valid_until` gates on a
+//! `Transition` link, see [`crate::wire::verify_transition_link`], and the
+//! leader's check that a Transition did not commit past its deadline), it
+//! requests a fresh attestation document from its OWN `/dev/nsm` and reads
+//! the `timestamp` the Nitro hypervisor stamped into it. Neither the parent
+//! instance nor a drifting enclave clock can move that value. One NSM round
+//! trip takes about a millisecond, and the callers are rare (one or two per
+//! `Transition`), so the value is read fresh every time and never cached.
 //!
 //! Which source is used is fixed at compile time:
 //!

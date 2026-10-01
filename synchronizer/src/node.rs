@@ -249,9 +249,11 @@ impl Node {
         // control signature verifies under old_key's frozen pubkey, and
         // the chain attestation binds `user_data == sha256(payload)` and
         // the OLD enclave's full identity (`from`). Both keys are re-derived
-        // from the signed payload, never from an untrusted wire field, and
-        // the payload's `valid_from` has been reached. Any failure folds to
-        // a single TransitionRejected.
+        // from the signed payload, never from an untrusted wire field. The
+        // payload's window is at least `UPGRADE_WINDOW_MIN` long and the
+        // trusted `now_ms` lies inside it, each edge widened by
+        // `TRANSITION_CLOCK_TOLERANCE_MS`. Any failure folds to a single
+        // TransitionRejected.
         let verified = match verify_transition_link(
             &link,
             decoded,
@@ -406,6 +408,7 @@ mod tests {
             to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from,
+            valid_until: valid_from + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
@@ -970,6 +973,7 @@ mod tests {
             to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
+            valid_until: (chrono::Utc::now() - chrono::Duration::hours(1)) + chrono::Duration::days(7),
             issued_at,
             nonce: vec![0x5a; 32],
         };

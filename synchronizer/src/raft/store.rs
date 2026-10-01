@@ -16,15 +16,15 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     Entry, EntryPayload, LogId, LogState, RaftLogId, RaftLogReader, RaftSnapshotBuilder,
     SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::raft::{MemberRecord, RaftNodeId, ReplicatedOp, ReplicatedOpResult, TypeConfig};
 use crate::{KeyState, Op, PcrKey, StateMachine, StateMachineSnapshot};
@@ -213,6 +213,10 @@ pub struct StateMachineStore {
     live_keys: AtomicU64,
     retired_keys: AtomicU64,
     snapshot_bytes: AtomicU64,
+    /// This node's openraft metrics, set once the Raft instance exists. Read
+    /// at apply time only to know whether this node is the leader, for the
+    /// late-commit check (see [`StateMachineStore::check_transition_deadlines`]).
+    raft_metrics: OnceLock<watch::Receiver<openraft::RaftMetrics<RaftNodeId, MemberRecord>>>,
 }
 
 /// State and snapshot sizes, read without locking.
@@ -236,6 +240,85 @@ impl StateMachineStore {
             retired_keys: self.retired_keys.load(Ordering::Relaxed),
             snapshot_bytes: (snapshot_bytes != 0).then_some(snapshot_bytes),
         }
+    }
+
+    /// Give the store this node's openraft metrics channel. Called once,
+    /// right after the Raft instance is created; later calls are ignored.
+    pub fn set_raft_metrics(
+        &self,
+        metrics: watch::Receiver<openraft::RaftMetrics<RaftNodeId, MemberRecord>>,
+    ) {
+        let _ = self.raft_metrics.set(metrics);
+    }
+
+    /// Whether this node is the leader right now, per its openraft metrics.
+    /// `false` before [`Self::set_raft_metrics`].
+    fn is_leader(&self) -> bool {
+        self.raft_metrics
+            .get()
+            .is_some_and(|m| m.borrow().state == openraft::ServerState::Leader)
+    }
+
+    /// The late-commit check for Transitions this node just applied.
+    ///
+    /// The leader verifies a Transition's link (including `valid_until`)
+    /// against its trusted time when the Transition is submitted, but the
+    /// entry commits whenever a quorum holds it, which can be arbitrarily
+    /// later: a write that timed out stays in the log and may commit once the
+    /// quorum is back. Apply cannot refuse it on time grounds (it must be
+    /// deterministic on every replica), so instead the leader that applies
+    /// the committed entry reads its trusted time again and, if that is past
+    /// `valid_until` plus [`crate::wire::TRANSITION_CLOCK_TOLERANCE_MS`],
+    /// logs an error and counts it
+    /// (`transitions_committed_after_deadline`). The pin has moved either
+    /// way; the check only makes the late commit visible.
+    ///
+    /// Only the leader checks. A follower, or a node replaying the log while
+    /// it catches up, applies the same entry later than it committed, so its
+    /// clock says nothing about the commit time. The leader applies an entry
+    /// right after committing it, and openraft only applies committed
+    /// entries, so the leader's "now" is an upper bound on the commit time
+    /// that is at most the apply latency late.
+    ///
+    /// The check runs on a spawned task so that the NSM round trip never
+    /// delays apply.
+    ///
+    /// The log line names the keys (PCR digests, not secrets). The metrics
+    /// sample does not: it carries no identifiers.
+    fn check_transition_deadlines(&self, transitions: Vec<(PcrKey, PcrKey, i64)>) {
+        if transitions.is_empty() || !self.is_leader() {
+            return;
+        }
+        tokio::spawn(async move {
+            let now_ms = match crate::trusted_time::now_ms().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not read trusted time to check committed transitions against \
+                         their deadline"
+                    );
+                    return;
+                }
+            };
+            for (old_key, new_key, valid_until_ms) in transitions {
+                if crate::wire::past_valid_until(now_ms, valid_until_ms) {
+                    crate::metrics::global()
+                        .transitions_committed_after_deadline
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        old_key = %hex::encode(old_key.0),
+                        new_key = %hex::encode(new_key.0),
+                        valid_until_ms,
+                        now_ms,
+                        tolerance_ms = crate::wire::TRANSITION_CLOCK_TOLERANCE_MS,
+                        "transition committed after deadline: the upgrade link was verified \
+                         before valid_until, but the entry committed after valid_until plus \
+                         the tolerance"
+                    );
+                }
+            }
+        });
     }
 
     fn record_sizes(&self, sm: &StateMachine) {
@@ -299,6 +382,7 @@ impl StateMachineStore {
                 new_key,
                 new_control_pubkey,
                 link_hash,
+                valid_until_ms: _,
             } => {
                 // The new key's attestation was observed by the leader from the
                 // submitting session; record it so the pure core's
@@ -391,6 +475,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         let mut guard = self.state.write().await;
         let (sm, applied) = &mut *guard;
         let mut results = Vec::new();
+        let mut applied_transitions = Vec::new();
         for entry in entries {
             applied.last_applied_log = Some(entry.log_id);
             match &entry.payload {
@@ -403,7 +488,22 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     version: crate::Version(0),
                     control_pubkey: [0u8; crate::CONTROL_PUBKEY_LEN],
                 })),
-                EntryPayload::Normal(op) => results.push(StateMachineStore::apply_one(sm, op)),
+                EntryPayload::Normal(op) => {
+                    let result = StateMachineStore::apply_one(sm, op);
+                    if let (
+                        ReplicatedOp::Transition {
+                            old_key,
+                            new_key,
+                            valid_until_ms,
+                            ..
+                        },
+                        ReplicatedOpResult::Applied(_),
+                    ) = (op, &result)
+                    {
+                        applied_transitions.push((*old_key, *new_key, *valid_until_ms));
+                    }
+                    results.push(result);
+                }
                 EntryPayload::Membership(mem) => {
                     applied.last_membership =
                         StoredMembership::new(Some(entry.log_id), mem.clone());
@@ -416,6 +516,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             }
         }
         self.record_sizes(sm);
+        drop(guard);
+        self.check_transition_deadlines(applied_transitions);
         Ok(results)
     }
 

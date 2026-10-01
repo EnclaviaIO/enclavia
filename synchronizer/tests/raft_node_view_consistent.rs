@@ -395,6 +395,7 @@ async fn run_scenario(seed: u64) {
                 new_key: key(new_idx),
                 new_control_pubkey: pubkey(pubkey_seed(new_idx)),
                 link_hash: link_hash(old_idx, link),
+                valid_until_ms: i64::MAX,
             };
             if let SubmitOutcome::Applied(v) = submit(&nodes, op).await {
                 // A committed revocation of this link would have refused it.

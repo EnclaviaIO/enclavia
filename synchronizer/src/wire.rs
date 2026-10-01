@@ -340,10 +340,10 @@ pub enum Request {
     /// derives `old_key`/`new_key` from the payload, verifies the link via
     /// [`verify_transition_link`] against the control pubkey frozen for the
     /// derived `old_key` at its registration (which also refuses the link
-    /// before the payload's `valid_from`), then retires `old_key`,
-    /// registers `new_key` (which must itself have produced an attestation
-    /// in this session, the submitting session does), and carries the
-    /// existing commitment + version forward.
+    /// outside the payload's `valid_from` / `valid_until` window), then
+    /// retires `old_key`, registers `new_key` (which must itself have
+    /// produced an attestation in this session, the submitting session
+    /// does), and carries the existing commitment + version forward.
     Transition {
         /// The #47 upgrade chain link authorizing the transition.
         link: ChainLink,
@@ -685,10 +685,10 @@ pub enum TransitionLinkError {
     SelfTransition,
     /// The payload's `valid_from` is still in the future: the verifier's
     /// trusted `now` is earlier than `valid_from` minus
-    /// [`TRANSITION_VALID_FROM_TOLERANCE_MS`].
+    /// [`TRANSITION_CLOCK_TOLERANCE_MS`].
     #[error(
         "transition link is not valid yet (valid_from {valid_from_ms} ms, now {now_ms} ms, \
-         tolerance {TRANSITION_VALID_FROM_TOLERANCE_MS} ms)"
+         tolerance {TRANSITION_CLOCK_TOLERANCE_MS} ms)"
     )]
     NotYetValid {
         /// The payload's `valid_from`, milliseconds since the Unix epoch.
@@ -696,22 +696,47 @@ pub enum TransitionLinkError {
         /// The verifier's trusted `now`, milliseconds since the Unix epoch.
         now_ms: u64,
     },
+    /// The payload's `valid_until` has passed: the verifier's trusted `now`
+    /// is later than `valid_until` plus [`TRANSITION_CLOCK_TOLERANCE_MS`].
+    #[error(
+        "transition link has expired (valid_until {valid_until_ms} ms, now {now_ms} ms, \
+         tolerance {TRANSITION_CLOCK_TOLERANCE_MS} ms)"
+    )]
+    Expired {
+        /// The payload's `valid_until`, milliseconds since the Unix epoch.
+        valid_until_ms: i64,
+        /// The verifier's trusted `now`, milliseconds since the Unix epoch.
+        now_ms: u64,
+    },
+    /// The payload's window `valid_until - valid_from` is shorter than
+    /// [`enclavia_protocol::chain::UPGRADE_WINDOW_MIN`] (or empty, or inverted).
+    #[error("transition link window (valid_from to valid_until) is shorter than the minimum")]
+    WindowInvalid,
 }
 
-/// How far ahead of the payload's `valid_from` a `Transition` is still
-/// accepted, in milliseconds.
+/// How far ahead of the payload's `valid_from`, and how far past its
+/// `valid_until`, a `Transition` is still accepted, in milliseconds.
 ///
 /// Matches `CLOCK_SKEW_TOLERANCE_SECS` (60 s) in `enclavia-server`, which
 /// applies the same gate on the enclave side before it swaps images. The
 /// synchronizer's `now` is its own NSM attestation timestamp (hypervisor
 /// time), so the tolerance only has to absorb the difference between two
 /// Nitro hosts' clocks and the whole-second stamps of QEMU's emulated NSM.
-pub const TRANSITION_VALID_FROM_TOLERANCE_MS: u64 = 60_000;
+pub const TRANSITION_CLOCK_TOLERANCE_MS: u64 = 60_000;
+
+/// Whether `now_ms` (trusted time, milliseconds since the Unix epoch) is
+/// later than `valid_until_ms` plus [`TRANSITION_CLOCK_TOLERANCE_MS`]. The
+/// `valid_until` gate in [`verify_transition_link`] and the leader's
+/// late-commit check after apply use this one comparison.
+pub fn past_valid_until(now_ms: u64, valid_until_ms: i64) -> bool {
+    i128::from(now_ms) > i128::from(valid_until_ms) + i128::from(TRANSITION_CLOCK_TOLERANCE_MS)
+}
 
 impl TransitionLinkError {
     /// The classified cause when the link's attestation document was
     /// rejected; `None` for the non-attestation checks (signature shape,
-    /// key derivation, session binding, `valid_from`).
+    /// key derivation, session binding, the `valid_from` / `valid_until`
+    /// window).
     pub fn attestation_reason(&self) -> Option<RejectionReason> {
         match self {
             TransitionLinkError::Attestation(e) => Some(e.reason()),
@@ -760,6 +785,11 @@ pub struct VerifiedTransition {
     /// [`upgrade_link_hash`] of the link's payload: the identity a
     /// committed revocation of `old_key` names to refuse this link.
     pub link_hash: [u8; 32],
+    /// The payload's `valid_until`, milliseconds since the Unix epoch. Not
+    /// an input to apply: the leader compares it with its trusted time once
+    /// the Transition has committed (see `raft::StateMachineStore`), to
+    /// detect a commit later than the deadline.
+    pub valid_until_ms: i64,
 }
 
 /// Phase one of transition-link verification: structural checks plus the
@@ -835,14 +865,42 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    running at the time" rule). Since `old_key` is `from.key()`, this
 ///    ties the moved pin to the enclave that emitted the link. `debug_mode` selects the
 ///    skip-cert-chain (QEMU / test) vs full-Nitro-CA path.
-/// 5. **Activation time.** The payload's `valid_from` must not be later
-///    than `now_ms + TRANSITION_VALID_FROM_TOLERANCE_MS`. The chain
+/// 5. **Activation window.** The payload's `valid_until` must be at least
+///    `UPGRADE_WINDOW_MIN` after its `valid_from`; `valid_from` must not be later than
+///    `now_ms + TRANSITION_CLOCK_TOLERANCE_MS`; and `valid_until` must not be
+///    earlier than `now_ms - TRANSITION_CLOCK_TOLERANCE_MS`. The chain
 ///    attestation is validated at the document's own timestamp, so without
-///    this gate a link would be usable from the moment it is emitted, not
-///    from the time its owner scheduled. `valid_from` is covered by the
-///    control signature (step 3), so it is trusted once that passes. The
-///    gate applies in both verification modes: it reads a signed payload
-///    field, not the attestation envelope.
+///    these gates a link would be usable from the moment it is emitted, not
+///    from the time its owner scheduled, and forever after, even once the
+///    owner has abandoned the upgrade. Both bounds are covered by the
+///    control signature (step 3), so they are trusted once that passes. The
+///    gates apply in both verification modes: they read signed payload
+///    fields, not the attestation envelope.
+///
+/// # What the window guarantees, and what it does not
+///
+/// The gates run when the Transition is SUBMITTED, against the leader's
+/// trusted time at that moment. The guarantee is therefore: a Transition
+/// submitted before `valid_from - TRANSITION_CLOCK_TOLERANCE_MS` or after
+/// `valid_until + TRANSITION_CLOCK_TOLERANCE_MS` is refused.
+///
+/// It is not "the pin never moves after `valid_until`". The verified op
+/// commits when a quorum holds it, and that can be arbitrarily later: if no
+/// quorum answers within the commit timeout the submitter gets
+/// `Unavailable`, but the entry stays in the leader's log and commits once
+/// the quorum is back, which the host (it relays all mesh traffic) can delay
+/// past `valid_until`. Raft's apply cannot re-check the time, because every
+/// replica must reach the same result from the log alone and their clocks
+/// differ. The leader that applies the committed entry therefore re-reads
+/// its trusted time and logs and counts a commit past `valid_until +
+/// TRANSITION_CLOCK_TOLERANCE_MS` (`transitions_committed_after_deadline`),
+/// and the backend's cutover sweep treats such an upgrade as expired. This
+/// asymmetry does not affect `valid_from`: a commit is never earlier than
+/// its verification.
+///
+/// To make sure an upgrade never happens, revoke its link (`Request::Revoke`):
+/// a committed revocation refuses the Transition at apply, on every replica,
+/// whenever the Transition commits.
 ///
 /// `now_ms` is the verifier's trusted current time in milliseconds since
 /// the Unix epoch. The node reads it from its own NSM attestation document
@@ -890,15 +948,28 @@ pub fn verify_transition_link(
     let payload: UpgradePayload = decode_canonical(&link.payload)
         .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
 
-    // 5. Activation time. Checked ahead of the attestation (step 4) so the
+    // 5. Activation window. Checked ahead of the attestation (step 4) so the
     //    outcome does not depend on the verification mode. The payload is
-    //    authenticated by the signature above, so `valid_from` is the
-    //    owner's schedule.
+    //    authenticated by the signature above, so `valid_from` and
+    //    `valid_until` are the owner's schedule.
+    if !enclavia_protocol::chain::upgrade_window_is_valid(payload.valid_from, payload.valid_until) {
+        return Err(TransitionLinkError::WindowInvalid);
+    }
     let valid_from_ms = payload.valid_from.timestamp_millis();
-    let earliest_ms = i128::from(valid_from_ms) - i128::from(TRANSITION_VALID_FROM_TOLERANCE_MS);
+    let earliest_ms = i128::from(valid_from_ms) - i128::from(TRANSITION_CLOCK_TOLERANCE_MS);
     if i128::from(now_ms) < earliest_ms {
         return Err(TransitionLinkError::NotYetValid {
             valid_from_ms,
+            now_ms,
+        });
+    }
+    //    Expiry, same trusted time and tolerance: a Transition submitted
+    //    after `valid_until` is refused. One verified before it may still
+    //    commit later (see "What the window guarantees" above).
+    let valid_until_ms = payload.valid_until.timestamp_millis();
+    if past_valid_until(now_ms, valid_until_ms) {
+        return Err(TransitionLinkError::Expired {
+            valid_until_ms,
             now_ms,
         });
     }
@@ -918,6 +989,7 @@ pub fn verify_transition_link(
         old_key: decoded.old_key,
         new_key: decoded.new_key,
         link_hash: upgrade_link_hash(&link.payload),
+        valid_until_ms,
     })
 }
 
@@ -1093,12 +1165,24 @@ mod tests {
         upgrade_link_valid_from(from_seed, to_seed, signing, chrono::Utc::now())
     }
 
-    /// [`upgrade_link`] with an explicit `valid_from`.
+    /// [`upgrade_link`] with an explicit `valid_from` (and the default window).
     fn upgrade_link_valid_from(
         from_seed: u8,
         to_seed: u8,
         signing: &SigningKey,
         valid_from: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
+        let valid_until = valid_from + enclavia_protocol::chain::UPGRADE_WINDOW_DEFAULT;
+        upgrade_link_window(from_seed, to_seed, signing, valid_from, valid_until)
+    }
+
+    /// [`upgrade_link`] with an explicit `valid_from` and `valid_until`.
+    fn upgrade_link_window(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: chrono::DateTime<chrono::Utc>,
+        valid_until: chrono::DateTime<chrono::Utc>,
     ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
@@ -1106,6 +1190,7 @@ mod tests {
             to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from,
+            valid_until,
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
@@ -1653,6 +1738,7 @@ mod tests {
             to: to.clone(),
             image_digest: "sha256:to".into(),
             valid_from: chrono::Utc::now(),
+            valid_until: chrono::Utc::now() + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5b; 32],
         };
@@ -1728,7 +1814,7 @@ mod tests {
 
     // --- valid_from gate ------------------------------------------------
 
-    const TOL: u64 = TRANSITION_VALID_FROM_TOLERANCE_MS;
+    const TOL: u64 = TRANSITION_CLOCK_TOLERANCE_MS;
 
     /// A link whose valid_from is an hour ahead of the trusted `now` is
     /// refused, even though every other check would pass.
@@ -1748,12 +1834,13 @@ mod tests {
         );
     }
 
-    /// At and after valid_from the link is accepted.
+    /// From valid_from to valid_until the link is accepted.
     #[test]
-    fn transition_link_at_or_after_valid_from_accepted() {
+    fn transition_link_inside_its_window_is_accepted() {
         let (sk, pk) = keypair(0x62);
         let link = upgrade_link_valid_from(0x62, 0x63, &sk, t0());
-        for now in [ms(t0()), ms(t0()) + 1, ms(t0()) + 30 * 86_400_000] {
+        let until = t0() + enclavia_protocol::chain::UPGRADE_WINDOW_DEFAULT;
+        for now in [ms(t0()), ms(t0()) + 1, ms(until)] {
             decode_and_verify_at(&link, key_from_seed(0x63), &pk, true, now)
                 .unwrap_or_else(|e| panic!("now = {now}: {e:?}"));
         }
@@ -1801,6 +1888,88 @@ mod tests {
             matches!(err, TransitionLinkError::Attestation(_)),
             "{err:?}"
         );
+    }
+
+    /// Exactly `valid_until + tolerance` is still accepted; one millisecond
+    /// later the link has expired.
+    #[test]
+    fn transition_link_valid_until_tolerance_edge() {
+        let (sk, pk) = keypair(0x6a);
+        let until = t0() + chrono::Duration::hours(1);
+        let link = upgrade_link_window(0x6a, 0x6b, &sk, t0(), until);
+        let edge = ms(until) + TOL;
+        decode_and_verify_at(&link, key_from_seed(0x6b), &pk, true, edge)
+            .expect("exactly at valid_until + tolerance");
+        let err =
+            decode_and_verify_at(&link, key_from_seed(0x6b), &pk, true, edge + 1).unwrap_err();
+        assert!(matches!(err, TransitionLinkError::Expired { .. }), "{err:?}");
+        assert_eq!(RpcError::from(err), RpcError::TransitionRejected);
+        // The late-commit check after apply uses the same comparison, with
+        // the deadline the verifier hands back.
+        let verified = decode_and_verify_at(&link, key_from_seed(0x6b), &pk, true, edge).unwrap();
+        assert_eq!(verified.valid_until_ms, until.timestamp_millis());
+        assert!(!past_valid_until(edge, verified.valid_until_ms));
+        assert!(past_valid_until(edge + 1, verified.valid_until_ms));
+    }
+
+    /// The expiry gate does not depend on the verification mode either: an
+    /// expired link is refused as `Expired` in production mode, before the
+    /// (fake) chain attestation is looked at.
+    #[test]
+    fn transition_link_valid_until_gate_in_both_modes() {
+        let (sk, pk) = keypair(0x6c);
+        let until = t0() + chrono::Duration::hours(1);
+        let link = upgrade_link_window(0x6c, 0x6d, &sk, t0(), until);
+        for debug_mode in [true, false] {
+            let err = decode_and_verify_at(
+                &link,
+                key_from_seed(0x6d),
+                &pk,
+                debug_mode,
+                ms(until) + TOL + 1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TransitionLinkError::Expired { .. }),
+                "debug_mode = {debug_mode}: {err:?}"
+            );
+        }
+    }
+
+    /// A window that is empty, inverted or one millisecond shorter than the
+    /// minimum is refused, whatever the time; exactly the minimum is not.
+    #[test]
+    fn transition_link_empty_window_is_rejected() {
+        use enclavia_protocol::chain::UPGRADE_WINDOW_MIN;
+        let (sk, pk) = keypair(0x6e);
+        let min_link = upgrade_link_window(0x6e, 0x6f, &sk, t0(), t0() + UPGRADE_WINDOW_MIN);
+        decode_and_verify_at(&min_link, key_from_seed(0x6f), &pk, true, ms(t0()))
+            .expect("a window of exactly the minimum is valid");
+        for until in [
+            t0(),
+            t0() - chrono::Duration::seconds(1),
+            t0() + UPGRADE_WINDOW_MIN - chrono::Duration::milliseconds(1),
+        ] {
+            let link = upgrade_link_window(0x6e, 0x6f, &sk, t0(), until);
+            let err =
+                decode_and_verify_at(&link, key_from_seed(0x6f), &pk, true, ms(t0())).unwrap_err();
+            assert!(matches!(err, TransitionLinkError::WindowInvalid), "{err:?}");
+        }
+    }
+
+    /// `valid_until` is signature-covered: extending it without the owner's
+    /// signature fails on the signature.
+    #[test]
+    fn transition_link_valid_until_is_signature_covered() {
+        let (sk, pk) = keypair(0x70);
+        let until = t0() + chrono::Duration::hours(1);
+        let mut link = upgrade_link_window(0x70, 0x71, &sk, t0(), until);
+        let mut payload: UpgradePayload = decode_canonical(&link.payload).unwrap();
+        payload.valid_until = t0() + chrono::Duration::days(365);
+        link.payload = enclavia_protocol::signing::encode(&payload);
+        let err = decode_and_verify_at(&link, key_from_seed(0x71), &pk, true, ms(until) + TOL + 1)
+            .unwrap_err();
+        assert!(matches!(err, TransitionLinkError::SignatureInvalid), "{err:?}");
     }
 
     /// The gate reads the SIGNED payload: a forged link that moves
