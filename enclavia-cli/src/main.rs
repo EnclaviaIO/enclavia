@@ -102,7 +102,10 @@ enum Command {
     /// github:EnclaviaIO/builder` is enough; no source checkout is
     /// needed (the builder's flake source is fetched automatically
     /// unless BUILDER_FLAKE is already exported). The image must be
-    /// linux/amd64. No account or login is required.
+    /// linux/amd64. No account or login is required. The printed PCRs
+    /// are this local build's: they won't match a deployed enclave's,
+    /// which also measure per-enclave values (such as the enclave id and
+    /// image digest); use `enclavia reproduce` to check those.
     #[command(visible_alias = "ci")]
     Build {
         /// Image to build, e.g. `myapp:dev`. Plain references are read
@@ -120,10 +123,11 @@ enum Command {
         /// `--container-port` you (will) use at create/deploy time.
         #[arg(long, default_value_t = 8080)]
         container_port: u16,
-        /// Build the debug-mode EIF (what a non-`--production` enclave
-        /// runs). Debug and production EIFs differ in PCRs, but an image
-        /// that builds as one builds as the other, so for a pass/fail CI
-        /// gate the default (production-shaped) build is fine.
+        /// Build with debug-attestation trust settings (what a
+        /// non-`--production` enclave runs). The builder only measures
+        /// this into the synchronizer trust config, which local builds
+        /// don't bake in, so today the EIF and its PCRs are the same with
+        /// or without it.
         #[arg(long)]
         debug: bool,
         /// Build the storage-capable variant (LUKS+btrfs over NBD), as

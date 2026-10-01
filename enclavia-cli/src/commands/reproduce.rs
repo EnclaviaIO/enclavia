@@ -469,13 +469,17 @@ async fn run_builder(
     // /nix/store paths and hand them to the builder via the env vars
     // its `nix build` invocation honours as `--override-input`.
     if let Some(rev) = recorded_builder_rev {
-        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, Some(rev)).await?;
+        let path = fetch_flake_source("builder", BUILDER_FLAKE_URL, Some(rev))
+            .await
+            .map_err(with_recorded_rev_hint)?;
         cmd.env("BUILDER_FLAKE", path);
     } else {
         eprintln!("No recorded builder_rev on this enclave; reproduce will use the BUILDER_FLAKE in your environment (or the builder's own default), which may differ from what the backend used and produce diverging PCRs.");
     }
     if let Some(rev) = recorded_crates_rev {
-        let path = fetch_flake_source("enclavia", ENCLAVIA_FLAKE_URL, Some(rev)).await?;
+        let path = fetch_flake_source("enclavia", ENCLAVIA_FLAKE_URL, Some(rev))
+            .await
+            .map_err(with_recorded_rev_hint)?;
         cmd.env("ENCLAVIA_FLAKE", path);
     } else {
         eprintln!("No recorded crates_rev on this enclave; reproduce will use the ENCLAVIA_FLAKE in your environment (or the builder's flake.lock pin), which may differ from what the backend used and produce diverging PCRs.");
@@ -543,6 +547,17 @@ fn parse_builder_output(stdout: &str) -> Result<PcrTriple, String> {
     })
 }
 
+/// Append the reproduce-specific cause to a failed fetch of a recorded
+/// rev: the rev came from the backend's row, not from the user.
+fn with_recorded_rev_hint(e: CliError) -> CliError {
+    match e {
+        CliError::Other(msg) => CliError::Other(format!(
+            "{msg} The rev was recorded by the backend at build time; older enclaves may pin revisions that predate the repositories becoming public, which need SSH access."
+        )),
+        e => e,
+    }
+}
+
 /// Fetch a flake source and return its /nix/store path. With a rev,
 /// pins the fetch to that exact commit — reproduce uses this to replay
 /// whatever the backend recorded for an enclave at build time. Without
@@ -595,7 +610,7 @@ pub(crate) async fn fetch_flake_source(
 
     if !output.status.success() {
         let rev_hint = match rev {
-            Some(rev) => format!(" The recorded {label} rev is {rev}; older enclaves may pin revisions that predate the repositories becoming public, which need SSH access."),
+            Some(rev) => format!(" Check that {label} rev {rev} exists."),
             None => String::new(),
         };
         return Err(CliError::Other(format!(
