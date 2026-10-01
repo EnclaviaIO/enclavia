@@ -135,7 +135,7 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
     ciborium::ser::into_writer(&payload, &mut payload_bytes)?;
 
     // user_data binds the attestation to the payload bytes verbatim.
-    // The backend's `verify_chain_attestation` recomputes sha256(payload)
+    // The backend's chain-link validation recomputes sha256(payload)
     // and rejects on mismatch.
     let mut hasher = Sha256::new();
     hasher.update(&payload_bytes);

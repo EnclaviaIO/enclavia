@@ -99,6 +99,11 @@ pub struct ChainSummary {
     /// explain what the row records: treat the chain as NOT verified
     /// even if every individual link validated.
     pub tip_matches_row: bool,
+    /// Full pin identity (PCR0-2 plus user PCRs 16-31) attested by the boot
+    /// that set the walk's final in-force state; `None` without a valid
+    /// genesis.
+    #[serde(skip)]
+    pub tip_identity: Option<PinIdentity>,
     pub links: Vec<VerifiedLink>,
 }
 
@@ -205,6 +210,7 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
         control_public_key: control_public_key_b64,
         debug_mode,
         tip_matches_row: walk.tip_matches_row,
+        tip_identity: walk.final_identity,
         links: out,
     })
 }
@@ -526,9 +532,10 @@ const VALID_FROM_SLACK: chrono::Duration = chrono::Duration::seconds(60);
 pub struct UpgradeExpectation {
     /// The enclave being upgraded.
     pub enclave_id: Uuid,
-    /// PCR0-2 the enclave runs now: the tip of its chain, every link
-    /// verified (Nitro-attested in production mode).
-    pub current: PcrsHex,
+    /// The pin identity the enclave runs now (PCR0-2 plus user PCRs 16-31),
+    /// as the boot link of its chain tip attests it, every link verified
+    /// (Nitro-attested in production mode).
+    pub current: PinIdentity,
     /// PCR0-2 the upgraded enclave must measure.
     pub target: PcrsHex,
     /// Image digest the target is built from.
@@ -552,8 +559,9 @@ pub struct UpgradeExpectation {
 ///
 /// 1. The bytes are the canonical encoding of an `UpgradePayload` for this
 ///    enclave.
-/// 2. `from` is the enclave's current identity: its PCR0-2 are the verified
-///    chain tip, and `to` carries the same user PCRs 16-31 (they hold
+/// 2. `from` is the enclave's current identity: the full identity (PCR0-2
+///    and user PCRs 16-31) the verified chain tip's boot link attests, and
+///    `to` carries the same user PCRs 16-31 (they hold
 ///    per-enclave data, the same before and after an upgrade), so the pin
 ///    cannot be moved to another user-PCR identity of the target image.
 /// 3. `to`'s PCR0-2 are the target's ([`UpgradeTarget`]) and `image_digest`
@@ -579,11 +587,16 @@ pub fn check_upgrade_payload(
     if p.enclave_id != expected.enclave_id {
         return refuse("it is for another enclave".into());
     }
-    if !p.from.image_pcrs_hex().same_as(&expected.current) {
+    if !p.from.image_pcrs_hex().same_as(&expected.current.image_pcrs_hex()) {
         return refuse(format!(
             "its `from` PCRs are not the ones this enclave runs (chain tip PCR0 {})",
-            expected.current.pcr0
+            expected.current.image_pcrs_hex().pcr0
         ));
+    }
+    if p.from.user() != expected.current.user() {
+        return refuse(
+            "its `from` carries other user PCRs 16-31 than the running enclave attests".into(),
+        );
     }
     if !p.to.image_pcrs_hex().same_as(&expected.target) {
         return refuse(format!(
@@ -631,8 +644,8 @@ pub fn check_upgrade_payload(
 /// The version an enclave runs now, as its own chain attests it.
 #[derive(Debug, Clone)]
 pub struct RunningVersion {
-    /// PCR0-2 of the chain tip.
-    pub pcrs: PcrsHex,
+    /// The chain tip's pin identity, as its boot link attests it.
+    pub identity: PinIdentity,
     /// The anti-rollback setting the running image's boot link attests.
     pub anti_rollback: AntiRollbackSetting,
 }
@@ -657,9 +670,16 @@ async fn verified_running(client: &ApiClient, enclave_id: &str) -> Result<Runnin
                 .into(),
         ));
     }
+    let identity = summary.tip_identity.ok_or_else(|| {
+        CliError::Other(
+            "the enclave's upgrade chain has no verified boot of the running image; refusing \
+             to sign an upgrade out of an unverified state"
+                .into(),
+        )
+    })?;
     let anti_rollback = running_anti_rollback(&summary.links, &summary.pcrs)?;
     Ok(RunningVersion {
-        pcrs: summary.pcrs,
+        identity,
         anti_rollback,
     })
 }
@@ -770,7 +790,7 @@ async fn upgrade_expectation(
     };
     Ok(UpgradeExpectation {
         enclave_id: enclave_uuid,
-        current: running.pcrs,
+        current: running.identity,
         target: target_pcrs,
         image_digest,
         requested_valid_from: valid_from,
@@ -1656,7 +1676,7 @@ mod tests {
         fn expectation(requested: Option<DateTime<Utc>>, min_delay: u64) -> UpgradeExpectation {
             UpgradeExpectation {
                 enclave_id: enclave(),
-                current: current().image_pcrs_hex(),
+                current: current(),
                 target: target().image_pcrs_hex(),
                 image_digest: "sha256:pushed".into(),
                 requested_valid_from: requested,
@@ -1728,6 +1748,14 @@ mod tests {
             let mut p = honest();
             p.from = PinIdentity::new([[0xb0; 48], [0xb1; 48], [0xb2; 48]], ZERO_USER_PCRS);
             refused(&p, &expectation(None, 0), "`from` PCRs");
+
+            // Hostile backend: `from` and `to` both name the running image's
+            // PCR0-2 under other user PCRs than the enclave attests, which
+            // would move a pin slot the enclave does not hold.
+            let mut p = honest();
+            p.from = current().with_user_pcrs(user);
+            p.to = target().with_user_pcrs(user);
+            refused(&p, &expectation(None, 0), "`from` carries other user PCRs");
         }
 
         /// Current_HostileBackend_ValidFrom: the backend signs an earlier

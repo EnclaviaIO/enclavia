@@ -115,7 +115,7 @@ async fn dial_relay() -> Result<tokio_vsock::VsockStream, String> {
 /// control pubkey as `user_data`.
 async fn nsm_attest(handshake_hash: Vec<u8>, control_pubkey: [u8; 65]) -> Result<Vec<u8>, String> {
     tokio::task::spawn_blocking(move || {
-        crate::attestation::get_attestation_with_data(&handshake_hash, &control_pubkey)
+        crate::attestation::session_attestation(&handshake_hash, &control_pubkey)
             .map_err(|e| format!("NSM attestation for the synchronizer session: {e}"))
     })
     .await

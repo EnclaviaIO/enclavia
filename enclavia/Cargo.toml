@@ -13,8 +13,13 @@ keywords = ["enclave", "attestation", "nitro", "tee", "https"]
 categories = ["cryptography", "network-programming", "api-bindings"]
 
 [features]
-default = []
+default = ["dangerous-skip-chain"]
 json = ["serde_json"]
+# `ClientBuilder::debug_mode`: validate the enclave's attestation without the
+# AWS Nitro certificate chain (QEMU enclaves). The caller opts in at runtime,
+# so the feature is on by default to keep that option; a build without it
+# refuses every debug-mode connection.
+dangerous-skip-chain = ["enclavia-protocol/dangerous-skip-chain"]
 
 [dependencies]
 # enclavia-protocol owns the shared attestation verifier. The SDK uses

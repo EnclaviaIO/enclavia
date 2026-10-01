@@ -15,7 +15,9 @@ repository.workspace = true
 description = "In-enclave boot helper: produces the genesis `ChainLink` for the public upgrade chain (#47) and submits it to the host-side chain-host daemon on vsock 5005."
 
 [dependencies]
-enclavia-protocol = { path = "../enclavia-protocol" }
+# `nsm`: the boot link's attestation, through
+# `ValidatedAttestation::request_local`.
+enclavia-protocol = { path = "../enclavia-protocol", features = ["nsm"] }
 enclavia-vsock = { path = "../enclavia-vsock" }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "fs"] }
 tokio-vsock = { workspace = true }
@@ -28,7 +30,9 @@ tracing-subscriber = { workspace = true }
 # debug, where the nitro-enclave QEMU machine emulates the NSM driver).
 # The `nix` feature enables the syscall path; the same binary runs in
 # both environments. The doc signature isn't checked in debug mode; the
-# backend's `verify_chain_attestation` accepts unsigned debug docs.
+# backend's chain-link validation accepts unsigned debug docs. The driver
+# here only reads PCRs (DescribePCR); attestation documents come from
+# enclavia-protocol's `ValidatedAttestation::request_local`.
 aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 uuid = { workspace = true }
 chrono = { workspace = true }

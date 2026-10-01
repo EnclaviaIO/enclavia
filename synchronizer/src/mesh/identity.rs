@@ -3,7 +3,7 @@
 //! Each node generates a fresh P-256 keypair at startup. Enclaves have no
 //! disk, so the keypair lives only in memory and never leaves the enclave.
 //! The public half is what the node stamps into its attestation document's
-//! `user_data` (the [`enclavia_protocol::attestation::AttestedIdentity::control_pubkey`]
+//! `user_data` (the [`enclavia_protocol::attestation::ValidatedAttestation::control_pubkey`]
 //! contract, 65-byte uncompressed SEC1); the private half signs the live
 //! Noise handshake hash on every connection so the peer can bind the attested
 //! identity to *this* channel (see

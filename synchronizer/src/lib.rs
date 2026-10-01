@@ -26,7 +26,7 @@
 //! to ECDSA P-256 in enclavia#21, and the per-enclave control key carried
 //! in `AttestationDoc::user_data` is a 65-byte uncompressed SEC1 P-256
 //! verifying key (see [`enclavia_protocol::attestation::CONTROL_PUBKEY_LEN`]
-//! and `AttestedIdentity::control_pubkey`). Signatures over chain payloads
+//! and `ValidatedAttestation::control_pubkey`). Signatures over chain payloads
 //! are 64-byte raw `r || s` P-256. This module stores the 65-byte pubkey
 //! verbatim; verification of the raw r||s signature against it lives in
 //! [`wire::verify_transition_link`] (a pure helper) and is wired into the
@@ -36,6 +36,8 @@
 //! for the broader design, and the 2026-06-10 design pass that supersedes
 //! the transition-credential and key-algorithm parts of that body.
 
+#[cfg(feature = "wire")]
+pub mod attest;
 #[cfg(feature = "wire")]
 pub mod wire;
 
@@ -187,7 +189,7 @@ pub struct KeyState {
     pub version: Version,
     /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key
     /// (`0x04 || X || Y`) that authorizes `Transition` from this key.
-    /// This is `AttestedIdentity::control_pubkey` (#21/#47), learned from
+    /// This is `ValidatedAttestation::control_pubkey` (#21/#47), learned from
     /// the key's attestation at Register time. Frozen at the moment the
     /// key was committed (`Register` or `Transition`-target): the caller
     /// takes whatever pubkey was in `attested` at that point and copies it
@@ -332,7 +334,7 @@ impl StateMachine {
 
     /// Record that `key` has produced a valid Nitro attestation and
     /// announced `control_pubkey` as its 65-byte SEC1 P-256 verifying
-    /// key (`AttestedIdentity::control_pubkey`).
+    /// key (`ValidatedAttestation::control_pubkey`).
     ///
     /// Caller is responsible for verifying the attestation document
     /// (PCRs, signature chain in production, nonce binding to the

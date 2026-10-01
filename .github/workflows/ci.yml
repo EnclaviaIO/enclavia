@@ -86,6 +86,29 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The production synchronizer must not be able to skip the attestation
+      # certificate chain. `-e normal,features` leaves dev-dependencies out,
+      # so this is the feature set the `enclave,raft` binary is built with
+      # (flake.nix `synchronizerNitro*`). The QEMU build must have it.
+      - name: skip-chain absent from the production synchronizer
+        run: |
+          set -euo pipefail
+          tree() { nix develop --command cargo tree -p synchronizer --features "$1" -e normal,features -i enclavia-protocol; }
+          prod=$(tree enclave,raft)
+          qemu=$(tree qemu,raft)
+          if grep -q dangerous-skip-chain <<<"$prod"; then
+            echo "::error::the enclave,raft synchronizer enables enclavia-protocol/dangerous-skip-chain"
+            echo "$prod"
+            exit 1
+          fi
+          grep -q dangerous-skip-chain <<<"$qemu"
+
+      # enclavia-protocol on its own default features, where the skip-chain
+      # methods do not exist: its compile_fail doctests check that (the
+      # workspace-wide run below has the feature on through the SDK).
+      - name: cargo doc-tests (enclavia-protocol, default features)
+        run: nix develop --command cargo test -p enclavia-protocol --doc
+
       # Doctests on the client SDK matter (per #158): the `enclavia`
       # crate's public API is documented with code examples that
       # users copy/paste, so a doctest break is a real-world break.

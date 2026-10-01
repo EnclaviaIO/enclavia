@@ -411,7 +411,7 @@ async fn reconnect_fails_closed_on_pcr_mismatch() {
                 Ok(c) => c,
                 Err(_) => break,
             };
-            // The client's re-attestation runs verify_against with the
+            // The client's re-attestation checks the live document against the
             // pinned PCRs; seed 0x22 does not match, so verify fails and
             // the client tears the connection down. We just need to serve
             // the wrong doc; the request is never answered.

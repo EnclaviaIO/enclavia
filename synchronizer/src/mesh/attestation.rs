@@ -4,16 +4,19 @@
 //! document whose `nonce` is the live Noise handshake hash (channel binding)
 //! and whose `user_data` carries the node's 65-byte uncompressed SEC1 P-256
 //! mesh pubkey (the public half of its per-boot [`super::identity::MeshIdentity`]).
-//! The peer verifies it with
-//! [`enclavia_protocol::attestation::verify_and_extract`], which enforces the
-//! handshake-hash binding and the 65-byte SEC1 contract, then checks the
-//! derived PCR digest against its self-PCR allowlist AND verifies the peer's
+//! The peer validates it as a session document
+//! ([`enclavia_protocol::attestation::UnvalidatedAttestation::validate_session`],
+//! which enforces the handshake-hash binding) and reads the 65-byte SEC1
+//! pubkey with
+//! [`enclavia_protocol::attestation::ValidatedAttestation::control_pubkey`],
+//! then checks the derived PCR digest against its self-PCR allowlist AND verifies the peer's
 //! identity-key signature over the handshake hash (see
 //! [`super::handshake`]).
 //!
 //! Two providers implement the trait:
 //!
-//! * [`NsmAttestor`] (production): drives `/dev/nsm` to sign the document.
+//! * [`NsmAttestor`] (production): asks the node's own `/dev/nsm`
+//!   ([`ValidatedAttestation::request_local`]) for the document.
 //! * `FakeAttestor` (test-utils only): wraps `enclavia-protocol`'s
 //!   `FakeAttestation` so the multi-node mesh test runs on a dev machine
 //!   without booting QEMU. Never compiled into the production binary.
@@ -24,7 +27,7 @@
 //! and the channel-binding signature are anchored to one keypair.
 
 use async_trait::async_trait;
-use enclavia_protocol::attestation::CONTROL_PUBKEY_LEN;
+use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, ValidatedAttestation};
 
 use crate::mesh::identity::MeshIdentity;
 
@@ -37,8 +40,7 @@ use crate::mesh::identity::MeshIdentity;
 pub trait AttestationProvider: Send + Sync {
     /// Produce an NSM attestation document whose `nonce` equals
     /// `handshake_hash` and whose `user_data` is this node's 65-byte SEC1
-    /// P-256 mesh pubkey. The bytes are exactly what the peer feeds to
-    /// [`enclavia_protocol::attestation::verify_and_extract`].
+    /// P-256 mesh pubkey. The peer validates the bytes as a session document.
     async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, AttestationProviderError>;
 
     /// This node's own 65-byte SEC1 P-256 mesh pubkey (the value stamped
@@ -55,50 +57,6 @@ pub enum AttestationProviderError {
     /// response.
     #[error("nsm driver error: {0}")]
     Nsm(String),
-}
-
-/// Request one attestation document from this node's own `/dev/nsm`, with a
-/// caller-chosen `nonce` and `user_data`. BLOCKING (the NSM driver is a
-/// blocking syscall): call it from a blocking context, or wrap it in
-/// `spawn_blocking` from async code.
-///
-/// This is the raw device call shared by two callers:
-///
-/// * [`NsmAttestor::attest`], per peer connection, with `nonce =
-///   handshake_hash` and `user_data = mesh_pubkey` (channel-bound document for
-///   a peer to verify).
-/// * the node's startup self-attestation, with an arbitrary `nonce` /
-///   `user_data`, to read back its OWN hardware-measured PCRs and derive its
-///   self-PCR allowlist (see `enclavia_protocol::attestation::extract_own_identity`).
-///   The local NSM device is inside the node's TCB and emulated identically by
-///   QEMU's nitro-enclave machine, so this works on both QEMU and real Nitro
-///   with no cert-chain trust required.
-pub fn request_own_attestation(
-    nonce: Option<Vec<u8>>,
-    user_data: Option<Vec<u8>>,
-) -> Result<Vec<u8>, AttestationProviderError> {
-    use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
-
-    let fd = nsm_init();
-    if fd == -1 {
-        return Err(AttestationProviderError::Nsm("nsm_init failed".into()));
-    }
-    let request = Request::Attestation {
-        user_data: user_data.map(Into::into),
-        nonce: nonce.map(Into::into),
-        public_key: None,
-    };
-    let result = match nsm_process_request(fd, request) {
-        Response::Attestation { document } => Ok(document),
-        Response::Error(e) => Err(AttestationProviderError::Nsm(format!("{e:?}"))),
-        _ => Err(AttestationProviderError::Nsm(
-            "unexpected NSM response".into(),
-        )),
-    };
-    // Close the device on every exit path.
-    nsm_exit(fd);
-    result
 }
 
 /// Production attestation provider: drives the in-enclave `/dev/nsm` device.
@@ -133,9 +91,13 @@ impl AttestationProvider for NsmAttestor {
 
         // The NSM driver is a blocking syscall; run it off the async
         // runtime's worker so the per-peer task does not stall the reactor.
-        tokio::task::spawn_blocking(move || request_own_attestation(Some(nonce), Some(user_data)))
-            .await
-            .map_err(|e| AttestationProviderError::Nsm(format!("join error: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            ValidatedAttestation::request_local(Some(&nonce), Some(&user_data), None)
+                .map(ValidatedAttestation::into_bytes)
+                .map_err(|e| AttestationProviderError::Nsm(e.to_string()))
+        })
+        .await
+        .map_err(|e| AttestationProviderError::Nsm(format!("join error: {e}")))?
     }
 
     fn mesh_pubkey(&self) -> [u8; CONTROL_PUBKEY_LEN] {
@@ -201,7 +163,7 @@ impl AttestationProvider for FakeAttestor {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use enclavia_protocol::attestation::{VerificationMode, verify_and_extract};
+    use enclavia_protocol::attestation::{RejectionReason, UnvalidatedAttestation};
 
     #[tokio::test]
     async fn fake_attestor_doc_verifies_and_yields_seed_digest() {
@@ -209,11 +171,16 @@ mod tests {
         let attestor = FakeAttestor::new(0x42, &identity);
         let hh = vec![0xabu8; 32];
         let doc = attestor.attest(&hh).await.unwrap();
-        // The peer side: verify with the same handshake hash, in debug mode.
-        let extracted = verify_and_extract(&doc, &hh, VerificationMode::DangerousSkipChain).expect("verify");
-        let digest = crate::PcrKey(extracted.identity.key());
-        assert_eq!(digest, FakeAttestor::pcr_digest(0x42));
-        assert_eq!(extracted.control_pubkey, identity.pubkey());
+        // The peer side: validate with the same handshake hash, skipping the
+        // chain (the fixture is unsigned).
+        let peer = UnvalidatedAttestation::from_bytes(doc)
+            .validate_session_skip_chain(&hh)
+            .expect("validate");
+        assert_eq!(
+            crate::PcrKey(peer.identity().key()),
+            FakeAttestor::pcr_digest(0x42)
+        );
+        assert_eq!(peer.control_pubkey().unwrap(), identity.pubkey());
     }
 
     #[tokio::test]
@@ -221,8 +188,9 @@ mod tests {
         let identity = MeshIdentity::generate();
         let attestor = FakeAttestor::new(0x10, &identity);
         let doc = attestor.attest(&[0x01u8; 32]).await.unwrap();
-        let err = 
-            verify_and_extract(&doc, &[0x02u8; 32], VerificationMode::DangerousSkipChain).unwrap_err();
-        assert!(format!("{err:?}").contains("Validation"));
+        let err = UnvalidatedAttestation::from_bytes(doc)
+            .validate_session_skip_chain(&[0x02u8; 32])
+            .unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::NonceMismatch);
     }
 }

@@ -15,7 +15,8 @@
 //!   anti-rollback setting from its measured config
 //!   ([`AntiRollbackSetting`]); a boot of a new image must keep the
 //!   previous image's setting. The attestation's `user_data` is
-//!   `sha256(payload)` (checked by [`super::attestation::verify_chain_attestation`]).
+//!   `sha256(payload)` (checked by
+//!   [`super::attestation::UnvalidatedAttestation::validate_chain_link`]).
 //! * [`ChainLinkKind::Upgrade`] — emitted by the OLD enclave after the
 //!   backend signs and ships a `PrepareUpgrade` control command.
 //!   Payload binds `enclave_id / from / to / image_digest / valid_from /
@@ -66,7 +67,9 @@ use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
+use crate::attestation::{
+    AttestationError, Pcrs, UnvalidatedAttestation, ValidatedAttestation,
+};
 use crate::pin_identity::PinIdentity;
 use crate::signing::{
     ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
@@ -612,7 +615,8 @@ pub enum Outcome {
 #[derive(Debug, thiserror::Error)]
 pub enum ChainValidationError {
     /// Bottom-line attestation verification (see
-    /// [`super::attestation::verify_chain_attestation`]).
+    /// [`super::attestation::UnvalidatedAttestation::validate_chain_link`]),
+    /// or the document's PCR0-2 are not the recorded ones.
     #[error("{0}")]
     Attestation(#[from] AttestationError),
     /// `attestation` byte vec is empty.
@@ -720,6 +724,12 @@ pub enum ChainValidationError {
     /// like [`Self::UpgradeNotYetActive`].
     #[error("promotion boot postdates the explaining upgrade's valid_until (plus clock skew)")]
     UpgradeExpired,
+    /// Walker-level rule: a promotion boot whose attested pin identity is not
+    /// the explaining upgrade's `to`. Its PCR0-2 match (that is how the
+    /// upgrade was found), so a user PCR 16-31 differs: the boot is of the
+    /// target image under another identity than the one the owner signed.
+    #[error("promotion boot's attested identity is not the explaining upgrade's `to` (user PCRs 16-31 differ)")]
+    PromotionIdentityMismatch,
     /// A stored chain entry's payload no longer CBOR-decodes (DB-side
     /// drift). Maps to 500.
     #[error("stored {0:?} payload corrupt: {1}")]
@@ -737,6 +747,11 @@ pub enum ChainValidationError {
 /// On `Ok(Outcome::Append { sequence })` the caller should INSERT the
 /// link assigning that sequence number. On `Ok(Outcome::Dedup)` the
 /// caller should not insert. On `Err(_)` the caller should reject.
+///
+/// `debug_mode` validates the attestation without its certificate chain, for
+/// links emitted under QEMU. It needs the `dangerous-skip-chain` feature;
+/// without it the link is refused with
+/// [`AttestationError::SkipChainNotCompiled`].
 pub fn validate_chain_link(
     link: &ChainLink,
     ctx: &ChainContext<'_>,
@@ -747,19 +762,46 @@ pub fn validate_chain_link(
         return Err(ChainValidationError::EmptyAttestation);
     }
     let recorded_pcrs = ctx.enclave_pcrs.to_pcrs()?;
-    let attested = verify_chain_attestation(
-        &link.attestation,
-        &link.payload,
-        &recorded_pcrs,
-        crate::attestation::VerificationMode::from_debug_flag(debug_mode),
-    )?;
+    let doc = link_attestation(link, debug_mode)?;
+    doc.require_pcrs(&recorded_pcrs)?;
 
     match link.kind {
         ChainLinkKind::Boot => validate_boot(link, ctx),
         ChainLinkKind::Upgrade | ChainLinkKind::Revocation => {
-            validate_signed(link, ctx, &attested, now)
+            validate_signed(link, ctx, doc.identity(), now)
         }
     }
+}
+
+/// Validate a link's attestation in the chain-link context: the document
+/// is bound to the link's payload. `debug_mode` skips the certificate chain
+/// (documents from QEMU's self-signing NSM); a build without the
+/// `dangerous-skip-chain` feature refuses it.
+fn link_attestation(
+    link: &ChainLink,
+    debug_mode: bool,
+) -> Result<ValidatedAttestation, AttestationError> {
+    let doc = UnvalidatedAttestation::from_bytes(link.attestation.clone());
+    if debug_mode {
+        return skip_chain(&doc, &link.payload);
+    }
+    doc.validate_chain_link(&link.payload)
+}
+
+#[cfg(any(test, feature = "dangerous-skip-chain"))]
+fn skip_chain(
+    doc: &UnvalidatedAttestation,
+    payload: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    doc.validate_chain_link_skip_chain(payload)
+}
+
+#[cfg(not(any(test, feature = "dangerous-skip-chain")))]
+fn skip_chain(
+    _doc: &UnvalidatedAttestation,
+    _payload: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    Err(AttestationError::SkipChainNotCompiled)
 }
 
 fn validate_boot(
@@ -1016,6 +1058,9 @@ pub struct ChainWalk {
     pub final_pcrs: Option<PcrsHex>,
     /// Image digest in force after the walk (same advancement rule).
     pub final_image_digest: Option<String>,
+    /// Full pin identity (PCR0-2 plus user PCRs 16-31) attested by the boot
+    /// that set the final in-force state. `None` exactly when `final_pcrs` is.
+    pub final_identity: Option<PinIdentity>,
     /// Whether the walk's final in-force state equals the enclave row
     /// state supplied to [`validate_chain`]. `false` means the chain
     /// does not explain what the row currently records (stale chain,
@@ -1052,7 +1097,7 @@ pub struct ChainWalk {
 ///   PCR check. A transition no signed upgrade link explains is
 ///   exactly what this rejects.
 ///
-/// Two walker-only rules have no per-link counterpart at ingest (they
+/// The walker-only rules below have no per-link counterpart at ingest (they
 /// relate a link to the rebuilt history, not to a fixed context):
 ///
 /// - A signed link whose payload byte-duplicates an earlier signed
@@ -1066,7 +1111,14 @@ pub struct ChainWalk {
 ///   history cannot claim an activation inside what was supposed to be
 ///   the pre-activation revoke window. `booted_at` is the enclave's
 ///   self-reported (host-influenced) clock, so this is defence-in-depth
-///   only; see the module-level "Identity and clock trust" note.
+///   only; see the module-level "Identity and clock trust" note. One
+///   postdating `valid_until` (plus the same tolerance) fails with
+///   [`ChainValidationError::UpgradeExpired`], on the same footing.
+/// - A promotion boot whose attested pin identity (user PCRs 16-31
+///   included) is not the explaining upgrade's `to` fails with
+///   [`ChainValidationError::PromotionIdentityMismatch`]: the upgrade is
+///   found by PCR0-2, which every enclave built from the target image
+///   shares.
 ///
 /// Callers MUST check [`ChainWalk::tip_matches_row`] in addition to
 /// the per-link outcomes: it ties the walk's final state to the row,
@@ -1096,6 +1148,8 @@ pub fn validate_chain(
     // `None` until a genesis validates; the row state then stands in
     // so later links still get individually validated and reported.
     let mut in_force: Option<(PcrsHex, String)> = None;
+    // Full pin identity attested by the boot that set `in_force`.
+    let mut in_force_identity: Option<PinIdentity> = None;
 
     for recorded in links {
         let link = &recorded.link;
@@ -1170,6 +1224,17 @@ pub fn validate_chain(
                                 prior.push(link.clone());
                                 continue;
                             }
+                            // The upgrade was found by PCR0-2; the boot must
+                            // also carry the user PCRs 16-31 the owner signed
+                            // in `to`. A document that does not validate is
+                            // left to `validate_chain_link` to report.
+                            if link_attestation(link, debug_mode)
+                                .is_ok_and(|doc| *doc.identity() != target.to)
+                            {
+                                outcomes.push(Err(ChainValidationError::PromotionIdentityMismatch));
+                                prior.push(link.clone());
+                                continue;
+                            }
                             (target.to.image_pcrs_hex(), target.image_digest, true)
                         } else {
                             // No signed upgrade explains these PCRs;
@@ -1199,6 +1264,9 @@ pub fn validate_chain(
         let outcome = validate_chain_link(link, &ctx, reference, debug_mode);
         if promotes && matches!(outcome, Ok(Outcome::Append { .. })) {
             in_force = Some((ctx_pcrs, ctx_digest));
+            in_force_identity = link_attestation(link, debug_mode)
+                .ok()
+                .map(|doc| doc.identity().clone());
         }
         outcomes.push(outcome);
         prior.push(link.clone());
@@ -1215,6 +1283,7 @@ pub fn validate_chain(
         outcomes,
         final_pcrs,
         final_image_digest,
+        final_identity: in_force_identity,
         tip_matches_row,
     }
 }
@@ -1320,7 +1389,7 @@ pub enum PcrDescentError {
 /// the validator context (`row_*`, `control_public_key`, `upgradable`)
 /// from `GET /enclaves/{id}`. On success it returns the chain's TIP
 /// PCRs; the caller MUST then verify the LIVE attestation against
-/// exactly those PCRs (e.g. [`crate::attestation::verify_against`]) to
+/// exactly those PCRs (e.g. [`crate::attestation::ValidatedAttestation::require_pcrs`]) to
 /// bind the verified descendant version to the running Noise session.
 /// This function does not see the live attestation and so cannot make
 /// that binding itself.
@@ -2896,6 +2965,104 @@ mod tests {
                     "{:?}",
                     walk.outcomes
                 );
+            }
+        }
+    }
+
+    /// A promotion boot is matched to its upgrade by PCR0-2; its attested
+    /// user PCRs must also be the upgrade's `to`. The walk reports the
+    /// in-force identity, user PCRs included.
+    #[test]
+    fn walk_rejects_promotion_under_another_user_pcr_identity() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let valid_from = now - Duration::days(1);
+        let mut user = crate::pin_identity::ZERO_USER_PCRS;
+        user[0] = [0x16; 48];
+        let from = identity_from_seed(0x63).with_user_pcrs(user);
+        let to = identity_from_seed(0x73).with_user_pcrs(user);
+
+        let upgrade_payload = UpgradePayload {
+            enclave_id: id,
+            from: from.clone(),
+            to: to.clone(),
+            image_digest: "sha256:v2".into(),
+            valid_from,
+            valid_until: valid_from + UPGRADE_WINDOW_DEFAULT,
+            issued_at: now - Duration::days(2),
+            nonce: vec![0x47; 32],
+        };
+        let payload_bytes = crate::signing::encode(&upgrade_payload);
+        let upgrade_attestation = FakeChainAttestation::for_payload(0x63, &payload_bytes)
+            .with_user_pcr(16, vec![0x16; 48])
+            .encode();
+        let sig = sign_control(&sk, SignedDomain::UpgradePayload, &payload_bytes);
+
+        // A boot of `seed`'s image, attesting PCR16 = `pcr16` (absent: zero).
+        let boot = |seed: u8, digest: &str, booted_at: DateTime<Utc>, pcr16: Option<u8>| {
+            let payload = crate::signing::encode(&BootPayload {
+                enclave_id: id,
+                image_digest: digest.into(),
+                pcrs: pcrs_hex_from_seed(seed),
+                booted_at,
+                nonce: vec![0x42; 32],
+                anti_rollback: AntiRollbackSetting::disabled(),
+            });
+            let mut fake = FakeChainAttestation::for_payload(seed, &payload);
+            if let Some(b) = pcr16 {
+                fake = fake.with_user_pcr(16, vec![b; 48]);
+            }
+            ChainLink {
+                id: Some(Uuid::new_v4()),
+                sequence: None,
+                kind: ChainLinkKind::Boot,
+                payload,
+                attestation: fake.encode(),
+                signature: None,
+            }
+        };
+
+        for (promo_pcr16, ok) in [(Some(0x16), true), (None, false), (Some(0x17), false)] {
+            let genesis = boot(0x63, "sha256:v1", now - Duration::days(3), Some(0x16));
+            let upgrade = ChainLink {
+                id: Some(Uuid::new_v4()),
+                sequence: None,
+                kind: ChainLinkKind::Upgrade,
+                payload: payload_bytes.clone(),
+                attestation: upgrade_attestation.clone(),
+                signature: Some(sig.to_vec()),
+            };
+            let promo = boot(0x73, "sha256:v2", now, promo_pcr16);
+            let links = vec![
+                recorded(genesis, now - Duration::days(3)),
+                recorded(upgrade, now - Duration::days(2)),
+                recorded(promo, now),
+            ];
+            let walk = validate_chain(
+                &links,
+                &id,
+                &pcrs_hex_from_seed(0x73),
+                "sha256:v2",
+                Some(&pk),
+                true,
+                now,
+                true,
+            );
+            if ok {
+                assert!(walk.outcomes.iter().all(Result::is_ok), "{:?}", walk.outcomes);
+                assert_eq!(walk.final_identity, Some(to.clone()));
+            } else {
+                assert!(
+                    matches!(
+                        walk.outcomes[2],
+                        Err(ChainValidationError::PromotionIdentityMismatch)
+                    ),
+                    "{:?}",
+                    walk.outcomes
+                );
+                assert!(!walk.tip_matches_row);
+                assert_eq!(walk.final_identity, Some(from.clone()));
             }
         }
     }

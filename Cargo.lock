@@ -1284,7 +1284,6 @@ dependencies = [
 name = "enclavia-crypto"
 version = "0.2.0"
 dependencies = [
- "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -1396,7 +1395,6 @@ dependencies = [
 name = "enclavia-server"
 version = "0.2.0"
 dependencies = [
- "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "chrono",
  "ciborium",
@@ -2467,7 +2465,6 @@ dependencies = [
 name = "nbd-client"
 version = "0.2.0"
 dependencies = [
- "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "chrono",
  "ciborium",
@@ -3979,7 +3976,6 @@ name = "synchronizer"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "aws-nitro-enclaves-nsm-api",
  "chrono",
  "ciborium",
  "enclavia-protocol",

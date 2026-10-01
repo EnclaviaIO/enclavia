@@ -3,13 +3,16 @@
 //! Enclaves have no clock synchronisation of their own, so the system clock
 //! is not an input to any security decision. When the node needs the current
 //! time to decide something (the `valid_from` and `valid_until` gates on a
-//! `Transition` link, see [`crate::wire::verify_transition_link`], and the
-//! leader's check that a Transition did not commit past its deadline), it
-//! requests a fresh attestation document from its OWN `/dev/nsm` and reads
-//! the `timestamp` the Nitro hypervisor stamped into it. Neither the parent
-//! instance nor a drifting enclave clock can move that value. One NSM round
-//! trip takes about a millisecond, and the callers are rare (one or two per
-//! `Transition`), so the value is read fresh every time and never cached.
+//! `Transition` link, see [`crate::wire::verify_transition_link`], the
+//! leader's check that a Transition did not commit past its deadline, and the
+//! clock-skew bound on a customer's or a peer's session document, see
+//! [`crate::attest::validate_session_at`]), it requests a fresh attestation
+//! document from its OWN `/dev/nsm` and reads the `timestamp` the Nitro
+//! hypervisor stamped into it. Neither the parent instance nor a drifting
+//! enclave clock can move that value. One NSM round trip takes about a
+//! millisecond, and the callers are rare (one or two per `Transition` and
+//! one per session handshake), so the value is read fresh every time and
+//! never cached.
 //!
 //! Which source is used is fixed at compile time:
 //!
@@ -27,9 +30,9 @@
 #[cfg(feature = "enclave")]
 pub async fn now_ms() -> Result<u64, String> {
     tokio::task::spawn_blocking(|| {
-        let doc = crate::mesh::attestation::request_own_attestation(None, None)
-            .map_err(|e| e.to_string())?;
-        enclavia_protocol::attestation::extract_own_timestamp_ms(&doc).map_err(|e| e.to_string())
+        enclavia_protocol::attestation::ValidatedAttestation::request_local(None, None, None)
+            .map(|doc| doc.timestamp_ms())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("nsm time task panicked: {e}"))?
