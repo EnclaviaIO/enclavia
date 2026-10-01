@@ -326,6 +326,12 @@ pub struct UpgradePayload {
     pub nonce: Vec<u8>,
 }
 
+/// How far ahead the backend puts `valid_from` when the owner names no
+/// activation time (or later, for an enclave whose minimum upgrade delay is
+/// longer). A self-custody signer that named no time accepts nothing
+/// earlier.
+pub const UPGRADE_DELAY_DEFAULT: Duration = Duration::days(7);
+
 /// The window `valid_until - valid_from` the backend gives an upgrade link.
 pub const UPGRADE_WINDOW_DEFAULT: Duration = Duration::days(7);
 

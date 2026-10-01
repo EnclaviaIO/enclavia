@@ -18,6 +18,8 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use enclavia_protocol::chain::{AntiRollbackSetting, PcrsHex};
+
 use crate::api::ApiClient;
 use crate::commands::resolve::resolve_enclave;
 use crate::error::CliError;
@@ -63,11 +65,37 @@ pub struct ReproduceResult {
     /// Whether the backend passed `--upgrade-target` for this version (the
     /// image obtains its synchronizer pin only by a Transition).
     pub recorded_upgrade_target: bool,
+    /// Whether the rebuild passed `--debug` (the enclave row's `mode`), which
+    /// also writes `synchronizer.debug_attestation = true`.
+    pub built_debug: bool,
+    /// Whether the rebuild passed `--storage` (the enclave row has storage).
+    pub built_storage: bool,
 }
 
 impl ReproduceResult {
     pub fn is_reproducible(&self) -> bool {
         self.mismatches.is_empty()
+    }
+
+    /// The anti-rollback setting in the measured config of the image this
+    /// run rebuilt, from the flags it passed the builder, read the way
+    /// chain-init reads the config at boot. Once the rebuild reproduces the
+    /// recorded PCRs, it is the setting of the image those PCRs name.
+    pub fn anti_rollback_setting(&self) -> Result<AntiRollbackSetting, CliError> {
+        let Some(recorded) = &self.recorded_synchronizer_pcrs else {
+            return Ok(AntiRollbackSetting::disabled());
+        };
+        let synchronizer_pcrs = match recorded {
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<PcrsHex>>(recorded.clone()),
+            _ => serde_json::from_value::<PcrsHex>(recorded.clone()).map(|p| vec![p]),
+        }
+        .map_err(|e| CliError::Other(format!("recorded synchronizer PCRs do not parse: {e}")))?;
+        Ok(AntiRollbackSetting {
+            enabled: self.built_storage && self.recorded_synchronizer_enabled,
+            upgrade_target: self.recorded_upgrade_target,
+            debug_attestation: self.built_debug,
+            synchronizer_pcrs,
+        })
     }
 }
 
@@ -309,6 +337,8 @@ async fn run_reproduce(
         recorded_synchronizer_pcrs: inputs.synchronizer_pcrs,
         recorded_synchronizer_enabled: inputs.synchronizer_enabled,
         recorded_upgrade_target: inputs.upgrade_target,
+        built_debug: row_is_debug(enclave),
+        built_storage: row_has_storage(enclave),
     })
 }
 
@@ -333,6 +363,26 @@ fn expected_pcrs(enclave: &serde_json::Value) -> Result<PcrTriple, CliError> {
         pcr1: take("PCR1")?,
         pcr2: take("PCR2")?,
     })
+}
+
+/// Whether the row records a debug (QEMU) build: the builder ran with
+/// `--debug`.
+fn row_is_debug(enclave: &serde_json::Value) -> bool {
+    enclave.get("mode").and_then(|v| v.as_str()) == Some("debug")
+}
+
+/// Whether the row records storage: the builder ran with `--storage`.
+fn row_has_storage(enclave: &serde_json::Value) -> bool {
+    enclave
+        .get("storage_size_bytes")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            enclave
+                .get("storage")
+                .and_then(|s| s.get("size_bytes"))
+                .and_then(|v| v.as_u64())
+        })
+        .is_some()
 }
 
 /// Public-repo URLs used to fetch the `builder` and `enclavia` flake
@@ -428,21 +478,11 @@ async fn run_builder(
         cmd.arg("--container-port").arg(port.to_string());
     }
 
-    let mode = enclave.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-    if mode == "debug" {
+    if row_is_debug(enclave) {
         cmd.arg("--debug");
     }
 
-    let storage_size = enclave
-        .get("storage_size_bytes")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            enclave
-                .get("storage")
-                .and_then(|s| s.get("size_bytes"))
-                .and_then(|v| v.as_u64())
-        });
-    if storage_size.is_some() {
+    if row_has_storage(enclave) {
         cmd.arg("--storage");
     }
 
@@ -815,6 +855,8 @@ mod tests {
             recorded_synchronizer_pcrs: None,
             recorded_synchronizer_enabled: false,
             recorded_upgrade_target: false,
+            built_debug: false,
+            built_storage: false,
         };
         assert!(r.is_reproducible());
 
@@ -827,6 +869,35 @@ mod tests {
             ..r
         };
         assert!(!r.is_reproducible());
+
+        // The rebuilt image's anti-rollback setting follows the flags the
+        // rebuild passed, read as chain-init reads the config.
+        let r = ReproduceResult {
+            mismatches: vec![],
+            ..r
+        };
+        assert_eq!(r.anti_rollback_setting().unwrap(), AntiRollbackSetting::disabled());
+        let on = ReproduceResult {
+            recorded_synchronizer_pcrs: Some(serde_json::json!([
+                { "PCR0": "aa", "PCR1": "bb", "PCR2": "cc" }
+            ])),
+            recorded_synchronizer_enabled: true,
+            recorded_upgrade_target: true,
+            built_debug: true,
+            built_storage: true,
+            ..r
+        };
+        let s = on.anti_rollback_setting().unwrap();
+        assert!(s.enabled && s.upgrade_target && s.debug_attestation);
+        assert_eq!(s.synchronizer_pcrs[0].pcr0, "aa");
+        // Without storage the init never starts the wiring.
+        let s = ReproduceResult {
+            built_storage: false,
+            ..on
+        }
+        .anti_rollback_setting()
+        .unwrap();
+        assert!(!s.enabled);
     }
 
     // -- ReproduceInputs::from_enclave_row -----------------------------------

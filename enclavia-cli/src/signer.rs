@@ -79,6 +79,9 @@ pub fn signer_for_entry(name: &str, entry: &KeyEntry) -> Result<Box<dyn ControlS
 /// domain), canonical CBOR command via the shared protocol encoder,
 /// envelope signature over the command bytes (control-command domain).
 /// Two `sign` calls (two YubiKey touches).
+///
+/// Signs `prep.payload` as given: the caller checks it first
+/// (`commands::upgrade::check_upgrade_payload`), since the backend built it.
 pub fn sign_confirm_submission(
     signer: &dyn ControlSigner,
     prep: &ConfirmPrepareResponse,

@@ -20,7 +20,8 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
     AntiRollbackSetting, BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
-    UpgradePayload, UPGRADE_WINDOW_MAX, UPGRADE_WINDOW_MIN, upgrade_window_is_valid, validate_chain,
+    UpgradePayload, UPGRADE_DELAY_DEFAULT, UPGRADE_WINDOW_MAX, UPGRADE_WINDOW_MIN,
+    upgrade_window_is_valid, validate_chain,
 };
 use enclavia_protocol::pin_identity::PinIdentity;
 use enclavia_protocol::signing::{SignedDomain, decode_canonical, verify_control_signature};
@@ -239,25 +240,46 @@ pub async fn list_upgrades(
 
 /// Confirm a staged upgrade, optionally scheduling its `valid_from` time.
 ///
-/// - `valid_from = None` lets the server default to `now + 7 days`.
+/// - `valid_from = None` lets the server default to `now + 7 days`
+///   ([`UPGRADE_DELAY_DEFAULT`]).
 /// - A past timestamp is clamped to `now` by the server.
 ///
 /// Custody dispatch: the enclave row's `control_key_mode` decides
 /// the path. Managed (or absent, pre-custody backends) keeps the
 /// original single-shot call; self-hosted runs the two-phase
-/// prepare/sign/submit flow against the locally-held control key.
+/// prepare/sign/submit flow against the locally-held control key, and
+/// needs `target`: what the upgraded enclave must measure, from a source
+/// the backend does not control (see [`UpgradeTarget`]).
 pub async fn confirm_upgrade(
     client: &ApiClient,
     enclave_id: &str,
     upgrade_id: &str,
     valid_from: Option<DateTime<Utc>>,
+    target: Option<UpgradeTarget>,
 ) -> Result<StagedUpgradeJson, CliError> {
     let enclave = client.get_enclave(enclave_id).await?;
     match control_key_mode(&enclave) {
         ControlKeyMode::SelfHosted => {
-            confirm_self_hosted(client, &enclave, enclave_id, upgrade_id, valid_from).await
+            let target = target.ok_or_else(|| {
+                CliError::Other(
+                    "this enclave uses self-hosted custody: say what the upgraded enclave must \
+                     measure before your key signs anything, with --reproduce (rebuild the \
+                     staged image locally) or --expect-pcrs (PCRs you built or reproduced \
+                     yourself)"
+                        .into(),
+                )
+            })?;
+            confirm_self_hosted(client, &enclave, enclave_id, upgrade_id, valid_from, target)
+                .await
         }
         ControlKeyMode::Managed => {
+            if target.is_some() {
+                return Err(CliError::Other(
+                    "--reproduce / --expect-pcrs / --expect-digest only apply to self-hosted \
+                     custody: in managed custody the backend signs the upgrade itself"
+                        .into(),
+                ));
+            }
             client.confirm_upgrade(enclave_id, upgrade_id, valid_from).await
         }
     }
@@ -335,25 +357,463 @@ fn signer_for_enclave(
     crate::signer::signer_for_entry(name, entry)
 }
 
-/// Two-phase confirm: prepare, sign locally (inner + envelope), submit.
-/// On a stale-nonce 409 from submit, re-runs prepare and retries ONCE
-/// (the enclave rotates its control nonce whenever a control command is
-/// processed, so a concurrent command invalidates our signed bytes).
+/// What the owner expects a self-custody upgrade to install, from sources
+/// the backend does not control. The backend builds the `UpgradePayload`
+/// the owner's key signs; these are what the CLI checks it against first.
+#[derive(Debug, Clone)]
+pub struct UpgradeTarget {
+    /// Where the target's PCR0-2 come from.
+    pub pcrs: TargetPcrs,
+    /// The image digest the owner pushed. `None` takes the staged row's
+    /// digest; the PCRs are what binds the image either way.
+    pub image_digest: Option<String>,
+    /// Sign even though the target trusts another set of synchronizer
+    /// measurements than the running version (a synchronizer rotation; see
+    /// [`check_synchronizer_change`]).
+    pub accept_synchronizer_change: bool,
+}
+
+/// Source of the PCR0-2 the upgraded enclave must measure.
+#[derive(Debug, Clone)]
+pub enum TargetPcrs {
+    /// PCRs the owner obtained independently: their own build, or an
+    /// earlier `enclavia reproduce <enclave> --upgrade <id>`.
+    Expected(PcrsHex),
+    /// Rebuild the staged upgrade now, from its image digest and recorded
+    /// sources (`enclavia reproduce --upgrade`), and take the PCRs the local
+    /// builder produces.
+    Reproduce,
+}
+
+/// Parse `--expect-pcrs`: a path to a pcr.json, or inline JSON (detected by
+/// a leading `{`), holding PCR0-2 as 96-character hex strings (`PCR0` or
+/// `pcr0` keys; other keys, like pcr.json's `HashAlgorithm`, are ignored).
+pub fn parse_expected_pcrs(arg: &str) -> Result<PcrsHex, CliError> {
+    let trimmed = arg.trim();
+    let json = if trimmed.starts_with('{') {
+        trimmed.to_string()
+    } else {
+        std::fs::read_to_string(trimmed)
+            .map_err(|e| CliError::Other(format!("cannot read --expect-pcrs file {trimmed:?}: {e}")))?
+    };
+    let pcrs: PcrsHex = serde_json::from_str(&json)
+        .map_err(|e| CliError::Other(format!("--expect-pcrs is not a {{PCR0,PCR1,PCR2}} object: {e}")))?;
+    for (name, value) in [("PCR0", &pcrs.pcr0), ("PCR1", &pcrs.pcr1), ("PCR2", &pcrs.pcr2)] {
+        if value.len() != 96 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(CliError::Other(format!(
+                "--expect-pcrs {name} is not 96 hex characters (SHA-384)"
+            )));
+        }
+    }
+    Ok(pcrs)
+}
+
+/// Check the reproduced target's anti-rollback setting against the running
+/// version's ([`AntiRollbackSetting::check_successor`]): anti-rollback is
+/// fixed when the enclave is created, so the target keeps it on or off; with
+/// it on, the target is built as an upgrade target (otherwise, booted on a
+/// blank disk once this upgrade is signed, it would register a fresh volume
+/// instead of taking over the enclave's pin, and the real Transition would
+/// be refused for good), checks the synchronizer's attestation the same way
+/// and trusts at least one synchronizer. A different trust list is checked
+/// separately ([`check_synchronizer_change`]).
+///
+/// `running` comes from the running version's attested boot link, never
+/// from the backend's enclave row: the backend sets the build flags and
+/// records them, and a hostile one could claim anti-rollback is off and
+/// build the target without it, which the reproduce check alone would
+/// replay without noticing.
+pub fn check_target_role(
+    running: &AntiRollbackSetting,
+    target: &AntiRollbackSetting,
+) -> Result<(), CliError> {
+    running.check_successor(target).map_err(|change| {
+        CliError::Other(format!(
+            "refusing to sign: {change} (running version: {}; staged image: {})",
+            anti_rollback_summary(running),
+            anti_rollback_summary(target)
+        ))
+    })
+}
+
+/// The synchronizer measurement sets in `running` and not in `target`
+/// (removed), and in `target` and not in `running` (added), comparing PCR
+/// hex case-insensitively.
+pub fn synchronizer_diff(running: &[PcrsHex], target: &[PcrsHex]) -> (Vec<PcrsHex>, Vec<PcrsHex>) {
+    let missing_from = |set: &[PcrsHex], p: &PcrsHex| !set.iter().any(|q| q.same_as(p));
+    let removed = running.iter().filter(|p| missing_from(target, p)).cloned().collect();
+    let added = target.iter().filter(|p| missing_from(running, p)).cloned().collect();
+    (removed, added)
+}
+
+/// Check the target's trusted synchronizer measurements against the running
+/// version's (from its attested boot link). A different set is a
+/// synchronizer rotation: the chain allows it, because the owner's signature
+/// over the target's PCRs (which cover the measured trust list) authorizes
+/// it, so the CLI makes it explicit. It shows the sets removed and added and
+/// refuses unless `accept` (`--accept-synchronizer-change`). Without the
+/// wiring the list is not used, so it is not compared. `source` says where
+/// the target's list comes from.
+pub fn check_synchronizer_change(
+    running: &AntiRollbackSetting,
+    target_synchronizers: &[PcrsHex],
+    source: &str,
+    accept: bool,
+) -> Result<(), CliError> {
+    if !running.enabled {
+        return Ok(());
+    }
+    let (removed, added) = synchronizer_diff(&running.synchronizer_pcrs, target_synchronizers);
+    if removed.is_empty() && added.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "The upgraded image trusts other synchronizers than the running version (target list \
+         from {source}):"
+    );
+    for (sign, set) in [("-", &removed), ("+", &added)] {
+        for p in set.iter() {
+            eprintln!("  {sign} PCR0 {}", p.pcr0);
+            eprintln!("    PCR1 {}", p.pcr1);
+            eprintln!("    PCR2 {}", p.pcr2);
+        }
+    }
+    let consequence = "Until a migration protocol exists, the upgraded image works only if the \
+                       cluster it trusts holds this enclave's pin: it is an upgrade target and \
+                       never registers, so against a cluster without the pin it fail-stops at \
+                       boot and the enclave stays down.";
+    if !accept {
+        return Err(CliError::Other(format!(
+            "refusing to sign: this upgrade is a synchronizer rotation ({} measurement set(s) \
+             removed, {} added). {consequence} Pass --accept-synchronizer-change to sign it \
+             anyway.",
+            removed.len(),
+            added.len()
+        )));
+    }
+    eprintln!("--accept-synchronizer-change given: signing the rotation. {consequence}");
+    Ok(())
+}
+
+/// One-line form of [`anti_rollback_lines`] for error messages.
+fn anti_rollback_summary(s: &AntiRollbackSetting) -> String {
+    if !s.enabled {
+        return "anti-rollback off".into();
+    }
+    format!(
+        "anti-rollback on, {}, {} synchronizer attestation, {} trusted synchronizer build(s)",
+        if s.upgrade_target { "upgrade target" } else { "first image" },
+        if s.debug_attestation { "DEBUG" } else { "Nitro-verified" },
+        s.synchronizer_pcrs.len()
+    )
+}
+
+/// Slack for clock differences between this machine and the backend when
+/// comparing `valid_from` with a requested or minimum activation time.
+const VALID_FROM_SLACK: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Everything a backend-built upgrade payload is checked against before
+/// the owner's key signs it ([`check_upgrade_payload`]).
+#[derive(Debug, Clone)]
+pub struct UpgradeExpectation {
+    /// The enclave being upgraded.
+    pub enclave_id: Uuid,
+    /// PCR0-2 the enclave runs now: the tip of its chain, every link
+    /// verified (Nitro-attested in production mode).
+    pub current: PcrsHex,
+    /// PCR0-2 the upgraded enclave must measure.
+    pub target: PcrsHex,
+    /// Image digest the target is built from.
+    pub image_digest: String,
+    /// The `valid_from` the owner asked for (`--at`, or now for
+    /// `--immediate`); `None` for the default delay.
+    pub requested_valid_from: Option<DateTime<Utc>>,
+    /// The enclave's minimum upgrade delay, from its row. The enclave
+    /// enforces its measured value itself (against its own clock); this is
+    /// the signer's own check of the same floor.
+    pub min_upgrade_delay_secs: u64,
+    /// The signer's clock.
+    pub now: DateTime<Utc>,
+}
+
+fn same_pcrs(a: &PcrsHex, b: &PcrsHex) -> bool {
+    a.pcr0.eq_ignore_ascii_case(&b.pcr0)
+        && a.pcr1.eq_ignore_ascii_case(&b.pcr1)
+        && a.pcr2.eq_ignore_ascii_case(&b.pcr2)
+}
+
+/// Check a backend-built `UpgradePayload` before signing it (self-hosted
+/// custody, where the backend is untrusted). The signature authorizes
+/// moving the enclave's pin, with its data, to the `to` identity from
+/// `valid_from` to `valid_until`, so the payload must say exactly what the
+/// owner intends. Accepts only when ALL of these hold:
+///
+/// 1. The bytes are the canonical encoding of an `UpgradePayload` for this
+///    enclave.
+/// 2. `from` is the enclave's current identity: its PCR0-2 are the verified
+///    chain tip, and `to` carries the same user PCRs 16-31 (they hold
+///    per-enclave data, the same before and after an upgrade), so the pin
+///    cannot be moved to another user-PCR identity of the target image.
+/// 3. `to`'s PCR0-2 are the target's ([`UpgradeTarget`]) and `image_digest`
+///    is the expected digest.
+/// 4. `valid_from` is no earlier than the owner asked for (the default
+///    delay when they named no time) and no earlier than the enclave's
+///    minimum upgrade delay allows, each less [`VALID_FROM_SLACK`]. Later
+///    only postpones the upgrade, and is shown.
+/// 5. The window is sane ([`checked_upgrade_window`]).
+///
+/// `issued_at` and `nonce` are not checked: they name nothing the
+/// signature authorizes.
+pub fn check_upgrade_payload(
+    payload: &[u8],
+    expected: &UpgradeExpectation,
+) -> Result<UpgradePayload, CliError> {
+    let refuse = |why: String| {
+        Err(CliError::Other(format!(
+            "refusing to sign the upgrade the backend prepared: {why}"
+        )))
+    };
+    let p = checked_upgrade_window(payload)?;
+    if p.enclave_id != expected.enclave_id {
+        return refuse("it is for another enclave".into());
+    }
+    if !same_pcrs(&p.from.image_pcrs_hex(), &expected.current) {
+        return refuse(format!(
+            "its `from` PCRs are not the ones this enclave runs (chain tip PCR0 {})",
+            expected.current.pcr0
+        ));
+    }
+    if !same_pcrs(&p.to.image_pcrs_hex(), &expected.target) {
+        return refuse(format!(
+            "its target PCRs are not the expected ones (expected PCR0 {}, payload PCR0 {})",
+            expected.target.pcr0,
+            p.to.image_pcrs_hex().pcr0
+        ));
+    }
+    if p.to.user() != p.from.user() {
+        return refuse(
+            "its target carries other user PCRs 16-31 than the running enclave".into(),
+        );
+    }
+    if p.image_digest != expected.image_digest {
+        return refuse(format!(
+            "its image digest {} is not the expected {}",
+            p.image_digest, expected.image_digest
+        ));
+    }
+    let asked = expected
+        .requested_valid_from
+        .unwrap_or(expected.now + UPGRADE_DELAY_DEFAULT);
+    let floor = expected.now
+        + chrono::Duration::seconds(i64::try_from(expected.min_upgrade_delay_secs).unwrap_or(i64::MAX / 2));
+    let earliest = std::cmp::max(asked, floor) - VALID_FROM_SLACK;
+    if p.valid_from < earliest {
+        return refuse(format!(
+            "its valid_from {} is earlier than you asked for (earliest acceptable {})",
+            p.valid_from, earliest
+        ));
+    }
+    Ok(p)
+}
+
+/// The version an enclave runs now, as its own chain attests it.
+#[derive(Debug, Clone)]
+pub struct RunningVersion {
+    /// PCR0-2 of the chain tip.
+    pub pcrs: PcrsHex,
+    /// The anti-rollback setting the running image's boot link attests.
+    pub anti_rollback: AntiRollbackSetting,
+}
+
+/// The version an enclave runs now: its chain, re-validated locally, must
+/// account for the row's state with every link valid, and the running
+/// image's setting is read from its own boot link.
+async fn verified_running(client: &ApiClient, enclave_id: &str) -> Result<RunningVersion, CliError> {
+    let summary = chain(client, enclave_id).await?;
+    if let Some(bad) = summary.links.iter().find(|l| l.validation.is_err()) {
+        return Err(CliError::Other(format!(
+            "the enclave's upgrade chain does not verify (link {:?}: {}); refusing to sign an \
+             upgrade out of an unverified state",
+            bad.sequence,
+            bad.validation.as_ref().err().map(String::as_str).unwrap_or_default()
+        )));
+    }
+    if !summary.tip_matches_row {
+        return Err(CliError::Other(
+            "the enclave's upgrade chain does not account for the state the backend reports; \
+             refusing to sign an upgrade out of an unverified state"
+                .into(),
+        ));
+    }
+    let anti_rollback = running_anti_rollback(&summary.links, &summary.pcrs)?;
+    Ok(RunningVersion {
+        pcrs: summary.pcrs,
+        anti_rollback,
+    })
+}
+
+/// The anti-rollback setting attested by the running image: the last
+/// verified boot link whose PCRs are the chain tip's. Every stored boot is
+/// a boot of a new image (reboots of the same image are not recorded), and
+/// the setting lives in the measured config the PCRs cover, so any boot of
+/// the tip's image carries the same setting.
+pub fn running_anti_rollback(
+    links: &[VerifiedLink],
+    tip: &PcrsHex,
+) -> Result<AntiRollbackSetting, CliError> {
+    links
+        .iter()
+        .rev()
+        .filter(|l| l.validation.is_ok())
+        .find_map(|l| match &l.payload {
+            Some(DecodedPayload::Boot(p)) if p.pcrs.same_as(tip) => Some(p.anti_rollback.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            CliError::Other(
+                "the enclave's chain has no verified boot link of the running image, so its \
+                 anti-rollback setting is unknown; refusing to sign"
+                    .into(),
+            )
+        })
+}
+
+/// Gather an [`UpgradeExpectation`] for a self-hosted confirm: the target
+/// (expected or locally reproduced), the verified current PCRs, the
+/// enclave's minimum delay.
+async fn upgrade_expectation(
+    client: &ApiClient,
+    enclave: &serde_json::Value,
+    enclave_id: &str,
+    upgrade_id: &str,
+    valid_from: Option<DateTime<Utc>>,
+    target: &UpgradeTarget,
+) -> Result<UpgradeExpectation, CliError> {
+    let enclave_uuid = Uuid::parse_str(enclave_id)
+        .map_err(|e| CliError::Other(format!("invalid enclave id {enclave_id:?}: {e}")))?;
+    let staged = client.get_upgrade(enclave_id, upgrade_id).await?;
+    let image_digest = match (&target.image_digest, &staged.image_digest) {
+        (Some(want), Some(have)) if want != have => {
+            return Err(CliError::Other(format!(
+                "upgrade {upgrade_id} is built from image {have}, not the {want} you expect"
+            )));
+        }
+        (Some(want), _) => want.clone(),
+        (None, Some(have)) => have.clone(),
+        (None, None) => {
+            return Err(CliError::Other(format!(
+                "upgrade {upgrade_id} has no image digest yet (its build has not completed)"
+            )));
+        }
+    };
+    let running = verified_running(client, enclave_id).await?;
+    eprintln!("The running version's anti-rollback setting, from its attested boot link:");
+    for line in anti_rollback_lines(&running.anti_rollback) {
+        eprintln!("  {line}");
+    }
+    let target_pcrs = match &target.pcrs {
+        TargetPcrs::Expected(pcrs) => {
+            eprintln!(
+                "The upgraded image must keep this setting. With --expect-pcrs the CLI cannot \
+                 check that; the PCRs you give must be of an image built that way."
+            );
+            // The only record of the target's trust list here is the
+            // backend's; the owner's PCRs are what bind the image to it.
+            check_synchronizer_change(
+                &running.anti_rollback,
+                staged.synchronizer_pcrs.as_deref().unwrap_or_default(),
+                "the backend's record of the staged build (your --expect-pcrs bind the image; \
+                 build it with this list)",
+                target.accept_synchronizer_change,
+            )?;
+            pcrs.clone()
+        }
+        TargetPcrs::Reproduce => {
+            eprintln!("Rebuilding upgrade {upgrade_id} locally to learn its PCRs...");
+            let r = crate::commands::reproduce::reproduce_upgrade(client, enclave_id, upgrade_id)
+                .await?;
+            if !r.is_reproducible() {
+                return Err(CliError::Other(format!(
+                    "the local rebuild of upgrade {upgrade_id} does not reproduce the PCRs the \
+                     backend recorded (mismatched: {}); refusing to sign",
+                    r.mismatches.iter().map(|m| m.slot).collect::<Vec<_>>().join(", ")
+                )));
+            }
+            // The reproduced PCRs bind the build flags the rebuild used, so
+            // this is the setting the target image really carries.
+            let target_setting = r.anti_rollback_setting()?;
+            check_target_role(&running.anti_rollback, &target_setting)?;
+            check_synchronizer_change(
+                &running.anti_rollback,
+                &target_setting.synchronizer_pcrs,
+                "your local rebuild",
+                target.accept_synchronizer_change,
+            )?;
+            PcrsHex {
+                pcr0: r.actual.pcr0,
+                pcr1: r.actual.pcr1,
+                pcr2: r.actual.pcr2,
+            }
+        }
+    };
+    Ok(UpgradeExpectation {
+        enclave_id: enclave_uuid,
+        current: running.pcrs,
+        target: target_pcrs,
+        image_digest,
+        requested_valid_from: valid_from,
+        min_upgrade_delay_secs: enclave
+            .get("min_upgrade_delay_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        now: Utc::now(),
+    })
+}
+
+fn print_upgrade_to_sign(p: &UpgradePayload, source: &TargetPcrs) {
+    let source = match source {
+        TargetPcrs::Expected(_) => "the PCRs you gave",
+        TargetPcrs::Reproduce => "your local rebuild",
+    };
+    eprintln!("Your control key is about to authorize this upgrade (target matches {source}):");
+    eprintln!("  image:       {}", p.image_digest);
+    for line in identity_lines("from.", &p.from) {
+        eprintln!("  {line}");
+    }
+    for line in identity_lines("to.", &p.to) {
+        eprintln!("  {line}");
+    }
+    eprintln!(
+        "  valid_from:  {}",
+        p.valid_from.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    eprintln!(
+        "  valid_until: {}",
+        p.valid_until.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+}
+
+/// Two-phase confirm: prepare, check the payload the backend built
+/// ([`check_upgrade_payload`]), sign locally (inner + envelope), submit.
+/// On a stale-nonce 409 from submit, re-runs prepare (and the check) and
+/// retries ONCE (the enclave rotates its control nonce whenever a control
+/// command is processed, so a concurrent command invalidates our signed
+/// bytes).
 async fn confirm_self_hosted(
     client: &ApiClient,
     enclave: &serde_json::Value,
     enclave_id: &str,
     upgrade_id: &str,
     valid_from: Option<DateTime<Utc>>,
+    target: UpgradeTarget,
 ) -> Result<StagedUpgradeJson, CliError> {
-    let signer = signer_for_enclave(enclave)?;
+    let expected =
+        upgrade_expectation(client, enclave, enclave_id, upgrade_id, valid_from, &target).await?;
     let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
-    let payload = checked_upgrade_window(&prep.payload)?;
-    eprintln!(
-        "Upgrade will take effect at {} once confirmed, and expires unexecuted at {}. \
-         Two signatures are required.",
-        payload.valid_from, payload.valid_until
-    );
+    let payload = check_upgrade_payload(&prep.payload, &expected)?;
+    print_upgrade_to_sign(&payload, &target.pcrs);
+    let signer = signer_for_enclave(enclave)?;
+    eprintln!("Two signatures are required.");
     let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
     submitting("Confirming");
     match client.confirm_submit(enclave_id, upgrade_id, &submission).await {
@@ -362,7 +822,10 @@ async fn confirm_self_hosted(
                 "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
             );
             let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
-            checked_upgrade_window(&prep.payload)?;
+            check_upgrade_payload(&prep.payload, &UpgradeExpectation {
+                now: Utc::now(),
+                ..expected
+            })?;
             let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
             submitting("Confirming");
             client.confirm_submit(enclave_id, upgrade_id, &submission).await
@@ -1135,6 +1598,317 @@ mod tests {
             )
             .unwrap_err();
             assert!(late.to_string().contains("too late"), "{late}");
+        }
+    }
+    // --- self-hosted upgrade payload check (hostile backend) ------------
+
+    mod upgrade_payload_check {
+        use super::*;
+        use enclavia_protocol::chain::UPGRADE_WINDOW_DEFAULT;
+        use enclavia_protocol::pin_identity::ZERO_USER_PCRS;
+        use enclavia_protocol::signing::encode;
+
+        fn now() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap()
+        }
+
+        fn enclave() -> Uuid {
+            Uuid::from_u128(0xe2)
+        }
+
+        /// What the enclave runs (the verified chain tip).
+        fn current() -> PinIdentity {
+            PinIdentity::new([[0xa0; 48], [0xa1; 48], [0xa2; 48]], ZERO_USER_PCRS)
+        }
+
+        /// What the owner pushed and expects (reproduced or given).
+        fn target() -> PinIdentity {
+            PinIdentity::new([[0xc0; 48], [0xc1; 48], [0xc2; 48]], ZERO_USER_PCRS)
+        }
+
+        fn expectation(requested: Option<DateTime<Utc>>, min_delay: u64) -> UpgradeExpectation {
+            UpgradeExpectation {
+                enclave_id: enclave(),
+                current: current().image_pcrs_hex(),
+                target: target().image_pcrs_hex(),
+                image_digest: "sha256:pushed".into(),
+                requested_valid_from: requested,
+                min_upgrade_delay_secs: min_delay,
+                now: now(),
+            }
+        }
+
+        /// What an honest backend builds for the default schedule.
+        fn honest() -> UpgradePayload {
+            let valid_from = now() + UPGRADE_DELAY_DEFAULT;
+            UpgradePayload {
+                enclave_id: enclave(),
+                from: current(),
+                to: target(),
+                image_digest: "sha256:pushed".into(),
+                valid_from,
+                valid_until: valid_from + UPGRADE_WINDOW_DEFAULT,
+                issued_at: now(),
+                nonce: vec![0x48; 32],
+            }
+        }
+
+        fn check(p: &UpgradePayload, e: &UpgradeExpectation) -> Result<UpgradePayload, CliError> {
+            check_upgrade_payload(&encode(p), e)
+        }
+
+        fn refused(p: &UpgradePayload, e: &UpgradeExpectation, why: &str) {
+            let err = check(p, e).unwrap_err().to_string();
+            assert!(err.contains("refusing to sign"), "{err}");
+            assert!(err.contains(why), "expected {why:?} in: {err}");
+        }
+
+        #[test]
+        fn honest_payloads_pass() {
+            check(&honest(), &expectation(None, 0)).unwrap();
+            // An explicit time, and a later one than asked (only postpones).
+            let at = now() + chrono::Duration::days(2);
+            let mut p = honest();
+            p.valid_from = at;
+            p.valid_until = at + UPGRADE_WINDOW_DEFAULT;
+            check(&p, &expectation(Some(at), 0)).unwrap();
+            check(&honest(), &expectation(Some(at), 0)).unwrap();
+        }
+
+        /// Current_HostileBackend_Target: the backend builds the upgrade to
+        /// another target than the owner approved.
+        #[test]
+        fn another_target_is_refused() {
+            let mut p = honest();
+            p.to = PinIdentity::new([[0xd0; 48], [0xd1; 48], [0xd2; 48]], ZERO_USER_PCRS);
+            refused(&p, &expectation(None, 0), "target PCRs");
+            // One PCR differing is enough.
+            let mut p = honest();
+            p.to = PinIdentity::new([[0xc0; 48], [0xc1; 48], [0xc3; 48]], ZERO_USER_PCRS);
+            refused(&p, &expectation(None, 0), "target PCRs");
+        }
+
+        /// The pin must not move to another user-PCR identity of the target
+        /// image, nor out of another identity than the enclave's own.
+        #[test]
+        fn other_identities_are_refused() {
+            let mut user = ZERO_USER_PCRS;
+            user[0] = [0x16; 48];
+            let mut p = honest();
+            p.to = target().with_user_pcrs(user);
+            refused(&p, &expectation(None, 0), "user PCRs");
+
+            let mut p = honest();
+            p.from = PinIdentity::new([[0xb0; 48], [0xb1; 48], [0xb2; 48]], ZERO_USER_PCRS);
+            refused(&p, &expectation(None, 0), "`from` PCRs");
+        }
+
+        /// Current_HostileBackend_ValidFrom: the backend signs an earlier
+        /// valid_from than the owner approved, explicitly or by default, or
+        /// one under the enclave's minimum delay.
+        #[test]
+        fn earlier_valid_from_is_refused() {
+            let at = now() + chrono::Duration::days(2);
+            let mut p = honest();
+            p.valid_from = at - chrono::Duration::hours(1);
+            p.valid_until = p.valid_from + UPGRADE_WINDOW_DEFAULT;
+            refused(&p, &expectation(Some(at), 0), "earlier than you asked");
+
+            // No time named: the default delay is what was approved.
+            let mut p = honest();
+            p.valid_from = now();
+            p.valid_until = now() + UPGRADE_WINDOW_DEFAULT;
+            refused(&p, &expectation(None, 0), "earlier than you asked");
+
+            // --immediate on an enclave with a 2-day minimum delay.
+            refused(&p, &expectation(Some(now()), 2 * 86_400), "earlier than you asked");
+        }
+
+        /// The valid_from edge: exactly the earliest acceptable time (less
+        /// the slack) passes, one second earlier does not.
+        #[test]
+        fn valid_from_edge() {
+            let e = expectation(None, 0);
+            let earliest = now() + UPGRADE_DELAY_DEFAULT - VALID_FROM_SLACK;
+            let mut p = honest();
+            p.valid_from = earliest;
+            p.valid_until = earliest + UPGRADE_WINDOW_DEFAULT;
+            check(&p, &e).unwrap();
+            p.valid_from = earliest - chrono::Duration::seconds(1);
+            refused(&p, &e, "earlier than you asked");
+        }
+
+        #[test]
+        fn other_enclave_digest_or_window_is_refused() {
+            let e = expectation(None, 0);
+            let mut p = honest();
+            p.enclave_id = Uuid::from_u128(0xe3);
+            refused(&p, &e, "another enclave");
+
+            let mut p = honest();
+            p.image_digest = "sha256:elsewhere".into();
+            refused(&p, &e, "image digest");
+
+            let mut p = honest();
+            p.valid_until = p.valid_from + UPGRADE_WINDOW_MAX + chrono::Duration::seconds(1);
+            refused(&p, &e, "longer than");
+        }
+
+        /// The F8 shape: bytes that also carry a revocation's fields (or any
+        /// unknown field, or trailing bytes) are not an upgrade payload.
+        #[test]
+        fn polyglot_or_non_canonical_bytes_are_refused() {
+            let e = expectation(None, 0);
+            let mut map = match ciborium::Value::serialized(&honest()).unwrap() {
+                ciborium::Value::Map(m) => m,
+                other => panic!("{other:?}"),
+            };
+            map.push((
+                ciborium::Value::Text("revokes_link".into()),
+                ciborium::Value::Bytes(vec![0x45; 32]),
+            ));
+            let mut polyglot = Vec::new();
+            ciborium::into_writer(&ciborium::Value::Map(map), &mut polyglot).unwrap();
+            assert!(check_upgrade_payload(&polyglot, &e).is_err());
+
+            let mut trailing = encode(&honest());
+            trailing.push(0);
+            assert!(check_upgrade_payload(&trailing, &e).is_err());
+        }
+
+        fn setting(enabled: bool, upgrade_target: bool, debug: bool, sync: &[&str]) -> AntiRollbackSetting {
+            AntiRollbackSetting {
+                enabled,
+                upgrade_target,
+                debug_attestation: debug,
+                synchronizer_pcrs: sync
+                    .iter()
+                    .map(|s| PcrsHex {
+                        pcr0: s.repeat(96),
+                        pcr1: s.repeat(96),
+                        pcr2: s.repeat(96),
+                    })
+                    .collect(),
+            }
+        }
+
+        /// A hostile backend could build the successor without
+        /// `--upgrade-target`, with the wiring turned on or off, with debug
+        /// attestation or trusting no synchronizer, and record that: the
+        /// reproduced flags then say so, and the CLI refuses against the
+        /// running version's attested setting. Another trust list is a
+        /// rotation, checked by `check_synchronizer_change`.
+        #[test]
+        fn target_role_check() {
+            let genesis = setting(true, false, false, &["a"]);
+            check_target_role(&genesis, &setting(true, true, false, &["a"])).unwrap();
+            let off = AntiRollbackSetting::disabled();
+            check_target_role(&off, &off).unwrap();
+            // Without the wiring the image does not use the other fields.
+            check_target_role(&off, &setting(false, true, true, &["c"])).unwrap();
+            for (target, why) in [
+                (setting(true, false, false, &["a"]), "not built as an upgrade target"),
+                (off.clone(), "turns anti-rollback off"),
+                (setting(false, true, false, &["a"]), "turns anti-rollback off"),
+                (setting(true, true, true, &["a"]), "debug_attestation"),
+                (setting(true, true, false, &[]), "trusts no synchronizer"),
+            ] {
+                let err = check_target_role(&genesis, &target).unwrap_err().to_string();
+                assert!(err.contains(why), "{target:?}: {err}");
+            }
+            let err = check_target_role(&off, &setting(true, true, false, &["a"]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("turns anti-rollback on"), "{err}");
+            // Another trust list is not a role error.
+            check_target_role(&genesis, &setting(true, true, false, &["c"])).unwrap();
+        }
+
+        /// A target trusting other synchronizers than the running version is
+        /// a rotation: refused without the flag, signed with it. The same
+        /// list (in any order or hex case) passes, and without the wiring the
+        /// list is not compared.
+        #[test]
+        fn synchronizer_change_needs_the_flag() {
+            let running = setting(true, false, false, &["a", "b"]);
+            let list = |seeds: &[&str]| setting(true, true, false, seeds).synchronizer_pcrs;
+            let mut same = list(&["b", "a"]);
+            same[0].pcr0 = same[0].pcr0.to_uppercase();
+            for accept in [false, true] {
+                check_synchronizer_change(&running, &same, "test", accept).unwrap();
+            }
+            for changed in [list(&["a"]), list(&["a", "b", "c"]), list(&["c"]), list(&[])] {
+                let err = check_synchronizer_change(&running, &changed, "test", false)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("--accept-synchronizer-change"), "{err}");
+                assert!(err.contains("fail-stops at boot"), "{err}");
+                check_synchronizer_change(&running, &changed, "test", true).unwrap();
+            }
+            let (removed, added) = synchronizer_diff(&running.synchronizer_pcrs, &list(&["b", "c"]));
+            assert_eq!(removed, list(&["a"]));
+            assert_eq!(added, list(&["c"]));
+            let off = AntiRollbackSetting::disabled();
+            check_synchronizer_change(&off, &list(&["c"]), "test", false).unwrap();
+        }
+
+        /// The running setting is the one the tip image's own verified boot
+        /// link attests; without such a link the CLI refuses.
+        #[test]
+        fn running_setting_comes_from_the_tip_boot_link() {
+            let boot = |pcr: &str, s: AntiRollbackSetting, ok: bool| VerifiedLink {
+                id: None,
+                sequence: None,
+                kind: ChainLinkKind::Boot,
+                created_at: None,
+                payload: Some(DecodedPayload::Boot(BootPayload {
+                    enclave_id: Uuid::nil(),
+                    image_digest: "sha256:x".into(),
+                    pcrs: PcrsHex {
+                        pcr0: pcr.repeat(96),
+                        pcr1: pcr.repeat(96),
+                        pcr2: pcr.repeat(96),
+                    },
+                    booted_at: Utc::now(),
+                    nonce: vec![0; 32],
+                    anti_rollback: s,
+                })),
+                attestation_bytes: 0,
+                signature_bytes: None,
+                validation: if ok {
+                    Ok(VerificationOk::Append { sequence: 0 })
+                } else {
+                    Err("bad".into())
+                },
+            };
+            let tip = PcrsHex {
+                pcr0: "b".repeat(96),
+                pcr1: "b".repeat(96),
+                pcr2: "b".repeat(96),
+            };
+            let v1 = setting(true, false, false, &["a"]);
+            let v2 = setting(true, true, false, &["a"]);
+            let links = vec![boot("a", v1.clone(), true), boot("b", v2.clone(), true)];
+            assert_eq!(running_anti_rollback(&links, &tip).unwrap(), v2);
+            // Only a verified link of the tip image counts.
+            let links = vec![boot("a", v1.clone(), true), boot("b", v2, false)];
+            assert!(running_anti_rollback(&links, &tip).is_err());
+            assert!(running_anti_rollback(&[boot("a", v1, true)], &tip).is_err());
+        }
+
+        #[test]
+        fn expected_pcrs_parse() {
+            let hex = |b: &str| b.repeat(96);
+            let inline = format!(
+                r#"{{"HashAlgorithm":"Sha384 {{ ... }}","PCR0":"{}","PCR1":"{}","PCR2":"{}"}}"#,
+                hex("a"),
+                hex("b"),
+                hex("c")
+            );
+            let pcrs = parse_expected_pcrs(&inline).unwrap();
+            assert_eq!(pcrs.pcr0, hex("a"));
+            assert!(parse_expected_pcrs(r#"{"PCR0":"aa","PCR1":"bb","PCR2":"cc"}"#).is_err());
+            assert!(parse_expected_pcrs("/nonexistent/pcr.json").is_err());
         }
     }
 }

@@ -541,6 +541,12 @@ enum UpgradeCmd {
     /// passes; no further CLI action is needed.
     ///
     /// --at and --immediate are mutually exclusive.
+    ///
+    /// Self-hosted custody: the backend builds the payload your key signs,
+    /// so pass --reproduce or --expect-pcrs to say what the upgraded enclave
+    /// must measure. The CLI also checks that the upgrade starts from the
+    /// enclave's verified current state, is not scheduled earlier than you
+    /// asked, and expires; it shows everything and refuses on a mismatch.
     Confirm {
         /// Target enclave id. Accepts a unique prefix.
         enclave_id: String,
@@ -557,6 +563,33 @@ enum UpgradeCmd {
         /// earlier than now + the enclave's measured minimum delay.
         #[arg(long, conflicts_with = "at")]
         immediate: bool,
+        /// Self-hosted custody: rebuild the staged image locally (as
+        /// `enclavia reproduce --upgrade` does) and sign only an upgrade
+        /// whose target has the PCRs the rebuild produces. Needs a local
+        /// `builder` (BUILDER_PATH) and Nix.
+        #[arg(long, conflicts_with = "expect_pcrs")]
+        reproduce: bool,
+        /// Self-hosted custody: sign only an upgrade whose target has these
+        /// PCR0-2: a pcr.json path, or inline JSON
+        /// `{"PCR0":"..","PCR1":"..","PCR2":".."}`. Use PCRs from your own
+        /// build or an earlier `enclavia reproduce --upgrade`, never ones
+        /// the backend reported.
+        #[arg(long, value_name = "FILE|JSON")]
+        expect_pcrs: Option<String>,
+        /// Self-hosted custody: the image digest you pushed
+        /// (`sha256:...`); the upgrade must be built from it. Defaults to
+        /// the staged upgrade's digest, which the PCRs then bind.
+        #[arg(long, value_name = "DIGEST")]
+        expect_digest: Option<String>,
+        /// Self-hosted custody: sign even though the upgraded image trusts
+        /// another set of synchronizer measurements than the running version
+        /// (a synchronizer rotation); the CLI shows the sets removed and
+        /// added. Until a migration protocol exists, the upgraded image works
+        /// only if the cluster it trusts holds this enclave's pin: an upgrade
+        /// target cannot register, so against a cluster without the pin it
+        /// fail-stops at boot and the enclave stays down.
+        #[arg(long)]
+        accept_synchronizer_change: bool,
     },
 
     /// Revoke a confirmed upgrade before it fires. The running enclave
@@ -1400,7 +1433,16 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             emit(json, &rows, || print_upgrade_list(&rows));
             Ok(())
         }
-        UpgradeCmd::Confirm { enclave_id, upgrade_id, at, immediate } => {
+        UpgradeCmd::Confirm {
+            enclave_id,
+            upgrade_id,
+            at,
+            immediate,
+            reproduce,
+            expect_pcrs,
+            expect_digest,
+            accept_synchronizer_change,
+        } => {
             let valid_from: Option<chrono::DateTime<chrono::Utc>> = if immediate {
                 Some(chrono::Utc::now())
             } else if let Some(ts) = at {
@@ -1413,9 +1455,33 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             };
             let client = ApiClient::new()?;
             let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
-            let result =
-                upgrade::confirm_upgrade(&client, &enclave_id, &upgrade_id, valid_from)
-                    .await?;
+            let target = match (reproduce, expect_pcrs) {
+                (true, _) => Some(upgrade::TargetPcrs::Reproduce),
+                (false, Some(arg)) => Some(upgrade::TargetPcrs::Expected(
+                    upgrade::parse_expected_pcrs(&arg)?,
+                )),
+                (false, None) => None,
+            }
+            .map(|pcrs| upgrade::UpgradeTarget {
+                pcrs,
+                image_digest: expect_digest.clone(),
+                accept_synchronizer_change,
+            });
+            if target.is_none() && (expect_digest.is_some() || accept_synchronizer_change) {
+                return Err(CliError::Other(
+                    "--expect-digest and --accept-synchronizer-change need --reproduce or \
+                     --expect-pcrs"
+                        .into(),
+                ));
+            }
+            let result = upgrade::confirm_upgrade(
+                &client,
+                &enclave_id,
+                &upgrade_id,
+                valid_from,
+                target,
+            )
+            .await?;
             emit(json, &result, || print_upgrade_confirm(&result));
             Ok(())
         }
