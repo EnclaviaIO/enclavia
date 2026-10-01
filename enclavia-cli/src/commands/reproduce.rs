@@ -60,6 +60,9 @@ pub struct ReproduceResult {
     /// Whether the backend passed `--synchronizer-enabled` for this
     /// version (the in-enclave anti-rollback wiring was baked ON).
     pub recorded_synchronizer_enabled: bool,
+    /// Whether the backend passed `--upgrade-target` for this version (the
+    /// image obtains its synchronizer pin only by a Transition).
+    pub recorded_upgrade_target: bool,
 }
 
 impl ReproduceResult {
@@ -117,6 +120,8 @@ struct ReproduceInputs {
     synchronizer_pcrs: Option<serde_json::Value>,
     /// Recorded `--synchronizer-enabled` state of the original build.
     synchronizer_enabled: bool,
+    /// Recorded `--upgrade-target` state of the original build.
+    upgrade_target: bool,
 }
 
 impl ReproduceInputs {
@@ -151,6 +156,10 @@ impl ReproduceInputs {
                 .cloned(),
             synchronizer_enabled: enclave
                 .get("synchronizer_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            upgrade_target: enclave
+                .get("upgrade_target")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         })
@@ -213,6 +222,7 @@ impl ReproduceInputs {
             crates_rev: upgrade.crates_rev.clone(),
             synchronizer_pcrs,
             synchronizer_enabled: upgrade.synchronizer_enabled,
+            upgrade_target: upgrade.upgrade_target,
         })
     }
 }
@@ -281,6 +291,7 @@ async fn run_reproduce(
         inputs.crates_rev.as_deref(),
         inputs.synchronizer_pcrs.as_ref(),
         inputs.synchronizer_enabled,
+        inputs.upgrade_target,
     )
     .await?;
 
@@ -297,6 +308,7 @@ async fn run_reproduce(
         recorded_egress_allowlist,
         recorded_synchronizer_pcrs: inputs.synchronizer_pcrs,
         recorded_synchronizer_enabled: inputs.synchronizer_enabled,
+        recorded_upgrade_target: inputs.upgrade_target,
     })
 }
 
@@ -355,6 +367,7 @@ async fn run_builder(
     recorded_crates_rev: Option<&str>,
     recorded_synchronizer_pcrs: Option<&serde_json::Value>,
     recorded_synchronizer_enabled: bool,
+    recorded_upgrade_target: bool,
 ) -> Result<PcrTriple, CliError> {
     let builder_path = std::env::var("BUILDER_PATH").unwrap_or_else(|_| "builder".to_string());
     let output_dir = std::env::temp_dir().join(format!("enclavia-reproduce-{enclave_id}"));
@@ -393,7 +406,11 @@ async fn run_builder(
     // and PCR2. Passed as inline JSON (the builder detects the leading
     // `[`); old images therefore stay reproducible even after the live
     // cluster has rotated to new PCRs.
-    for arg in synchronizer_args(recorded_synchronizer_pcrs, recorded_synchronizer_enabled)? {
+    for arg in synchronizer_args(
+        recorded_synchronizer_pcrs,
+        recorded_synchronizer_enabled,
+        recorded_upgrade_target,
+    )? {
         cmd.arg(arg);
     }
 
@@ -631,25 +648,27 @@ pub(crate) async fn fetch_flake_source(
     Ok(PathBuf::from(parsed.path))
 }
 
-/// Build the `--synchronizer-pcrs` / `--synchronizer-enabled` argv tail
-/// from the recorded provenance.
+/// Build the `--synchronizer-pcrs` / `--synchronizer-enabled` /
+/// `--upgrade-target` argv tail from the recorded provenance.
 ///
 /// `(None, false)` is the pre-feature / feature-off shape: no flags, the
 /// rebuild mirrors a build without the synchronizer section. Anchors
 /// without the enabled flag replay a "baked but dormant" build. Enabled
 /// without anchors is impossible to rebuild (the builder rejects the
 /// combination), so we fail loudly instead of producing a guaranteed
-/// PCR mismatch.
+/// PCR mismatch. The upgrade-target marker lives in the synchronizer
+/// section, so it needs anchors too.
 fn synchronizer_args(
     pcrs: Option<&serde_json::Value>,
     enabled: bool,
+    upgrade_target: bool,
 ) -> Result<Vec<String>, CliError> {
-    match (pcrs, enabled) {
+    match (pcrs, enabled || upgrade_target) {
         (None, false) => Ok(vec![]),
         (None, true) => Err(CliError::Other(
-            "this version records synchronizer_enabled without synchronizer_pcrs; the builder \
-             rejects that combination, so the original build cannot be replayed (backend \
-             stamping bug?)"
+            "this version records synchronizer_enabled or upgrade_target without \
+             synchronizer_pcrs; the builder rejects that combination, so the original build \
+             cannot be replayed (backend stamping bug?)"
                 .into(),
         )),
         (Some(list), _) => {
@@ -659,6 +678,9 @@ fn synchronizer_args(
             let mut args = vec!["--synchronizer-pcrs".to_string(), json];
             if enabled {
                 args.push("--synchronizer-enabled".to_string());
+            }
+            if upgrade_target {
+                args.push("--upgrade-target".to_string());
             }
             Ok(args)
         }
@@ -792,6 +814,7 @@ mod tests {
             recorded_egress_allowlist: serde_json::Value::Null,
             recorded_synchronizer_pcrs: None,
             recorded_synchronizer_enabled: false,
+            recorded_upgrade_target: false,
         };
         assert!(r.is_reproducible());
 
@@ -859,6 +882,7 @@ mod tests {
             crates_rev: crates_rev.map(|s| s.to_string()),
             synchronizer_pcrs: None,
             synchronizer_enabled: false,
+            upgrade_target: false,
             created_at: chrono::Utc::now(),
         }
     }
@@ -964,6 +988,7 @@ mod tests {
         let inputs = ReproduceInputs::from_enclave_row(&enclave, "eid").unwrap();
         assert!(inputs.synchronizer_pcrs.is_none());
         assert!(!inputs.synchronizer_enabled);
+        assert!(!inputs.upgrade_target);
     }
 
     #[test]
@@ -982,24 +1007,26 @@ mod tests {
             pcr2: "c".repeat(96),
         }]);
         up.synchronizer_enabled = true;
+        up.upgrade_target = true;
         let inputs = ReproduceInputs::from_staged_upgrade(&up).unwrap();
         // The typed anchors re-serialise to the same JSON-array shape the
         // enclave-row path produces (PCR0/PCR1/PCR2 keys).
         assert_eq!(inputs.synchronizer_pcrs, Some(anchors_json()));
         assert!(inputs.synchronizer_enabled);
+        assert!(inputs.upgrade_target);
     }
 
     // -- synchronizer_args ----------------------------------------------------
 
     #[test]
     fn synchronizer_args_empty_when_feature_off() {
-        assert!(synchronizer_args(None, false).unwrap().is_empty());
+        assert!(synchronizer_args(None, false, false).unwrap().is_empty());
     }
 
     #[test]
     fn synchronizer_args_passes_inline_json_and_enabled_flag() {
         let anchors = anchors_json();
-        let args = synchronizer_args(Some(&anchors), true).unwrap();
+        let args = synchronizer_args(Some(&anchors), true, false).unwrap();
         assert_eq!(args.len(), 3);
         assert_eq!(args[0], "--synchronizer-pcrs");
         // Inline JSON: the builder detects the leading `[` and parses it
@@ -1012,17 +1039,28 @@ mod tests {
     #[test]
     fn synchronizer_args_anchors_without_enabled_omits_flag() {
         let anchors = anchors_json();
-        let args = synchronizer_args(Some(&anchors), false).unwrap();
+        let args = synchronizer_args(Some(&anchors), false, false).unwrap();
         assert_eq!(args.len(), 2);
         assert!(!args.contains(&"--synchronizer-enabled".to_string()));
     }
 
     #[test]
     fn synchronizer_args_enabled_without_anchors_errors() {
-        let err = synchronizer_args(None, true).unwrap_err();
+        let err = synchronizer_args(None, true, false).unwrap_err();
         assert!(
             err.to_string().contains("synchronizer_enabled"),
             "got: {err}"
         );
+        assert!(synchronizer_args(None, false, true).is_err());
+    }
+
+    /// An upgrade-target build replays `--upgrade-target` after the anchors.
+    #[test]
+    fn synchronizer_args_replays_the_upgrade_target_flag() {
+        let anchors = anchors_json();
+        let args = synchronizer_args(Some(&anchors), true, true).unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[2], "--synchronizer-enabled");
+        assert_eq!(args[3], "--upgrade-target");
     }
 }

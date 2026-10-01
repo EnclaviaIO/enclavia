@@ -13,8 +13,10 @@
 //!   the region directly off the host stream and compare against the
 //!   cluster's pinned commitment. Any mismatch is rollback evidence and
 //!   the client REFUSES to serve (fail-stop). A blank (all-zero) region
-//!   with no pinned key is a fresh device: register it and proceed.
-//!   A WRITTEN region with no pinned key under our PCR key is either a
+//!   with no pinned key is a fresh device: register it and proceed,
+//!   unless the measured config marks this image as an upgrade target
+//!   ([`ImageRole::UpgradeTarget`]), which never registers and goes to the
+//!   Transition branch below like a written region.//!   A WRITTEN region with no pinned key under our PCR key is either a
 //!   rollback or the first boot after a staged upgrade (#46): the pin
 //!   then lives under the OLD image's key, and the disambiguator is the
 //!   #47 upgrade `ChainLink`, fetched best-effort from `chain-host` and
@@ -290,22 +292,40 @@ pub enum BootDecision {
     FailStop(String),
 }
 
+/// What this image may do with a key the oracle does not know. Read from
+/// the measured config (`synchronizer.upgrade_target`), set by the builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageRole {
+    /// The enclave's first image: a blank volume under an unknown key is a
+    /// fresh enclave, which registers.
+    Genesis,
+    /// An image built as the target of an upgrade. Its pin can only come
+    /// from the `Transition` out of its predecessor, which carries the
+    /// predecessor's state, so it never registers: otherwise the host could
+    /// boot it on a blank disk once the upgrade link exists, have it serve
+    /// an empty volume as the owner's designated successor while the
+    /// predecessor's data is acknowledged, and block the real `Transition`
+    /// for good (the successor key would already exist).
+    UpgradeTarget,
+}
+
 /// The boot-time decision table. Pure so it can be tested exhaustively;
 /// this is the heart of the rollback-protection kernel.
 ///
-/// | device region | synchronizer | verdict |
-/// |---------------|--------------|---------|
-/// | any           | Found, hash matches    | Serve |
-/// | any           | Found, hash mismatches | FailStop (rollback or corruption) |
-/// | blank         | NotFound               | RegisterThenServe (fresh device) |
-/// | non-blank     | NotFound               | TransitionOrFailStop (staged upgrade, #46, or rollback evidence) |
+/// | device region | synchronizer | image role | verdict |
+/// |---------------|--------------|------------|---------|
+/// | any           | Found, hash matches    | any | Serve |
+/// | any           | Found, hash mismatches | any | FailStop (rollback or corruption) |
+/// | blank         | NotFound               | genesis | RegisterThenServe (fresh device) |
+/// | blank         | NotFound               | upgrade target | TransitionOrFailStop (an upgrade target never registers) |
+/// | non-blank     | NotFound               | any | TransitionOrFailStop (staged upgrade, #46, or rollback evidence) |
 ///
 /// Note the blank + Found case falls out of the hash compare: a pinned
 /// commitment over a blank region (registered at first boot, no write
 /// yet) matches a still-blank device and serves; a pinned commitment
 /// over real data against a blanked device mismatches and fail-stops
 /// (a wiped/substituted disk is a rollback).
-pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
+pub fn boot_decision(region: &[u8], outcome: &GetOutcome, role: ImageRole) -> BootDecision {
     match outcome {
         GetOutcome::Found { commitment, .. } => {
             if commitment_of_region(region) == *commitment {
@@ -320,7 +340,15 @@ pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
         }
         GetOutcome::NotFound => {
             if region_is_blank(region) {
-                BootDecision::RegisterThenServe
+                match role {
+                    ImageRole::Genesis => BootDecision::RegisterThenServe,
+                    ImageRole::UpgradeTarget => BootDecision::TransitionOrFailStop(
+                        "this image is an upgrade target and the synchronizer has no pinned \
+                         state for it: it can only adopt its predecessor's pin by a \
+                         Transition, never register a fresh volume; refusing to serve"
+                            .to_string(),
+                    ),
+                }
             } else {
                 BootDecision::TransitionOrFailStop(
                     "device carries a written superblock region but the synchronizer has no \
@@ -1551,9 +1579,10 @@ where
 }
 
 /// Run the boot decision table against a live session: `Get`, compare,
-/// and on a fresh device register the blank region. On the
-/// written-but-unpinned verdict, attempt the #46 staged-upgrade
-/// `Transition` (see [`transition_and_reverify`]); `upgrade_link` is the
+/// and on a fresh device of a [`ImageRole::Genesis`] image register the
+/// blank region. On the written-but-unpinned verdict, and on any unpinned
+/// volume of an [`ImageRole::UpgradeTarget`] image, attempt the #46
+/// staged-upgrade `Transition` (see [`transition_and_reverify`]); `upgrade_link` is the
 /// LAZY chain-host fetch, awaited only on that branch. Any verdict other
 /// than serve / register / successful transition propagates as a fatal
 /// error.
@@ -1565,6 +1594,7 @@ where
 pub async fn verify_or_register<O, F>(
     oracle: &mut O,
     key: PcrKey,
+    role: ImageRole,
     region: &[u8],
     upgrade_link: F,
 ) -> Result<Version, FatalError>
@@ -1582,7 +1612,7 @@ where
     let outcome =
         get_outcome(result).map_err(|e| format!("boot verify: synchronizer Get failed: {e}"))?;
 
-    match boot_decision(region, &outcome) {
+    match boot_decision(region, &outcome, role) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches pinned commitment; serving");
             let GetOutcome::Found { version, .. } = outcome else {
@@ -1743,7 +1773,7 @@ where
         })?;
     let outcome =
         get_outcome(result).map_err(|e| format!("boot verify: post-transition Get failed: {e}"))?;
-    match boot_decision(region, &outcome) {
+    match boot_decision(region, &outcome, ImageRole::UpgradeTarget) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches the migrated pinned commitment; serving");
             let GetOutcome::Found { version, .. } = outcome else {
@@ -1928,6 +1958,12 @@ struct RawSynchronizerSection {
     /// from the measured config and never from the environment.
     #[serde(default)]
     debug_attestation: bool,
+    /// `true` when the builder built this image as the target of an
+    /// upgrade ([`ImageRole::UpgradeTarget`]): it never registers. Absent
+    /// or `false` for an enclave's first image. Measured, like the rest of
+    /// the section.
+    #[serde(default)]
+    upgrade_target: bool,
 }
 
 /// The synchronizer trust anchors loaded from the MEASURED enclave
@@ -1944,6 +1980,9 @@ pub struct SynchronizerTrust {
     /// Verification mode for the server's document (see
     /// [`RawSynchronizerSection::debug_attestation`]).
     pub debug_attestation: bool,
+    /// What the boot decision may do with a key the oracle does not know
+    /// (see [`RawSynchronizerSection::upgrade_target`]).
+    pub role: ImageRole,
 }
 
 /// Load the 65-byte uncompressed SEC1 P-256 control pubkey from the
@@ -2030,6 +2069,11 @@ pub fn load_synchronizer_trust(path: &Path) -> Result<SynchronizerTrust, FatalEr
         control_pubkey,
         server_policy: ServerPcrPolicy::Expected(expected),
         debug_attestation: section.debug_attestation,
+        role: if section.upgrade_target {
+            ImageRole::UpgradeTarget
+        } else {
+            ImageRole::Genesis
+        },
     })
 }
 
@@ -2070,6 +2114,8 @@ pub struct SyncSession {
     /// This enclave's pin-identity key (PCR0-2 plus user PCRs 16-31, see
     /// `enclavia_protocol::pin_identity`).
     pub key: PcrKey,
+    /// This image's role from the measured config.
+    pub role: ImageRole,
 }
 
 /// Dial the host-side relay (CID 2, vsock port
@@ -2121,7 +2167,11 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
             .authenticate(doc, &trust.server_policy, trust.debug_attestation)
             .await?;
         info!("synchronizer session mutually authenticated (oracle PCRs verified)");
-        Ok::<_, FatalError>(SyncSession { client, key })
+        Ok::<_, FatalError>(SyncSession {
+            client,
+            key,
+            role: trust.role,
+        })
     })
     .await
     .map_err(|_| {
@@ -2164,6 +2214,7 @@ where
     let version = verify_or_register(
         &mut session.client,
         session.key,
+        session.role,
         &region,
         fetch_latest_upgrade_link(),
     )
@@ -2370,7 +2421,7 @@ mod tests {
             commitment: commitment_of_region(&region),
             version: Version(0),
         };
-        assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
+        assert_eq!(boot_decision(&region, &outcome, ImageRole::Genesis), BootDecision::Serve);
     }
 
     #[test]
@@ -2381,7 +2432,7 @@ mod tests {
             version: Version(0),
         };
         assert!(matches!(
-            boot_decision(&region, &outcome),
+            boot_decision(&region, &outcome, ImageRole::Genesis),
             BootDecision::FailStop(_)
         ));
     }
@@ -2390,9 +2441,38 @@ mod tests {
     fn decision_blank_not_found_registers() {
         let region = vec![0u8; SB_REGION_LEN];
         assert_eq!(
-            boot_decision(&region, &GetOutcome::NotFound),
+            boot_decision(&region, &GetOutcome::NotFound, ImageRole::Genesis),
             BootDecision::RegisterThenServe
         );
+    }
+
+    /// An upgrade target never registers: a blank volume its key has no pin
+    /// for goes to the Transition branch, like a written one. A pinned key
+    /// is judged by the hash compare, whatever the role.
+    #[test]
+    fn decision_upgrade_target_never_registers() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        assert!(matches!(
+            boot_decision(&blank, &GetOutcome::NotFound, ImageRole::UpgradeTarget),
+            BootDecision::TransitionOrFailStop(_)
+        ));
+        let region = region_with_data();
+        assert!(matches!(
+            boot_decision(&region, &GetOutcome::NotFound, ImageRole::UpgradeTarget),
+            BootDecision::TransitionOrFailStop(_)
+        ));
+        let pinned = GetOutcome::Found {
+            commitment: commitment_of_region(&blank),
+            version: Version(0),
+        };
+        assert_eq!(
+            boot_decision(&blank, &pinned, ImageRole::UpgradeTarget),
+            BootDecision::Serve
+        );
+        assert!(matches!(
+            boot_decision(&region, &pinned, ImageRole::UpgradeTarget),
+            BootDecision::FailStop(_)
+        ));
     }
 
     #[test]
@@ -2402,7 +2482,7 @@ mod tests {
         // upgrade link it still fail-stops (see the transition tests).
         let region = region_with_data();
         assert!(matches!(
-            boot_decision(&region, &GetOutcome::NotFound),
+            boot_decision(&region, &GetOutcome::NotFound, ImageRole::Genesis),
             BootDecision::TransitionOrFailStop(_)
         ));
     }
@@ -2416,7 +2496,7 @@ mod tests {
             commitment: commitment_of_region(&region),
             version: Version(0),
         };
-        assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
+        assert_eq!(boot_decision(&region, &outcome, ImageRole::Genesis), BootDecision::Serve);
     }
 
     #[test]
@@ -2428,7 +2508,7 @@ mod tests {
             version: Version(0),
         };
         assert!(matches!(
-            boot_decision(&region, &outcome),
+            boot_decision(&region, &outcome, ImageRole::Genesis),
             BootDecision::FailStop(_)
         ));
     }
@@ -2443,7 +2523,7 @@ mod tests {
             version: Version(0),
         };
         assert!(matches!(
-            boot_decision(&region, &outcome),
+            boot_decision(&region, &outcome, ImageRole::Genesis),
             BootDecision::FailStop(_)
         ));
     }
@@ -2600,7 +2680,7 @@ mod tests {
             vec![Ok(Version(7))],
         );
 
-        verify_or_register(&mut oracle, test_key(), &region, async {
+        verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2617,7 +2697,7 @@ mod tests {
         let region = region_with_data();
         let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { None })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback evidence"), "{err}");
@@ -2636,7 +2716,7 @@ mod tests {
             vec![Err(ClientError::Rpc(RpcError::TransitionRejected))],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2657,7 +2737,7 @@ mod tests {
             vec![Ok(Version(7))],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2674,7 +2754,7 @@ mod tests {
         let mut oracle =
             ScriptedOracle::new(vec![not_found(), not_found()], vec![], vec![Ok(Version(7))]);
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2695,11 +2775,75 @@ mod tests {
 
         let mut link = test_upgrade_link(3);
         link.kind = ChainLinkKind::Boot;
-        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(link) })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { Some(link) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback evidence"), "{err}");
         assert!(oracle.seen_transitions.is_empty());
+    }
+
+    /// The squatting the role closes: an upgrade target booted on a blank
+    /// disk before its predecessor transitioned. Without a link it fail-stops
+    /// (and never registers: the scripted Register deque is empty); with the
+    /// link it adopts the predecessor's pin and serves only if the volume is
+    /// what that pin holds.
+    #[tokio::test]
+    async fn upgrade_target_on_a_blank_disk_never_registers() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+        let err = verify_or_register(
+            &mut oracle,
+            test_key(),
+            ImageRole::UpgradeTarget,
+            &blank,
+            async { None },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("upgrade target"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+
+        // The predecessor holds written data: the migrated pin does not
+        // match the blank disk, fail-stop.
+        let mut oracle = ScriptedOracle::new(
+            vec![
+                not_found(),
+                Ok((Commitment(commitment_of_region(&region_with_data())), Version(5))),
+            ],
+            vec![],
+            vec![Ok(Version(5))],
+        );
+        let err = verify_or_register(
+            &mut oracle,
+            test_key(),
+            ImageRole::UpgradeTarget,
+            &blank,
+            async { Some(test_upgrade_link(4)) },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
+
+        // The predecessor never wrote: its blank pin moves over and serves.
+        let mut oracle = ScriptedOracle::new(
+            vec![
+                not_found(),
+                Ok((Commitment(commitment_of_region(&blank)), Version(0))),
+            ],
+            vec![],
+            vec![Ok(Version(0))],
+        );
+        let v = verify_or_register(
+            &mut oracle,
+            test_key(),
+            ImageRole::UpgradeTarget,
+            &blank,
+            async { Some(test_upgrade_link(4)) },
+        )
+        .await
+        .expect("the predecessor's blank pin, transitioned, serves");
+        assert_eq!(v, Version(0));
+        assert_eq!(oracle.seen_transitions.len(), 1);
     }
 
     /// A link that moves another identity's pin, or whose payload is not
@@ -2714,7 +2858,7 @@ mod tests {
         );
         let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
         let foreign = upgrade_link_to(3, other);
-        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(foreign) })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { Some(foreign) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not this enclave"), "{err}");
@@ -2723,7 +2867,7 @@ mod tests {
         let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
         let mut trailing = test_upgrade_link(3);
         trailing.payload.push(0x00);
-        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(trailing) })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { Some(trailing) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("canonical"), "{err}");
@@ -2741,7 +2885,7 @@ mod tests {
             vec![],
             vec![],
         );
-        verify_or_register(&mut oracle, test_key(), &region, async {
+        verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             panic!("matching pin must not fetch the upgrade link")
         })
         .await
@@ -2749,7 +2893,7 @@ mod tests {
 
         let blank = vec![0u8; SB_REGION_LEN];
         let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(())], vec![]);
-        verify_or_register(&mut oracle, test_key(), &blank, async {
+        verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async {
             panic!("fresh device must not fetch the upgrade link")
         })
         .await
@@ -2769,7 +2913,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             panic!("matching pin must not fetch the upgrade link")
         })
         .await
@@ -2779,7 +2923,7 @@ mod tests {
         // Register: exactly Version(0).
         let blank = vec![0u8; SB_REGION_LEN];
         let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(())], vec![]);
-        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap();
         assert_eq!(v, Version(0));
@@ -2793,7 +2937,7 @@ mod tests {
             vec![],
             vec![Ok(Version(3))],
         );
-        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(9))
         })
         .await
@@ -3439,6 +3583,29 @@ mod tests {
         };
         assert!(trust.server_policy.admits(&listed));
         assert!(!trust.server_policy.admits(&other));
+    }
+
+    /// `synchronizer.upgrade_target` selects the upgrade-target role; absent
+    /// (an enclave's first image) it is genesis.
+    #[test]
+    fn trust_reads_the_image_role() {
+        for (flag, role) in [
+            ("", ImageRole::Genesis),
+            (r#","upgrade_target": false"#, ImageRole::Genesis),
+            (r#","upgrade_target": true"#, ImageRole::UpgradeTarget),
+        ] {
+            let config = format!(
+                r#"{{"control_public_key": "{}", "synchronizer": {{"expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]{flag}}}}}"#,
+                control_pubkey_b64(),
+                hex48(0xa5),
+                hex48(0xa6),
+                hex48(0xa7),
+            );
+            let path = write_config(&format!("role-{}", flag.len()), &config);
+            let trust = load_synchronizer_trust(&path).expect("load");
+            std::fs::remove_file(&path).ok();
+            assert_eq!(trust.role, role, "config {config}");
+        }
     }
 
     /// `debug_attestation` defaults to FALSE (production full-chain
@@ -4268,7 +4435,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .expect("our own already-committed registration must not brick the boot");
         assert_eq!(v, Version(0));
@@ -4286,7 +4453,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -4305,7 +4472,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         assert!(
@@ -4327,7 +4494,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Register failed"), "{err}");
@@ -4346,7 +4513,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("registration raced"), "{err}");
