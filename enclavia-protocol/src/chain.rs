@@ -15,7 +15,8 @@
 //!   anti-rollback setting from its measured config
 //!   ([`AntiRollbackSetting`]); a boot of a new image must keep the
 //!   previous image's setting. The attestation's `user_data` is
-//!   `sha256(payload)` (checked by [`super::attestation::verify_chain_attestation`]).
+//!   `sha256(payload)` (checked by
+//!   [`super::attestation::UnvalidatedAttestation::validate_chain_link`]).
 //! * [`ChainLinkKind::Upgrade`] — emitted by the OLD enclave after the
 //!   backend signs and ships a `PrepareUpgrade` control command.
 //!   Payload binds `from / to / image_digest / valid_from / issued_at /
@@ -63,7 +64,9 @@ use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
+use crate::attestation::{
+    AttestationError, Pcrs, UnvalidatedAttestation, ValidatedAttestation,
+};
 use crate::pin_identity::PinIdentity;
 use crate::signing::{
     ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
@@ -606,7 +609,8 @@ pub enum Outcome {
 #[derive(Debug, thiserror::Error)]
 pub enum ChainValidationError {
     /// Bottom-line attestation verification (see
-    /// [`super::attestation::verify_chain_attestation`]).
+    /// [`super::attestation::UnvalidatedAttestation::validate_chain_link`]),
+    /// or the document's PCR0-2 are not the recorded ones.
     #[error("{0}")]
     Attestation(#[from] AttestationError),
     /// `attestation` byte vec is empty.
@@ -731,6 +735,11 @@ pub enum ChainValidationError {
 /// On `Ok(Outcome::Append { sequence })` the caller should INSERT the
 /// link assigning that sequence number. On `Ok(Outcome::Dedup)` the
 /// caller should not insert. On `Err(_)` the caller should reject.
+///
+/// `debug_mode` validates the attestation without its certificate chain, for
+/// links emitted under QEMU. It needs the `dangerous-skip-chain` feature;
+/// without it the link is refused with
+/// [`AttestationError::SkipChainNotCompiled`].
 pub fn validate_chain_link(
     link: &ChainLink,
     ctx: &ChainContext<'_>,
@@ -741,19 +750,46 @@ pub fn validate_chain_link(
         return Err(ChainValidationError::EmptyAttestation);
     }
     let recorded_pcrs = ctx.enclave_pcrs.to_pcrs()?;
-    let attested = verify_chain_attestation(
-        &link.attestation,
-        &link.payload,
-        &recorded_pcrs,
-        crate::attestation::VerificationMode::from_debug_flag(debug_mode),
-    )?;
+    let doc = link_attestation(link, debug_mode)?;
+    doc.require_pcrs(&recorded_pcrs)?;
 
     match link.kind {
         ChainLinkKind::Boot => validate_boot(link, ctx),
         ChainLinkKind::Upgrade | ChainLinkKind::Revocation => {
-            validate_signed(link, ctx, &attested, now)
+            validate_signed(link, ctx, doc.identity(), now)
         }
     }
+}
+
+/// Validate a link's attestation in the chain-link context: the document
+/// is bound to the link's payload. `debug_mode` skips the certificate chain
+/// (documents from QEMU's self-signing NSM); a build without the
+/// `dangerous-skip-chain` feature refuses it.
+fn link_attestation(
+    link: &ChainLink,
+    debug_mode: bool,
+) -> Result<ValidatedAttestation, AttestationError> {
+    let doc = UnvalidatedAttestation::from_bytes(link.attestation.clone());
+    if debug_mode {
+        return skip_chain(&doc, &link.payload);
+    }
+    doc.validate_chain_link(&link.payload)
+}
+
+#[cfg(any(test, feature = "dangerous-skip-chain"))]
+fn skip_chain(
+    doc: &UnvalidatedAttestation,
+    payload: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    doc.validate_chain_link_skip_chain(payload)
+}
+
+#[cfg(not(any(test, feature = "dangerous-skip-chain")))]
+fn skip_chain(
+    _doc: &UnvalidatedAttestation,
+    _payload: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    Err(AttestationError::SkipChainNotCompiled)
 }
 
 fn validate_boot(
@@ -1313,7 +1349,7 @@ pub enum PcrDescentError {
 /// the validator context (`row_*`, `control_public_key`, `upgradable`)
 /// from `GET /enclaves/{id}`. On success it returns the chain's TIP
 /// PCRs; the caller MUST then verify the LIVE attestation against
-/// exactly those PCRs (e.g. [`crate::attestation::verify_against`]) to
+/// exactly those PCRs (e.g. [`crate::attestation::ValidatedAttestation::require_pcrs`]) to
 /// bind the verified descendant version to the running Noise session.
 /// This function does not see the live attestation and so cannot make
 /// that binding itself.

@@ -240,7 +240,7 @@ where
 /// The mesh-identity signature is the channel-binding step the mutually
 /// attested mesh layers on top of the attestation document: it proves the
 /// enclave that produced the attestation (and announced
-/// [`crate::attestation::AttestedIdentity::control_pubkey`] in the doc's
+/// [`crate::attestation::ValidatedAttestation::control_pubkey`] in the doc's
 /// `user_data`) is the same party terminating *this* Noise channel, by
 /// signing the channel's handshake hash with the matching private key.
 #[derive(Debug, thiserror::Error)]
@@ -264,7 +264,8 @@ pub enum MeshIdentityError {
 /// live Noise handshake hash with the same per-boot identity key whose
 /// public half it stamped into its attestation document's `user_data`. The
 /// peer verifies the result with [`verify_mesh_identity`] after extracting
-/// that pubkey via [`crate::attestation::verify_and_extract`].
+/// that pubkey from the validated document
+/// ([`crate::attestation::ValidatedAttestation::control_pubkey`]).
 pub fn sign_mesh_identity(signing_key: &p256::ecdsa::SigningKey, handshake_hash: &[u8]) -> Vec<u8> {
     use p256::ecdsa::{Signature, signature::Signer};
     let sig: Signature = signing_key.sign(handshake_hash);
@@ -275,7 +276,8 @@ pub fn sign_mesh_identity(signing_key: &p256::ecdsa::SigningKey, handshake_hash:
 /// hash.
 ///
 /// `mesh_pubkey` is the 65-byte uncompressed SEC1 P-256 key extracted from
-/// the peer's attestation document (`AttestedIdentity::control_pubkey`);
+/// the peer's validated attestation document
+/// (`ValidatedAttestation::control_pubkey`);
 /// `signature` is the 64-byte raw r||s ECDSA signature the peer sent over
 /// the channel; `handshake_hash` is this Noise session's hash (identical on
 /// both ends). On success the caller knows the attested enclave is the same

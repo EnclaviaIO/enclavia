@@ -8,9 +8,9 @@
 //!    handshake hash with its per-boot mesh identity key, then sends both as a
 //!    [`MeshFrame::Authenticate`].
 //! 2. Reads the peer's `Authenticate` and verifies, in order:
-//!    * the attestation document with
-//!      [`enclavia_protocol::attestation::verify_and_extract`] (which enforces
-//!      the handshake-hash binding, so a captured document cannot be replayed,
+//!    * the attestation document, validated as a session document
+//!      ([`enclavia_protocol::attestation::UnvalidatedAttestation::validate_session`],
+//!      which enforces the handshake-hash binding, so a captured document cannot be replayed,
 //!      and yields the peer's PCRs + 65-byte SEC1 mesh pubkey);
 //!    * the peer's PCR digest against the self-PCR allowlist (it must be
 //!      running our image);
@@ -366,20 +366,17 @@ where
     };
 
     // 3. Verify the peer's attestation document (nonce binds it to this
-    //    session, yields the pin identity + mesh pubkey).
-    let extracted = attestation::verify_and_extract(
-        &peer_doc,
-        &handshake_hash,
-        attestation::VerificationMode::from_debug_flag(debug_mode),
-    )
-    .map_err(|e| {
-        tracing::warn!(reason = %e.reason(), error = %e, "mesh peer attestation rejected");
-        crate::metrics::record_rejection(crate::metrics::RejectionSource::Peer, e.reason());
-        HandshakeError::PeerAttestation(e)
-    })?;
-    // Same identity derivation as for customers (PCR0-2 plus user PCRs
-    // 16-31), so the allowlist compares full identities.
-    let pcr_digest = PcrKey(extracted.identity.key());
+    //    session, yields the pin identity + mesh pubkey). Same identity
+    //    derivation as for customers (PCR0-2 plus user PCRs 16-31), so the
+    //    allowlist compares full identities.
+    let (pcr_digest, peer_pubkey) =
+        crate::attest::validate_session(&peer_doc, &handshake_hash, debug_mode)
+            .and_then(|doc| Ok((PcrKey(doc.identity().key()), doc.control_pubkey()?)))
+            .map_err(|e| {
+                tracing::warn!(reason = %e.reason(), error = %e, "mesh peer attestation rejected");
+                crate::metrics::record_rejection(crate::metrics::RejectionSource::Peer, e.reason());
+                HandshakeError::PeerAttestation(e)
+            })?;
 
     // 4. Self-PCR allowlist: the peer must be running our image.
     if !allowlist.admits(&pcr_digest) {
@@ -399,7 +396,7 @@ where
     //    is what stops a relay from splicing a captured attestation onto a
     //    channel it terminates: it does not hold the private mesh key.
     enclavia_protocol::mesh::verify_mesh_identity(
-        &extracted.control_pubkey,
+        &peer_pubkey,
         &peer_sig,
         &handshake_hash,
     )
@@ -420,7 +417,7 @@ where
         transport,
         PeerIdentity {
             pcr_digest,
-            mesh_pubkey: extracted.control_pubkey,
+            mesh_pubkey: peer_pubkey,
         },
     ))
 }

@@ -14,6 +14,16 @@ license.workspace = true
 repository.workspace = true
 description = "In-enclave NBD client over vsock: backs the encrypted filesystem on top of the host-side storage relay."
 
+[features]
+default = ["dangerous-skip-chain"]
+# Validate the synchronizer's attestation without the AWS Nitro certificate
+# chain when the measured config says `synchronizer.debug_attestation =
+# true` (QEMU deployments, whose NSM self-signs). The choice is made at
+# runtime from the measured config, so this feature is on by default to keep
+# that behaviour; a build without it refuses the oracle's document whenever
+# the flag is set.
+dangerous-skip-chain = ["synchronizer/dangerous-skip-chain"]
+
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
@@ -27,16 +37,14 @@ tokio-vsock = { workspace = true }
 # The `client` feature deliberately pulls in NO mesh / NSM driver /
 # openraft; see synchronizer/Cargo.toml.
 synchronizer = { path = "../synchronizer", features = ["client"] }
-# `extract_own_pcrs` (derive our own PcrKey from the doc we just minted)
-# and the synchronizer relay port constant. The async Noise plumbing
-# lives behind the synchronizer client, so default features stay off.
-enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+# `ValidatedAttestation::request_local` (`nsm`: our own document, from which
+# we derive our PcrKey) and the synchronizer relay port constant. The async
+# Noise plumbing lives behind the synchronizer client, so default features
+# stay off.
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false, features = ["nsm"] }
 enclavia-vsock = { path = "../enclavia-vsock" }
 # SHA-256 of the primary btrfs superblock region: the pinned commitment.
 sha2.workspace = true
-# Drive /dev/nsm for the real attestation document (`nix` turns the
-# driver syscalls on; the workspace pin strips it by default).
-aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 # Read the #47 control pubkey out of /etc/enclavia/config.json (the same
 # field enclavia-server reads).
 serde.workspace = true

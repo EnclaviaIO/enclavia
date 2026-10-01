@@ -14,8 +14,20 @@ license.workspace = true
 repository.workspace = true
 description = "In-enclave Noise responder: terminates the encrypted channel and forwards plaintext to the inner container."
 
+[features]
+default = ["dangerous-skip-chain"]
+# Validate the synchronizer's attestation without the AWS Nitro certificate
+# chain when the measured config says `synchronizer.debug_attestation =
+# true` (QEMU deployments, whose NSM self-signs). The choice is made at
+# runtime from the measured config, so this feature is on by default to keep
+# that behaviour; a build without it refuses the oracle's document whenever
+# the flag is set.
+dangerous-skip-chain = ["synchronizer/dangerous-skip-chain"]
+
 [dependencies]
-enclavia-protocol = { path = "../enclavia-protocol" }
+# `nsm`: this enclave's own documents, through
+# `ValidatedAttestation::request_local`.
+enclavia-protocol = { path = "../enclavia-protocol", features = ["nsm"] }
 enclavia-vsock = { path = "../enclavia-vsock" }
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
@@ -34,9 +46,6 @@ sha2.workspace = true
 # (`UpgradePayload.valid_from` floor in `run_prepare_upgrade`).
 chrono = { workspace = true }
 tokio-vsock = { workspace = true }
-# Re-enable the `nix` feature: enclavia-server is the one place that
-# actually drives `/dev/nsm` to produce attestations.
-aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 # Customer-side synchronizer client: the RevokeUpgrade flow commits the
 # revocation to the synchronizer (for enclaves that pin storage there)
 # before reporting it done. The `client` feature carries no mesh / openraft.

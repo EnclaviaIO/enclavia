@@ -78,7 +78,7 @@ fn matching_pcrs() -> Pcrs {
 async fn upgrade_succeeds_and_streams_bytes_both_ways() {
     let url = spawn_test_server(|mut t| async move {
         // Attestation exchange in debug mode: server encodes a FakeAttestation
-        // pinned to the handshake hash so the SDK's verify_against passes.
+        // pinned to the handshake hash so the SDK's live-attestation check passes.
         match t.receive::<ClientMessage>().await.unwrap() {
             ClientMessage::RequestAttestation => {}
             other => panic!("expected RequestAttestation, got {other:?}"),

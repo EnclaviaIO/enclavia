@@ -1,32 +1,48 @@
-//! Nitro NSM attestation verification.
+//! Nitro NSM attestation documents, as two types.
 //!
-//! Two entry points share the same parse-and-verify core:
+//! - [`UnvalidatedAttestation`] holds bytes that came from outside this
+//!   process: a peer's `Authenticate` frame, a stored chain link, a backend
+//!   response. It exposes no contents at all (no PCRs, timestamp,
+//!   `user_data`), only the bytes for storing or forwarding. The way to
+//!   read a document is to validate it in a named context, so the binding
+//!   that context needs cannot be forgotten:
+//!   - [`UnvalidatedAttestation::validate_session`]: a document presented
+//!     on a live Noise session. Its `nonce` must equal the session's
+//!     handshake hash.
+//!   - [`UnvalidatedAttestation::validate_chain_link`]: a chain link's
+//!     document. Its `user_data` must equal `sha256(payload)`.
+//! - [`ValidatedAttestation`] is the only type with accessors. It has no
+//!   public constructor: it comes from one of the two methods above, or
+//!   from [`ValidatedAttestation::request_local`] (feature `nsm`), which
+//!   asks this process's OWN `/dev/nsm`. The local device is inside the
+//!   caller's trusted computing base, so its output needs no chain check.
 //!
-//! - [`verify_against`] — "is this document from the enclave I expected?"
-//!   The SDK's call path: a client knows what PCRs the target enclave is
-//!   supposed to have and wants the document to confirm it.
+//! Validation establishes authenticity. Which enclave to trust is policy,
+//! a separate step on the validated document:
+//! [`ValidatedAttestation::require_pcrs`],
+//! [`ValidatedAttestation::require_pcrs_in`],
+//! [`ValidatedAttestation::require_identity`], or the caller's own
+//! allowlist over [`ValidatedAttestation::identity`].
 //!
-//! - [`verify_and_extract`] — "what enclave produced this document?" The
-//!   synchronizer's call path: it does not pre-commit to a specific
-//!   identity; the document's verified PCRs *are* the identity, and the
-//!   caller hashes them into its own key. The doc must also carry the
-//!   enclave's raw 32-byte Ed25519 control pubkey in `user_data` — the
-//!   synchronizer registers it alongside the key and uses it to verify
-//!   `Transition` signatures later.
+//! ## Skipping the certificate chain
 //!
-//! Both check that the doc's nonce equals `base64(handshake_hash)`,
-//! binding the document to the live Noise session. Every entry point
-//! takes a [`VerificationMode`]: [`VerificationMode::Production`]
-//! validates the full AWS Nitro CA chain and COSE_Sign1 signature, while
-//! [`VerificationMode::DangerousSkipChain`] skips both (the in-enclave
-//! NSM self-signs when run under QEMU) and must never be reachable from
-//! runtime state a host or peer can influence.
+//! QEMU's emulated NSM signs documents with its own key, not under the AWS
+//! Nitro CA. [`UnvalidatedAttestation::validate_session_skip_chain`] and
+//! [`UnvalidatedAttestation::validate_chain_link_skip_chain`] check the
+//! structure, the context binding and (for a session document) the
+//! clock-skew bound, but NOT the certificate chain or the COSE signature,
+//! so any well-formed document passes, including one forged by the host.
+//! They exist only with the `dangerous-skip-chain` feature
+//! (implied by `test-utils`); a build without it has no way to skip the
+//! chain.
 //!
 //! ## Which clock the certificate chain is validated at
 //!
-//! Every session-bound entry point (the ones taking a `handshake_hash`)
-//! validates the chain at the document's own signed `timestamp`, not at
-//! the verifier's clock. The nonce proves the document is fresh for the
+//! Both contexts validate the chain at the document's own signed
+//! `timestamp`, not at the verifier's clock (see `nitro_verify.rs` for why
+//! that instant is sound).
+//!
+//! For a session document the nonce proves the document is fresh for the
 //! session; the verifier's clock would add only a failure mode: a Nitro
 //! leaf certificate becomes valid seconds before the first document it
 //! signs, so a verifier running even a few seconds slow would see it as
@@ -35,19 +51,16 @@
 //! The local clock is kept only as the coarse
 //! [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] sanity bound.
 //!
-//! [`verify_chain_attestation`] (stored chain-link documents, verified
-//! long after they were produced) also validates at the document's own
-//! timestamp, with no local-clock bound.
+//! A chain link is a stored record verified long after it was produced,
+//! so no bound against the local clock applies to it.
 
-use attestation_doc_validation::{
-    PCRProvider, attestation_doc::decode_attestation_document,
-    attestation_doc::get_pcrs as att_get_pcrs, validate_expected_nonce, validate_expected_pcrs,
-};
+use attestation_doc_validation::validate_expected_nonce;
 use aws_nitro_enclaves_nsm_api::api::AttestationDoc;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use crate::pin_identity::{PinIdentity, PinIdentityError};
+
 
 /// PCR (Platform Configuration Register) measurements that identify a
 /// specific enclave image and configuration:
@@ -200,7 +213,7 @@ impl std::fmt::Display for ValidationFailure {
     }
 }
 
-/// Errors from attestation verification.
+/// Errors from attestation validation and policy checks.
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
     /// Decode / structure / certificate chain / signature / clock-skew /
@@ -209,9 +222,8 @@ pub enum AttestationError {
     /// worth re-exporting).
     #[error("attestation document validation failed: {0}")]
     Validation(ValidationFailure),
-    /// A PCR value coming out of the validated document hex-decoded to
-    /// something other than 32/48/64 bytes. Should be unreachable for real
-    /// Nitro docs.
+    /// A PCR given to [`Pcrs::from_hex`] decoded to something other than
+    /// 32/48/64 bytes.
     #[error("attestation document PCR {idx} has unexpected length {len}")]
     InvalidPcrLength {
         /// The PCR index (0, 1, or 2).
@@ -219,38 +231,36 @@ pub enum AttestationError {
         /// The decoded length in bytes.
         len: usize,
     },
-    /// A PCR slot was not hex-encoded. Should be unreachable: the
-    /// upstream crate is the one that hex-encodes them on the way out.
+    /// A PCR given to [`Pcrs::from_hex`] is not hex.
     #[error("attestation document PCR {0} is not valid hex")]
     InvalidPcrHex(usize),
     /// The doc's `user_data` field is missing or not a 65-byte
-    /// uncompressed SEC1 ECDSA P-256 verifying key. Required by
-    /// [`verify_and_extract`] — the synchronizer needs the control
-    /// pubkey to verify `Transition` signatures later in the session.
+    /// uncompressed SEC1 ECDSA P-256 verifying key. Returned by
+    /// [`ValidatedAttestation::control_pubkey`]: the synchronizer needs the
+    /// control pubkey to verify `Transition` signatures later.
     #[error(
         "attestation document user_data is missing or not a 65-byte uncompressed SEC1 P-256 pubkey"
     )]
     InvalidControlPubkey,
     /// The doc's `user_data` field is missing or not the 32-byte
-    /// SHA-256 hash of the chain link's `payload`. Required by
-    /// [`verify_chain_attestation`] — every chain link binds its
-    /// `attestation.user_data` to `sha256(payload)`, so any mismatch
-    /// means either the payload or the attestation has been swapped.
+    /// SHA-256 hash of the chain link's `payload`. Returned by
+    /// [`UnvalidatedAttestation::validate_chain_link`]: every chain link
+    /// binds its `attestation.user_data` to `sha256(payload)`, so any
+    /// mismatch means either the payload or the attestation has been
+    /// swapped.
     #[error("attestation document user_data does not match sha256(payload)")]
     PayloadBindingMismatch,
     /// The doc's `user_data` field is missing or not exactly 32 bytes
     /// where a control nonce was expected. Returned by
-    /// [`verify_control_nonce_attestation`]: the in-enclave server's
+    /// [`ValidatedAttestation::control_nonce`]: the in-enclave server's
     /// `RequestAttestation` reply always embeds the current 32-byte
     /// control nonce as `user_data`, so any other shape means the
     /// document was produced for a different purpose (or tampered with).
     #[error("attestation document user_data is not a 32-byte control nonce")]
     InvalidControlNonce,
-    /// The document verified (structure, signature, nonce binding) but
-    /// its PCR0/1/2 equal NONE of the caller's expected triples.
-    /// Returned by [`verify_and_extract_pcrs`]: the presenting enclave
-    /// is genuine but is not the identity the caller trusts
-    /// (server authentication).
+    /// The document is genuine but its PCR0/1/2 equal NONE of the caller's
+    /// expected triples. Returned by [`ValidatedAttestation::require_pcrs_in`]:
+    /// the presenting enclave is not the identity the caller trusts.
     #[error("attestation document PCRs match none of the expected values")]
     PcrsNotExpected,
     /// The document's PCR map is not a valid pin identity (a missing
@@ -258,6 +268,11 @@ pub enum AttestationError {
     /// See [`crate::pin_identity`].
     #[error("attestation document PCRs are not a valid pin identity: {0}")]
     InvalidIdentity(#[from] PinIdentityError),
+    /// The caller asked to skip the certificate chain, but this build has no
+    /// skip-chain validation (its `dangerous-skip-chain` feature is off).
+    /// The document is refused, never validated some other way.
+    #[error("skipping the attestation certificate chain is not compiled into this build")]
+    SkipChainNotCompiled,
 }
 
 impl AttestationError {
@@ -272,6 +287,7 @@ impl AttestationError {
             | AttestationError::InvalidIdentity(_) => RejectionReason::Malformed,
             AttestationError::PayloadBindingMismatch => RejectionReason::PayloadBindingMismatch,
             AttestationError::PcrsNotExpected => RejectionReason::PcrMismatch,
+            AttestationError::SkipChainNotCompiled => RejectionReason::UntrustedChain,
         }
     }
 
@@ -337,433 +353,397 @@ pub const NON_UPGRADABLE_CONTROL_KEY: [u8; CONTROL_PUBKEY_LEN] = [
     0xda,
 ];
 
-/// Verified enclave identity extracted from an NSM attestation document.
+/// An attestation document received from outside this process, not yet
+/// validated. It exposes no contents; validate it in the context it was
+/// received in to read anything.
 ///
-/// Returned by [`verify_and_extract`] when the document validates and the
-/// caller wants both the pin identity (for deriving a session key) and the
-/// enclave's ECDSA P-256 control pubkey (for verifying future
-/// `Transition` signatures from this key).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttestedIdentity {
-    /// PCR0-2 and user PCRs 16-31 from the validated document, read by
-    /// the rules in [`crate::pin_identity`].
-    pub identity: PinIdentity,
-    /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key extracted
-    /// from the doc's `user_data` field. The synchronizer registers
-    /// this alongside the [`PinIdentity::key`]-derived key on first
-    /// attestation, and uses it to verify raw r||s signatures on
-    /// subsequent `Transition` RPCs.
-    pub control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+/// ```compile_fail,E0599
+/// // An unvalidated document has no accessors.
+/// let doc = enclavia_protocol::attestation::UnvalidatedAttestation::from_bytes(vec![]);
+/// let _ = doc.identity();
+/// ```
+#[cfg_attr(
+    not(feature = "dangerous-skip-chain"),
+    doc = "Without the `dangerous-skip-chain` feature the chain cannot be skipped:",
+    doc = "",
+    doc = "```compile_fail,E0599",
+    doc = "let doc = enclavia_protocol::attestation::UnvalidatedAttestation::from_bytes(vec![]);",
+    doc = "let _ = doc.validate_session_skip_chain(&[]);",
+    doc = "```"
+)]
+#[derive(Clone)]
+pub struct UnvalidatedAttestation {
+    bytes: Vec<u8>,
 }
 
-/// How much of an attestation document's cryptographic envelope is
-/// verified.
-///
-/// This used to be a bare `debug_mode: bool` on every verify entry
-/// point, which made the skip-the-root-of-trust switch look like any
-/// other flag (enclavia#101). The dedicated type makes the insecure
-/// choice explicit and greppable at every call site: constructing
-/// [`VerificationMode::DangerousSkipChain`] is a visible, reviewable
-/// act, never an anonymous `true`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerificationMode {
-    /// Full verification: the AWS Nitro CA chain is validated and the
-    /// COSE_Sign1 signature is verified. The only mode in which a
-    /// document proves anything about the hardware that produced it.
-    Production,
-    /// Structural decode ONLY: the CA chain and COSE signature are NOT
-    /// checked, so ANY well-formed document passes — including one
-    /// forged by the host. Exists solely for QEMU's self-signing
-    /// emulated NSM and the `test-utils` document builders. Must never
-    /// be selected by runtime state a host or peer can influence; every
-    /// production caller derives its mode from a compile-time feature
-    /// or an explicit developer opt-in.
-    DangerousSkipChain,
+impl std::fmt::Debug for UnvalidatedAttestation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnvalidatedAttestation")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
-impl VerificationMode {
-    /// Bridge from the workspace's established `debug_mode: bool`
-    /// plumbing (compile-time `cfg` constants in the synchronizer, the
-    /// SDK's explicit `ClientBuilder::debug_mode` opt-in).
+impl UnvalidatedAttestation {
+    /// Wrap document bytes received from a peer, a stored chain link or any
+    /// other channel. Nothing is decoded until a `validate_*` method runs.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// The raw bytes, for storing or forwarding. Not a way to read the
+    /// document: decoding them yourself skips every check this type exists
+    /// to enforce.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The raw bytes, for storing or forwarding (see [`Self::as_bytes`]).
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Validate a document presented on a live Noise session.
     ///
-    /// The argument MUST be a compile-time constant or an explicit
-    /// developer opt-in — never a value read from the environment, a
-    /// request, or any other channel the host or peer influences: `true`
-    /// disables the certificate chain that makes attestation mean
-    /// anything.
-    pub fn from_debug_flag(debug_mode: bool) -> Self {
-        if debug_mode {
-            Self::DangerousSkipChain
-        } else {
-            Self::Production
+    /// Checks, in order:
+    ///
+    /// 1. COSE_Sign1 decode and structure; the AWS Nitro CA chain at the
+    ///    document's own `timestamp`; the COSE signature under the leaf.
+    /// 2. The document's `timestamp` is within
+    ///    [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] of the verifier's clock.
+    /// 3. `nonce == handshake_hash`: the document was produced for THIS
+    ///    session, so a capture from any other session is refused.
+    /// 4. The PCR map is a valid pin identity (see
+    ///    [`crate::pin_identity`]).
+    pub fn validate_session(
+        &self,
+        handshake_hash: &[u8],
+    ) -> Result<ValidatedAttestation, AttestationError> {
+        validate_session_with(
+            &self.bytes,
+            handshake_hash,
+            Chain::Verify,
+            &SessionCtx::system(),
+        )
+    }
+
+    /// Validate a chain link's document against the link's `payload`.
+    ///
+    /// Checks, in order:
+    ///
+    /// 1. COSE_Sign1 decode and structure; the AWS Nitro CA chain at the
+    ///    document's own `timestamp`; the COSE signature under the leaf.
+    ///    A chain link is a stored record that is verified again long after
+    ///    it was produced, while a Nitro leaf certificate is valid for only
+    ///    a few hours, so the verifier's clock is not consulted. What this
+    ///    establishes is "genuine Nitro hardware attested this payload at
+    ///    `timestamp`", which is the claim a chain link makes.
+    /// 2. `user_data == sha256(payload)`: the binding that makes a chain
+    ///    entry tamper-evident.
+    /// 3. The PCR map is a valid pin identity.
+    ///
+    /// The `nonce` is not checked: a chain link is not produced in a Noise
+    /// session, so there is nothing to bind it to.
+    pub fn validate_chain_link(
+        &self,
+        payload: &[u8],
+    ) -> Result<ValidatedAttestation, AttestationError> {
+        validate_chain_link_with(
+            &self.bytes,
+            payload,
+            Chain::Verify,
+            crate::nitro_verify::AWS_NITRO_ROOT_CA_DER,
+        )
+    }
+
+    /// [`Self::validate_session`] WITHOUT the certificate chain or the COSE
+    /// signature: structure, clock-skew bound, nonce and pin identity only.
+    /// Any well-formed document passes, including one forged by the host. For QEMU's self-signing NSM and test fixtures only.
+    #[cfg(any(test, feature = "dangerous-skip-chain"))]
+    pub fn validate_session_skip_chain(
+        &self,
+        handshake_hash: &[u8],
+    ) -> Result<ValidatedAttestation, AttestationError> {
+        validate_session_with(
+            &self.bytes,
+            handshake_hash,
+            Chain::Skip,
+            &SessionCtx::system(),
+        )
+    }
+
+    /// [`Self::validate_chain_link`] WITHOUT the certificate chain or the
+    /// COSE signature: structure, payload binding and pin identity only.
+    /// Any well-formed document passes. For QEMU's self-signing NSM and
+    /// test fixtures only.
+    #[cfg(any(test, feature = "dangerous-skip-chain"))]
+    pub fn validate_chain_link_skip_chain(
+        &self,
+        payload: &[u8],
+    ) -> Result<ValidatedAttestation, AttestationError> {
+        validate_chain_link_with(
+            &self.bytes,
+            payload,
+            Chain::Skip,
+            crate::nitro_verify::AWS_NITRO_ROOT_CA_DER,
+        )
+    }
+}
+
+/// Where a [`ValidatedAttestation`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Requested from this process's own `/dev/nsm`
+    /// ([`ValidatedAttestation::request_local`]).
+    Local,
+    /// Received on a Noise session
+    /// ([`UnvalidatedAttestation::validate_session`]).
+    Session {
+        /// `false` when validated with the skip-chain method.
+        chain_verified: bool,
+    },
+    /// A chain link's document
+    /// ([`UnvalidatedAttestation::validate_chain_link`]).
+    ChainLink {
+        /// `false` when validated with the skip-chain method.
+        chain_verified: bool,
+    },
+}
+
+/// An attestation document whose authenticity has been established: it
+/// passed validation in a named context, or it came from this process's own
+/// `/dev/nsm`. The only type with accessors for a document's contents.
+///
+/// There is no public constructor, no conversion from bytes and no
+/// deserialisation:
+///
+/// ```compile_fail,E0451
+/// // The fields are private, so it cannot be assembled by hand.
+/// let _ = enclavia_protocol::attestation::ValidatedAttestation { bytes: vec![] };
+/// ```
+///
+/// ```compile_fail,E0277
+/// // No conversion from bytes.
+/// let _: enclavia_protocol::attestation::ValidatedAttestation = vec![0u8].into();
+/// ```
+///
+/// ```compile_fail,E0277
+/// // No deserialisation.
+/// fn decode<T: serde::de::DeserializeOwned>() {}
+/// decode::<enclavia_protocol::attestation::ValidatedAttestation>();
+/// ```
+///
+/// ```compile_fail,E0599
+/// // No default value.
+/// let _ = enclavia_protocol::attestation::ValidatedAttestation::default();
+/// ```
+#[derive(Clone)]
+pub struct ValidatedAttestation {
+    bytes: Vec<u8>,
+    identity: PinIdentity,
+    timestamp_ms: u64,
+    user_data: Option<Vec<u8>>,
+    provenance: Provenance,
+}
+
+impl std::fmt::Debug for ValidatedAttestation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedAttestation")
+            .field("provenance", &self.provenance)
+            .field("identity", &self.identity)
+            .field("timestamp_ms", &self.timestamp_ms)
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ValidatedAttestation {
+    /// Request a document from this process's OWN `/dev/nsm`. BLOCKING (the
+    /// driver is a blocking ioctl): call it from a blocking context, or
+    /// through `spawn_blocking` from async code.
+    ///
+    /// The result is trusted without a chain check: the local NSM device is
+    /// the hardware module measuring this very enclave (or, under QEMU's
+    /// nitro-enclave machine, the emulated module measuring the same), so
+    /// the caller is reading its own measurements, not authenticating a
+    /// remote party. This is the only way to wrap NSM output in a
+    /// [`ValidatedAttestation`].
+    #[cfg(feature = "nsm")]
+    pub fn request_local(
+        nonce: Option<&[u8]>,
+        user_data: Option<&[u8]>,
+        public_key: Option<&[u8]>,
+    ) -> Result<Self, LocalAttestationError> {
+        use aws_nitro_enclaves_nsm_api::api::{Request, Response};
+        use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+
+        let fd = nsm_init();
+        if fd < 0 {
+            return Err(LocalAttestationError::Device(
+                "nsm_init failed (is /dev/nsm present?)".into(),
+            ));
         }
+        let request = Request::Attestation {
+            user_data: user_data.map(|b| b.to_vec().into()),
+            nonce: nonce.map(|b| b.to_vec().into()),
+            public_key: public_key.map(|b| b.to_vec().into()),
+        };
+        let response = nsm_process_request(fd, request);
+        nsm_exit(fd);
+        let bytes = match response {
+            Response::Attestation { document } => document,
+            Response::Error(e) => {
+                return Err(LocalAttestationError::Device(format!(
+                    "NSM attestation error: {e:?}"
+                )));
+            }
+            other => {
+                return Err(LocalAttestationError::Device(format!(
+                    "unexpected NSM response: {other:?}"
+                )));
+            }
+        };
+        let doc = decode_only(&bytes).map_err(LocalAttestationError::Document)?;
+        Self::from_doc(bytes, doc, Provenance::Local).map_err(LocalAttestationError::Document)
     }
 
-    fn skips_chain(self) -> bool {
-        matches!(self, Self::DangerousSkipChain)
+    fn from_doc(
+        bytes: Vec<u8>,
+        doc: AttestationDoc,
+        provenance: Provenance,
+    ) -> Result<Self, AttestationError> {
+        let identity = PinIdentity::from_doc_pcrs(&doc.pcrs)?;
+        Ok(Self {
+            bytes,
+            identity,
+            timestamp_ms: doc.timestamp,
+            user_data: doc.user_data.map(|b| b.into_vec()),
+            provenance,
+        })
+    }
+
+    /// Where this document came from.
+    pub fn provenance(&self) -> Provenance {
+        self.provenance
+    }
+
+    /// The document's pin identity: PCR0-2 and user PCRs 16-31, read by the
+    /// rules in [`crate::pin_identity`].
+    pub fn identity(&self) -> &PinIdentity {
+        &self.identity
+    }
+
+    /// The document's image PCRs (PCR0-2).
+    pub fn pcrs(&self) -> Pcrs {
+        self.identity.image_pcrs()
+    }
+
+    /// The NSM `timestamp`, in milliseconds since the Unix epoch. The Nitro
+    /// hypervisor stamps it; on a [`Provenance::Local`] document neither the
+    /// parent instance nor the enclave's own clock can move it, so it is a
+    /// trusted "now". On a remote document it is the instant the chain was
+    /// validated at, not a statement about the present.
+    pub fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+
+    /// The document's `user_data`, if any.
+    pub fn user_data(&self) -> Option<&[u8]> {
+        self.user_data.as_deref()
+    }
+
+    /// The raw document bytes, for sending or storing.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The raw document bytes, for sending or storing.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// `user_data` read as an ECDSA P-256 control pubkey: exactly
+    /// [`CONTROL_PUBKEY_LEN`] bytes in uncompressed SEC1 form (`0x04`
+    /// prefix). An enclave announces its control pubkey this way on a
+    /// synchronizer session, and a mesh node its mesh pubkey.
+    pub fn control_pubkey(&self) -> Result<[u8; CONTROL_PUBKEY_LEN], AttestationError> {
+        let key: [u8; CONTROL_PUBKEY_LEN] = self
+            .user_data()
+            .ok_or(AttestationError::InvalidControlPubkey)?
+            .try_into()
+            .map_err(|_| AttestationError::InvalidControlPubkey)?;
+        // The compressed forms (0x02 / 0x03) are refused so no verifier has
+        // to handle point decompression.
+        if key[0] != 0x04 {
+            return Err(AttestationError::InvalidControlPubkey);
+        }
+        Ok(key)
+    }
+
+    /// `user_data` read as the in-enclave server's 32-byte control nonce,
+    /// which its `RequestAttestation` reply carries. A backend that verifies
+    /// the reply before dispatching a signed control command learns both
+    /// that the session ends in the expected enclave and that the nonce it
+    /// signs was minted there.
+    pub fn control_nonce(&self) -> Result<[u8; 32], AttestationError> {
+        self.user_data()
+            .ok_or(AttestationError::InvalidControlNonce)?
+            .try_into()
+            .map_err(|_| AttestationError::InvalidControlNonce)
+    }
+
+    /// Policy: the document's PCR0-2 equal `expected`.
+    pub fn require_pcrs(&self, expected: &Pcrs) -> Result<(), AttestationError> {
+        if self.pcrs() != *expected {
+            return Err(AttestationError::validation(
+                RejectionReason::PcrMismatch,
+                "attestation document PCR0-2 differ from the expected values",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Policy: the document's PCR0-2 equal one of `expected`; returns the
+    /// matching triple. An empty `expected` admits nothing. User PCRs are
+    /// not compared, for anchors that are PCR0-2 triples (the synchronizer's
+    /// measured configs, `enclavia reproduce`).
+    pub fn require_pcrs_in(&self, expected: &[Pcrs]) -> Result<Pcrs, AttestationError> {
+        let pcrs = self.pcrs();
+        if !expected.contains(&pcrs) {
+            return Err(AttestationError::PcrsNotExpected);
+        }
+        Ok(pcrs)
+    }
+
+    /// Policy: the document carries exactly `expected`, user PCRs 16-31
+    /// included (absent ones read as zero).
+    pub fn require_identity(&self, expected: &PinIdentity) -> Result<(), AttestationError> {
+        self.require_pcrs(&expected.image_pcrs())?;
+        if self.identity != *expected {
+            return Err(AttestationError::validation(
+                RejectionReason::PcrMismatch,
+                "attestation document user PCRs (16-31) differ from the expected identity",
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Verify an attestation document against expected PCRs.
-///
-/// SDK entry point. The caller has pinned the enclave's identity at
-/// configure-time and wants `Ok(())` on a match or an error otherwise.
-///
-/// Checks performed (in order, in both [`VerificationMode`]s):
-///
-/// 1. Parse + structural validation of the COSE_Sign1 wrapper.
-/// 2. Nonce equals `base64(handshake_hash)`.
-/// 3. PCR0/1/2 in the doc equal the caller-supplied `expected_pcrs`.
-///
-/// Additionally, in [`VerificationMode::Production`], the AWS Nitro CA
-/// chain is validated and the COSE signature is verified.
-pub fn verify_against(
-    attestation_data: &[u8],
-    handshake_hash: &[u8],
-    expected_pcrs: &Pcrs,
-    mode: VerificationMode,
-) -> Result<(), AttestationError> {
-    let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
-    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
-
-    validate_expected_pcrs(&doc, &pcrs_hex)
-        .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
-
-    Ok(())
+/// Errors from [`ValidatedAttestation::request_local`].
+#[cfg(feature = "nsm")]
+#[derive(Debug, thiserror::Error)]
+pub enum LocalAttestationError {
+    /// The `/dev/nsm` driver failed to initialise or answered with an
+    /// error.
+    #[error("/dev/nsm: {0}")]
+    Device(String),
+    /// The device returned a document that does not decode, or whose PCR
+    /// map is not a valid pin identity.
+    #[error("own NSM attestation document: {0}")]
+    Document(AttestationError),
 }
 
-/// Verify a control-nonce attestation and return the attested nonce.
-///
-/// Backend control-dispatch entry point (upgrade-chain hardening). Before signing
-/// and sending a control command, the dispatcher requests an attestation
-/// over the control channel; the in-enclave server's reply binds the
-/// live Noise session (doc `nonce` = `base64(handshake_hash)`) and
-/// carries the current 32-byte control nonce in `user_data`. Verifying
-/// the document before dispatch gives the caller two guarantees a bare
-/// `GetControlNonce` round-trip cannot:
-///
-/// 1. The Noise session terminates inside the enclave whose PCRs the
-///    caller expected, with no host in the middle, so the eventual
-///    `ControlResult` is authentic rather than the relay's word.
-/// 2. The nonce embedded in the signed command was minted by that
-///    enclave, not substituted on the way through the host.
-///
-/// Verification is [`verify_against`] (COSE chain in production mode,
-/// session-nonce binding, PCR equality) plus a requirement that
-/// `user_data` is exactly 32 bytes, returned as the attested control
-/// nonce.
-pub fn verify_control_nonce_attestation(
-    attestation_data: &[u8],
-    handshake_hash: &[u8],
-    expected_pcrs: &Pcrs,
-    mode: VerificationMode,
-) -> Result<[u8; 32], AttestationError> {
-    let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
-    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
-
-    validate_expected_pcrs(&doc, &pcrs_hex)
-        .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
-
-    let user_data = doc
-        .user_data
-        .as_ref()
-        .ok_or(AttestationError::InvalidControlNonce)?;
-    user_data
-        .as_slice()
-        .try_into()
-        .map_err(|_| AttestationError::InvalidControlNonce)
-}
-
-/// Verify an attestation document and return the enclave identity it
-/// embeds.
-///
-/// Synchronizer entry point. The caller does not know in advance which
-/// enclave is connecting — the verified document's PCRs *are* the
-/// identity, and the doc's `user_data` carries the enclave's ECDSA P-256
-/// control pubkey. The caller derives a stable session key from the
-/// returned [`AttestedIdentity::identity`] with [`PinIdentity::key`]
-/// (PCR0-2 plus user PCRs 16-31), and registers
-/// [`AttestedIdentity::control_pubkey`] for verifying future
-/// `Transition` RPCs from this key.
-///
-/// Verification is identical to [`verify_against`] minus the
-/// `expected_pcrs` equality check (there are no expected PCRs at this
-/// layer — the doc's nonce binding to the handshake hash is what
-/// authenticates the document's origin to the live session), plus a
-/// requirement that `user_data` is exactly [`CONTROL_PUBKEY_LEN`]
-/// bytes — the uncompressed SEC1 ECDSA P-256 verifying key.
-pub fn verify_and_extract(
-    attestation_data: &[u8],
-    handshake_hash: &[u8],
-    mode: VerificationMode,
-) -> Result<AttestedIdentity, AttestationError> {
-    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
-
-    let identity = PinIdentity::from_doc_pcrs(&doc.pcrs)?;
-
-    let user_data = doc
-        .user_data
-        .as_ref()
-        .ok_or(AttestationError::InvalidControlPubkey)?;
-    let control_pubkey: [u8; CONTROL_PUBKEY_LEN] = user_data
-        .as_slice()
-        .try_into()
-        .map_err(|_| AttestationError::InvalidControlPubkey)?;
-    // SEC1 uncompressed-form prefix must be 0x04. Anything else (0x02 /
-    // 0x03 compressed, or random bytes that happen to fit) is rejected
-    // here so the in-enclave verifier doesn't have to handle the
-    // compressed-form decompression path.
-    if control_pubkey[0] != 0x04 {
-        return Err(AttestationError::InvalidControlPubkey);
-    }
-
-    Ok(AttestedIdentity {
-        identity,
-        control_pubkey,
-    })
-}
-
-/// Verify an attestation document's session binding AND that its PCRs
-/// equal one of the caller's `expected` triples, with no `user_data`
-/// requirement. Returns the verified PCRs (which of the expected set
-/// matched).
-///
-/// Server-authentication entry point.
-/// The synchronizer's CUSTOMER client uses this to authenticate the
-/// ORACLE back to itself: the synchronizer sends its own NSM document
-/// bound to the live Noise session and the client validates it here
-/// against the synchronizer measurements it trusts.
-///
-/// Checks performed:
-///
-/// 1. Parse + structural validation of the COSE_Sign1 wrapper; in
-///    [`VerificationMode::Production`] the AWS Nitro CA chain is
-///    validated and the COSE signature verified, exactly like
-///    [`verify_against`] / [`verify_and_extract`].
-/// 2. Nonce equals `base64(handshake_hash)`: the document is bound to
-///    *this* Noise session, so a document captured from any other
-///    session (including the mesh and other customers' sessions) is
-///    rejected.
-/// 3. The document's PCR0/1/2 equal one of `expected` EXACTLY. An empty
-///    `expected` admits nothing. The comparison is mandatory and lives
-///    here (not at the caller) so no public API exists that verifies a
-///    document without committing to an identity; a bare
-///    verify-and-return-PCRs form would be passable by ANY enclave,
-///    including a reflection of the caller's own document.
-///
-/// The server's user PCRs (16-31) are deliberately not compared. A user
-/// PCR holds only what the enclave's own measured code extends into it,
-/// and that code is already pinned by PCR0-2; the synchronizer extends
-/// none. So they carry nothing the PCR0-2 anchor does not already fix,
-/// and the anchors (measured configs, the backend's list, `enclavia
-/// reproduce`) stay PCR0-2 triples. Customer enclaves are different:
-/// their per-enclave data lives in user PCRs, which is why their pin
-/// identity (see [`crate::pin_identity`]) includes them.
-///
-/// Differs from [`verify_against`] in accepting a SET of valid triples
-/// (a deployment may roll between two cluster images), and from
-/// [`verify_and_extract`] in not requiring (or reading) `user_data`:
-/// the server side of the customer protocol carries no control pubkey,
-/// so demanding one would force the server to stuff a meaningless value
-/// into the document.
-pub fn verify_and_extract_pcrs(
-    attestation_data: &[u8],
-    handshake_hash: &[u8],
-    expected: &[Pcrs],
-    mode: VerificationMode,
-) -> Result<Pcrs, AttestationError> {
-    let doc = verify_session_bound(attestation_data, handshake_hash, mode)?;
-
-    let hex_pcrs = att_get_pcrs(&doc)
-        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
-
-    let pcrs = Pcrs {
-        pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
-        pcr1: decode_pcr(&hex_pcrs.pcr_1, 1)?,
-        pcr2: decode_pcr(&hex_pcrs.pcr_2, 2)?,
-    };
-    if !expected.iter().any(|e| e == &pcrs) {
-        return Err(AttestationError::PcrsNotExpected);
-    }
-    Ok(pcrs)
-}
-
-/// Extract PCR0/1/2 from an attestation document the caller JUST obtained from
-/// its OWN `/dev/nsm`, WITHOUT verifying the certificate chain or the nonce.
-///
-/// # This is NOT a verification function. Read before using.
-///
-/// Every other entry point in this module (`verify_against`,
-/// `verify_and_extract`, `verify_control_nonce_attestation`,
-/// `verify_chain_attestation`) authenticates a document that came from SOMEONE
-/// ELSE: in production it validates the AWS Nitro CA chain and the COSE
-/// signature, and it binds the document to a live Noise session via the nonce.
-/// This function does NONE of that. It only structurally decodes the COSE_Sign1
-/// envelope and pulls out the PCRs. A document fed to it could be a forgery and
-/// it would happily return whatever PCRs the forgery claims.
-///
-/// That is acceptable for, and ONLY for, one caller: a node deriving its OWN
-/// self-PCR digest from a document it just requested from its OWN local
-/// `/dev/nsm`. The local NSM device is inside the node's trusted computing base
-/// (on real Nitro it is the hardware module measuring this very VM; under
-/// QEMU's nitro-enclave machine it is the emulated module measuring the same),
-/// so there is no cert chain to trust (the node is reading its own hardware
-/// measurements, not authenticating a remote party) and there is no Noise
-/// session to bind to (the node generated the request itself, with an arbitrary
-/// nonce). This replaces a host-supplied PCR allowlist, which the host (the
-/// adversary) could otherwise choose to admit a rogue image into the mesh.
-///
-/// Do NOT use this on a document received over the network, ever: use
-/// [`verify_and_extract`] (peer attestation) or [`verify_against`] (pinned
-/// identity) for that.
-pub fn extract_own_pcrs(attestation_data: &[u8]) -> Result<Pcrs, AttestationError> {
-    // Structural decode only: no cert chain, no signature, no nonce. The
-    // `DangerousSkipChain` arm of `parse_and_validate` is exactly this
-    // (decode_attestation_document), and it is correct here on BOTH QEMU and
-    // real Nitro because the caller is reading its own local device, not
-    // authenticating a remote party.
-    let doc = parse_and_validate(attestation_data, VerificationMode::DangerousSkipChain)?;
-    let hex_pcrs = att_get_pcrs(&doc)
-        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
-    Ok(Pcrs {
-        pcr0: decode_pcr(&hex_pcrs.pcr_0, 0)?,
-        pcr1: decode_pcr(&hex_pcrs.pcr_1, 1)?,
-        pcr2: decode_pcr(&hex_pcrs.pcr_2, 2)?,
-    })
-}
-
-/// Read the pin identity (PCR0-2 and user PCRs 16-31, see
-/// [`crate::pin_identity`]) from an attestation document the caller JUST
-/// obtained from its OWN `/dev/nsm`, WITHOUT verifying the certificate
-/// chain or the nonce.
-///
-/// # This is NOT a verification function
-///
-/// Same contract as [`extract_own_pcrs`]: the only acceptable input is a
-/// document the caller requested from its own local NSM device. A node uses
-/// it to learn the identity (and so the synchronizer key) a peer derives
-/// from the same document with [`verify_and_extract`]. Never feed it a
-/// document received over the network.
-pub fn extract_own_identity(attestation_data: &[u8]) -> Result<PinIdentity, AttestationError> {
-    let doc = parse_and_validate(attestation_data, VerificationMode::DangerousSkipChain)?;
-    Ok(PinIdentity::from_doc_pcrs(&doc.pcrs)?)
-}
-
-/// Read the NSM `timestamp` (milliseconds since the Unix epoch) from an
-/// attestation document the caller JUST obtained from its OWN `/dev/nsm`,
-/// WITHOUT verifying the certificate chain or the signature.
-///
-/// # This is NOT a verification function
-///
-/// Same contract as [`extract_own_pcrs`]: the only acceptable input is a
-/// document the caller requested from its own local NSM device a moment
-/// ago. The Nitro hypervisor stamps `timestamp`, and neither the parent
-/// instance nor the enclave's own (unsynchronised) wall clock can move it,
-/// so a node can use it as a trusted "now" for time-gated decisions without
-/// trusting its system clock. Never feed it a document received over the
-/// network: a remote party chooses whatever timestamp it likes there.
-pub fn extract_own_timestamp_ms(attestation_data: &[u8]) -> Result<u64, AttestationError> {
-    let doc = parse_and_validate(attestation_data, VerificationMode::DangerousSkipChain)?;
-    Ok(doc.timestamp)
-}
-
-/// Verify a chain-link attestation document.
-///
-/// Used by the backend's `POST /enclaves/{id}/chain-links` ingest
-/// path: each chain link (`boot`, `upgrade`, `revocation`) carries a
-/// hardware-signed `attestation` whose `user_data` field commits to the
-/// link's `payload` via `sha256(payload)`. This function performs the
-/// minimum-trust check required at ingest:
-///
-/// 1. Parse + structural validation of the COSE_Sign1 wrapper (same as
-///    [`verify_against`] / [`verify_and_extract`]).
-/// 2. `attestation.user_data == sha256(payload)` — the binding that
-///    makes the chain entry tamper-evident.
-/// 3. PCR0/1/2 in the doc equal `expected_pcrs` (the backend's recorded
-///    PCRs for this enclave, post-build).
-///
-/// Returns the document's full pin identity (PCR0-2 plus user PCRs 16-31,
-/// see [`crate::pin_identity`]) so a caller that holds a claimed identity,
-/// such as an upgrade link's `from`, can compare all of it. Use
-/// [`verify_chain_attestation_identity`] when the whole identity is
-/// expected.
-///
-/// In [`VerificationMode::Production`], the AWS Nitro CA chain is
-/// validated and the COSE signature is verified, same as the
-/// session-bound entry points. The chain is validated at the document's
-/// own signed `timestamp`: a chain link is a stored record that is verified
-/// again long after it was produced (the synchronizer's `Transition` after
-/// an upgrade timelock, SDK and CLI chain walks), while a Nitro leaf
-/// certificate is valid for only a few hours, so validating at the
-/// verifier's clock would reject every link older than that. What the
-/// check establishes is "genuine Nitro hardware attested this payload at
-/// `timestamp`", which is the claim a chain link makes. No bound against
-/// the local clock applies here, since old links are legitimate.
-///
-/// In [`VerificationMode::DangerousSkipChain`], only
-/// structural validity is required —
-/// matching QEMU's emulated NSM device, which signs documents with its
-/// own key instead of the AWS CA (and the `test-utils` doc builders,
-/// which carry placeholder signatures).
-///
-/// The doc's `nonce` field is **not** checked here. The chain-link
-/// attestations are not produced in the context of a Noise session, so
-/// there is no handshake hash to bind against; the binding lives in
-/// `user_data` instead. Any value in `nonce` is accepted.
-pub fn verify_chain_attestation(
-    attestation_data: &[u8],
-    payload: &[u8],
-    expected_pcrs: &Pcrs,
-    mode: VerificationMode,
-) -> Result<PinIdentity, AttestationError> {
-    let pcrs_hex = PcrsHex::from_pcrs(expected_pcrs);
-    let doc = parse_and_validate(attestation_data, mode)?;
-
-    let user_data = doc
-        .user_data
-        .as_ref()
-        .ok_or(AttestationError::PayloadBindingMismatch)?;
-    let expected: [u8; 32] = {
-        let mut hasher = Sha256::new();
-        hasher.update(payload);
-        hasher.finalize().into()
-    };
-    if user_data.as_slice() != expected {
-        return Err(AttestationError::PayloadBindingMismatch);
-    }
-
-    validate_expected_pcrs(&doc, &pcrs_hex)
-        .map_err(|e| AttestationError::validation(RejectionReason::PcrMismatch, e.to_string()))?;
-
-    Ok(PinIdentity::from_doc_pcrs(&doc.pcrs)?)
-}
-
-/// [`verify_chain_attestation`] against a full pin identity: the document
-/// must carry exactly `expected`, user PCRs 16-31 included (absent ones
-/// read as zero, see [`crate::pin_identity`]).
-///
-/// Used wherever a link's claimed identity decides something, e.g. the
-/// synchronizer's `Transition`, which moves the pin held by the key of an
-/// upgrade link's `from` identity: the link's attestation must prove the
-/// enclave that emitted it had exactly that identity.
-pub fn verify_chain_attestation_identity(
-    attestation_data: &[u8],
-    payload: &[u8],
-    expected: &PinIdentity,
-    mode: VerificationMode,
-) -> Result<(), AttestationError> {
-    let attested =
-        verify_chain_attestation(attestation_data, payload, &expected.image_pcrs(), mode)?;
-    if attested != *expected {
-        return Err(AttestationError::validation(
-            RejectionReason::PcrMismatch,
-            "attestation document user PCRs (16-31) differ from the expected identity",
-        ));
-    }
-    Ok(())
-}
-
-/// Largest accepted distance between a session-bound document's signed
+/// Largest accepted distance between a session document's signed
 /// `timestamp` and the verifier's clock, in either direction.
 ///
 /// Not a freshness check: the handshake-hash nonce already proves the
@@ -777,9 +757,18 @@ pub fn verify_chain_attestation_identity(
 /// check this replaced (the leaf is only valid for a few hours).
 pub const MAX_SESSION_DOC_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Verification context for a session-bound document: the trust anchor and
-/// the verifier's clock. Production uses [`SessionCtx::system`]; the unit
-/// tests substitute a test CA and a chosen "now".
+/// Whether a validation checks the certificate chain. `Skip` exists only in
+/// builds that have the skip-chain methods.
+#[derive(Clone, Copy)]
+enum Chain {
+    Verify,
+    #[cfg(any(test, feature = "dangerous-skip-chain"))]
+    Skip,
+}
+
+/// Verification context for a session document: the trust anchor and the
+/// verifier's clock. Production uses [`SessionCtx::system`]; the unit tests
+/// substitute a test CA and a chosen "now".
 struct SessionCtx<'a> {
     root_der: &'a [u8],
     now_ms: u64,
@@ -796,39 +785,26 @@ impl SessionCtx<'static> {
     }
 }
 
-/// Parse and verify a document bound to a live Noise session: the shared
-/// core of every entry point that takes a `handshake_hash`.
-///
-/// In [`VerificationMode::Production`] the certificate chain is validated
-/// at the document's own signed `timestamp`, not at the verifier's clock
-/// (see `nitro_verify.rs` for why that instant is sound). The nonce check
-/// below is what makes the document fresh for this session, so the
-/// verifier's clock only enters as the coarse
-/// [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] sanity bound. The bound applies in
-/// [`VerificationMode::DangerousSkipChain`] too, which skips only the chain
-/// and the signature: QEMU's emulated NSM stamps the host's wall clock
-/// (whole seconds), so a genuine QEMU document is as close to the
-/// verifier's clock as a Nitro one.
-fn verify_session_bound(
-    attestation_data: &[u8],
+/// The session context. With [`Chain::Verify`] the chain is validated at
+/// the document's own `timestamp`, and the verifier's clock enters only as
+/// the [`MAX_SESSION_DOC_CLOCK_SKEW_MS`] bound. `Chain::Skip` skips only the
+/// chain and the signature; the bound still applies, since QEMU's emulated
+/// NSM stamps the host's wall clock (whole seconds).
+fn validate_session_with(
+    bytes: &[u8],
     handshake_hash: &[u8],
-    mode: VerificationMode,
-) -> Result<AttestationDoc, AttestationError> {
-    verify_session_bound_with(
-        attestation_data,
-        handshake_hash,
-        mode,
-        &SessionCtx::system(),
-    )
-}
-
-fn verify_session_bound_with(
-    attestation_data: &[u8],
-    handshake_hash: &[u8],
-    mode: VerificationMode,
+    chain: Chain,
     ctx: &SessionCtx<'_>,
-) -> Result<AttestationDoc, AttestationError> {
-    let doc = parse_and_validate_with_root(attestation_data, mode, ctx.root_der)?;
+) -> Result<ValidatedAttestation, AttestationError> {
+    let (doc, chain_verified) = match chain {
+        Chain::Verify => (
+            crate::nitro_verify::validate_at_doc_timestamp(bytes, ctx.root_der)
+                .map_err(AttestationError::Validation)?,
+            true,
+        ),
+        #[cfg(any(test, feature = "dangerous-skip-chain"))]
+        Chain::Skip => (decode_only(bytes)?, false),
+    };
     let skew = doc.timestamp.abs_diff(ctx.now_ms);
     if skew > MAX_SESSION_DOC_CLOCK_SKEW_MS {
         return Err(AttestationError::validation(
@@ -842,42 +818,50 @@ fn verify_session_bound_with(
     }
 
     check_nonce(&doc, handshake_hash)?;
-    Ok(doc)
+    ValidatedAttestation::from_doc(bytes.to_vec(), doc, Provenance::Session { chain_verified })
 }
 
-/// Structural decode only (the [`VerificationMode::DangerousSkipChain`]
-/// path).
-fn decode_only(attestation_data: &[u8]) -> Result<AttestationDoc, AttestationError> {
-    let (_, doc) = decode_attestation_document(attestation_data)
-        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
-    Ok(doc)
-}
+/// The chain-link context. The chain is validated at the document's own
+/// `timestamp`; the local clock is not consulted.
+fn validate_chain_link_with(
+    bytes: &[u8],
+    payload: &[u8],
+    chain: Chain,
+    root_der: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    let (doc, chain_verified) = match chain {
+        Chain::Verify => (
+            crate::nitro_verify::validate_at_doc_timestamp(bytes, root_der)
+                .map_err(AttestationError::Validation)?,
+            true,
+        ),
+        #[cfg(any(test, feature = "dangerous-skip-chain"))]
+        Chain::Skip => (decode_only(bytes)?, false),
+    };
 
-/// Parse without a session binding ([`verify_chain_attestation`],
-/// [`extract_own_pcrs`]). In production the chain is checked at the
-/// document's own signed `timestamp`, and the local clock is not consulted.
-fn parse_and_validate(
-    attestation_data: &[u8],
-    mode: VerificationMode,
-) -> Result<AttestationDoc, AttestationError> {
-    parse_and_validate_with_root(
-        attestation_data,
-        mode,
-        crate::nitro_verify::AWS_NITRO_ROOT_CA_DER,
+    let user_data = doc
+        .user_data
+        .as_ref()
+        .ok_or(AttestationError::PayloadBindingMismatch)?;
+    let expected: [u8; 32] = Sha256::digest(payload).into();
+    if user_data.as_slice() != expected {
+        return Err(AttestationError::PayloadBindingMismatch);
+    }
+
+    ValidatedAttestation::from_doc(
+        bytes.to_vec(),
+        doc,
+        Provenance::ChainLink { chain_verified },
     )
 }
 
-fn parse_and_validate_with_root(
-    attestation_data: &[u8],
-    mode: VerificationMode,
-    root_der: &[u8],
-) -> Result<AttestationDoc, AttestationError> {
-    if mode.skips_chain() {
-        decode_only(attestation_data)
-    } else {
-        crate::nitro_verify::validate_at_doc_timestamp(attestation_data, root_der)
-            .map_err(AttestationError::Validation)
-    }
+/// Structural decode only: COSE_Sign1 and document structure, nothing
+/// authenticated.
+#[cfg(any(test, feature = "dangerous-skip-chain", feature = "nsm"))]
+fn decode_only(bytes: &[u8]) -> Result<AttestationDoc, AttestationError> {
+    let (_, doc) = attestation_doc_validation::attestation_doc::decode_attestation_document(bytes)
+        .map_err(|e| AttestationError::validation(RejectionReason::Malformed, e.to_string()))?;
+    Ok(doc)
 }
 
 fn check_nonce(doc: &AttestationDoc, handshake_hash: &[u8]) -> Result<(), AttestationError> {
@@ -886,50 +870,6 @@ fn check_nonce(doc: &AttestationDoc, handshake_hash: &[u8]) -> Result<(), Attest
         .map_err(|e| AttestationError::validation(RejectionReason::NonceMismatch, e.to_string()))
 }
 
-fn decode_pcr(hex_str: &str, idx: usize) -> Result<Vec<u8>, AttestationError> {
-    let bytes = hex::decode(hex_str).map_err(|_| AttestationError::InvalidPcrHex(idx))?;
-    if ![32usize, 48, 64].contains(&bytes.len()) {
-        return Err(AttestationError::InvalidPcrLength {
-            idx,
-            len: bytes.len(),
-        });
-    }
-    Ok(bytes)
-}
-
-/// Internal hex-encoded view of a [`Pcrs`] for the `PCRProvider` trait.
-/// The upstream crate compares PCRs by string equality on hex
-/// representations, so we encode once at the entry point.
-struct PcrsHex {
-    pcr0: String,
-    pcr1: String,
-    pcr2: String,
-}
-
-impl PcrsHex {
-    fn from_pcrs(pcrs: &Pcrs) -> Self {
-        Self {
-            pcr0: hex::encode(&pcrs.pcr0),
-            pcr1: hex::encode(&pcrs.pcr1),
-            pcr2: hex::encode(&pcrs.pcr2),
-        }
-    }
-}
-
-impl PCRProvider for PcrsHex {
-    fn pcr_0(&self) -> Option<&str> {
-        Some(&self.pcr0)
-    }
-    fn pcr_1(&self) -> Option<&str> {
-        Some(&self.pcr1)
-    }
-    fn pcr_2(&self) -> Option<&str> {
-        Some(&self.pcr2)
-    }
-    fn pcr_8(&self) -> Option<&str> {
-        None
-    }
-}
 
 /// Test-only helpers for constructing attestation documents with known
 /// PCRs and nonces. Behind the `test-utils` feature so downstream test
@@ -964,10 +904,9 @@ pub mod test_utils {
     }
 
     /// Builder for synthetic attestation documents accepted by
-    /// [`verify_against`](super::verify_against) /
-    /// [`verify_and_extract`](super::verify_and_extract) in debug mode.
+    /// [`UnvalidatedAttestation::validate_session_skip_chain`](super::UnvalidatedAttestation::validate_session_skip_chain).
     ///
-    /// In debug mode the COSE signature is not validated, so any
+    /// Without the chain check the COSE signature is not validated, so any
     /// well-formed COSE_Sign1 envelope around a well-formed
     /// [`AttestationDoc`] is accepted. PCR0/1/2 are 48-byte SHA-384
     /// values (matches what real Nitro hardware emits).
@@ -980,7 +919,7 @@ pub mod test_utils {
         /// before comparing, so it works out.
         pub handshake_hash: Vec<u8>,
         /// 65-byte uncompressed SEC1 ECDSA P-256 verifying key. Encoded
-        /// into the doc's `user_data` field — [`super::verify_and_extract`]
+        /// into the doc's `user_data` field — [`super::ValidatedAttestation::control_pubkey`]
         /// requires this to be a 65-byte pubkey with the SEC1 prefix
         /// `0x04`.
         pub control_pubkey: [u8; super::CONTROL_PUBKEY_LEN],
@@ -1033,7 +972,7 @@ pub mod test_utils {
         }
 
         /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
-        /// `debug_mode` verify path.
+        /// skip-chain session validation.
         pub fn encode(&self) -> Vec<u8> {
             assert_eq!(self.pcr0.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
             assert_eq!(self.pcr1.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
@@ -1054,7 +993,7 @@ pub mod test_utils {
                 Digest::SHA384,
                 now_ms(),
                 pcrs,
-                // certificate / cabundle: not validated in debug mode,
+                // certificate / cabundle: not validated without the chain check,
                 // but `validate_attestation_document_structure` does
                 // require each cert byte slice to be 1..=1024 bytes.
                 vec![0u8; 64],
@@ -1089,8 +1028,8 @@ pub mod test_utils {
 
     /// Builder for synthetic control-nonce attestation documents
     /// accepted by
-    /// [`verify_control_nonce_attestation`](super::verify_control_nonce_attestation)
-    /// in debug mode. Mirrors the in-enclave server's
+    /// [`UnvalidatedAttestation::validate_session_skip_chain`](super::UnvalidatedAttestation::validate_session_skip_chain)
+    /// and read by [`ValidatedAttestation::control_nonce`](super::ValidatedAttestation::control_nonce). Mirrors the in-enclave server's
     /// `RequestAttestation` reply shape: `nonce` carries the Noise
     /// handshake hash, `user_data` carries the 32-byte control nonce.
     pub struct FakeControlNonceAttestation {
@@ -1118,7 +1057,7 @@ pub mod test_utils {
         }
 
         /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
-        /// `debug_mode` verify path.
+        /// skip-chain session validation.
         pub fn encode(&self) -> Vec<u8> {
             assert_eq!(self.pcr0.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
             assert_eq!(self.pcr1.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
@@ -1159,8 +1098,8 @@ pub mod test_utils {
     }
 
     /// Builder for synthetic chain-link attestation documents accepted
-    /// by [`verify_chain_attestation`](super::verify_chain_attestation)
-    /// in debug mode. Differs from [`FakeAttestation`] in two ways:
+    /// by [`UnvalidatedAttestation::validate_chain_link_skip_chain`](super::UnvalidatedAttestation::validate_chain_link_skip_chain).
+    /// Differs from [`FakeAttestation`] in two ways:
     ///   * `user_data` carries the SHA-256 of a caller-supplied
     ///     `payload` (not the control pubkey, which the chain ingest
     ///     path doesn't read).
@@ -1205,7 +1144,7 @@ pub mod test_utils {
         }
 
         /// CBOR-encoded COSE_Sign1 bytes ready to pass through the
-        /// `debug_mode` chain-attestation verify path.
+        /// skip-chain chain-link validation.
         pub fn encode(&self) -> Vec<u8> {
             assert_eq!(self.pcr0.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
             assert_eq!(self.pcr1.len(), 48, "test PCRs must be 48 bytes (SHA-384)");
@@ -1226,7 +1165,7 @@ pub mod test_utils {
                 vec![0u8; 64],
                 vec![vec![0u8; 64]],
                 Some(self.user_data.clone()),
-                // Nonce is not consulted by `verify_chain_attestation`,
+                // Nonce is not consulted by `validate_chain_link`,
                 // but the doc has to carry one to serialise. Zero-padded
                 // to a length the structure-validator accepts.
                 Some(vec![0u8; 32]),
@@ -1254,244 +1193,19 @@ pub mod test_utils {
 mod tests {
     use super::*;
 
-    /// Every test document comes from the `test-utils` builders (or the
-    /// QEMU-shaped self-signed path), so the chain-skipping mode is the
-    /// only one that can accept them.
-    const DM: VerificationMode = VerificationMode::DangerousSkipChain;
-
     fn hh() -> Vec<u8> {
         // 32-byte BLAKE2s-shaped handshake hash for tests.
         (0u8..32).collect()
     }
 
-    #[test]
-    fn verify_and_extract_returns_doc_identity_in_debug_mode() {
-        let fake = test_utils::FakeAttestation::with_seed(0x11, hh());
-        let bytes = fake.encode();
-
-        let identity = verify_and_extract(&bytes, &hh(), DM).expect("verify");
-        assert_eq!(
-            identity.identity.image()[0].as_slice(),
-            fake.pcr0.as_slice()
-        );
-        assert_eq!(
-            identity.identity.image()[1].as_slice(),
-            fake.pcr1.as_slice()
-        );
-        assert_eq!(
-            identity.identity.image()[2].as_slice(),
-            fake.pcr2.as_slice()
-        );
-        assert_eq!(identity.control_pubkey, fake.control_pubkey);
+    /// Every test document comes from the `test-utils` builders, which carry
+    /// placeholder signatures, so only the skip-chain methods accept them.
+    fn session(bytes: Vec<u8>, hh: &[u8]) -> Result<ValidatedAttestation, AttestationError> {
+        UnvalidatedAttestation::from_bytes(bytes).validate_session_skip_chain(hh)
     }
 
-    #[test]
-    fn extract_own_pcrs_returns_doc_pcrs_without_nonce_or_chain() {
-        // A document the node "just got from its own /dev/nsm" (here a
-        // FakeAttestation fixture). extract_own_pcrs must return its PCR0/1/2
-        // verbatim with no nonce/cert-chain check, so the node can derive its
-        // own self-PCR digest regardless of the throwaway/self-signed key.
-        let fake = test_utils::FakeAttestation::with_seed(0x5a, hh());
-        let bytes = fake.encode();
-
-        let pcrs = extract_own_pcrs(&bytes).expect("extract own pcrs");
-        assert_eq!(pcrs.pcr0, fake.pcr0);
-        assert_eq!(pcrs.pcr1, fake.pcr1);
-        assert_eq!(pcrs.pcr2, fake.pcr2);
-
-        // The digest matches what verify_and_extract derives for the same doc,
-        // i.e. it is the SAME identity a peer would compute, just without the
-        // verification a peer document requires.
-        let verified = verify_and_extract(&bytes, &hh(), DM).expect("verify");
-        assert_eq!(pcrs, verified.identity.image_pcrs());
-        assert_eq!(
-            extract_own_identity(&bytes).expect("extract own identity"),
-            verified.identity
-        );
-    }
-
-    #[test]
-    fn extract_own_pcrs_ignores_the_nonce_entirely() {
-        // Unlike verify_and_extract, extract_own_pcrs takes no handshake hash
-        // and never inspects the nonce: a doc minted with one nonce still
-        // yields its PCRs. (The node mints the request itself with an arbitrary
-        // nonce; there is no session to bind to.)
-        let fake = test_utils::FakeAttestation::with_seed(0x77, vec![0xde; 32]);
-        let pcrs = extract_own_pcrs(&fake.encode()).expect("extract own pcrs");
-        assert_eq!(pcrs.pcr0, fake.pcr0);
-    }
-
-    #[test]
-    fn extract_own_pcrs_rejects_garbage_bytes() {
-        let err = extract_own_pcrs(b"not a cose document").unwrap_err();
-        assert!(
-            matches!(err, AttestationError::Validation(_)),
-            "expected Validation, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn extract_own_timestamp_reads_the_doc_timestamp() {
-        // FakeAttestation stamps the current time; the point is that the
-        // value comes out of the document, with no nonce or chain check.
-        let fake = test_utils::FakeAttestation::with_seed(0x21, vec![0xde; 32]);
-        let before = test_utils::now_ms();
-        let ts = extract_own_timestamp_ms(&fake.encode()).unwrap();
-        assert!((before..=test_utils::now_ms()).contains(&ts), "{ts}");
-        assert!(extract_own_timestamp_ms(b"not a cose document").is_err());
-    }
-
-    #[test]
-    fn verify_control_nonce_attestation_returns_attested_nonce() {
-        let nonce = [0xab; 32];
-        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), nonce);
-        let expected = Pcrs {
-            pcr0: fake.pcr0.clone(),
-            pcr1: fake.pcr1.clone(),
-            pcr2: fake.pcr2.clone(),
-        };
-
-        let got =
-            verify_control_nonce_attestation(&fake.encode(), &hh(), &expected, DM).expect("verify");
-        assert_eq!(got, nonce);
-    }
-
-    #[test]
-    fn verify_control_nonce_attestation_rejects_wrong_pcrs() {
-        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
-        let wrong = Pcrs {
-            pcr0: vec![0xff; 48],
-            pcr1: fake.pcr1.clone(),
-            pcr2: fake.pcr2.clone(),
-        };
-
-        let err = verify_control_nonce_attestation(&fake.encode(), &hh(), &wrong, DM).unwrap_err();
-        assert!(matches!(err, AttestationError::Validation(_)), "{err}");
-    }
-
-    #[test]
-    fn verify_control_nonce_attestation_rejects_wrong_handshake_hash() {
-        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
-        let expected = Pcrs {
-            pcr0: fake.pcr0.clone(),
-            pcr1: fake.pcr1.clone(),
-            pcr2: fake.pcr2.clone(),
-        };
-        let other_hh: Vec<u8> = (100u8..132).collect();
-
-        let err =
-            verify_control_nonce_attestation(&fake.encode(), &other_hh, &expected, DM).unwrap_err();
-        assert!(matches!(err, AttestationError::Validation(_)), "{err}");
-    }
-
-    #[test]
-    fn verify_control_nonce_attestation_rejects_non_32_byte_user_data() {
-        let mut fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
-        fake.control_nonce = vec![0xab; 16]; // wrong length
-        let expected = Pcrs {
-            pcr0: fake.pcr0.clone(),
-            pcr1: fake.pcr1.clone(),
-            pcr2: fake.pcr2.clone(),
-        };
-
-        let err =
-            verify_control_nonce_attestation(&fake.encode(), &hh(), &expected, DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::InvalidControlNonce),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn verify_and_extract_rejects_doc_without_user_data() {
-        // Build a doc with `user_data: None` by constructing it directly,
-        // since `FakeAttestation::encode` always populates user_data.
-        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
-        use ciborium::value::Value as CborValue;
-        use std::collections::BTreeMap;
-
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0usize, vec![0x11u8; 48]);
-        pcrs.insert(1usize, vec![0x12u8; 48]);
-        pcrs.insert(2usize, vec![0x13u8; 48]);
-        pcrs.insert(8usize, vec![0u8; 48]);
-
-        let doc = AttestationDoc::new(
-            "test-module".to_string(),
-            Digest::SHA384,
-            test_utils::now_ms(),
-            pcrs,
-            vec![0u8; 64],
-            vec![vec![0u8; 64]],
-            None, // user_data missing — the case under test.
-            Some(hh()),
-            None,
-        );
-
-        let mut payload = Vec::new();
-        ciborium::into_writer(&doc, &mut payload).unwrap();
-        let cose = CborValue::Array(vec![
-            CborValue::Bytes(vec![0xa0]),
-            CborValue::Map(Vec::new()),
-            CborValue::Bytes(payload),
-            CborValue::Bytes(vec![0u8; 96]),
-        ]);
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&cose, &mut bytes).unwrap();
-
-        let err = verify_and_extract(&bytes, &hh(), DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::InvalidControlPubkey),
-            "expected InvalidControlPubkey, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verify_and_extract_rejects_doc_with_wrong_size_user_data() {
-        let mut fake = test_utils::FakeAttestation::with_seed(0x22, hh());
-        // Override user_data via the `control_pubkey` field by encoding
-        // a longer payload — done by reaching directly into the struct
-        // and re-encoding manually. Easier: build the doc inline with a
-        // 16-byte user_data.
-        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
-        use ciborium::value::Value as CborValue;
-        use std::collections::BTreeMap;
-        let _ = &mut fake;
-
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0usize, vec![0x22u8; 48]);
-        pcrs.insert(1usize, vec![0x23u8; 48]);
-        pcrs.insert(2usize, vec![0x24u8; 48]);
-        pcrs.insert(8usize, vec![0u8; 48]);
-
-        let doc = AttestationDoc::new(
-            "test-module".to_string(),
-            Digest::SHA384,
-            test_utils::now_ms(),
-            pcrs,
-            vec![0u8; 64],
-            vec![vec![0u8; 64]],
-            Some(vec![0u8; 16]), // 16 bytes is the wrong size.
-            Some(hh()),
-            None,
-        );
-
-        let mut payload = Vec::new();
-        ciborium::into_writer(&doc, &mut payload).unwrap();
-        let cose = CborValue::Array(vec![
-            CborValue::Bytes(vec![0xa0]),
-            CborValue::Map(Vec::new()),
-            CborValue::Bytes(payload),
-            CborValue::Bytes(vec![0u8; 96]),
-        ]);
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&cose, &mut bytes).unwrap();
-
-        let err = verify_and_extract(&bytes, &hh(), DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::InvalidControlPubkey),
-            "expected InvalidControlPubkey, got {err:?}"
-        );
+    fn chain_link(bytes: Vec<u8>, payload: &[u8]) -> Result<ValidatedAttestation, AttestationError> {
+        UnvalidatedAttestation::from_bytes(bytes).validate_chain_link_skip_chain(payload)
     }
 
     /// The expected-PCR triple matching `FakeAttestation::with_seed(seed)`.
@@ -1503,83 +1217,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verify_and_extract_pcrs_returns_doc_pcrs_in_debug_mode() {
-        let fake = test_utils::FakeAttestation::with_seed(0x66, hh());
-        let pcrs =
-            verify_and_extract_pcrs(&fake.encode(), &hh(), &[seed_pcrs(0x66)], DM).expect("verify");
-        assert_eq!(pcrs.pcr0, fake.pcr0);
-        assert_eq!(pcrs.pcr1, fake.pcr1);
-        assert_eq!(pcrs.pcr2, fake.pcr2);
+    /// A COSE_Sign1 around a document with PCR0-2 from `seed`, PCR8, and the
+    /// given `user_data` / `nonce`, for shapes the builders do not produce.
+    fn doc_with(seed: u8, user_data: Option<Vec<u8>>, nonce: Option<Vec<u8>>) -> Vec<u8> {
+        doc_at(seed, test_utils::now_ms(), user_data, nonce)
     }
 
-    #[test]
-    fn verify_and_extract_pcrs_rejects_unexpected_pcrs() {
-        let fake = test_utils::FakeAttestation::with_seed(0x66, hh());
-        let err =
-            verify_and_extract_pcrs(&fake.encode(), &hh(), &[seed_pcrs(0x99)], DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::PcrsNotExpected),
-            "expected PcrsNotExpected, got {err:?}"
-        );
-        // An empty expected set admits nothing.
-        let err = verify_and_extract_pcrs(&fake.encode(), &hh(), &[], DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::PcrsNotExpected),
-            "expected PcrsNotExpected, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verify_and_extract_pcrs_rejects_wrong_handshake_hash() {
-        let fake = test_utils::FakeAttestation::with_seed(0x67, hh());
-        let wrong: Vec<u8> = vec![0xab; 32];
-        let err =
-            verify_and_extract_pcrs(&fake.encode(), &wrong, &[seed_pcrs(0x67)], DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::Validation(_)),
-            "expected Validation, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verify_and_extract_pcrs_rejects_garbage_bytes() {
-        let err = verify_and_extract_pcrs(b"not a cose document", &hh(), &[seed_pcrs(0x66)], DM)
-            .unwrap_err();
-        assert!(
-            matches!(err, AttestationError::Validation(_)),
-            "expected Validation, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verify_and_extract_pcrs_accepts_doc_without_user_data() {
-        // The server side of the customer protocol carries no control
-        // pubkey, so the doc may legitimately omit user_data (a real
-        // /dev/nsm request with user_data = None). Build one inline,
-        // since FakeAttestation always populates user_data.
-        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
+    fn doc_at(
+        seed: u8,
+        timestamp_ms: u64,
+        user_data: Option<Vec<u8>>,
+        nonce: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        use aws_nitro_enclaves_nsm_api::api::Digest as NsmDigest;
         use ciborium::value::Value as CborValue;
         use std::collections::BTreeMap;
 
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0usize, vec![0x68u8; 48]);
-        pcrs.insert(1usize, vec![0x69u8; 48]);
-        pcrs.insert(2usize, vec![0x6au8; 48]);
-        pcrs.insert(8usize, vec![0u8; 48]);
-
+        let pcrs = seed_pcrs(seed);
+        let mut map = BTreeMap::new();
+        map.insert(0usize, pcrs.pcr0);
+        map.insert(1usize, pcrs.pcr1);
+        map.insert(2usize, pcrs.pcr2);
+        map.insert(8usize, vec![0u8; 48]);
         let doc = AttestationDoc::new(
             "test-module".to_string(),
-            Digest::SHA384,
-            test_utils::now_ms(),
-            pcrs,
+            NsmDigest::SHA384,
+            timestamp_ms,
+            map,
             vec![0u8; 64],
             vec![vec![0u8; 64]],
-            None, // no user_data: must still verify.
-            Some(hh()),
+            user_data,
+            nonce,
             None,
         );
-
         let mut payload = Vec::new();
         ciborium::into_writer(&doc, &mut payload).unwrap();
         let cose = CborValue::Array(vec![
@@ -1590,122 +1260,193 @@ mod tests {
         ]);
         let mut bytes = Vec::new();
         ciborium::into_writer(&cose, &mut bytes).unwrap();
-
-        let pcrs = verify_and_extract_pcrs(&bytes, &hh(), &[seed_pcrs(0x68)], DM).expect("verify");
-        assert_eq!(pcrs.pcr0, vec![0x68u8; 48]);
+        bytes
     }
 
     #[test]
-    fn verify_against_accepts_matching_pcrs_in_debug_mode() {
-        let fake = test_utils::FakeAttestation::with_seed(0x22, hh());
+    fn session_doc_yields_identity_and_control_pubkey() {
+        let fake = test_utils::FakeAttestation::with_seed(0x11, hh());
         let bytes = fake.encode();
-        let expected = Pcrs {
-            pcr0: fake.pcr0.clone(),
-            pcr1: fake.pcr1.clone(),
-            pcr2: fake.pcr2.clone(),
-        };
-        verify_against(&bytes, &hh(), &expected, DM).expect("verify");
-    }
+        let doc = session(bytes.clone(), &hh()).expect("validate");
 
-    #[test]
-    fn verify_against_rejects_mismatched_pcrs() {
-        let fake = test_utils::FakeAttestation::with_seed(0x33, hh());
-        let bytes = fake.encode();
-        let expected = Pcrs {
-            pcr0: vec![0xff; 48],
-            pcr1: fake.pcr1.clone(),
-            pcr2: fake.pcr2.clone(),
-        };
-        let err = verify_against(&bytes, &hh(), &expected, DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::Validation(_)),
-            "expected Validation, got {err:?}"
+        assert_eq!(doc.identity().image()[0].as_slice(), fake.pcr0.as_slice());
+        assert_eq!(doc.identity().image()[1].as_slice(), fake.pcr1.as_slice());
+        assert_eq!(doc.identity().image()[2].as_slice(), fake.pcr2.as_slice());
+        assert_eq!(doc.pcrs(), seed_pcrs(0x11));
+        assert_eq!(doc.control_pubkey().unwrap(), fake.control_pubkey);
+        assert_eq!(doc.user_data(), Some(fake.control_pubkey.as_slice()));
+        assert!(doc.timestamp_ms().abs_diff(test_utils::now_ms()) < 60_000);
+        assert_eq!(doc.raw_bytes(), bytes.as_slice());
+        assert_eq!(
+            doc.provenance(),
+            Provenance::Session {
+                chain_verified: false
+            }
         );
     }
 
+    /// The session binding: a document produced for one handshake hash is
+    /// refused on any other session.
     #[test]
-    fn verify_rejects_wrong_handshake_hash() {
-        let fake = test_utils::FakeAttestation::with_seed(0x44, hh());
-        let bytes = fake.encode();
-        let wrong: Vec<u8> = vec![0xab; 32];
-        let err = verify_and_extract(&bytes, &wrong, DM).unwrap_err();
-        assert!(
-            matches!(err, AttestationError::Validation(_)),
-            "expected Validation, got {err:?}"
-        );
+    fn session_doc_with_wrong_handshake_hash_fails() {
+        let doc = test_utils::FakeAttestation::with_seed(0x44, hh()).encode();
+        let err = session(doc, &[0xab; 32]).unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::NonceMismatch, "{err:?}");
     }
 
     /// Skipping the chain does not skip the clock-skew bound: a session
     /// document stamped further than the bound from the verifier's clock is
-    /// refused in both modes.
+    /// refused. A chain link's document has no such bound (old links are
+    /// legitimate).
     #[test]
-    fn skip_chain_still_bounds_clock_skew() {
-        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
-        use ciborium::value::Value as CborValue;
-        use std::collections::BTreeMap;
-
-        let encode = |timestamp: u64| {
-            let mut pcrs = BTreeMap::new();
-            for i in [0usize, 1, 2, 8] {
-                pcrs.insert(i, vec![0x45u8; 48]);
-            }
-            let mut control_pubkey = vec![0x04u8];
-            control_pubkey.extend_from_slice(&[0x55; 64]);
-            let doc = AttestationDoc::new(
-                "test-module".to_string(),
-                Digest::SHA384,
-                timestamp,
-                pcrs,
-                vec![0u8; 64],
-                vec![vec![0u8; 64]],
-                Some(control_pubkey),
-                Some(hh()),
-                None,
-            );
-            let mut payload = Vec::new();
-            ciborium::into_writer(&doc, &mut payload).unwrap();
-            let cose = CborValue::Array(vec![
-                CborValue::Bytes(vec![0xa0]),
-                CborValue::Map(Vec::new()),
-                CborValue::Bytes(payload),
-                CborValue::Bytes(vec![0u8; 96]),
-            ]);
-            let mut bytes = Vec::new();
-            ciborium::into_writer(&cose, &mut bytes).unwrap();
-            bytes
-        };
-
+    fn skip_chain_session_still_bounds_clock_skew() {
         let now = test_utils::now_ms();
         let margin = 60 * 60 * 1000;
-        verify_and_extract(&encode(now), &hh(), DM).expect("current timestamp");
+        let pubkey = Some(test_utils::FakeAttestation::with_seed(0x45, hh()).control_pubkey.to_vec());
+        session(doc_at(0x45, now, pubkey.clone(), Some(hh())), &hh()).expect("current timestamp");
         for stale in [
             now - MAX_SESSION_DOC_CLOCK_SKEW_MS - margin,
             now + MAX_SESSION_DOC_CLOCK_SKEW_MS + margin,
         ] {
-            let err = verify_and_extract(&encode(stale), &hh(), DM).unwrap_err();
-            assert!(err.to_string().contains("from the local clock"), "{err}");
+            let err = session(doc_at(0x45, stale, pubkey.clone(), Some(hh())), &hh()).unwrap_err();
+            assert_eq!(err.reason(), RejectionReason::ClockSkew, "{err:?}");
+        }
+        let payload = b"payload";
+        let binding = Some(Sha256::digest(payload).to_vec());
+        chain_link(doc_at(0x45, 0, binding, Some(vec![0; 32])), payload)
+            .expect("a chain link is not bounded by the local clock");
+    }
+
+    /// A chain link's document is not a session document: its nonce is not
+    /// the session's handshake hash.
+    #[test]
+    fn chain_link_doc_is_not_a_session_doc() {
+        let link = test_utils::FakeChainAttestation::for_payload(0x12, b"payload").encode();
+        let err = session(link, &hh()).unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::NonceMismatch, "{err:?}");
+    }
+
+    /// And a session document is not a chain link's: its `user_data` is not
+    /// the hash of any payload it is presented with.
+    #[test]
+    fn session_doc_is_not_a_chain_link_doc() {
+        let doc = test_utils::FakeAttestation::with_seed(0x13, hh()).encode();
+        let err = chain_link(doc, b"payload").unwrap_err();
+        assert!(
+            matches!(err, AttestationError::PayloadBindingMismatch),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn control_nonce_reads_32_byte_user_data() {
+        let nonce = [0xab; 32];
+        let fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), nonce);
+        let doc = session(fake.encode(), &hh()).expect("validate");
+        doc.require_pcrs(&seed_pcrs(0x21)).expect("pcrs");
+        assert_eq!(doc.control_nonce().unwrap(), nonce);
+    }
+
+    #[test]
+    fn control_nonce_rejects_non_32_byte_user_data() {
+        let mut fake = test_utils::FakeControlNonceAttestation::with_seed(0x21, hh(), [0xab; 32]);
+        fake.control_nonce = vec![0xab; 16];
+        let doc = session(fake.encode(), &hh()).expect("validate");
+        assert!(matches!(
+            doc.control_nonce(),
+            Err(AttestationError::InvalidControlNonce)
+        ));
+    }
+
+    #[test]
+    fn control_pubkey_rejects_missing_or_wrong_size_user_data() {
+        for user_data in [None, Some(vec![0u8; 16])] {
+            let doc = session(doc_with(0x22, user_data.clone(), Some(hh())), &hh())
+                .expect("validate");
+            assert!(
+                matches!(
+                    doc.control_pubkey(),
+                    Err(AttestationError::InvalidControlPubkey)
+                ),
+                "user_data = {user_data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_pubkey_rejects_compressed_prefix() {
+        let mut key = vec![0x02u8];
+        key.extend_from_slice(&[0x55; 64]);
+        let doc = session(doc_with(0x23, Some(key), Some(hh())), &hh()).expect("validate");
+        assert!(matches!(
+            doc.control_pubkey(),
+            Err(AttestationError::InvalidControlPubkey)
+        ));
+    }
+
+    /// The server side of the customer protocol carries no control pubkey,
+    /// so a session document may omit `user_data`.
+    #[test]
+    fn session_doc_without_user_data_validates() {
+        let doc = session(doc_with(0x68, None, Some(hh())), &hh()).expect("validate");
+        assert_eq!(doc.user_data(), None);
+        assert_eq!(
+            doc.require_pcrs_in(&[seed_pcrs(0x68)]).unwrap(),
+            seed_pcrs(0x68)
+        );
+    }
+
+    #[test]
+    fn require_pcrs_in_admits_any_listed_triple_and_nothing_else() {
+        let doc = session(
+            test_utils::FakeAttestation::with_seed(0x66, hh()).encode(),
+            &hh(),
+        )
+        .expect("validate");
+        assert_eq!(
+            doc.require_pcrs_in(&[seed_pcrs(0x01), seed_pcrs(0x66)])
+                .unwrap(),
+            seed_pcrs(0x66)
+        );
+        assert!(matches!(
+            doc.require_pcrs_in(&[seed_pcrs(0x99)]),
+            Err(AttestationError::PcrsNotExpected)
+        ));
+        assert!(matches!(
+            doc.require_pcrs_in(&[]),
+            Err(AttestationError::PcrsNotExpected)
+        ));
+    }
+
+    #[test]
+    fn require_pcrs_checks_every_image_pcr() {
+        let doc = session(
+            test_utils::FakeAttestation::with_seed(0x33, hh()).encode(),
+            &hh(),
+        )
+        .expect("validate");
+        doc.require_pcrs(&seed_pcrs(0x33)).expect("match");
+        for idx in 0..3 {
+            let mut wrong = seed_pcrs(0x33);
+            [&mut wrong.pcr0, &mut wrong.pcr1, &mut wrong.pcr2][idx][0] ^= 0xff;
+            let err = doc.require_pcrs(&wrong).unwrap_err();
+            assert_eq!(err.reason(), RejectionReason::PcrMismatch, "PCR{idx}");
         }
     }
 
     /// Two documents with the same PCR0-2 but a different locked PCR16 are
     /// two identities, so two synchronizer keys.
     #[test]
-    fn verify_and_extract_reads_user_pcrs_into_the_identity() {
+    fn identity_includes_user_pcrs() {
         let plain = test_utils::FakeAttestation::with_seed(0x21, hh());
         let a =
             test_utils::FakeAttestation::with_seed(0x21, hh()).with_user_pcr(16, vec![0xa1; 48]);
         let b =
             test_utils::FakeAttestation::with_seed(0x21, hh()).with_user_pcr(16, vec![0xb2; 48]);
 
-        let plain = verify_and_extract(&plain.encode(), &hh(), DM)
-            .expect("plain")
-            .identity;
-        let a = verify_and_extract(&a.encode(), &hh(), DM)
-            .expect("a")
-            .identity;
-        let b = verify_and_extract(&b.encode(), &hh(), DM)
-            .expect("b")
-            .identity;
+        let plain = session(plain.encode(), &hh()).expect("plain").identity().clone();
+        let a = session(a.encode(), &hh()).expect("a").identity().clone();
+        let b = session(b.encode(), &hh()).expect("b").identity().clone();
 
         assert_eq!(a.image_pcrs(), b.image_pcrs());
         assert_eq!(a.pcr(16), Some(&[0xa1; 48]));
@@ -1720,63 +1461,66 @@ mod tests {
 
     /// A user PCR of the wrong length makes the document malformed.
     #[test]
-    fn verify_and_extract_rejects_a_short_user_pcr() {
+    fn short_user_pcr_is_malformed() {
         let fake =
             test_utils::FakeAttestation::with_seed(0x22, hh()).with_user_pcr(17, vec![1; 47]);
-        let err = verify_and_extract(&fake.encode(), &hh(), DM).unwrap_err();
+        let err = session(fake.encode(), &hh()).unwrap_err();
         assert_eq!(err.reason(), RejectionReason::Malformed, "{err:?}");
     }
 
-    /// `verify_chain_attestation_identity` compares the user PCRs too.
+    /// `require_identity` compares the user PCRs too.
     #[test]
-    fn chain_attestation_identity_checks_user_pcrs() {
+    fn require_identity_checks_user_pcrs() {
         let payload = b"payload";
-        let doc = test_utils::FakeChainAttestation::for_payload(0x30, payload)
+        let bytes = test_utils::FakeChainAttestation::for_payload(0x30, payload)
             .with_user_pcr(16, vec![0x16; 48])
             .encode();
-        let image = pcrs_from_seed(0x30);
+        let image = seed_pcrs(0x30);
         let mut user = crate::pin_identity::ZERO_USER_PCRS;
         user[0] = [0x16; 48];
         let right = PinIdentity::from_image_pcrs(&image, user).unwrap();
         let wrong = right.with_user_pcrs(crate::pin_identity::ZERO_USER_PCRS);
 
-        let attested = verify_chain_attestation(&doc, payload, &image, DM).expect("image match");
-        assert_eq!(attested, right);
-        verify_chain_attestation_identity(&doc, payload, &right, DM).expect("full match");
-        let err = verify_chain_attestation_identity(&doc, payload, &wrong, DM).unwrap_err();
+        let doc = chain_link(bytes, payload).expect("validate");
+        doc.require_pcrs(&image).expect("image match");
+        assert_eq!(*doc.identity(), right);
+        doc.require_identity(&right).expect("full match");
+        let err = doc.require_identity(&wrong).unwrap_err();
         assert_eq!(err.reason(), RejectionReason::PcrMismatch);
     }
 
-    fn pcrs_from_seed(seed: u8) -> Pcrs {
-        Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        }
-    }
-
     #[test]
-    fn verify_chain_attestation_accepts_well_formed_link_in_debug_mode() {
+    fn chain_link_doc_validates_against_its_payload() {
         let payload = b"chain-link-payload-canary".to_vec();
         let fake = test_utils::FakeChainAttestation::for_payload(0x33, &payload);
-        let bytes = fake.encode();
-        let expected_pcrs = pcrs_from_seed(0x33);
+        let doc = chain_link(fake.encode(), &payload).expect("valid chain attestation");
+        doc.require_pcrs(&seed_pcrs(0x33)).expect("pcrs");
+        assert_eq!(
+            doc.provenance(),
+            Provenance::ChainLink {
+                chain_verified: false
+            }
+        );
+    }
 
-        verify_chain_attestation(&bytes, &payload, &expected_pcrs, DM)
-            .expect("valid chain attestation must pass");
+    /// The payload binding: the same document presented with any other
+    /// payload is refused.
+    #[test]
+    fn chain_link_doc_with_mismatched_payload_fails() {
+        let payload = b"chain-link-payload-canary".to_vec();
+        let fake = test_utils::FakeChainAttestation::for_payload(0x44, &payload);
+        let err = chain_link(fake.encode(), b"DIFFERENT").unwrap_err();
+        assert!(
+            matches!(err, AttestationError::PayloadBindingMismatch),
+            "expected PayloadBindingMismatch, got {err:?}"
+        );
+        assert_eq!(err.reason(), RejectionReason::PayloadBindingMismatch);
     }
 
     #[test]
-    fn verify_chain_attestation_rejects_mismatched_payload_binding() {
-        let payload = b"chain-link-payload-canary".to_vec();
-        let fake = test_utils::FakeChainAttestation::for_payload(0x44, &payload);
-        let bytes = fake.encode();
-        let expected_pcrs = pcrs_from_seed(0x44);
-
-        // Same attestation, different payload — user_data binds to the
-        // original, so the verifier must reject the substitution.
-        let err = verify_chain_attestation(&bytes, b"DIFFERENT", &expected_pcrs, DM)
-            .expect_err("payload swap must fail the binding check");
+    fn chain_link_doc_without_user_data_fails() {
+        let err = chain_link(doc_with(0x77, None, Some(vec![0u8; 32])), b"any-payload")
+            .unwrap_err();
         assert!(
             matches!(err, AttestationError::PayloadBindingMismatch),
             "expected PayloadBindingMismatch, got {err:?}"
@@ -1784,77 +1528,27 @@ mod tests {
     }
 
     #[test]
-    fn verify_chain_attestation_rejects_pcr_mismatch() {
-        let payload = b"chain-link-payload-canary".to_vec();
-        let fake = test_utils::FakeChainAttestation::for_payload(0x55, &payload);
-        let bytes = fake.encode();
-        // Wrong expected PCRs — the caller's recorded PCRs disagree with
-        // what the doc carries. Verifier must reject.
-        let mismatched_pcrs = pcrs_from_seed(0x99);
-
-        let err = verify_chain_attestation(&bytes, &payload, &mismatched_pcrs, DM)
-            .expect_err("PCR mismatch must fail");
-        assert!(
-            matches!(err, AttestationError::Validation(_)),
-            "expected Validation error, got {err:?}"
-        );
+    fn garbage_is_malformed_in_both_contexts() {
+        let err = session(b"not a cose document".to_vec(), &hh()).unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::Malformed);
+        let err = chain_link(b"not a cose document".to_vec(), b"p").unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::Malformed);
     }
 
-    /// Rejection reasons in skip-chain mode: the structural, nonce, PCR and
-    /// payload-binding causes are classified the same as in production.
+    /// Without a chain check, every document is refused by the production
+    /// methods: the fixtures' placeholder certificates do not parse, let
+    /// alone chain to the AWS Nitro root.
     #[test]
-    fn rejection_reasons_in_skip_chain_mode() {
-        let doc = test_utils::FakeAttestation::with_seed(0x21, hh()).encode();
-        let reason = |r: Result<Pcrs, AttestationError>| r.unwrap_err().reason();
-
-        assert_eq!(
-            reason(verify_and_extract_pcrs(
-                b"garbage",
-                &hh(),
-                &[pcrs_from_seed(0x21)],
-                DM
-            )),
-            RejectionReason::Malformed
+    fn production_methods_refuse_unsigned_fixtures() {
+        let doc = UnvalidatedAttestation::from_bytes(
+            test_utils::FakeAttestation::with_seed(0x21, hh()).encode(),
         );
-        assert_eq!(
-            reason(verify_and_extract_pcrs(
-                &doc,
-                &[0xee; 32],
-                &[pcrs_from_seed(0x21)],
-                DM
-            )),
-            RejectionReason::NonceMismatch
+        assert!(doc.validate_session(&hh()).is_err());
+        let payload = b"payload";
+        let link = UnvalidatedAttestation::from_bytes(
+            test_utils::FakeChainAttestation::for_payload(0x21, payload).encode(),
         );
-        assert_eq!(
-            reason(verify_and_extract_pcrs(
-                &doc,
-                &hh(),
-                &[pcrs_from_seed(0x22)],
-                DM
-            )),
-            RejectionReason::PcrMismatch
-        );
-        assert_eq!(
-            verify_against(&doc, &hh(), &pcrs_from_seed(0x22), DM)
-                .unwrap_err()
-                .reason(),
-            RejectionReason::PcrMismatch
-        );
-
-        let payload = b"chain-link-payload".to_vec();
-        let link = test_utils::FakeChainAttestation::for_payload(0x23, &payload).encode();
-        assert_eq!(
-            verify_chain_attestation(&link, b"other", &pcrs_from_seed(0x23), DM)
-                .unwrap_err()
-                .reason(),
-            RejectionReason::PayloadBindingMismatch
-        );
-        assert_eq!(
-            verify_chain_attestation(&link, &payload, &pcrs_from_seed(0x24), DM)
-                .unwrap_err()
-                .reason(),
-            RejectionReason::PcrMismatch
-        );
+        assert!(link.validate_chain_link(payload).is_err());
     }
 
     /// Labels are unique and `ALL` lists every reason once.
@@ -1865,53 +1559,8 @@ mod tests {
         assert_eq!(labels.len(), RejectionReason::ALL.len());
         assert_eq!(RejectionReason::NotYetValid.to_string(), "not_yet_valid");
     }
-
-    #[test]
-    fn verify_chain_attestation_rejects_doc_without_user_data() {
-        use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
-        use ciborium::value::Value as CborValue;
-        use std::collections::BTreeMap;
-
-        let payload = b"any-payload".to_vec();
-        let pcrs = pcrs_from_seed(0x77);
-
-        let mut pcr_map = BTreeMap::new();
-        pcr_map.insert(0usize, pcrs.pcr0.clone());
-        pcr_map.insert(1usize, pcrs.pcr1.clone());
-        pcr_map.insert(2usize, pcrs.pcr2.clone());
-        pcr_map.insert(8usize, vec![0u8; 48]);
-
-        let doc = AttestationDoc::new(
-            "test-module".to_string(),
-            Digest::SHA384,
-            test_utils::now_ms(),
-            pcr_map,
-            vec![0u8; 64],
-            vec![vec![0u8; 64]],
-            None, // user_data missing — the case under test.
-            Some(vec![0u8; 32]),
-            None,
-        );
-
-        let mut doc_bytes = Vec::new();
-        ciborium::into_writer(&doc, &mut doc_bytes).unwrap();
-        let cose = CborValue::Array(vec![
-            CborValue::Bytes(vec![0xa0]),
-            CborValue::Map(Vec::new()),
-            CborValue::Bytes(doc_bytes),
-            CborValue::Bytes(vec![0u8; 96]),
-        ]);
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&cose, &mut bytes).unwrap();
-
-        let err = verify_chain_attestation(&bytes, &payload, &pcrs, DM)
-            .expect_err("missing user_data must be rejected");
-        assert!(
-            matches!(err, AttestationError::PayloadBindingMismatch),
-            "expected PayloadBindingMismatch, got {err:?}"
-        );
-    }
 }
+
 
 /// Production-mode (full chain + COSE signature) tests against a throwaway
 /// test CA. The fixtures below are a P-384 root, intermediate and
@@ -1926,6 +1575,7 @@ mod tests {
 #[cfg(test)]
 mod production_chain_tests {
     use super::*;
+    use attestation_doc_validation::attestation_doc::decode_attestation_document;
     use crate::nitro_verify::Sha2;
     use aws_nitro_enclaves_cose::CoseSign1;
     use aws_nitro_enclaves_cose::crypto::{
@@ -2035,14 +1685,18 @@ mod production_chain_tests {
 
     /// CBOR payload of an NSM-shaped document from the test chain.
     fn doc_payload(timestamp_ms: u64, nonce: &[u8]) -> Vec<u8> {
+        let mut control_pubkey = vec![0x04u8];
+        control_pubkey.extend_from_slice(&[0x55; 64]);
+        doc_payload_with(timestamp_ms, nonce, control_pubkey)
+    }
+
+    fn doc_payload_with(timestamp_ms: u64, nonce: &[u8], user_data: Vec<u8>) -> Vec<u8> {
         let pcrs = seed_pcrs(0x31);
         let mut map = BTreeMap::new();
         map.insert(0usize, pcrs.pcr0);
         map.insert(1usize, pcrs.pcr1);
         map.insert(2usize, pcrs.pcr2);
         map.insert(8usize, vec![0u8; 48]);
-        let mut control_pubkey = vec![0x04u8];
-        control_pubkey.extend_from_slice(&[0x55; 64]);
         let doc = AttestationDoc::new(
             "i-test-enc0123456789abcdef".to_string(),
             NsmDigest::SHA384,
@@ -2051,7 +1705,7 @@ mod production_chain_tests {
             der(LEAF_HEX),
             // Nitro order: root first, then intermediates.
             vec![der(ROOT_HEX), der(INTERMEDIATE_HEX)],
-            Some(control_pubkey),
+            Some(user_data),
             Some(nonce.to_vec()),
             None,
         );
@@ -2071,13 +1725,34 @@ mod production_chain_tests {
         sign(&doc_payload(timestamp_ms, nonce), &TestSigner::leaf())
     }
 
-    fn verify(doc: &[u8], nonce: &[u8], now_ms: u64) -> Result<AttestationDoc, AttestationError> {
+    /// A chain link's document from the test chain: `user_data` is
+    /// `sha256(payload)`.
+    fn link_doc(timestamp_ms: u64, payload: &[u8]) -> Vec<u8> {
+        let user_data = Sha256::digest(payload).to_vec();
+        sign(
+            &doc_payload_with(timestamp_ms, &[0u8; 32], user_data),
+            &TestSigner::leaf(),
+        )
+    }
+
+    /// `validate_session` against the test CA, with the verifier's clock at
+    /// `now_ms`.
+    fn verify(
+        doc: &[u8],
+        nonce: &[u8],
+        now_ms: u64,
+    ) -> Result<ValidatedAttestation, AttestationError> {
         let root = der(ROOT_HEX);
         let ctx = SessionCtx {
             root_der: &root,
             now_ms,
         };
-        verify_session_bound_with(doc, nonce, VerificationMode::Production, &ctx)
+        validate_session_with(doc, nonce, Chain::Verify, &ctx)
+    }
+
+    /// `validate_chain_link` against the test CA.
+    fn verify_link(doc: &[u8], payload: &[u8]) -> Result<ValidatedAttestation, AttestationError> {
+        validate_chain_link_with(doc, payload, Chain::Verify, &der(ROOT_HEX))
     }
 
     #[test]
@@ -2095,7 +1770,7 @@ mod production_chain_tests {
         assert!(err.contains("CertNotValidYet"), "{err}");
 
         let got = verify(&doc, &hh(), verifier_now).expect("must verify at doc timestamp");
-        assert_eq!(got.timestamp, doc_ts);
+        assert_eq!(got.timestamp_ms(), doc_ts);
     }
 
     #[test]
@@ -2194,57 +1869,89 @@ mod production_chain_tests {
 
     #[test]
     fn chain_not_rooted_in_the_aws_nitro_root_fails() {
-        // Production entry points use the embedded AWS root, which the test
-        // chain does not lead to.
+        // The public methods use the embedded AWS root, which the test chain
+        // does not lead to.
         let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
-        let doc = signed_doc(doc_ts, &hh());
-        let err = verify_and_extract(&doc, &hh(), VerificationMode::Production).unwrap_err();
+        let doc = UnvalidatedAttestation::from_bytes(signed_doc(doc_ts, &hh()));
+        let err = doc.validate_session(&hh()).unwrap_err();
         assert!(
             err.to_string().contains("certificate chain invalid"),
             "{err}"
         );
         assert_eq!(err.reason(), RejectionReason::UntrustedChain);
+        let link = UnvalidatedAttestation::from_bytes(link_doc(doc_ts, b"payload"));
+        let err = link.validate_chain_link(b"payload").unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::UntrustedChain);
+    }
+
+    #[test]
+    fn verified_session_doc_reports_its_contents() {
+        let doc_ts = LEAF_NOT_BEFORE_MS + 5_000;
+        let got = verify(&signed_doc(doc_ts, &hh()), &hh(), doc_ts).expect("verify");
+        assert_eq!(got.timestamp_ms(), doc_ts);
+        assert_eq!(got.pcrs(), seed_pcrs(0x31));
+        assert_eq!(got.control_pubkey().unwrap()[1..], [0x55; 64]);
+        assert_eq!(
+            got.provenance(),
+            Provenance::Session {
+                chain_verified: true
+            }
+        );
     }
 
     #[test]
     fn stored_doc_validates_at_its_own_timestamp_regardless_of_local_clock() {
-        // The unbound path (chain links) never reads the local clock: the
-        // test leaf's validity window does not contain the real current
-        // time, yet the document verifies at its own timestamp.
-        let root = der(ROOT_HEX);
+        // The chain-link context never reads the local clock: the test
+        // leaf's validity window does not contain the real current time, yet
+        // the document verifies at its own timestamp.
         let doc_ts = LEAF_NOT_BEFORE_MS + 60 * 60 * 1000;
-        let doc = signed_doc(doc_ts, &[0u8; 32]);
-        let parsed = parse_and_validate_with_root(&doc, VerificationMode::Production, &root)
+        let got = verify_link(&link_doc(doc_ts, b"payload"), b"payload")
             .expect("stored doc must verify at its own timestamp");
-        assert_eq!(parsed.timestamp, doc_ts);
+        assert_eq!(got.timestamp_ms(), doc_ts);
+        assert_eq!(
+            got.provenance(),
+            Provenance::ChainLink {
+                chain_verified: true
+            }
+        );
+    }
+
+    #[test]
+    fn stored_doc_with_other_payload_fails_binding() {
+        let doc = link_doc(LEAF_NOT_BEFORE_MS + 5_000, b"payload");
+        let err = verify_link(&doc, b"other payload").unwrap_err();
+        assert!(
+            matches!(err, AttestationError::PayloadBindingMismatch),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn stored_doc_expired_at_its_own_timestamp_fails() {
-        let root = der(ROOT_HEX);
-        let doc = signed_doc(LEAF_NOT_AFTER_MS + 1_000, &[0u8; 32]);
-        let err =
-            parse_and_validate_with_root(&doc, VerificationMode::Production, &root).unwrap_err();
+        let doc = link_doc(LEAF_NOT_AFTER_MS + 1_000, b"payload");
+        let err = verify_link(&doc, b"payload").unwrap_err();
         assert!(err.to_string().contains("CertExpired"), "{err}");
         assert_eq!(err.reason(), RejectionReason::Expired);
     }
 
     #[test]
     fn stored_doc_with_moved_timestamp_fails_signature() {
-        let root = der(ROOT_HEX);
-        let genuine = signed_doc(LEAF_NOT_AFTER_MS + 1_000, &[0u8; 32]);
-        let tampered = replace_payload(&genuine, doc_payload(LEAF_NOT_BEFORE_MS, &[0u8; 32]));
-        let err = parse_and_validate_with_root(&tampered, VerificationMode::Production, &root)
-            .unwrap_err();
+        let genuine = link_doc(LEAF_NOT_AFTER_MS + 1_000, b"payload");
+        let user_data = Sha256::digest(b"payload").to_vec();
+        let tampered = replace_payload(
+            &genuine,
+            doc_payload_with(LEAF_NOT_BEFORE_MS, &[0u8; 32], user_data),
+        );
+        let err = verify_link(&tampered, b"payload").unwrap_err();
         assert!(err.to_string().contains("COSE signature"), "{err}");
         assert_eq!(err.reason(), RejectionReason::Signature);
     }
 
     #[test]
     fn garbage_is_malformed_in_production_mode() {
-        let root = der(ROOT_HEX);
-        let err = parse_and_validate_with_root(b"not cose", VerificationMode::Production, &root)
-            .unwrap_err();
+        let err = verify_link(b"not cose", b"payload").unwrap_err();
+        assert_eq!(err.reason(), RejectionReason::Malformed);
+        let err = verify(b"not cose", &hh(), LEAF_NOT_BEFORE_MS).unwrap_err();
         assert_eq!(err.reason(), RejectionReason::Malformed);
     }
 

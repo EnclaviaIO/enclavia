@@ -26,9 +26,9 @@
 #[cfg(feature = "enclave")]
 pub async fn now_ms() -> Result<u64, String> {
     tokio::task::spawn_blocking(|| {
-        let doc = crate::mesh::attestation::request_own_attestation(None, None)
-            .map_err(|e| e.to_string())?;
-        enclavia_protocol::attestation::extract_own_timestamp_ms(&doc).map_err(|e| e.to_string())
+        enclavia_protocol::attestation::ValidatedAttestation::request_local(None, None, None)
+            .map(|doc| doc.timestamp_ms())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("nsm time task panicked: {e}"))?

@@ -92,6 +92,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use enclavia_protocol::attestation::ValidatedAttestation;
 use enclavia_protocol::chain::{ChainLink, ChainLinkKind, UpgradePayload};
 use enclavia_protocol::signing::decode_canonical;
 use sha2::{Digest, Sha256};
@@ -2080,29 +2081,12 @@ pub fn load_synchronizer_trust(path: &Path) -> Result<SynchronizerTrust, FatalEr
 /// Request one attestation document from this enclave's own `/dev/nsm`
 /// with `nonce = handshake_hash` (channel binding) and `user_data =
 /// control_pubkey` (#47). BLOCKING: call through `spawn_blocking`.
-/// Mirrors `synchronizer::mesh::attestation::request_own_attestation`,
-/// re-implemented here so nbd-client does not pull the mesh feature in.
-fn request_nsm_attestation(nonce: Vec<u8>, user_data: Vec<u8>) -> Result<Vec<u8>, FatalError> {
-    use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
-
-    let fd = nsm_init();
-    if fd == -1 {
-        return Err("nsm_init failed (is /dev/nsm present?)".into());
-    }
-    let request = Request::Attestation {
-        user_data: Some(user_data.into()),
-        nonce: Some(nonce.into()),
-        public_key: None,
-    };
-    let result = match nsm_process_request(fd, request) {
-        Response::Attestation { document } => Ok(document),
-        Response::Error(e) => Err(format!("NSM attestation error: {e:?}").into()),
-        _ => Err("unexpected NSM response".into()),
-    };
-    // Close the device on every exit path.
-    nsm_exit(fd);
-    result
+fn request_nsm_attestation(
+    nonce: Vec<u8>,
+    user_data: Vec<u8>,
+) -> Result<ValidatedAttestation, FatalError> {
+    ValidatedAttestation::request_local(Some(&nonce), Some(&user_data), None)
+        .map_err(|e| -> FatalError { format!("own NSM attestation: {e}").into() })
 }
 
 /// An authenticated synchronizer session plus the PCR key it is bound
@@ -2156,15 +2140,13 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
         // RPC `key` fields match the session binding. Any user PCR a boot
         // feature uses must already be extended and locked here: it is part
         // of the key from this first contact on.
-        let identity = enclavia_protocol::attestation::extract_own_identity(&doc)
-            .map_err(|e| format!("cannot extract own pin identity from NSM document: {e}"))?;
-        let key = PcrKey(identity.key());
+        let key = PcrKey(doc.identity().key());
         // Mutual auth: send our document, then verify the oracle's
         // answering attestation (nonce-bound to this session) against
         // the measured-config policy. A server that cannot prove it is
         // the expected synchronizer is fail-stop.
         let client = hs
-            .authenticate(doc, &trust.server_policy, trust.debug_attestation)
+            .authenticate(doc.into_bytes(), &trust.server_policy, trust.debug_attestation)
             .await?;
         info!("synchronizer session mutually authenticated (oracle PCRs verified)");
         Ok::<_, FatalError>(SyncSession {

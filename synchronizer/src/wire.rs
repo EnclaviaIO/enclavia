@@ -561,7 +561,7 @@ pub enum ServerPcrPolicy {
     /// The server's user PCRs (16-31) are not part of the anchor: only the
     /// synchronizer's own measured code could extend them, that code is
     /// pinned by PCR0-2, and it extends none. See
-    /// [`enclavia_protocol::attestation::verify_and_extract_pcrs`].
+    /// [`enclavia_protocol::attestation::ValidatedAttestation::require_pcrs_in`].
     Expected(Vec<Pcrs>),
 }
 
@@ -620,15 +620,12 @@ pub fn verify_server_attestation(
 ) -> Result<Pcrs, ServerAuthError> {
     use enclavia_protocol::attestation::AttestationError;
     let ServerPcrPolicy::Expected(expected) = policy;
-    // The PCR comparison happens INSIDE the protocol verifier (its
-    // `expected` parameter is mandatory), so no code path can verify a
-    // server document without committing to an identity.
-    match enclavia_protocol::attestation::verify_and_extract_pcrs(
-        nsm_doc,
-        handshake_hash,
-        expected,
-        enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
-    ) {
+    let doc = crate::attest::validate_session(nsm_doc, handshake_hash, debug_mode)
+        .map_err(ServerAuthError::Attestation)?;
+    // Authenticity alone admits any genuine enclave, including a reflection
+    // of the caller's own document: the policy check is what commits to an
+    // identity, and this function never returns without it.
+    match doc.require_pcrs_in(expected) {
         Ok(pcrs) => Ok(pcrs),
         Err(AttestationError::PcrsNotExpected) => Err(ServerAuthError::PcrRejected),
         Err(e) => Err(ServerAuthError::Attestation(e)),
@@ -658,8 +655,8 @@ pub enum TransitionLinkError {
     SignatureShape,
     /// The frozen control pubkey for the derived `old_key` did not decode
     /// as uncompressed SEC1 P-256. Indicates the stored pubkey is corrupt;
-    /// should be unreachable for a key registered from a real
-    /// `AttestedIdentity`.
+    /// should be unreachable for a key registered from a validated
+    /// document (`ValidatedAttestation::control_pubkey`).
     #[error("frozen control pubkey for old_key does not decode as SEC1 P-256")]
     BadControlPubkey,
     /// `signature` does not verify against the frozen control pubkey for
@@ -841,16 +838,16 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    revocation or a command never counts), against
 ///    `old_control_pubkey`, the 65-byte SEC1 P-256 key the synchronizer
 ///    froze for `decoded.old_key` at its Register time
-///    (`AttestedIdentity::control_pubkey`). This proves the retiring
+///    (`ValidatedAttestation::control_pubkey`). This proves the retiring
 ///    enclave authorized this exact `from -> to` pair; control-pubkey
 ///    substitution is defeated because the pubkey is frozen, and the
 ///    decode-before-verify ordering is safe because the signature covers
 ///    `from`.
-/// 4. **Chain attestation.** `verify_chain_attestation_identity` must accept
-///    the link's `attestation` against its `payload`, i.e. the attestation's
-///    `user_data == sha256(payload)` and its full pin identity (PCR0-2 and
-///    every user PCR 16-31) equals `from` (the OLD enclave emitted the
-///    link, so it attested its OWN identity, matching
+/// 4. **Chain attestation.** The link's `attestation` must validate as a
+///    chain link's document for its `payload` and carry exactly `from`, i.e.
+///    the attestation's `user_data == sha256(payload)` and its full pin
+///    identity (PCR0-2 and every user PCR 16-31) equals `from` (the OLD
+///    enclave emitted the link, so it attested its OWN identity, matching
 ///    `enclavia_protocol::chain`'s "attested by the enclave version
 ///    running at the time" rule). Since `old_key` is `from.key()`, this
 ///    ties the moved pin to the enclave that emitted the link. `debug_mode` selects the
@@ -942,13 +939,9 @@ pub fn verify_transition_link(
     // 4. Chain attestation binds the document to sha256(payload) and to
     //    the OLD enclave's full identity (`from`, user PCRs included): the
     //    old enclave emitted the link, so it attested its own identity.
-    enclavia_protocol::attestation::verify_chain_attestation_identity(
-        &link.attestation,
-        &link.payload,
-        &payload.from,
-        enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
-    )
-    .map_err(TransitionLinkError::Attestation)?;
+    crate::attest::validate_chain_link(&link.attestation, &link.payload, debug_mode)
+        .and_then(|doc| doc.require_identity(&payload.from))
+        .map_err(TransitionLinkError::Attestation)?;
 
     Ok(VerifiedTransition {
         old_key: decoded.old_key,
@@ -1663,7 +1656,7 @@ mod tests {
     }
 
     /// Tampering the attestation so its PCRs match neither from nor to is
-    /// caught by `verify_chain_attestation`.
+    /// caught by the chain-link attestation check.
     #[test]
     fn transition_link_attestation_pcr_mismatch_rejected() {
         let (sk, pk) = keypair(0x38);

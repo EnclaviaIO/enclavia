@@ -10,6 +10,7 @@
 
 use aws_nitro_enclaves_nsm_api::api::{Request, Response};
 use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+use enclavia_protocol::attestation::ValidatedAttestation;
 
 /// Raw PCR bytes read off NSM. Same byte length the EIF measures
 /// (48-byte SHA-384 on Nitro / nitro-enclave QEMU).
@@ -69,12 +70,13 @@ impl Nsm {
         }
     }
 
-    /// Produce an attestation document binding the chain payload.
+    /// Produce an attestation document binding the chain payload, through
+    /// `ValidatedAttestation::request_local` (the only way to wrap NSM
+    /// output; this struct's own fd only reads PCRs).
     ///
-    /// `user_data` is the 32-byte sha256(payload) the backend's
-    /// `verify_chain_attestation` reads back to confirm the chain link
-    /// is well-formed. `nonce` is the same 32 random bytes the
-    /// BootPayload carries (the chain ingest verifier doesn't check the
+    /// `user_data` is the 32-byte sha256(payload) the backend's chain-link
+    /// validation reads back to confirm the chain link is well-formed.
+    /// `nonce` is the same 32 random bytes the BootPayload carries (the chain ingest verifier doesn't check the
     /// document's nonce, but populating it with the payload's nonce
     /// avoids a slot whose value would otherwise be undefined).
     pub fn attest(
@@ -82,15 +84,8 @@ impl Nsm {
         user_data: &[u8; 32],
         nonce: &[u8; 32],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let request = Request::Attestation {
-            user_data: Some(user_data.to_vec().into()),
-            nonce: Some(nonce.to_vec().into()),
-            public_key: None,
-        };
-        match nsm_process_request(self.fd, request) {
-            Response::Attestation { document } => Ok(document),
-            Response::Error(error) => Err(format!("NSM Attestation error: {error:?}").into()),
-            other => Err(format!("NSM Attestation unexpected response: {other:?}").into()),
-        }
+        ValidatedAttestation::request_local(Some(nonce), Some(user_data), None)
+            .map(ValidatedAttestation::into_bytes)
+            .map_err(Into::into)
     }
 }

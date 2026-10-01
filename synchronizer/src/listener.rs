@@ -9,13 +9,13 @@
 //!   CBOR-encoded [`Frame`].
 //! - First plaintext frame on the connection MUST be [`Frame::Authenticate`],
 //!   which carries the raw bytes of a Nitro NSM attestation document.
-//!   The listener calls
-//!   [`enclavia_protocol::attestation::verify_and_extract`] with the
-//!   Noise handshake hash as the expected nonce, derives
+//!   The listener validates it as a session document
+//!   ([`enclavia_protocol::attestation::UnvalidatedAttestation::validate_session`])
+//!   with the Noise handshake hash as the expected nonce, derives
 //!   `PcrKey = PinIdentity::key()` (PCR0-2 plus user PCRs 16-31, see
 //!   [`enclavia_protocol::pin_identity`]) from the verified document,
 //!   pulls the 65-byte SEC1 P-256 control pubkey out of the doc's
-//!   `user_data` (`AttestedIdentity::control_pubkey`), and binds the
+//!   `user_data` (`ValidatedAttestation::control_pubkey`), and binds the
 //!   session to that key for life.
 //! - The SERVER then authenticates back (#208): it requests a fresh NSM
 //!   document from its own `/dev/nsm` with `nonce = handshake_hash`
@@ -128,7 +128,8 @@ impl SessionAttestor for NsmSessionAttestor {
     async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, String> {
         let nonce = handshake_hash.to_vec();
         tokio::task::spawn_blocking(move || {
-            crate::mesh::attestation::request_own_attestation(Some(nonce), None)
+            attestation::ValidatedAttestation::request_local(Some(&nonce), None, None)
+                .map(attestation::ValidatedAttestation::into_bytes)
                 .map_err(|e| e.to_string())
         })
         .await
@@ -170,7 +171,7 @@ impl SessionAttestor for FakeSessionAttestor {
 /// control_pubkey, request)` triple here. The implementor owns whatever happens
 /// next (observe + apply locally, or route to the leader). The 65-byte
 /// `control_pubkey` is the session's announced
-/// `AttestedIdentity::control_pubkey`; the single-node path observes it before
+/// `ValidatedAttestation::control_pubkey`; the single-node path observes it before
 /// applying, and the replicated path carries it into the `ReplicatedOp` so
 /// followers can freeze / record it without re-attesting.
 #[async_trait::async_trait]
@@ -293,7 +294,7 @@ where
     //    session is a NEW enclave submitting a Transition, the
     //    `new_key == session_key` and NewKeyNotAttested checks pass.
     //
-    //    The pubkey is `AttestedIdentity::control_pubkey` verbatim, the
+    //    The pubkey is `ValidatedAttestation::control_pubkey` verbatim, the
     //    same 65-byte uncompressed SEC1 ECDSA P-256 key (#21/#47) the
     //    `Transition` chain-link verifier checks the upgrade payload's
     //    signature against (it checks it against the OLD key's frozen
@@ -315,25 +316,20 @@ where
                 capabilities = ?client_protocol.capabilities,
                 "customer session protocol"
             );
-            let identity = attestation::verify_and_extract(
-                &nsm_doc,
-                &handshake_hash,
-                attestation::VerificationMode::from_debug_flag(debug_mode),
-            )
-            .map_err(|e| {
-                tracing::warn!(
-                    reason = %e.reason(),
-                    error = %e,
-                    "customer attestation rejected"
-                );
-                crate::metrics::record_rejection(
-                    crate::metrics::RejectionSource::Client,
-                    e.reason(),
-                );
-                ConnError::Attestation(e)
-            })?;
-            let key = PcrKey(identity.identity.key());
-            (key, identity.control_pubkey)
+            crate::attest::validate_session(&nsm_doc, &handshake_hash, debug_mode)
+                .and_then(|doc| Ok((PcrKey(doc.identity().key()), doc.control_pubkey()?)))
+                .map_err(|e| {
+                    tracing::warn!(
+                        reason = %e.reason(),
+                        error = %e,
+                        "customer attestation rejected"
+                    );
+                    crate::metrics::record_rejection(
+                        crate::metrics::RejectionSource::Client,
+                        e.reason(),
+                    );
+                    ConnError::Attestation(e)
+                })?
         }
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
         None => return Ok(()),

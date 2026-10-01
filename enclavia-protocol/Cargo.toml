@@ -20,10 +20,20 @@ async-transport = ["tokio", "tracing"]
 # daemon (enforcer). Default-on; the wasm SDK build (default-features =
 # false) never needs it.
 egress-config = ["dep:ipnet", "tracing"]
-# Enables test_utils::FakeAttestation for downstream test suites. Pulls
-# in nothing optional — the helpers only use deps that are already
-# unconditionally required for attestation verification.
-test-utils = []
+# `ValidatedAttestation::request_local`: drives this process's own
+# `/dev/nsm` (the `nix` feature of the NSM API crate is the driver). Every
+# in-enclave crate that requests its own attestation document goes through
+# it, so the driver's output is wrapped in exactly one place.
+nsm = ["aws-nitro-enclaves-nsm-api/nix"]
+# `UnvalidatedAttestation::validate_*_skip_chain`: accept a document whose
+# certificate chain and COSE signature are NOT checked, as QEMU's
+# self-signing emulated NSM produces. Any well-formed document passes, so a
+# production build must not enable it.
+dangerous-skip-chain = []
+# Enables test_utils::FakeAttestation for downstream test suites. The
+# fixtures carry placeholder signatures, so they only validate through the
+# skip-chain methods, which this feature therefore implies.
+test-utils = ["dangerous-skip-chain"]
 
 [dependencies]
 snow = { workspace = true }
@@ -48,8 +58,8 @@ aws-nitro-enclaves-cose = { workspace = true }
 webpki = { workspace = true }
 p384 = { workspace = true }
 # The workspace pins `default-features = false`, which strips the `nix`
-# feature (NSM driver / `/dev/nsm` syscalls). We only need the `api`
-# module's pure data types here.
+# feature (NSM driver / `/dev/nsm` syscalls); the `nsm` feature above turns
+# it back on for `ValidatedAttestation::request_local`.
 aws-nitro-enclaves-nsm-api.workspace = true
 base64.workspace = true
 hex.workspace = true

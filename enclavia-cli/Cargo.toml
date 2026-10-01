@@ -67,5 +67,11 @@ rpassword = { version = "7", optional = true }
 tempfile = "3"
 
 [features]
-default = ["yubikey"]
+default = ["yubikey", "dangerous-skip-chain"]
 yubikey = ["dep:yubikey", "dep:rpassword"]
+# `enclavia upgrade chain` re-validates a debug enclave's chain links without
+# the AWS Nitro certificate chain. Which enclaves are debug comes from the
+# enclave row the backend serves (`mode`), at runtime, so the feature is on
+# by default to keep that behaviour; a build without it reports every link
+# of a debug enclave as invalid.
+dangerous-skip-chain = ["enclavia-protocol/dangerous-skip-chain"]

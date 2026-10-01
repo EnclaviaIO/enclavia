@@ -7,8 +7,9 @@
 //! follows the same pattern):
 //!
 //! - `debug` listens on a Unix domain socket (env: `LISTEN_PATH`). The
-//!   attestation verifier uses the `decode_attestation_document` debug
-//!   path (skip cert chain), matching what QEMU's self-signing NSM emits.
+//!   attestation verifier skips the certificate chain (the
+//!   `dangerous-skip-chain` validation), matching what QEMU's self-signing
+//!   NSM emits.
 //! - `enclave` listens on vsock (env: `VSOCK_PORT`, default
 //!   [`SYNCHRONIZER_CLIENT_PORT`] = 5010). The verifier requires a full
 //!   Nitro CA-chain-signed attestation document.
@@ -131,11 +132,11 @@ struct MeshEnv {
 /// attestation document from the node's own `/dev/nsm` (with an arbitrary nonce
 /// / user_data, since there is no session or peer to bind to) and reading back
 /// its pin identity (PCR0-2 plus user PCRs 16-31, the same derivation the
-/// listener applies to customers) with
-/// [`extract_own_identity`](enclavia_protocol::attestation::extract_own_identity). The
-/// host is the adversary: a host-supplied digest (the old `MESH_SELF_PCR*` env
-/// vars) would let it choose an allowlist that admits a rogue image into the
-/// mesh and Raft. The local NSM device is inside the node's TCB and measures
+/// listener applies to customers) from the
+/// [`ValidatedAttestation`](enclavia_protocol::attestation::ValidatedAttestation)
+/// that `request_local` returns. The host is the adversary: a host-supplied
+/// digest (the old `MESH_SELF_PCR*` env vars) would let it choose an allowlist
+/// that admits a rogue image into the mesh and Raft. The local NSM device is inside the node's TCB and measures
 /// this exact VM identically on real Nitro and under QEMU's nitro-enclave
 /// machine, so no cert-chain trust is needed (the node is reading its own
 /// hardware, not authenticating a remote party). If the NSM request or parse
@@ -143,10 +144,9 @@ struct MeshEnv {
 /// config is refused with a loud error log (fatal in a `raft` build).
 #[cfg(any(feature = "mesh", feature = "raft"))]
 fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
-    use enclavia_protocol::attestation::extract_own_identity;
+    use enclavia_protocol::attestation::ValidatedAttestation;
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::PcrKey;
-    use synchronizer::mesh::attestation::request_own_attestation;
     use synchronizer::mesh::config::MeshConfig;
     use synchronizer::mesh::identity::MeshIdentity;
     use synchronizer::mesh::transport::{VsockMeshAcceptor, VsockMeshDialer};
@@ -181,21 +181,14 @@ fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
     // our hardware-measured identity. nonce/user_data are irrelevant here (no
     // session, no peer to bind to), so we pass placeholders. No env fallback on
     // failure: the host must not be able to pick this digest.
-    let self_doc = match request_own_attestation(None, None) {
+    let self_doc = match ValidatedAttestation::request_local(None, None, None) {
         Ok(doc) => doc,
         Err(e) => {
             error!(error = %e, "self-attestation from /dev/nsm failed; refusing the mesh config");
             return None;
         }
     };
-    let self_identity = match extract_own_identity(&self_doc) {
-        Ok(id) => id,
-        Err(e) => {
-            error!(error = %e, "failed to parse own /dev/nsm attestation document; refusing the mesh config");
-            return None;
-        }
-    };
-    let self_digest = PcrKey(self_identity.key());
+    let self_digest = PcrKey(self_doc.identity().key());
     info!("derived self-PCR digest from /dev/nsm for the mesh allowlist");
 
     let config = MeshConfig::new(self_name.clone(), peers, self_digest);

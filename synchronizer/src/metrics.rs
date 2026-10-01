@@ -734,9 +734,11 @@ pub async fn clock_offset_ms() -> Option<i64> {
     let probe = tokio::task::spawn_blocking(|| {
         let _release = Release;
         let before = std::time::SystemTime::now();
-        let doc = crate::mesh::attestation::request_own_attestation(None, None).ok()?;
+        let doc =
+            enclavia_protocol::attestation::ValidatedAttestation::request_local(None, None, None)
+                .ok()?;
         let after = std::time::SystemTime::now();
-        let nsm_ms = enclavia_protocol::attestation::extract_own_timestamp_ms(&doc).ok()?;
+        let nsm_ms = doc.timestamp_ms();
         let wall = |t: std::time::SystemTime| {
             t.duration_since(std::time::UNIX_EPOCH)
                 .ok()

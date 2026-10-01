@@ -31,6 +31,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use enclavia_protocol::attestation::ValidatedAttestation;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
@@ -962,8 +963,7 @@ async fn verify_key_policy(key_id: &str) -> Result<(), Box<dyn std::error::Error
 /// (no recipient public key needed — we only want the measurements). Works
 /// identically under QEMU (emulated NSM) and real Nitro.
 fn own_pcrs() -> Result<enclavia_protocol::attestation::Pcrs, Box<dyn std::error::Error>> {
-    let attestation = nsm_attestation(&[])?;
-    Ok(enclavia_protocol::attestation::extract_own_pcrs(&attestation)?)
+    Ok(ValidatedAttestation::request_local(None, None, None)?.pcrs())
 }
 
 /// Recover a plaintext via KMS using the attestation-bound recipient flow
@@ -987,7 +987,8 @@ async fn kms_decrypt(
 
     // Attest the ephemeral public key. KMS reads `public_key` from the doc
     // and wraps the content key to it.
-    let attestation = nsm_attestation(&public_der)?;
+    let attestation =
+        ValidatedAttestation::request_local(None, None, Some(&public_der))?.into_bytes();
 
     let req = DecryptReq {
         key_id,
@@ -1003,37 +1004,6 @@ async fn kms_decrypt(
     let parsed: DecryptResp = serde_json::from_slice(&resp)?;
     let envelope = B64.decode(parsed.ciphertext_for_recipient.as_bytes())?;
     Ok(enclavia_protocol::kms_recipient::decode(&ephemeral, &envelope)?)
-}
-
-/// Request an NSM attestation document carrying `public_key` (our ephemeral
-/// RSA public key, DER SPKI). Mirrors `enclavia-server::attestation`. Works
-/// identically under QEMU (emulated NSM, self-signed doc) and real Nitro.
-fn nsm_attestation(public_key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
-
-    let fd = nsm_init();
-    if fd == -1 {
-        return Err("nsm_init failed (is /dev/nsm present?)".into());
-    }
-    let request = Request::Attestation {
-        user_data: None,
-        nonce: None,
-        // Empty slice -> no recipient key (we only want the PCRs); a
-        // non-empty key is embedded for the KMS Recipient flow.
-        public_key: if public_key.is_empty() {
-            None
-        } else {
-            Some(From::from(public_key.to_vec()))
-        },
-    };
-    let result = match nsm_process_request(fd, request) {
-        Response::Attestation { document } => Ok(document),
-        Response::Error(e) => Err(format!("NSM attestation error: {e:?}").into()),
-        _ => Err("unexpected NSM response".into()),
-    };
-    nsm_exit(fd);
-    result
 }
 
 async fn kms_schedule_deletion(key_id: &str) -> Result<(), Box<dyn std::error::Error>> {

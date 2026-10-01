@@ -23,8 +23,8 @@ tracing-subscriber = { workspace = true, optional = true }
 tokio-vsock = { workspace = true, optional = true }
 # Wire types + the pure transition-link verifier. The `Transition` RPC
 # carries a #47 upgrade `ChainLink`; verifying it needs `ChainLink` /
-# `UpgradePayload` / `verify_chain_attestation` plus the 65-byte SEC1
-# P-256 control-pubkey contract from `AttestedIdentity`. `default-features
+# `UpgradePayload` and the attestation types (`UnvalidatedAttestation`,
+# `ValidatedAttestation` and its 65-byte SEC1 P-256 control-pubkey reader). `default-features
 # = false` strips the async-transport (tokio) bits the `wire` feature does
 # not need; the `node` feature turns `async-transport` back on for the
 # Noise responder helpers the listener uses.
@@ -46,20 +46,14 @@ sha2 = { workspace = true, optional = true }
 # Mesh layer (#118) only. `async-trait` lets the AttestationProvider /
 # mesh-transport traits stay object-safe (dyn-dispatched) across the
 # vsock vs UDS/in-memory implementations; `rand` generates the per-boot
-# P-256 mesh keypair and the backoff jitter; `aws-nitro-enclaves-nsm-api`
-# drives `/dev/nsm` to produce the node's own attestation document (both
-# the per-peer channel-bound docs and the startup self-attestation that
-# derives the self-PCR allowlist digest); `hex` is used by the in-crate
-# test fixtures that build hex-encoded PCR triples. All four are pulled in
-# only by the `mesh` feature (implied by `node`).
+# P-256 mesh keypair and the backoff jitter; `hex` is used by the in-crate
+# test fixtures that build hex-encoded PCR triples. All three are pulled in
+# only by the `mesh` feature (implied by `node`). The node's own attestation
+# documents come from `enclavia-protocol`'s `nsm` feature
+# (`ValidatedAttestation::request_local`).
 async-trait = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-# `nix` feature exposes the `/dev/nsm` driver module (nsm_init /
-# nsm_process_request / nsm_exit); the workspace pin strips it by default
-# (only the `api` data types are unconditionally needed elsewhere). The
-# production NsmAttestor drives the device, so it needs the driver.
-aws-nitro-enclaves-nsm-api = { workspace = true, optional = true, features = ["nix"] }
 # Raft replication (#119, slice 3) only. `openraft` is the consensus
 # engine: in-memory log + state machine (no persistence per the #16
 # design), `serde` for CBOR-encoding the replicated ops + snapshots and
@@ -93,6 +87,13 @@ wire = [
     "dep:p256",
     "dep:sha2",
 ]
+# Validate peer and chain-link attestation documents WITHOUT the AWS Nitro
+# certificate chain, as QEMU's self-signing NSM requires: the code paths that
+# take `debug_mode = true`. Without it those paths refuse every document
+# (`AttestationError::SkipChainNotCompiled`). Implied by `qemu`, `debug` and
+# `test-utils`; the production `enclave` build must not have it (CI checks
+# its feature tree).
+dangerous-skip-chain = ["wire", "enclavia-protocol/dangerous-skip-chain"]
 # Async single-node RPC surface. Adds tokio + the Noise responder
 # helpers (async-transport) on top of `wire`. Implies `wire` and the
 # mesh layer (the peer mesh shares the Noise + attestation plumbing).
@@ -129,7 +130,7 @@ mesh = [
     "dep:rand",
     "dep:p256",
     "dep:hex",
-    "dep:aws-nitro-enclaves-nsm-api",
+    "enclavia-protocol/nsm",
     "dep:tokio-vsock",
     "dep:enclavia-vsock",
 ]
@@ -141,7 +142,7 @@ mesh = [
 # step (#208) needs SOME document to serve, so the dev binary answers
 # with a synthetic `FakeAttestation` (`listener::FakeSessionAttestor`).
 # The production `enclave` / `qemu` binaries never compile it.
-debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "enclavia-protocol/test-utils"]
+debug = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "enclavia-protocol/test-utils", "dangerous-skip-chain"]
 enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tracing", "dep:tracing-subscriber", "dep:tokio-vsock"]
 # QEMU nitro-enclave variant. Identical transport to `enclave` (the
 # customer listener and the mesh both ride vsock, since an in-enclave
@@ -153,13 +154,13 @@ enclave = ["node", "tokio/net", "tokio/macros", "tokio/rt-multi-thread", "dep:tr
 # debug_mode flag accepts (skip the cert-chain check only). Neither
 # `debug` (UDS dev listener) nor `enclave` (full-chain verify) fits a
 # QEMU cluster on its own; this feature is the third combination.
-qemu = ["enclave"]
+qemu = ["enclave", "dangerous-skip-chain"]
 # Dev-machine multi-node mesh test support: UDS/in-memory transport +
 # FakeAttestor. Tests only, never compiled into the production binary.
 # Adds `tokio/net` for the UDS listener/stream and turns on
 # enclavia-protocol's `test-utils` so `FakeAttestation` fixtures are
 # reachable from the mesh `FakeAttestor`.
-test-utils = ["mesh", "tokio/net", "enclavia-protocol/test-utils"]
+test-utils = ["mesh", "tokio/net", "enclavia-protocol/test-utils", "dangerous-skip-chain"]
 # Raft replication layer (#119, slice 3). Wraps the pure StateMachine in
 # an openraft state machine, drives an in-memory log, and rides the
 # AppendEntries / Vote / InstallSnapshot RPCs over the `mesh` transport's

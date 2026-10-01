@@ -47,14 +47,13 @@ tokio-vsock = { workspace = true }
 
 # KMS phase 2 (#198): the Decrypt call asks KMS to return the plaintext as
 # a CiphertextForRecipient envelope encrypted to an ephemeral key we attest
-# via NSM, so the parent proxying the call never sees the passphrase.
-# `nix` feature = the /dev/nsm driver (nsm_init/process_request).
-aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
+# via NSM (`ValidatedAttestation::request_local`, the `nsm` feature), so the
+# parent proxying the call never sees the passphrase.
 # `kms_recipient::decode` opens that envelope. default-features = false to
 # skip the async-transport (tokio/tracing) modules we do not use; the bare
 # `tokio` feature is still needed for `write_all_vsock` (the segmented
 # vsock write helper used by meta_put).
-enclavia-protocol = { path = "../enclavia-protocol", default-features = false, features = ["tokio"] }
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false, features = ["tokio", "nsm"] }
 enclavia-vsock = { path = "../enclavia-vsock" }
 
 [lib]

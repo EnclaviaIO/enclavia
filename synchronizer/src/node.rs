@@ -14,7 +14,7 @@
 //! 1. Performed the Noise handshake with the caller.
 //! 2. Verified the caller's Nitro attestation document, derived a
 //!    [`PcrKey`] from its PCRs, and extracted the 65-byte SEC1 P-256
-//!    control pubkey from `user_data` (`AttestedIdentity::control_pubkey`).
+//!    control pubkey from `user_data` (`ValidatedAttestation::control_pubkey`).
 //! 3. Called [`Node::observe_attestation`] for the caller's key + pubkey.
 //!
 //! For a `Transition` the SUBMITTING session is the NEW enclave: it
@@ -86,7 +86,7 @@ impl Node {
 
     /// Record that `key` has produced a valid Nitro attestation and
     /// announced `control_pubkey` as its 65-byte SEC1 P-256 verifying key
-    /// (`AttestedIdentity::control_pubkey`). The listener calls this once
+    /// (`ValidatedAttestation::control_pubkey`). The listener calls this once
     /// per session, immediately after the attestation document is
     /// verified.
     ///
@@ -447,7 +447,7 @@ mod tests {
         key_old
     }
 
-    /// Debug-mode node so `verify_chain_attestation` accepts the synthetic
+    /// Debug-mode node so the chain-link validation accepts the synthetic
     /// `FakeChainAttestation` docs (no real Nitro CA chain).
     fn debug_node() -> Node {
         Node::with_debug_mode(true)

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use enclavia_protocol::attestation::ValidatedAttestation;
 use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
 use enclavia_protocol::{
     CHAIN_LINK_ACK, ClientMessage, ControlCommand, RekeyParams, ServerMessage, StreamHalf,
@@ -170,7 +171,9 @@ async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
 /// `user_data = sha256(payload)`. Talks to `/dev/nsm` in both
 /// environments: real hardware on Nitro, QEMU's emulated NSM device in
 /// debug (same wire shape, self-signed instead of AWS-CA-signed).
-fn build_chain_attestation(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn build_chain_attestation(
+    payload: &[u8],
+) -> Result<ValidatedAttestation, enclavia_protocol::attestation::LocalAttestationError> {
     let user_data: [u8; 32] = {
         let mut h = Sha256::new();
         h.update(payload);
@@ -181,7 +184,7 @@ fn build_chain_attestation(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error
     // it with random bytes to avoid a deterministic value.
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    attestation::get_chain_attestation(&user_data, &nonce)
+    attestation::chain_attestation(&user_data, &nonce)
 }
 
 /// Verify and dispatch a signed control command. Returns the user-visible
@@ -418,19 +421,16 @@ async fn run_prepare_upgrade(
         Ok(a) => a,
         Err(e) => return (false, format!("chain attestation failed: {e}")),
     };
-    match enclavia_protocol::attestation::extract_own_identity(&attestation) {
-        Ok(own) if own == payload.from => {}
-        Ok(own) => {
-            return (
-                false,
-                format!(
-                    "upgrade payload `from` identity does not match this enclave: \
-                     payload {:?}, attested {:?}",
-                    payload.from, own
-                ),
-            );
-        }
-        Err(e) => return (false, format!("cannot read own pin identity: {e}")),
+    if *attestation.identity() != payload.from {
+        return (
+            false,
+            format!(
+                "upgrade payload `from` identity does not match this enclave: \
+                 payload {:?}, attested {:?}",
+                payload.from,
+                attestation.identity()
+            ),
+        );
     }
 
     // Storage re-key (only for storage enclaves). The PCR0-2 of the signed
@@ -457,7 +457,7 @@ async fn run_prepare_upgrade(
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: chain_payload.to_vec(),
-        attestation,
+        attestation: attestation.into_bytes(),
         signature: Some(payload_signature.to_vec()),
     };
 
@@ -533,7 +533,7 @@ async fn run_revoke_upgrade(
         sequence: None,
         kind: ChainLinkKind::Revocation,
         payload: chain_payload.to_vec(),
-        attestation,
+        attestation: attestation.into_bytes(),
         signature: Some(payload_signature.to_vec()),
     };
 
@@ -1122,7 +1122,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 match msg {
                     ClientMessage::RequestAttestation => {
                         let control_nonce = *nonce.lock().await;
-                        let attestation_data = attestation::get_attestation_with_data(
+                        let attestation_data = attestation::session_attestation(
                             &handshake_hash,
                             &control_nonce,
                         )?;
