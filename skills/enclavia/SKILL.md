@@ -111,6 +111,16 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
 
 - `enclavia upgrade confirm <id> <upgrade-id> [--at RFC3339 | --immediate] --json`
   -> updated staged-upgrade object. Default schedule is now + 7 days.
+  Self-hosted custody also needs `--reproduce` (local rebuild) or `--expect-pcrs FILE|JSON`
+  (target PCR0-2), optionally `--expect-digest sha256:...`; the CLI refuses to sign an
+  upgrade payload that does not match them. Anti-rollback cannot change on an upgrade:
+  with `--reproduce` it also refuses a target whose anti-rollback setting differs from
+  the running version's (read from the running image's attested boot link): turned on
+  or off, or with it on, not built as an upgrade target, another synchronizer
+  attestation mode, or no trusted synchronizer. A target trusting other
+  synchronizer builds (a rotation) is shown and refused unless
+  `--accept-synchronizer-change`; only pass it when the user confirms the new
+  cluster holds the enclave's pin (otherwise the upgraded image fail-stops at boot).
 
 - `enclavia upgrade revoke <id> <upgrade-id> --json`
   -> updated staged-upgrade object (cancelled).
