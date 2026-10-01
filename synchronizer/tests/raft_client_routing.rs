@@ -490,14 +490,14 @@ fn assert_quorum_logged_committed(nodes: &[&Node], cluster_size: usize) {
 }
 
 /// [`assert_quorum_logged_committed`] over a whole, healthy cluster.
-fn assert_all_nodes_logged_committed(nodes: &[Node]) {
+fn assert_cluster_quorum_logged_committed(nodes: &[Node]) {
     let all: Vec<&Node> = nodes.iter().collect();
     assert_quorum_logged_committed(&all, nodes.len());
 }
 
 /// Assert EVERY node's state machine holds `key` at `version`. The majority
 /// ACK guarantees the entry is in a quorum's LOG immediately (proven
-/// separately, no loop, by [`assert_all_nodes_logged_committed`]); in a
+/// separately, no loop, by [`assert_cluster_quorum_logged_committed`]); in a
 /// healthy cluster the remaining follower receives it within a heartbeat, and
 /// applying a committed entry into a follower's STATE MACHINE trails log
 /// replication by at most one more heartbeat. So observing the applied
@@ -594,7 +594,7 @@ async fn pin_then_get_same_node_leader() {
 
     // Majority ACK: the moment the Pin is ACKed, a quorum's LOG already holds
     // the committed entry. NO settle loop, the ACK is the guarantee.
-    assert_all_nodes_logged_committed(&nodes);
+    assert_cluster_quorum_logged_committed(&nodes);
     // And the entry applies into every node's state machine (bounded
     // convergence, not what makes it durable).
     assert_all_nodes_have(&nodes, key, Version(0)).await;
@@ -643,7 +643,7 @@ async fn pin_then_get_same_node_follower() {
     // Majority ACK holds regardless of which node the client dialed: the
     // forwarded write was ACKed only once a quorum's log had it (no loop), and
     // applies into every state machine (bounded convergence).
-    assert_all_nodes_logged_committed(&nodes);
+    assert_cluster_quorum_logged_committed(&nodes);
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
     let resp = client.rpc(Request::Get { key }).await;
@@ -1040,7 +1040,7 @@ async fn writes_continue_through_leader_outage_then_heal() {
     let (_, pk) = keypair(seed);
     let key = key_from_seed(seed);
     register_until_acked(find(&nodes, "node-a"), seed, pk, key, c(0x01)).await;
-    assert_all_nodes_logged_committed(&nodes);
+    assert_cluster_quorum_logged_committed(&nodes);
     assert_all_nodes_have(&nodes, key, Version(0)).await;
 
     // Partition the current leader: the other two must elect a new one.

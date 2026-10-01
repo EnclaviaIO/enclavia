@@ -27,8 +27,11 @@
 //!   the enclave's baked-in control pubkey.
 //! * [`ChainLinkKind::Revocation`] — emitted by the OLD enclave on a
 //!   pre-activation revoke. Payload binds the chain entry id being
-//!   cancelled + `issued_at / nonce`. Same signature treatment as
-//!   upgrade.
+//!   cancelled (`revokes`), the payload hash of the upgrade link it
+//!   cancels (`revokes_link`, see [`upgrade_link_hash`]; this hash, not
+//!   the id or any timestamp, is what the synchronizer refuses), and
+//!   `issued_at / nonce`. Same signature treatment as upgrade, in the
+//!   revocation-payload domain.
 //!
 //! Non-upgradable enclaves can only ever produce a single Boot entry
 //! (the genesis). [`validate_chain_link`] rejects upgrade / revocation

@@ -306,9 +306,10 @@ pub enum RaftHandleError {
     /// the underlying [`ValidationError`].
     #[error("operation rejected by state machine: {0}")]
     Rejected(#[from] ValidationError),
-    /// openraft refused the write: not the leader (carries a leader hint, if
-    /// known), quorum lost, or an internal Raft error. The caller should
-    /// redirect to the hinted leader or retry.
+    /// openraft refused the write: not the leader, quorum lost, or an internal
+    /// Raft error. Carries openraft's error text only, never a structured
+    /// leader hint: a caller that wants to redirect re-resolves the leader
+    /// with [`RaftHandle::leader_name`].
     #[error("raft write failed: {0}")]
     Raft(String),
     /// A linearizable read could not be guaranteed (not the leader / quorum
@@ -689,8 +690,8 @@ impl RaftHandle {
     ///
     /// Must be called on the leader. Returns the applied [`KeyState`] on
     /// success, [`RaftHandleError::Rejected`] if the pure core deterministically
-    /// rejected the op, or [`RaftHandleError::Raft`] (carrying a leader hint
-    /// when openraft knows one) if this node is not the leader / quorum is lost.
+    /// rejected the op, or [`RaftHandleError::Raft`] (openraft's error text, no
+    /// structured leader hint) if this node is not the leader / quorum is lost.
     ///
     /// Success means the entry is durable on a quorum of voters: openraft
     /// resolves a client write only after the entry is committed (in the log of

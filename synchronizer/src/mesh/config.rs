@@ -4,11 +4,12 @@
 //! ## Self-PCR allowlist (the trust model)
 //!
 //! The synchronizer cluster is a closed set of *identical* EIFs: every node
-//! runs the same image, so every node measures the same PCR0/1/2. A node
-//! therefore admits a peer only when the peer's attested PCR digest equals
-//! its OWN image measurements. There is no separate "trusted peer PCR list":
-//! the allowlist is a singleton, `{ self_pcr_digest }`. It is deliberately
-//! un-upgradable in v1 (the #16 design pass froze the mesh allowlist to
+//! runs the same image, so every node has the same pin identity (PCR0-2 plus
+//! user PCRs 16-31, which the synchronizer never extends). A node therefore
+//! admits a peer only when the key of the peer's attested identity
+//! ([`PcrKey`], see [`enclavia_protocol::pin_identity`]) equals its OWN.
+//! There is no separate "trusted peer PCR list": the allowlist is a
+//! singleton, `{ self_pcr_digest }`. It is deliberately un-upgradable in v1 (the #16 design pass froze the mesh allowlist to
 //! exactly the node's own PCR digest, no successor-PCR admission, no
 //! config-driven list).
 //!
@@ -64,8 +65,8 @@ impl PcrAllowlist {
         Self { allowed }
     }
 
-    /// Whether a peer presenting `digest` (the SHA-256 of its attested
-    /// PCR0/1/2) is admitted.
+    /// Whether a peer presenting `digest` (the [`PcrKey`] of its attested pin
+    /// identity) is admitted.
     pub fn admits(&self, digest: &PcrKey) -> bool {
         self.allowed.contains(digest)
     }

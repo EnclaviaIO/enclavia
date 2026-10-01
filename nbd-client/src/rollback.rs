@@ -26,8 +26,8 @@
 //! * **Runtime:** every NBD write that covers the region is hashed on
 //!   the way through, a `Pin` RPC is issued, and the corresponding NBD
 //!   reply to the kernel is HELD until the cluster's durable `PinOk`
-//!   arrives (the replicated server only ACKs a Pin after the entry is
-//!   replicated to every voter, see `synchronizer::raft::serve`).
+//!   arrives (the replicated server only ACKs a Pin once the entry is
+//!   committed on a quorum of voters, see `synchronizer::raft::serve`).
 //!   Unrelated requests are never stalled: the reply pump parks only the
 //!   gated reply and keeps forwarding everything else.
 //!
@@ -771,8 +771,13 @@ pub fn pin_error_is_retryable(e: &ClientError) -> bool {
 /// quorum right now" refusal. This is the ONE structured `Rpc` error the
 /// client retries: the synchronizer returns it while it cannot commit
 /// (no leader during an election, or quorum lost while nodes rejoin), a
-/// condition that clears on its own in seconds to minutes without any
-/// state having changed.
+/// condition that clears on its own in seconds to minutes.
+///
+/// After a write, `Unavailable` means "outcome unknown", not "not applied":
+/// the oracle bounds how long it waits for a quorum, and an entry it gave up
+/// waiting for can still commit later. A retried pin names the same
+/// `expected_version`, so a first attempt that did commit comes back as a
+/// `VersionConflict` that the `Get` resolves to our own commitment.
 pub fn pin_error_is_unavailable(e: &ClientError) -> bool {
     matches!(e, ClientError::Rpc(RpcError::Unavailable))
 }
