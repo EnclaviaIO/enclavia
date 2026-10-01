@@ -908,6 +908,7 @@ mod tests {
                 crates_rev: None,
                 synchronizer_pcrs: None,
                 synchronizer_enabled: true,
+                upgrade_target: true,
                 created_at: now(),
             }
         }
