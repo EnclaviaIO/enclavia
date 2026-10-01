@@ -109,7 +109,9 @@ login is needed. Needs `nix` plus the `builder` binary on `$PATH` (or
 both tool deps and the binary, and no source checkout is required — the
 builder's flake source is fetched automatically (pin it with
 `--builder-rev`, or export `BUILDER_FLAKE` to use a local checkout).
-The image must be linux/amd64.
+The image must be linux/amd64. The PCRs it prints won't match a deployed
+enclave's, which also measure per-enclave values (such as the enclave id
+and image digest); `reproduce` is the command for that check.
 
 `reproduce` rebuilds the EIF locally from the exact pinned sources the
 backend used and compares the resulting PCRs, so you can independently

@@ -51,7 +51,7 @@ pub struct BuildArgs {
     pub output_dir: PathBuf,
     /// Port the container listens on inside the enclave.
     pub container_port: u16,
-    /// Build the debug-mode EIF (QEMU-bootable, attestation marked debug).
+    /// Pass `--debug` to the builder (debug-attestation trust settings).
     pub debug: bool,
     /// Build the storage-capable variant (LUKS+btrfs over NBD).
     pub storage: bool,
