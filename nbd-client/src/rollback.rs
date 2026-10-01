@@ -2648,6 +2648,7 @@ mod tests {
             to,
             image_digest: "sha256:next".into(),
             valid_from: chrono::Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            valid_until: (chrono::Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap()) + chrono::Duration::days(7),
             issued_at: chrono::Utc.with_ymd_and_hms(2026, 9, 24, 0, 0, 0).unwrap(),
             nonce: vec![0x5c; 32],
         };

@@ -20,7 +20,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
     BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
-    UpgradePayload, validate_chain,
+    UpgradePayload, UPGRADE_WINDOW_MAX, UPGRADE_WINDOW_MIN, upgrade_window_is_valid, validate_chain,
 };
 use enclavia_protocol::pin_identity::PinIdentity;
 use enclavia_protocol::signing::{SignedDomain, decode_canonical, verify_control_signature};
@@ -348,9 +348,11 @@ async fn confirm_self_hosted(
 ) -> Result<StagedUpgradeJson, CliError> {
     let signer = signer_for_enclave(enclave)?;
     let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
+    let payload = checked_upgrade_window(&prep.payload)?;
     eprintln!(
-        "Upgrade will take effect at {} once confirmed. Two signatures are required.",
-        prep.valid_from
+        "Upgrade will take effect at {} once confirmed, and expires unexecuted at {}. \
+         Two signatures are required.",
+        payload.valid_from, payload.valid_until
     );
     let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
     submitting("Confirming");
@@ -360,12 +362,41 @@ async fn confirm_self_hosted(
                 "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
             );
             let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
+            checked_upgrade_window(&prep.payload)?;
             let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
             submitting("Confirming");
             client.confirm_submit(enclave_id, upgrade_id, &submission).await
         }
         other => other,
     }
+}
+
+/// Decode a backend-built upgrade payload (canonically) and check its
+/// activation window: `valid_until` after `valid_from` by at least
+/// [`UPGRADE_WINDOW_MIN`] and at most [`UPGRADE_WINDOW_MAX`]. An upgrade not executed in its window can never
+/// be, so a longer window keeps an abandoned upgrade usable for longer.
+pub fn checked_upgrade_window(payload: &[u8]) -> Result<UpgradePayload, CliError> {
+    let payload: UpgradePayload = decode_canonical(payload)
+        .map_err(|e| CliError::Other(format!("prepared payload is not an UpgradePayload: {e}")))?;
+    if !upgrade_window_is_valid(payload.valid_from, payload.valid_until) {
+        return Err(CliError::Other(format!(
+            "refusing to sign the upgrade the backend prepared: its window ({} to {}) is \
+             shorter than {} minutes",
+            payload.valid_from,
+            payload.valid_until,
+            UPGRADE_WINDOW_MIN.num_minutes()
+        )));
+    }
+    if payload.valid_until - payload.valid_from > UPGRADE_WINDOW_MAX {
+        return Err(CliError::Other(format!(
+            "refusing to sign the upgrade the backend prepared: its window ({} to {}) is \
+             longer than {} days",
+            payload.valid_from,
+            payload.valid_until,
+            UPGRADE_WINDOW_MAX.num_days()
+        )));
+    }
+    Ok(payload)
 }
 
 /// Signing is done; the submit round-trip through the backend to the
@@ -505,6 +536,10 @@ fn print_revocation_target(t: &RevocationTarget) {
     eprintln!(
         "  valid_from:  {}",
         t.upgrade.valid_from.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    eprintln!(
+        "  valid_until: {}",
+        t.upgrade.valid_until.format("%Y-%m-%d %H:%M:%S UTC")
     );
 }
 
@@ -665,6 +700,7 @@ mod tests {
             to: identity_fixture(),
             image_digest: "sha256:next".into(),
             valid_from: Utc.with_ymd_and_hms(2026, 6, 9, 11, 0, 0).unwrap(),
+            valid_until: (Utc.with_ymd_and_hms(2026, 6, 9, 11, 0, 0).unwrap()) + chrono::Duration::days(7),
             issued_at: Utc.with_ymd_and_hms(2026, 6, 9, 10, 15, 22).unwrap(),
             nonce: vec![0x43; 32],
         };
@@ -678,6 +714,42 @@ mod tests {
             }
             other => panic!("unexpected payload kind: {other:?}"),
         }
+    }
+
+    /// The CLI signs an upgrade only with a window of at least
+    /// `UPGRADE_WINDOW_MIN` and at most `UPGRADE_WINDOW_MAX`.
+    #[test]
+    fn upgrade_window_edges() {
+        let from = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
+        let payload = |until| {
+            let p = UpgradePayload {
+                enclave_id: Uuid::nil(),
+                from: identity_fixture(),
+                to: identity_fixture(),
+                image_digest: "sha256:next".into(),
+                valid_from: from,
+                valid_until: until,
+                issued_at: from - chrono::Duration::days(1),
+                nonce: vec![0x47; 32],
+            };
+            enclavia_protocol::signing::encode(&p)
+        };
+        let one_s = chrono::Duration::seconds(1);
+        let one_ms = chrono::Duration::milliseconds(1);
+        assert!(checked_upgrade_window(&payload(from + UPGRADE_WINDOW_MIN)).is_ok());
+        assert!(checked_upgrade_window(&payload(from + UPGRADE_WINDOW_MAX)).is_ok());
+        for until in [
+            from,
+            from - one_s,
+            from + UPGRADE_WINDOW_MIN - one_ms,
+            from + UPGRADE_WINDOW_MAX + one_s,
+        ] {
+            let err = checked_upgrade_window(&payload(until)).unwrap_err();
+            assert!(err.to_string().contains("refusing to sign"), "{err}");
+        }
+        let mut trailing = payload(from + UPGRADE_WINDOW_MIN);
+        trailing.push(0);
+        assert!(checked_upgrade_window(&trailing).is_err());
     }
 
     #[test]
@@ -876,6 +948,7 @@ mod tests {
                 to: identity_fixture(),
                 image_digest: "sha256:next".into(),
                 valid_from: now() + chrono::Duration::days(2),
+                valid_until: (now() + chrono::Duration::days(2)) + chrono::Duration::days(7),
                 issued_at,
                 nonce: id.as_bytes().to_vec(),
             };

@@ -320,7 +320,8 @@ fn violates_min_upgrade_delay(
 
 /// Execute the `PrepareUpgrade` flow:
 /// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
-/// 2. Validate the CBOR payload decodes as `UpgradePayload`.
+/// 2. Validate the CBOR payload decodes as `UpgradePayload`, with
+///    `valid_until` at least `UPGRADE_WINDOW_MIN` after `valid_from`.
 /// 3. Enforce the measured minimum upgrade delay on `valid_from`.
 /// 4. Get a chain attestation binding `sha256(payload)`, and require the pin
 ///    identity it carries (PCR0-2 plus user PCRs 16-31) to equal the
@@ -366,6 +367,19 @@ async fn run_prepare_upgrade(
                 );
             }
         };
+
+    // A window no Transition can use would only produce a dead link.
+    if !enclavia_protocol::chain::upgrade_window_is_valid(payload.valid_from, payload.valid_until) {
+        return (
+            false,
+            format!(
+                "upgrade payload window {} to {} is shorter than the minimum of {} s",
+                payload.valid_from,
+                payload.valid_until,
+                enclavia_protocol::chain::UPGRADE_WINDOW_MIN.num_seconds()
+            ),
+        );
+    }
 
     // The measured minimum upgrade delay. `valid_from` is checked
     // against this enclave's OWN clock, not the signer-supplied
@@ -1459,6 +1473,7 @@ mod tests {
             to: identity,
             image_digest: "sha256:test".into(),
             valid_from: chrono::Utc::now() + chrono::Duration::days(1),
+            valid_until: (chrono::Utc::now() + chrono::Duration::days(1)) + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![nonce_seed; 32],
         };
@@ -1800,6 +1815,37 @@ mod tests {
             msg.contains("measured minimum upgrade delay"),
             "msg = {msg}"
         );
+    }
+
+    /// An upgrade payload whose window is empty or one millisecond shorter
+    /// than the minimum is refused before anything else happens; a window of
+    /// exactly the minimum gets past the check.
+    #[tokio::test]
+    async fn prepare_upgrade_rejects_a_short_window() {
+        use enclavia_protocol::chain::UPGRADE_WINDOW_MIN;
+        let one_ms = chrono::Duration::milliseconds(1);
+        for (window, refused) in [
+            (chrono::Duration::zero(), true),
+            (UPGRADE_WINDOW_MIN - one_ms, true),
+            (UPGRADE_WINDOW_MIN, false),
+        ] {
+            let server_nonce = [0x12u8; 32];
+            let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+            let (sk, pk) = fixed_pair();
+            let mut payload: enclavia_protocol::chain::UpgradePayload =
+                ciborium::from_reader(sample_upgrade_payload(0x0B).as_slice()).unwrap();
+            payload.valid_until = payload.valid_from + window;
+            let cmd =
+                make_prepare_upgrade_command(server_nonce, &sk, cbor_encode(&payload), None);
+            let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
+            let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+            assert!(!ok, "msg = {msg}");
+            assert_eq!(
+                msg.contains("shorter than the minimum"),
+                refused,
+                "window {window}: msg = {msg}"
+            );
+        }
     }
 
     #[tokio::test]

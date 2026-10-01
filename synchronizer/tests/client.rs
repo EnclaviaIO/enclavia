@@ -234,6 +234,7 @@ fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
         to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: chrono::Utc::now(),
+        valid_until: chrono::Utc::now() + chrono::Duration::days(7),
         issued_at: chrono::Utc::now(),
         nonce: vec![0x5a; 32],
     };
@@ -574,6 +575,7 @@ fn upgrade_link_issued_at(
         to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: issued_at,
+        valid_until: issued_at + chrono::Duration::days(7),
         issued_at,
         nonce: vec![0x5a; 32],
     };

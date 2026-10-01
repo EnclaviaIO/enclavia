@@ -182,6 +182,7 @@ mod tests {
             to: PinIdentity::new([[0xc0; 48], [0xc1; 48], [0xc2; 48]], ZERO_USER_PCRS),
             image_digest: "sha256:target".into(),
             valid_from: Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap(),
+            valid_until: (Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap()) + chrono::Duration::days(7),
             issued_at: Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap(),
             nonce: vec![0x42; 32],
         }

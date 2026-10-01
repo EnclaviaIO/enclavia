@@ -208,11 +208,47 @@ pub struct UpgradePayload {
     /// synchronizer moves the pin held under `from`'s key to this key.
     pub to: PinIdentity,
     pub image_digest: String,
+    /// Earliest time the link may move the pin (the synchronizer refuses a
+    /// `Transition` before it, minus a clock tolerance).
     pub valid_from: DateTime<Utc>,
+    /// Latest time the link may move the pin: the synchronizer refuses a
+    /// `Transition` after it, plus the same tolerance. Must be at least
+    /// [`UPGRADE_WINDOW_MIN`] after `valid_from`. An upgrade that was not executed in this window
+    /// cannot be executed later, so a link the owner has since abandoned
+    /// is not a bearer credential forever. The backend sets it to
+    /// `valid_from + `[`UPGRADE_WINDOW_DEFAULT`]; a self-custody signer
+    /// refuses a window longer than [`UPGRADE_WINDOW_MAX`].
+    pub valid_until: DateTime<Utc>,
     pub issued_at: DateTime<Utc>,
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
 }
+
+/// The window `valid_until - valid_from` the backend gives an upgrade link.
+pub const UPGRADE_WINDOW_DEFAULT: Duration = Duration::days(7);
+
+/// The longest window `valid_until - valid_from` a self-custody signer
+/// accepts in a payload the backend built.
+pub const UPGRADE_WINDOW_MAX: Duration = Duration::days(30);
+
+/// The shortest window `valid_until - valid_from` any verifier accepts.
+///
+/// The window has to be usable: the new image must boot, open a
+/// synchronizer session and submit its `Transition`, retrying through a
+/// leader election or a node restart, all while the synchronizer's NSM time
+/// is inside the window widened by its 60 s clock tolerance. A window of a
+/// few minutes would be consumed by the tolerance and one slow boot, and the
+/// upgrade could never complete. One hour is far above that and far below
+/// [`UPGRADE_WINDOW_DEFAULT`].
+pub const UPGRADE_WINDOW_MIN: Duration = Duration::hours(1);
+
+/// Whether `[valid_from, valid_until]` is a window an upgrade link may
+/// carry: at least [`UPGRADE_WINDOW_MIN`] long (so never empty or
+/// inverted). Every verifier of an upgrade payload applies this rule.
+pub fn upgrade_window_is_valid(valid_from: DateTime<Utc>, valid_until: DateTime<Utc>) -> bool {
+    valid_until - valid_from >= UPGRADE_WINDOW_MIN
+}
+
 
 /// Payload shape for a [`ChainLinkKind::Revocation`] link.
 ///
@@ -477,6 +513,10 @@ pub enum ChainValidationError {
     /// attestation carries (PCR0-2 or any user PCR 16-31 differ).
     #[error("upgrade payload `from` identity does not match the link's attestation")]
     UpgradeFromMismatch,
+    /// Upgrade link whose window `valid_until - valid_from` is shorter than
+    /// [`UPGRADE_WINDOW_MIN`] (or empty, or inverted).
+    #[error("upgrade payload window (valid_from to valid_until) is shorter than the minimum")]
+    UpgradeWindowInvalid,
     /// Boot link's `image_digest` disagrees with `enclaves.image_digest`.
     #[error("boot payload image_digest does not match the enclave's pinned digest")]
     ImageDigestMismatch,
@@ -546,6 +586,14 @@ pub enum ChainValidationError {
     /// the enclave-side min-upgrade-delay check.
     #[error("promotion boot predates the explaining upgrade's valid_from (minus clock skew)")]
     UpgradeNotYetActive,
+    /// Walker-level rule: a promotion boot whose self-reported `booted_at`
+    /// is later than the explaining upgrade's `valid_until` (plus the
+    /// clock-skew tolerance). The link had expired, so the synchronizer
+    /// refuses the transition; a history that shows the new image
+    /// promoted after it is not one the link authorized. Defence-in-depth,
+    /// like [`Self::UpgradeNotYetActive`].
+    #[error("promotion boot postdates the explaining upgrade's valid_until (plus clock skew)")]
+    UpgradeExpired,
     /// A stored chain entry's payload no longer CBOR-decodes (DB-side
     /// drift). Maps to 500.
     #[error("stored {0:?} payload corrupt: {1}")]
@@ -694,6 +742,9 @@ fn validate_signed(
                 })?;
             if parsed.enclave_id != *ctx.enclave_id {
                 return Err(ChainValidationError::EnclaveIdMismatch);
+            }
+            if !upgrade_window_is_valid(parsed.valid_from, parsed.valid_until) {
+                return Err(ChainValidationError::UpgradeWindowInvalid);
             }
             // The link names the identity whose pin it moves (`from`), so
             // the enclave that emitted it must have attested exactly that
@@ -972,6 +1023,15 @@ pub fn validate_chain(
                                 < target.valid_from - Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS)
                             {
                                 outcomes.push(Err(ChainValidationError::UpgradeNotYetActive));
+                                prior.push(link.clone());
+                                continue;
+                            }
+                            // Nor POSTDATE its `valid_until` (plus skew): an
+                            // expired link moves no pin.
+                            if p.booted_at
+                                > target.valid_until + Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS)
+                            {
+                                outcomes.push(Err(ChainValidationError::UpgradeExpired));
                                 prior.push(link.clone());
                                 continue;
                             }
@@ -1298,6 +1358,7 @@ mod tests {
             to: identity_from_seed(pcr_seed),
             image_digest: image_digest.into(),
             valid_from,
+            valid_until: valid_from + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x43; 32],
         };
@@ -1811,6 +1872,7 @@ mod tests {
             from,
             image_digest: "sha256:v2".into(),
             valid_from: chrono::Utc::now() + Duration::days(7),
+            valid_until: (chrono::Utc::now() + Duration::days(7)) + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x46; 32],
         };
@@ -2042,6 +2104,7 @@ mod tests {
             to: identity_from_seed(to_seed),
             image_digest: target_digest.into(),
             valid_from,
+            valid_until: valid_from + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x45; 32],
         };
@@ -2506,6 +2569,95 @@ mod tests {
         );
         assert!(walk.tip_matches_row);
         assert_eq!(walk.final_pcrs, Some(row_pcrs));
+    }
+
+    /// A promotion boot later than the upgrade's `valid_until` plus the skew
+    /// tolerance is refused (the link had expired); at the edge it passes.
+    #[test]
+    fn walk_rejects_promotion_after_valid_until() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let valid_from = now - Duration::days(9);
+        let valid_until = valid_from + UPGRADE_WINDOW_DEFAULT;
+        let skew = Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS);
+        for (booted_at, ok) in [
+            (valid_until + skew, true),
+            (valid_until + skew + Duration::seconds(1), false),
+        ] {
+            let mut genesis = boot_link(id, "sha256:v1", 0x62);
+            genesis.id = Some(Uuid::new_v4());
+            genesis.sequence = Some(0);
+            let mut upgrade =
+                transition_upgrade_link(id, "sha256:v2", 0x62, 0x72, &sk, valid_from);
+            upgrade.id = Some(Uuid::new_v4());
+            upgrade.sequence = Some(1);
+            let mut promo = boot_link_at(id, "sha256:v2", 0x72, booted_at);
+            promo.id = Some(Uuid::new_v4());
+            promo.sequence = Some(2);
+            let links = vec![
+                recorded(genesis, now - Duration::days(10)),
+                recorded(upgrade, valid_from - Duration::days(1)),
+                recorded(promo, booted_at),
+            ];
+            let walk = validate_chain(
+                &links,
+                &id,
+                &pcrs_hex_from_seed(0x72),
+                "sha256:v2",
+                Some(&pk),
+                true,
+                now,
+                true,
+            );
+            if ok {
+                assert!(walk.outcomes.iter().all(Result::is_ok), "{:?}", walk.outcomes);
+            } else {
+                assert!(
+                    matches!(walk.outcomes[2], Err(ChainValidationError::UpgradeExpired)),
+                    "{:?}",
+                    walk.outcomes
+                );
+            }
+        }
+    }
+
+    /// An upgrade link whose window is empty, inverted or one millisecond
+    /// shorter than the minimum is refused; exactly the minimum is accepted.
+    #[test]
+    fn upgrade_with_an_empty_window_is_rejected() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, _) = chain_with_pending_upgrade(id, &sk);
+        for (window, ok) in [
+            (Duration::zero(), false),
+            (Duration::seconds(-1), false),
+            (UPGRADE_WINDOW_MIN - Duration::milliseconds(1), false),
+            (UPGRADE_WINDOW_MIN, true),
+        ] {
+            let mut link = upgrade_link(
+                id,
+                "sha256:v3",
+                0x1e,
+                &sk,
+                chrono::Utc::now() + Duration::days(8),
+            );
+            let mut payload: UpgradePayload = decode_canonical(&link.payload).unwrap();
+            payload.valid_until = payload.valid_from + window;
+            link.payload = crate::signing::encode(&payload);
+            link.attestation = FakeChainAttestation::for_payload(0x1e, &link.payload).encode();
+            link.signature =
+                Some(sign_control(&sk, SignedDomain::UpgradePayload, &link.payload).to_vec());
+            let result = validate_chain_link(
+                &link,
+                &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+                chrono::Utc::now(),
+                true,
+            );
+            let refused = matches!(result, Err(ChainValidationError::UpgradeWindowInvalid));
+            assert_eq!(refused, !ok, "window {window}: {result:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
