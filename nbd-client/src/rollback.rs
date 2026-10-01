@@ -275,8 +275,8 @@ pub enum GetOutcome {
 pub enum BootDecision {
     /// Pinned commitment matches the device: serve.
     Serve,
-    /// Fresh device, unregistered key: register (first Pin) the blank
-    /// region's commitment, then serve.
+    /// Fresh device, unregistered key: `Register` the blank region's
+    /// commitment, then serve. The only place the client ever registers.
     RegisterThenServe,
     /// Written superblock, no pin under our key: either a rollback or
     /// the first boot after a staged upgrade (#46). Attempt a PCR
@@ -855,11 +855,31 @@ where
     )
     .await
     {
-        Ok(Ok(version)) => {
+        Ok(Ok(version)) if version.0 == expected.0 + 1 => {
             debug!(version = version.0, "superblock pin durably acknowledged");
             *expected = version;
             Ok(())
         }
+        // A compare-and-swap from `expected` lands at exactly `expected + 1`;
+        // any other answer is not our pin.
+        Ok(Ok(version)) => Err((
+            PinFailure::Fatal,
+            format!(
+                "pin from version {} answered version {}: not the compare-and-swap \
+                 this client sent; refusing to keep serving",
+                expected.0, version.0
+            ),
+        )),
+        // The oracle does not know our key. A running enclave was
+        // registered (or transitioned) at boot, so this oracle has lost
+        // that state or is another cluster. Never re-register: that would
+        // start a second history of this volume.
+        Ok(Err(ClientError::Rpc(RpcError::NotFound))) => Err((
+            PinFailure::Fatal,
+            "pin answered NotFound: the synchronizer does not know this enclave's key \
+             (its state is lost, or this is another cluster); refusing to keep serving"
+                .to_string(),
+        )),
         Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
             *expected = disambiguate_conflict(oracle, key, commitment).await?;
             Ok(())
@@ -1441,7 +1461,9 @@ where
 pub trait BootOracle {
     /// `Client::get`.
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError>;
-    /// `Client::pin` (the CAS guard is ignored on a first-time Register).
+    /// `Client::register`: only the boot decision's fresh-device branch.
+    async fn register(&mut self, key: PcrKey, commitment: Commitment) -> Result<(), ClientError>;
+    /// `Client::pin` (compare-and-swap on a registered key).
     async fn pin(
         &mut self,
         key: PcrKey,
@@ -1458,6 +1480,9 @@ where
 {
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError> {
         Client::get(self, key).await
+    }
+    async fn register(&mut self, key: PcrKey, commitment: Commitment) -> Result<(), ClientError> {
+        Client::register(self, key, commitment).await
     }
     async fn pin(
         &mut self,
@@ -1568,46 +1593,42 @@ where
         BootDecision::RegisterThenServe => {
             info!("boot verify: fresh device, registering with the synchronizer");
             let commitment = Commitment(commitment_of_region(region));
-            let result =
-                tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, Version(0), commitment))
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "boot verify: registration Pin timed out after {SYNC_RPC_TIMEOUT:?} \
-                     (synchronizer unreachable)"
-                        )
-                    })?;
-            let version = match result {
-                Ok(version) => version,
-                // At-least-once, same as the runtime path: an earlier
-                // attempt of THIS registration can commit and still lose
-                // its ack (the oracle re-submits a Pin it answered
-                // `Unavailable`, and the re-submission passes the CAS).
-                // The next attempt then sees `VersionConflict` for a pin
-                // that is already ours. Disambiguate with a `Get`: our
-                // own commitment means the registration landed; ANY
-                // other commitment is a second writer and stays
-                // fail-stop, exactly as before.
-                Err(ClientError::Rpc(RpcError::VersionConflict)) => {
-                    disambiguate_conflict(oracle, key, commitment.0)
+            let result = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.register(key, commitment))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "boot verify: Register timed out after {SYNC_RPC_TIMEOUT:?} \
+                         (synchronizer unreachable)"
+                    )
+                })?;
+            match result {
+                Ok(()) => {}
+                // At-least-once, like a pin: an earlier attempt of THIS
+                // registration can commit and still lose its answer (the
+                // oracle re-submits a write it answered `Unavailable`), and
+                // the next attempt then finds the key registered. The `Get`
+                // settles it: our own commitment at version 0 is our
+                // registration; anything else is a second writer, fail-stop.
+                Err(ClientError::Rpc(RpcError::AlreadyRegistered)) => {
+                    let version = disambiguate_conflict(oracle, key, commitment.0)
                         .await
                         .map_err(|(_, msg)| {
-                            format!("boot verify: registration Pin conflicted: {msg}")
-                        })?
+                            format!("boot verify: Register found the key registered: {msg}")
+                        })?;
+                    if version != Version(0) {
+                        // Get said NotFound, but the key now holds our
+                        // commitment past version 0: another session
+                        // registered and pinned it in between. Two live
+                        // writers for one key can only corrupt each other.
+                        return Err(format!(
+                            "boot verify: registration raced (the key is at version {} \
+                             != 0); another session owns this key",
+                            version.0
+                        )
+                        .into());
+                    }
                 }
-                Err(e) => return Err(format!("boot verify: registration Pin failed: {e}").into()),
-            };
-            if version != Version(0) {
-                // Get said NotFound but the Pin did not register: another
-                // session squeezed a registration in between. Two live
-                // writers for one PcrKey can only corrupt each other;
-                // refuse to serve.
-                return Err(format!(
-                    "boot verify: registration raced (PinOk version {} != 0); another \
-                     session owns this key",
-                    version.0
-                )
-                .into());
+                Err(e) => return Err(format!("boot verify: Register failed: {e}").into()),
             }
             Ok(Version(0))
         }
@@ -2164,8 +2185,11 @@ where
 /// attestation. Boot verification is deliberately NOT re-run on
 /// reconnect: the device has been live and gated the whole time, so the
 /// pinned state cannot have moved under us; the key-continuity check in
-/// [`SyncPinner`] guards the only thing that could change. The CAS
-/// version likewise survives reconnects (same enclave, same state).
+/// [`SyncPinner`] guards the only thing that could change. An oracle
+/// that does not know our key (another cluster, or one that lost its state)
+/// answers the next Pin `NotFound`, which is fatal: the client registers
+/// only from the boot decision, never after. The CAS version likewise
+/// survives reconnects (same enclave, same state).
 pub fn into_pinner(boot: BootResult) -> SyncPinner<tokio_vsock::VsockStream> {
     SyncPinner {
         client: boot.session.client,
@@ -2462,10 +2486,10 @@ mod tests {
     /// Scripted [`BootOracle`]: pops pre-programmed RPC results in order
     /// and records every Transition link. `expect` panics double as the
     /// "this RPC must never be issued on this path" assertions (e.g. no
-    /// Pin/Register on a written region).
+    /// Register on a written region; boot never pins at all).
     pub(super) struct ScriptedOracle {
         gets: std::collections::VecDeque<Result<(Commitment, Version), ClientError>>,
-        pins: std::collections::VecDeque<Result<Version, ClientError>>,
+        registers: std::collections::VecDeque<Result<(), ClientError>>,
         transitions: std::collections::VecDeque<Result<Version, ClientError>>,
         pub(super) seen_transitions: Vec<ChainLink>,
     }
@@ -2473,12 +2497,12 @@ mod tests {
     impl ScriptedOracle {
         pub(super) fn new(
             gets: Vec<Result<(Commitment, Version), ClientError>>,
-            pins: Vec<Result<Version, ClientError>>,
+            registers: Vec<Result<(), ClientError>>,
             transitions: Vec<Result<Version, ClientError>>,
         ) -> Self {
             Self {
                 gets: gets.into_iter().collect(),
-                pins: pins.into_iter().collect(),
+                registers: registers.into_iter().collect(),
                 transitions: transitions.into_iter().collect(),
                 seen_transitions: Vec::new(),
             }
@@ -2489,13 +2513,20 @@ mod tests {
         async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
             self.gets.pop_front().expect("unexpected Get")
         }
+        async fn register(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<(), ClientError> {
+            self.registers.pop_front().expect("unexpected Register")
+        }
         async fn pin(
             &mut self,
             _key: PcrKey,
             _expected_version: Version,
             _commitment: Commitment,
         ) -> Result<Version, ClientError> {
-            self.pins.pop_front().expect("unexpected Pin")
+            panic!("boot verification never pins")
         }
         async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
             self.seen_transitions.push(link);
@@ -2717,7 +2748,7 @@ mod tests {
         .expect("matching pin must serve");
 
         let blank = vec![0u8; SB_REGION_LEN];
-        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(())], vec![]);
         verify_or_register(&mut oracle, test_key(), &blank, async {
             panic!("fresh device must not fetch the upgrade link")
         })
@@ -2747,7 +2778,7 @@ mod tests {
 
         // Register: exactly Version(0).
         let blank = vec![0u8; SB_REGION_LEN];
-        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(())], vec![]);
         let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
             .await
             .unwrap();
@@ -4047,6 +4078,13 @@ mod retry_budget_tests {
         async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
             Ok((self.commitment, self.version))
         }
+        async fn register(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<(), ClientError> {
+            unreachable!("no registration on the pin path")
+        }
         async fn pin(
             &mut self,
             _key: PcrKey,
@@ -4121,6 +4159,66 @@ mod retry_budget_tests {
         assert_eq!(pinner.oracle.commitment, Commitment([0x03; 32]));
     }
 
+    /// An oracle that answers one pin with a fixed result.
+    struct OneAnswer(Option<Result<Version, ClientError>>);
+
+    impl BootOracle for OneAnswer {
+        async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
+            unreachable!("no Get on these paths")
+        }
+        async fn register(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<(), ClientError> {
+            unreachable!("a running enclave never registers")
+        }
+        async fn pin(
+            &mut self,
+            _key: PcrKey,
+            _expected_version: Version,
+            _commitment: Commitment,
+        ) -> Result<Version, ClientError> {
+            self.0.take().expect("one pin only")
+        }
+        async fn transition(&mut self, _link: ChainLink) -> Result<Version, ClientError> {
+            unreachable!("no transition on the pin path")
+        }
+    }
+
+    /// After boot the client never treats an unknown key as success: a
+    /// runtime pin answered `NotFound` (an oracle that lost our state, or
+    /// another cluster the host routed us to) is fatal at once, and so is
+    /// any `PinOk` that is not `expected + 1` (say, version 0 from an oracle
+    /// that registered the key afresh). Neither moves `expected`.
+    #[tokio::test]
+    async fn runtime_pin_never_accepts_an_unknown_key() {
+        let key = PcrKey([0x42; 32]);
+        let mut expected = Version(3);
+        let not_found = Err(ClientError::Rpc(RpcError::NotFound));
+        let (failure, msg) = pin_once_on(&mut OneAnswer(Some(not_found)), key, &mut expected, [1; 32])
+            .await
+            .unwrap_err();
+        assert_eq!(failure, PinFailure::Fatal);
+        assert!(msg.contains("NotFound"), "{msg}");
+        assert_eq!(expected, Version(3));
+
+        for answered in [0, 3, 5] {
+            let (failure, msg) =
+                pin_once_on(&mut OneAnswer(Some(Ok(Version(answered)))), key, &mut expected, [1; 32])
+                    .await
+                    .unwrap_err();
+            assert_eq!(failure, PinFailure::Fatal);
+            assert!(msg.contains("not the compare-and-swap"), "{msg}");
+            assert_eq!(expected, Version(3));
+        }
+
+        pin_once_on(&mut OneAnswer(Some(Ok(Version(4)))), key, &mut expected, [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(expected, Version(4));
+    }
+
     /// The same unknown outcome, but another writer's pin is what landed:
     /// the retry's CAS fails, the `Get` shows a foreign commitment, and the
     /// pin fail-stops as a fork.
@@ -4145,21 +4243,20 @@ mod retry_budget_tests {
     }
 }
 
-/// The boot registration path's `VersionConflict` handling: our own
+/// The boot registration path's `AlreadyRegistered` handling: our own
 /// already-committed registration must serve, anything else fail-stops.
 #[cfg(test)]
 mod boot_conflict_tests {
     use super::tests::{ScriptedOracle, not_found, test_key};
     use super::*;
 
-    fn conflict() -> Result<Version, ClientError> {
-        Err(ClientError::Rpc(RpcError::VersionConflict))
+    fn conflict() -> Result<(), ClientError> {
+        Err(ClientError::Rpc(RpcError::AlreadyRegistered))
     }
 
-    /// The boot brick: on a fresh device the registration Pin is
-    /// answered `Unavailable`, the oracle re-submits it, the
-    /// re-submission commits, and the next attempt sees
-    /// `VersionConflict`. The disambiguating `Get` returns OUR OWN
+    /// The boot brick: on a fresh device the Register is answered
+    /// `Unavailable`, the oracle re-submits it, the re-submission
+    /// commits, and the next attempt sees `AlreadyRegistered`. The disambiguating `Get` returns OUR OWN
     /// commitment, so the registration did land: serve.
     #[tokio::test]
     async fn boot_registration_conflict_with_own_commitment_serves() {
@@ -4193,7 +4290,7 @@ mod boot_conflict_tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("registration Pin conflicted"), "{msg}");
+        assert!(msg.contains("Register found the key registered"), "{msg}");
         assert!(msg.contains("DIFFERENT commitment"), "{msg}");
     }
 
@@ -4218,7 +4315,7 @@ mod boot_conflict_tests {
         );
     }
 
-    /// A registration Pin refused for any OTHER reason keeps failing on
+    /// A Register refused for any OTHER reason keeps failing on
     /// the first answer, with no Get issued (the scripted deque holds
     /// only the boot Get, so a second one would panic).
     #[tokio::test]
@@ -4233,7 +4330,7 @@ mod boot_conflict_tests {
         let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("registration Pin failed"), "{err}");
+        assert!(err.to_string().contains("Register failed"), "{err}");
     }
 
     /// The conflict tolerance does NOT weaken the registration-race

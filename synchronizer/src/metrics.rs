@@ -70,15 +70,14 @@ const N_BUCKETS: usize = RPC_LATENCY_BOUNDS_MS.len() + 1;
 // Labels
 // ---------------------------------------------------------------------------
 
-/// Customer RPC kind. `Register` is a `Pin` that created the key (its
-/// response carries version 0).
+/// Customer RPC kind, one per request variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcKind {
     /// `Request::Get`.
     Get,
-    /// `Request::Pin` on an existing key.
+    /// `Request::Pin`.
     Pin,
-    /// `Request::Pin` that registered the key.
+    /// `Request::Register`.
     Register,
     /// `Request::Transition`.
     Transition,
@@ -107,22 +106,14 @@ impl RpcKind {
         }
     }
 
-    /// The kind `request` is counted under before its outcome is known.
+    /// The kind `request` is counted under.
     pub fn of_request(request: &Request) -> Self {
         match request {
             Request::Get { .. } => RpcKind::Get,
             Request::Pin { .. } => RpcKind::Pin,
+            Request::Register { .. } => RpcKind::Register,
             Request::Transition { .. } => RpcKind::Transition,
             Request::Revoke { .. } => RpcKind::Revoke,
-        }
-    }
-
-    /// Refine the kind with the response: a `Pin` answered with version 0
-    /// registered the key.
-    pub fn refine(self, response: &Response) -> Self {
-        match (self, response) {
-            (RpcKind::Pin, Response::PinOk { version }) if version.0 == 0 => RpcKind::Register,
-            (k, _) => k,
         }
     }
 }
@@ -136,6 +127,8 @@ pub enum RpcOutcome {
     Unauthorized,
     /// [`RpcError::NotFound`].
     NotFound,
+    /// [`RpcError::AlreadyRegistered`].
+    AlreadyRegistered,
     /// [`RpcError::TransitionRejected`].
     TransitionRejected,
     /// [`RpcError::OperationRejected`].
@@ -156,10 +149,11 @@ pub enum RpcOutcome {
 
 impl RpcOutcome {
     /// Every outcome, in label order.
-    pub const ALL: [RpcOutcome; 10] = [
+    pub const ALL: [RpcOutcome; 11] = [
         RpcOutcome::Ok,
         RpcOutcome::Unauthorized,
         RpcOutcome::NotFound,
+        RpcOutcome::AlreadyRegistered,
         RpcOutcome::TransitionRejected,
         RpcOutcome::OperationRejected,
         RpcOutcome::VersionConflict,
@@ -175,6 +169,7 @@ impl RpcOutcome {
             RpcOutcome::Ok => "ok",
             RpcOutcome::Unauthorized => "unauthorized",
             RpcOutcome::NotFound => "not_found",
+            RpcOutcome::AlreadyRegistered => "already_registered",
             RpcOutcome::TransitionRejected => "transition_rejected",
             RpcOutcome::OperationRejected => "operation_rejected",
             RpcOutcome::VersionConflict => "version_conflict",
@@ -201,6 +196,7 @@ impl RpcOutcome {
             Response::Err { error } => match error {
                 RpcError::Unauthorized => RpcOutcome::Unauthorized,
                 RpcError::NotFound => RpcOutcome::NotFound,
+                RpcError::AlreadyRegistered => RpcOutcome::AlreadyRegistered,
                 RpcError::TransitionRejected => RpcOutcome::TransitionRejected,
                 RpcError::OperationRejected => RpcOutcome::OperationRejected,
                 RpcError::VersionConflict => RpcOutcome::VersionConflict,
@@ -373,7 +369,7 @@ impl RpcStats {
     /// Count one completed request, classified from its response.
     pub fn record_response(&self, kind: RpcKind, response: &Response, elapsed: Duration) {
         self.record(
-            kind.refine(response),
+            kind,
             RpcOutcome::of_response(response),
             elapsed,
         );
@@ -382,7 +378,7 @@ impl RpcStats {
     /// Count one completed request, classified from its [`Answered`].
     pub fn record_answered(&self, kind: RpcKind, answered: &Answered, elapsed: Duration) {
         self.record(
-            kind.refine(&answered.response),
+            kind,
             RpcOutcome::of_answered(answered),
             elapsed,
         );
@@ -1054,22 +1050,21 @@ mod tests {
         assert_eq!(RpcKind::of_request(&get()), RpcKind::Get);
         assert_eq!(RpcKind::of_request(&pin()), RpcKind::Pin);
         assert_eq!(
-            RpcKind::Pin.refine(&Response::PinOk {
-                version: Version(0)
+            RpcKind::of_request(&Request::Register {
+                key: PcrKey([1; 32]),
+                commitment: Commitment([2; 32]),
             }),
             RpcKind::Register
         );
         assert_eq!(
-            RpcKind::Pin.refine(&Response::PinOk {
-                version: Version(4)
+            RpcOutcome::of_response(&Response::Err {
+                error: RpcError::AlreadyRegistered,
             }),
-            RpcKind::Pin
+            RpcOutcome::AlreadyRegistered
         );
-        // An error does not reveal whether the pin would have registered.
         let conflict = Response::Err {
             error: RpcError::VersionConflict,
         };
-        assert_eq!(RpcKind::Pin.refine(&conflict), RpcKind::Pin);
         assert_eq!(
             RpcOutcome::of_response(&conflict),
             RpcOutcome::VersionConflict
@@ -1144,10 +1139,8 @@ mod tests {
     fn rpc_stats_record_every_dimension() {
         let stats = RpcStats::new();
         stats.record_response(
-            RpcKind::Pin,
-            &Response::PinOk {
-                version: Version(0),
-            },
+            RpcKind::Register,
+            &Response::RegisterOk,
             Duration::from_micros(1500),
         );
         stats.record_response(

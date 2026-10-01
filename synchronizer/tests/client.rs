@@ -140,11 +140,12 @@ where
     }
 }
 
-/// Happy path: mutual authentication succeeds, then first Pin registers
-/// (Version 0), second bumps to 1, Get returns the latest commitment +
-/// version.
+/// Happy path: mutual authentication succeeds; a Pin before the key is
+/// registered is NotFound, Register creates it (a second Register is
+/// AlreadyRegistered), a Pin bumps it to 1, Get returns the latest
+/// commitment + version.
 #[tokio::test]
-async fn pin_register_then_bump_then_get() {
+async fn register_then_pin_then_get() {
     let node = Arc::new(Node::with_debug_mode(true));
     let (mut client, key, task) = connect_as(node, 0x42).await;
 
@@ -154,16 +155,18 @@ async fn pin_register_then_bump_then_get() {
         synchronizer::wire::PROTOCOL_VERSION
     );
 
-    let v0 = client
-        .pin(key, Version(0), c(0xaa))
-        .await
-        .expect("first pin");
-    assert_eq!(v0, Version(0), "first pin must be the registration");
+    // A Pin never registers.
+    let err = client.pin(key, Version(0), c(0xaa)).await.unwrap_err();
+    assert!(matches!(err, ClientError::Rpc(RpcError::NotFound)), "{err:?}");
 
-    let v1 = client
-        .pin(key, Version(0), c(0xbb))
-        .await
-        .expect("second pin");
+    client.register(key, c(0xaa)).await.expect("register");
+    let err = client.register(key, c(0xaa)).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc(RpcError::AlreadyRegistered)),
+        "{err:?}"
+    );
+
+    let v1 = client.pin(key, Version(0), c(0xbb)).await.expect("pin");
     assert_eq!(v1, Version(1));
 
     let (commitment, version) = client.get(key).await.expect("get");
@@ -211,7 +214,7 @@ async fn second_session_reads_first_sessions_pin() {
     let node = Arc::new(Node::with_debug_mode(true));
 
     let (mut client, key, _task) = connect_as(Arc::clone(&node), 0x45).await;
-    client.pin(key, Version(0), c(0xcd)).await.expect("pin");
+    client.register(key, c(0xcd)).await.expect("register");
     drop(client);
 
     let (mut client2, key2, _task2) = connect_as(node, 0x45).await;
@@ -248,16 +251,15 @@ fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
     }
 }
 
-/// Seed an OLD enclave's key into the node (attest + Pin), modelling its
+/// Seed an OLD enclave's key into the node (attest + Register), modelling its
 /// earlier, now-stopped session, so its control pubkey is frozen.
 async fn register_old(node: &Node, seed: u8, control_pubkey: [u8; CONTROL_PUBKEY_LEN]) -> PcrKey {
     let key_old = key_from_seed(seed);
     node.observe_attestation(key_old, control_pubkey).await;
     node.handle_request(
         key_old,
-        Request::Pin {
+        Request::Register {
             key: key_old,
-            expected_version: Version(0),
             commitment: c(0xee),
         },
     )

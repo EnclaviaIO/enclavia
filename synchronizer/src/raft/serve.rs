@@ -38,7 +38,7 @@
 //!
 //! ## Majority ACK
 //!
-//! Writes (`Pin` / `Register` / `Transition`) are ACKed once
+//! Writes (`Register` / `Pin` / `Transition` / `Revoke`) are ACKed once
 //! [`RaftHandle::client_write`] returns, i.e. once the entry is committed on a
 //! quorum of voters (2 of 3) and applied on the leader. That ACK survives the
 //! loss of any single node; the argument is in the [`crate::raft`] module docs'
@@ -54,6 +54,8 @@
 //! "maybe applied". It does: a retried Pin names the same `expected_version`,
 //! so if the first attempt committed the retry fails the compare-and-swap with
 //! `VersionConflict`, and the client's `Get` finds its own commitment; a
+//! retried Register fails with `AlreadyRegistered` and is resolved the same
+//! way; a
 //! retried Transition or Revoke is rejected or idempotent in the same way, and
 //! the client confirms with `Get`. Timed-out writes are not retried on the
 //! server side (see [`super::forward`]), so a lost quorum does not pile up
@@ -93,21 +95,14 @@ pub async fn handle_on_leader(
 ) -> Answered {
     match req {
         Request::Get { key } => handle_get(raft, session_key, key).await,
+        Request::Register { key, commitment } => {
+            handle_register(raft, session_key, key, commitment, control_pubkey).await
+        }
         Request::Pin {
             key,
             expected_version,
             commitment,
-        } => {
-            handle_pin(
-                raft,
-                session_key,
-                key,
-                expected_version,
-                commitment,
-                control_pubkey,
-            )
-            .await
-        }
+        } => handle_pin(raft, session_key, key, expected_version, commitment).await,
         Request::Transition { link } => {
             handle_transition(raft, session_key, control_pubkey, link, debug_mode).await
         }
@@ -183,114 +178,77 @@ async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Answ
     }
 }
 
-/// Map the single wire `Pin` RPC onto a replicated `Register` (first pin) or
-/// `Pin` (re-pin), deciding from the CURRENT leader state (the replicated state
-/// machine), then submit it.
+/// Submit a replicated `Register` for the session's own key.
 ///
-/// The `expected_version` compare-and-swap guard is enforced by the pure
-/// core's deterministic `apply` on the committed entry (identically on every
-/// replica), never by this pre-check: it is what stops two live writers for
-/// one key (a host-booted clone pair shares the image's PCRs) from forking
-/// the pinned history — the loser's first divergent pin is rejected with
-/// `VersionConflict` instead of silently last-write-winning. For a first
-/// pin the op maps to `Register`, which is inherently a CAS on
-/// non-existence, so the guard is ignored there.
-///
-/// ## The concurrent-first-pin race
-///
-/// Two enclaves cannot share a `PcrKey` (it is the hash of their pin identity),
-/// so a key is only ever pinned by one identity. But the SAME enclave can hold
-/// two sessions (e.g. a client retry that overlaps the original), and both can
-/// observe the key as unregistered and submit `Register`. Only one such
-/// `Register` commits; the other is applied as a committed entry that the pure
-/// core deterministically rejects with [`ValidationError::AlreadyRegistered`]
-/// (the rejection replicates identically on every node). That losing `Register`
-/// is a benign race, not a client error: the key IS now registered, so we retry
-/// it ONCE as a `Pin`, which is exactly what the client wanted (write a fresh
-/// commitment). A second `AlreadyRegistered` cannot happen (the key is live and
-/// `Pin` does not check registration that way), so one retry is sufficient and
-/// bounded.
-async fn handle_pin(
+/// The client sends it only from its boot decision, for a blank volume the
+/// oracle does not know. The pure core's `apply` decides on the committed
+/// entry, identically on every replica: a key already registered is
+/// rejected [`ValidationError::AlreadyRegistered`] (the client then checks
+/// with a `Get` whether that registration was its own earlier attempt), a
+/// retired key [`ValidationError::KeyRetired`]. The session's control
+/// pubkey is the one frozen for the key.
+async fn handle_register(
     raft: &RaftHandle,
     session_key: PcrKey,
     key: PcrKey,
-    expected_version: crate::Version,
     commitment: crate::Commitment,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
 ) -> Answered {
     if key != session_key {
         return err(RpcError::Unauthorized);
     }
-
-    // Decide Register vs Pin from the leader's LOCAL applied state. This used
-    // to be a `linearizable_get`, which costs a full ReadIndex quorum round on
-    // the mesh per Pin; that made the pre-check the most expensive part of the
-    // steady-state Pin path. The local read is safe because the decision is
-    // only a HINT: the authoritative check is the deterministic pure-core
-    // `apply` on the committed entry, and both stale directions are handled:
-    //
-    // * Local "unregistered" but actually registered (another session's
-    //   Register raced us): the committed `Register` is rejected
-    //   `AlreadyRegistered` and retried ONCE as a `Pin` below (pre-existing
-    //   path).
-    // * Local "registered" is always a committed fact (applied state is a
-    //   prefix of committed history), and a live key only leaves via that same
-    //   enclave's `Transition`; a Pin racing its own retirement surfaces the
-    //   core's rejection, exactly as it would have with the linearized read.
-    let is_registered = raft.state_machine().get(&key).await.is_some();
-
-    let first_op = if is_registered {
-        ReplicatedOp::Pin {
-            key,
-            expected_version,
-            commitment,
-        }
-    } else {
-        ReplicatedOp::Register {
+    match raft
+        .client_write(ReplicatedOp::Register {
             key,
             commitment,
             control_pubkey,
-        }
-    };
+        })
+        .await
+    {
+        Ok(_) => Answered::new(Response::RegisterOk),
+        Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
+        // No quorum within the bound: the entry may still commit, so the
+        // answer is "outcome unknown", never an ACK.
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("register"),
+        // Not the leader any more / quorum lost: the write is not known to
+        // be committed on a quorum, so the oracle must not ACK it.
+        Err(_) => err(RpcError::Unavailable),
+    }
+}
 
-    match raft.client_write(first_op).await {
+/// Submit a replicated compare-and-swap `Pin` for a registered key.
+///
+/// The `expected_version` guard is enforced by the pure core's deterministic
+/// `apply` on the committed entry (identically on every replica): it is what
+/// stops two live writers for one key (a host-booted clone pair shares the
+/// image's PCRs) from forking the pinned history, since the loser's first
+/// divergent pin is rejected with `VersionConflict` instead of silently
+/// last-write-winning. A key the replicated state does not hold is
+/// [`ValidationError::KeyNotCurrent`], answered `NotFound`: a Pin never
+/// registers, so a client whose key is unknown here (a cluster that lost
+/// its state, or another cluster altogether) is told so instead of having
+/// a fresh history started for it.
+async fn handle_pin(
+    raft: &RaftHandle,
+    session_key: PcrKey,
+    key: PcrKey,
+    expected_version: crate::Version,
+    commitment: crate::Commitment,
+) -> Answered {
+    if key != session_key {
+        return err(RpcError::Unauthorized);
+    }
+    match raft
+        .client_write(ReplicatedOp::Pin {
+            key,
+            expected_version,
+            commitment,
+        })
+        .await
+    {
         Ok(state) => Answered::new(Response::PinOk {
             version: state.version,
         }),
-        // Concurrent first-pin race: our Register lost to another session's
-        // Register for the same key. The key is now registered, so retry ONCE
-        // as a Pin (bounded, deterministic: a live key's Pin cannot itself hit
-        // AlreadyRegistered).
-        //
-        // The retried Pin carries the caller's `expected_version`, which the
-        // CAS then enforces against the just-registered key. This is only
-        // reachable in the concurrent-first-pin race (the wire has one Pin
-        // RPC for both Register and re-pin), and it is contained: both
-        // racers booted from the same snapshot, so their commitments are
-        // identical in practice; even in the divergent case the fallback
-        // pin wins the CAS (v0 matches) but the loser's client sees
-        // `version != 0` and fail-stops, and the "winner"'s next pin hits
-        // VersionConflict with a foreign commitment and fail-stops too —
-        // conservative stop on both sides, never a silent rollback.
-        Err(RaftHandleError::Rejected(ValidationError::AlreadyRegistered)) => {
-            match raft
-                .client_write(ReplicatedOp::Pin {
-                    key,
-                    expected_version,
-                    commitment,
-                })
-                .await
-            {
-                Ok(state) => Answered::new(Response::PinOk {
-                    version: state.version,
-                }),
-                Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-                Err(RaftHandleError::CommitTimeout(_)) => timed_out("pin"),
-                // Not the leader any more, or quorum lost: the write is not
-                // known to be committed, so never ACK it.
-                Err(_) => err(RpcError::Unavailable),
-            }
-        }
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
         // No quorum within the bound: the entry may still commit, so the
         // answer is "outcome unknown", never an ACK.

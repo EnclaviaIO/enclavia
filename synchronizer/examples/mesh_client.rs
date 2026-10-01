@@ -25,15 +25,15 @@
 //!      measured PCRs must match, exactly as a real customer pins them
 //!      from its measured config. There is no accept-any escape; see
 //!      `synchronizer::wire::ServerPcrPolicy`.
-//!   5. Send one `Frame::Rpc { request }` (Pin or Get) and print the
+//!   5. Send one `Frame::Rpc { request }` (Register or Get) and print the
 //!      decoded `Response`.
 //!
-//! The PCR seed is fixed (`--seed`, default 0x42) so a Pin on one node
+//! The PCR seed is fixed (`--seed`, default 0x42) so a Register on one node
 //! and a Get on another reference the SAME key, exercising the cluster's
 //! cross-node forwarding + linearizable read.
 //!
 //! Usage:
-//!   mesh_client <proxy-uds> pin <commitment-hex-byte> --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]
+//!   mesh_client <proxy-uds> register <commitment-hex-byte> --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]
 //!   mesh_client <proxy-uds> get --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]
 
 use std::time::Duration;
@@ -68,7 +68,7 @@ fn parse_args() -> Args {
     let usage = "usage: mesh_client <proxy-uds> <pin|get> [commitment-hex] --server-pcrs <pcr.json> [--port P] [--seed S] [--user-pcr16 B]";
     let mut a = std::env::args().skip(1);
     let proxy = a.next().expect(usage);
-    let cmd = a.next().expect("missing command (pin|get)");
+    let cmd = a.next().expect("missing command (register|get)");
     let mut commitment_byte = 0xc0u8;
     let mut port = 5010u32;
     let mut seed = 0x42u8;
@@ -77,7 +77,7 @@ fn parse_args() -> Args {
     let rest: Vec<String> = a.collect();
     let mut i = 0;
     // Positional commitment byte for `pin`.
-    if cmd == "pin" && i < rest.len() && !rest[i].starts_with("--") {
+    if cmd == "register" && i < rest.len() && !rest[i].starts_with("--") {
         commitment_byte = parse_hex_byte(&rest[i]);
         i += 1;
     }
@@ -315,16 +315,10 @@ async fn main() {
     .await;
 
     let request = match args.cmd.as_str() {
-        // NOTE: with the compare-and-swap pin protocol this debug tool
-        // names Version(0), so it can only register a fresh key or re-pin
-        // a key still at version 0; pinning a live key further gets
-        // VersionConflict. Fine for a smoke tool (fresh enclave per run);
-        // if you ever need it against a long-lived key, thread an
-        // --expected-version flag through and mirror the nbd-client's
-        // Get-disambiguation on conflicts.
-        "pin" => Request::Pin {
+        // Registers a fresh key (one per run): a second run with the same
+        // seed against the same cluster gets AlreadyRegistered.
+        "register" => Request::Register {
             key: session_key,
-            expected_version: synchronizer::Version(0),
             commitment: Commitment([args.commitment_byte; 32]),
         },
         "get" => Request::Get { key: session_key },
@@ -341,8 +335,8 @@ async fn main() {
     .expect("timed out waiting for response");
 
     match &resp {
-        Response::PinOk { version } => {
-            println!("RESULT pin ok version={}", version.0);
+        Response::RegisterOk => {
+            println!("RESULT register ok");
         }
         Response::GetOk {
             commitment,
