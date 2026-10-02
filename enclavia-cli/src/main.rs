@@ -524,6 +524,13 @@ enum UpgradeCmd {
     Chain {
         /// Target enclave id. Accepts a unique prefix.
         enclave_id: String,
+        /// The enclave is a debug (QEMU) enclave: check its attestations
+        /// without the AWS Nitro certificate chain (QEMU's NSM self-signs,
+        /// so they prove nothing about hardware). Say it only for an enclave
+        /// you created in debug mode; the CLI never takes this from the
+        /// backend, and refuses if the backend reports a different mode.
+        #[arg(long)]
+        debug_enclave: bool,
     },
 
     /// List all staged upgrades for an enclave, newest first. Shows the
@@ -590,6 +597,12 @@ enum UpgradeCmd {
         /// fail-stops at boot and the enclave stays down.
         #[arg(long)]
         accept_synchronizer_change: bool,
+        /// Self-hosted custody: the enclave is a debug (QEMU) enclave, so its
+        /// chain is checked without the AWS Nitro certificate chain (see
+        /// `upgrade chain --debug-enclave`). Never taken from the backend;
+        /// the CLI refuses if the backend reports a different mode.
+        #[arg(long)]
+        debug_enclave: bool,
     },
 
     /// Revoke a confirmed upgrade before it fires. The running enclave
@@ -1419,10 +1432,13 @@ fn print_enclave_logs(v: &serde_json::Value) {
 
 async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
     match cmd {
-        UpgradeCmd::Chain { enclave_id } => {
+        UpgradeCmd::Chain {
+            enclave_id,
+            debug_enclave,
+        } => {
             let client = ApiClient::new()?;
             let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
-            let summary = upgrade::chain(&client, &enclave_id).await?;
+            let summary = upgrade::chain(&client, &enclave_id, debug_enclave).await?;
             emit(json, &summary, || print_chain(&summary));
             Ok(())
         }
@@ -1442,6 +1458,7 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             expect_pcrs,
             expect_digest,
             accept_synchronizer_change,
+            debug_enclave,
         } => {
             let valid_from: Option<chrono::DateTime<chrono::Utc>> = if immediate {
                 Some(chrono::Utc::now())
@@ -1466,11 +1483,14 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
                 pcrs,
                 image_digest: expect_digest.clone(),
                 accept_synchronizer_change,
+                debug_enclave,
             });
-            if target.is_none() && (expect_digest.is_some() || accept_synchronizer_change) {
+            if target.is_none()
+                && (expect_digest.is_some() || accept_synchronizer_change || debug_enclave)
+            {
                 return Err(CliError::Other(
-                    "--expect-digest and --accept-synchronizer-change need --reproduce or \
-                     --expect-pcrs"
+                    "--expect-digest, --accept-synchronizer-change and --debug-enclave need \
+                     --reproduce or --expect-pcrs"
                         .into(),
                 ));
             }

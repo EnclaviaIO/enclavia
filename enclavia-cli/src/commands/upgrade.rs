@@ -80,11 +80,10 @@ pub struct ChainSummary {
     /// Base64 of the 65-byte uncompressed SEC1 P-256 public key.
     /// `None` when the enclave is non-upgradable.
     pub control_public_key: Option<String>,
-    /// True when the enclave row reports `mode == "debug"`. Links are
-    /// then re-validated with `debug_mode = true`, mirroring the
-    /// backend's ingest: attestation documents are checked structurally
-    /// but NOT against the AWS Nitro CA chain (QEMU enclaves can only
-    /// produce fake, unsigned documents).
+    /// True when the caller said the enclave is a debug (QEMU) enclave
+    /// (`--debug-enclave`) and the backend agrees. Links are then
+    /// re-validated without the AWS Nitro certificate chain: QEMU's NSM
+    /// self-signs, so the documents are checked structurally only.
     pub debug_mode: bool,
     /// Whether the walk's final in-force state (genesis advanced by
     /// every verified promotion boot) equals the enclave row's current
@@ -110,7 +109,16 @@ pub struct ChainSummary {
 /// Per-link validation failures are recorded on the link and do not
 /// abort the walk — the user wants to see the whole chain even when a
 /// row is broken, so they can diagnose what went wrong.
-pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliError> {
+///
+/// `debug_enclave` is the caller's statement that the enclave is a debug
+/// (QEMU) enclave, whose attestations are checked without the AWS Nitro
+/// certificate chain. It never comes from the backend: the walk refuses
+/// when the row's `mode` disagrees ([`attestation_debug_mode`]).
+pub async fn chain(
+    client: &ApiClient,
+    id: &str,
+    debug_enclave: bool,
+) -> Result<ChainSummary, CliError> {
     let enclave = client.get_enclave(id).await?;
     let wire_links = client.get_enclave_chain(id).await?;
 
@@ -129,10 +137,11 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
     let enclave_uuid = Uuid::parse_str(id)
         .map_err(|e| CliError::Other(format!("enclave id `{id}` is not a UUID: {e}")))?;
 
-    // `mode` is CLI-specific (it picks the debug attestation path); the
-    // rest of the validator context is the shared, tolerant
-    // `EnclaveChainRow` parse used by every chain consumer.
-    let debug_mode = debug_mode_from_enclave_row(&enclave);
+    // Whether to skip the certificate chain is the caller's decision; the
+    // row's `mode` must only agree with it. The rest of the validator
+    // context is the shared, tolerant `EnclaveChainRow` parse used by every
+    // chain consumer.
+    let debug_mode = attestation_debug_mode(&enclave, debug_enclave)?;
     let row: EnclaveChainRow = serde_json::from_value(enclave)
         .map_err(|e| CliError::Other(format!("enclave row: {e}")))?;
     let control_public_key_b64 = row
@@ -202,14 +211,36 @@ pub async fn chain(client: &ApiClient, id: &str) -> Result<ChainSummary, CliErro
     })
 }
 
-/// `mode` field off the enclave row. The backend stamps its
-/// deployment-wide mode here (`"debug"` for the QEMU launcher) and uses
-/// the same flag at chain-ingest time, so the local re-validation must
-/// run with it too: debug enclaves can only produce fake attestation
-/// documents, which the validator then checks structurally instead of
-/// against the AWS Nitro CA chain.
-fn debug_mode_from_enclave_row(enclave: &serde_json::Value) -> bool {
-    enclave.get("mode").and_then(|v| v.as_str()) == Some("debug")
+/// Whether to validate an enclave's attestations without the AWS Nitro
+/// certificate chain: exactly when the caller says the enclave is a debug
+/// (QEMU) enclave. Skipping the chain accepts any well-formed document, so
+/// the choice is never taken from the backend's enclave row; the row's
+/// `mode` must only agree with the caller, and any disagreement (or a row
+/// without a mode) is refused.
+pub fn attestation_debug_mode(
+    enclave: &serde_json::Value,
+    debug_enclave: bool,
+) -> Result<bool, CliError> {
+    let mode = enclave.get("mode").and_then(|v| v.as_str());
+    match (mode, debug_enclave) {
+        (Some("debug"), true) | (Some("production"), false) => Ok(debug_enclave),
+        (Some("debug"), false) => Err(CliError::Other(
+            "the backend reports this enclave as a debug (QEMU) enclave, whose attestations \
+             are not rooted in AWS Nitro hardware. If you created it as a debug enclave, pass \
+             --debug-enclave; otherwise do not trust this backend's answer"
+                .into(),
+        )),
+        (Some("production"), true) => Err(CliError::Other(
+            "--debug-enclave was given, but the backend reports a production enclave, whose \
+             attestations are checked against the AWS Nitro certificate chain; drop \
+             --debug-enclave"
+                .into(),
+        )),
+        (other, _) => Err(CliError::Other(format!(
+            "the backend reports the enclave mode as {other:?}, not \"debug\" or \
+             \"production\"; refusing to choose how to check its attestations"
+        ))),
+    }
 }
 
 fn decode_payload(kind: &ChainLinkKind, bytes: &[u8]) -> Option<DecodedPayload> {
@@ -371,6 +402,10 @@ pub struct UpgradeTarget {
     /// measurements than the running version (a synchronizer rotation; see
     /// [`check_synchronizer_change`]).
     pub accept_synchronizer_change: bool,
+    /// The owner's statement that the enclave is a debug (QEMU) enclave,
+    /// whose chain is checked without the AWS Nitro certificate chain (see
+    /// [`attestation_debug_mode`]).
+    pub debug_enclave: bool,
 }
 
 /// Source of the PCR0-2 the upgraded enclave must measure.
@@ -628,8 +663,12 @@ pub struct RunningVersion {
 /// The version an enclave runs now: its chain, re-validated locally, must
 /// account for the row's state with every link valid, and the running
 /// image's setting is read from its own boot link.
-async fn verified_running(client: &ApiClient, enclave_id: &str) -> Result<RunningVersion, CliError> {
-    let summary = chain(client, enclave_id).await?;
+async fn verified_running(
+    client: &ApiClient,
+    enclave_id: &str,
+    debug_enclave: bool,
+) -> Result<RunningVersion, CliError> {
+    let summary = chain(client, enclave_id, debug_enclave).await?;
     if let Some(bad) = summary.links.iter().find(|l| l.validation.is_err()) {
         return Err(CliError::Other(format!(
             "the enclave's upgrade chain does not verify (link {:?}: {}); refusing to sign an \
@@ -706,7 +745,7 @@ async fn upgrade_expectation(
             )));
         }
     };
-    let running = verified_running(client, enclave_id).await?;
+    let running = verified_running(client, enclave_id, target.debug_enclave).await?;
     eprintln!("The running version's anti-rollback setting, from its attested boot link:");
     for line in anti_rollback_lines(&running.anti_rollback) {
         eprintln!("  {line}");
@@ -1272,18 +1311,27 @@ mod tests {
         assert!(decoded.is_none());
     }
 
-    /// The chain walker mirrors the backend's ingest-time `debug_mode`
-    /// flag, read off the enclave row's `mode` field. (The rest of the
-    /// row context is parsed by the shared `EnclaveChainRow`, tested in
-    /// `enclavia-protocol`.)
+    /// Debug (skip-chain) validation comes only from the caller's flag; the
+    /// row's `mode` must agree, and anything else is refused. A backend
+    /// claiming `debug` cannot switch certificate-chain checks off.
     #[test]
-    fn debug_mode_from_enclave_row_matches_mode_field() {
+    fn attestation_debug_mode_is_the_callers_flag() {
         let debug_row = serde_json::json!({ "mode": "debug" });
-        assert!(debug_mode_from_enclave_row(&debug_row));
         let prod_row = serde_json::json!({ "mode": "production" });
-        assert!(!debug_mode_from_enclave_row(&prod_row));
-        let absent_row = serde_json::json!({});
-        assert!(!debug_mode_from_enclave_row(&absent_row));
+        assert!(attestation_debug_mode(&debug_row, true).unwrap());
+        assert!(!attestation_debug_mode(&prod_row, false).unwrap());
+        let err = attestation_debug_mode(&debug_row, false).unwrap_err().to_string();
+        assert!(err.contains("pass --debug-enclave"), "{err}");
+        let err = attestation_debug_mode(&prod_row, true).unwrap_err().to_string();
+        assert!(err.contains("drop --debug-enclave"), "{err}");
+        for row in [
+            serde_json::json!({}),
+            serde_json::json!({ "mode": null }),
+            serde_json::json!({ "mode": "Debug" }),
+        ] {
+            assert!(attestation_debug_mode(&row, false).is_err(), "{row}");
+            assert!(attestation_debug_mode(&row, true).is_err(), "{row}");
+        }
     }
 
     // -----------------------------------------------------------------------

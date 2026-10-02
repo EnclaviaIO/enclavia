@@ -106,8 +106,12 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
 - `enclavia upgrade list <id> --json`
   -> ARRAY of staged-upgrade objects `{id,status,docker_image,image_digest?,valid_from?,created_at}`.
 
-- `enclavia upgrade chain <id> --json`
+- `enclavia upgrade chain <id> [--debug-enclave] --json`
   -> `{enclave_id,upgradable,image_digest,pcrs,control_public_key?,debug_mode,tip_matches_row,links:[{kind,sequence,validation,...}]}` (locally re-verified).
+  `--debug-enclave` (also on `upgrade confirm`) only for a debug (QEMU) enclave the user
+  created as one: its attestations are then checked without the AWS Nitro certificate
+  chain. The CLI refuses when the backend reports another mode; never add the flag
+  because the backend says the enclave is debug.
 
 - `enclavia upgrade confirm <id> <upgrade-id> [--at RFC3339 | --immediate] --json`
   -> updated staged-upgrade object. Default schedule is now + 7 days.

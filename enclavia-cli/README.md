@@ -138,10 +138,11 @@ of deploying; nothing activates without a signed confirm.
 
 ```sh
 enclavia upgrade list <enclave-id>
-enclavia upgrade chain <enclave-id>       # the enclave's attested boot/upgrade history
+enclavia upgrade chain <enclave-id> [--debug-enclave]  # the enclave's attested boot/upgrade history
 enclavia upgrade confirm <enclave-id> <upgrade-id> [--at RFC3339 | --immediate]
     [--reproduce | --expect-pcrs FILE|JSON] [--expect-digest sha256:...]   # self-hosted custody
     [--accept-synchronizer-change]       # sign a synchronizer rotation (see below)
+    [--debug-enclave]                    # only for a debug (QEMU) enclave you created as one
 enclavia upgrade revoke <enclave-id> <upgrade-id>
 ```
 
@@ -175,6 +176,11 @@ staged build) and refuses unless you pass `--accept-synchronizer-change`.
 Until a migration protocol exists, such an upgrade works only if the new
 cluster holds this enclave's pin: the upgraded image never registers, so
 otherwise it fail-stops at boot and the enclave stays down.
+
+A debug (QEMU) enclave self-signs its attestations. `upgrade chain` and
+`confirm` check its chain without the AWS Nitro certificate chain only when
+you pass `--debug-enclave`; the CLI never takes that from the backend, and
+refuses when the backend reports another mode.
 
 ### Control keys (self-hosted custody)
 
