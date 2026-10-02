@@ -65,6 +65,8 @@ pub struct ConnectOptions {
     /// matching the native SDK. Debug enclaves are offered independently
     /// of environment (beta or stable), so set this whenever the target
     /// is a debug enclave, not based on which deployment you're talking to.
+    /// Works only in a build with the `dangerous-skip-chain` feature (a
+    /// development build); other builds refuse the connection.
     pub debug_mode: Option<bool>,
     pub trust_upgrades: Option<TrustUpgrades>,
 }

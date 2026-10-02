@@ -22,6 +22,12 @@ name = "enclavia_dart_ffi"
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
+[features]
+# `ConnectOptions.debugMode` for QEMU enclaves (attestation without the AWS
+# Nitro certificate chain). Enabled by the build hook only when the app's
+# root pubspec sets the `dangerous_skip_chain` user-define; off otherwise.
+dangerous-skip-chain = ["enclavia-ffi/dangerous-skip-chain"]
+
 [dependencies]
 enclavia-ffi = { path = "../../enclavia-ffi" }
 uniffi = { version = "=0.31.2", features = ["cli"] }

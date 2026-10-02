@@ -8,14 +8,14 @@
 //!
 //! Modes:
 //!   pin  - each op is a `Pin` with a varying commitment. Op 0 of each
-//!          session is the Register (first pin); it is reported in a
+//!          session is the Register; it is reported in a
 //!          separate bucket so registration cost never pollutes the
 //!          steady-state numbers.
 //!   get  - each op is a linearizable `Get` (the key must exist, so the
 //!          session issues ONE untimed Pin first). This isolates the
 //!          ReadIndex quorum round from the write path: on the current
-//!          serve path a Pin is roughly Get + commit + full-replication
-//!          wait, so (pin - get) attributes the write-side cost.
+//!          serve path a Pin is roughly a local registration check + a
+//!          quorum commit, so (pin - get) attributes the write-side cost.
 //!
 //! Usage:
 //!   pin_bench <proxy-uds> --server-pcrs <pcr.json> \
@@ -39,7 +39,7 @@ use tokio::net::UnixStream;
 
 const MAX_FRAME_SIZE: usize = 65535;
 
-/// Per-RPC ceiling. Generous: the serve path's replication_wait is 2s
+/// Per-RPC ceiling. Generous: a commit can ride out a leader election
 /// and a retryable client would reconnect, but the bench treats any op
 /// this slow as a failure worth counting, not retrying.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -127,13 +127,10 @@ fn load_expected_pcrs(path: &str) -> Pcrs {
     }
 }
 
+/// The session key of a `FakeAttestation::with_seed(seed)` document (no user
+/// PCRs), as the listener derives it.
 fn key_from_seed(seed: u8) -> PcrKey {
-    let raw = Pcrs {
-        pcr0: vec![seed; 48],
-        pcr1: vec![seed.wrapping_add(1); 48],
-        pcr2: vec![seed.wrapping_add(2); 48],
-    };
-    PcrKey(raw.digest())
+    PcrKey(enclavia_protocol::attestation::test_utils::identity_from_seed(seed).key())
 }
 
 async fn proxy_connect(proxy: &str, port: u32) -> UnixStream {
@@ -221,16 +218,14 @@ async fn open_session(args: &Args, expected: &Pcrs, seed: u8) -> Session {
     write_frame(
         &mut stream,
         &mut transport,
-        &Frame::Authenticate {
-            nsm_doc: fake.encode(),
-        },
+        &Frame::authenticate(fake.encode()),
     )
     .await;
 
     let pt = read_plaintext(&mut stream, &mut transport).await;
     let frame: Frame = ciborium::from_reader(pt.as_slice()).expect("cbor decode server frame");
     let nsm_doc = match frame {
-        Frame::Authenticate { nsm_doc } => nsm_doc,
+        Frame::Authenticate { nsm_doc, .. } => nsm_doc,
         other => panic!("expected the node's Authenticate frame, got {other:?}"),
     };
     verify_server_attestation(
@@ -257,7 +252,7 @@ async fn timed_op(sess: &mut Session, req: Request) -> (u64, bool) {
     let micros = start.elapsed().as_micros() as u64;
     let ok = matches!(
         resp,
-        Ok(Response::PinOk { .. }) | Ok(Response::GetOk { .. })
+        Ok(Response::RegisterOk) | Ok(Response::PinOk { .. }) | Ok(Response::GetOk { .. })
     );
     if !ok {
         eprintln!("[bench] op failed: {resp:?}");
@@ -269,7 +264,7 @@ async fn timed_op(sess: &mut Session, req: Request) -> (u64, bool) {
 struct SessionResult {
     /// (op index, micros, ok) per timed op.
     ops: Vec<(usize, u64, bool)>,
-    /// Micros for the session's Register (first pin), pin mode only.
+    /// Micros for the session's Register, pin mode only.
     register_micros: Option<u64>,
     setup_micros: u64,
 }
@@ -294,15 +289,13 @@ async fn run_session(args: Args, expected: Pcrs, idx: usize) -> SessionResult {
 
     let key = sess.key;
     if args.mode == "pin" {
-        // Op 0 is the Register: time it into its own bucket. The
-        // expected_version is ignored on a Register (it is inherently a
-        // CAS on non-existence); subsequent pins name the version the
-        // previous PinOk returned (the compare-and-swap guard).
+        // Op 0 is the Register: time it into its own bucket. Subsequent
+        // pins name the version the previous PinOk returned (the
+        // compare-and-swap guard).
         let (us, ok) = timed_op(
             &mut sess,
-            Request::Pin {
+            Request::Register {
                 key,
-                expected_version: Version(0),
                 commitment: commitment_for(seed, 0),
             },
         )

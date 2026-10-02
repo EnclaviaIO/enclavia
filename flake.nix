@@ -16,18 +16,43 @@
     # `synchronizer-eif` output below.
     nitro-util.url = "github:monzo/aws-nitro-util";
 
-    # Source-only input carrying the builder's patched init (CID-2
-    # heartbeat for QEMU's vhost-device-vsock) and kernel/init blobs we
-    # reuse for the synchronizer EIF. `flake = false` so we just get its
-    # source tree; override during local development with
-    # `--override-input builder-src path:../builder`.
+    # The builder's source, for the synchronizer EIFs' minimal kernel,
+    # its config and the patched init. Source only, not a flake input:
+    # the builder flake has an `enclavia` input that points back at this
+    # flake. The backend overrides that input with an enclavia source
+    # when it builds customer EIFs, and if this flake then had the
+    # builder as a flake input, Nix would look for the builder's
+    # relative `path:./dummy-*` inputs inside the enclavia source and
+    # fail. The kernel is built here from this source with the builder's
+    # own nixpkgs pin (`nixpkgs-builder`), the same way the builder's
+    # flake.nix builds it (see nix/builder-kernels.nix), so it is the
+    # exact derivation the builder builds and CI tests.
+    # Pinned by rev (builder master at the merge of EnclaviaIO/builder#76,
+    # which added the aarch64 kernel and static aarch64 init). Override
+    # during local development with
+    # `--override-input builder-src path:../builder`, together with
+    # `nixpkgs-builder` if that checkout pins another nixpkgs.
     builder-src = {
-      url = "github:EnclaviaIO/builder";
+      url = "github:EnclaviaIO/builder/efa534b610b4cb3e90d9141831d60966d719090a";
       flake = false;
     };
+
+    # The nixpkgs rev that the builder's flake.lock pins at the
+    # `builder-src` rev. The kernel is built with it, not with our
+    # nixpkgs. It must move together with `builder-src`: evaluation fails
+    # if the two disagree.
+    nixpkgs-builder.url = "github:NixOS/nixpkgs/643809054d65fdd466a63e3155b8c498cb483c04";
+
+    # In-enclave clock-sync daemon (keeps CLOCK_REALTIME on the NSM
+    # attestation timestamp), baked into the synchronizer EIFs. Pinned by
+    # rev. Its inputs are deliberately NOT made to follow ours: the binary
+    # is then byte-identical to the one the builder puts in customer EIFs,
+    # and its own lock already pins the same toolchain revisions as this
+    # flake.
+    nitro-timesync.url = "github:EnclaviaIO/nitro-timesync/2486fce026c593bb0512351aa06a0027cf1cbd64";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, builder-src, nixpkgs-builder, nitro-timesync }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -74,9 +99,10 @@
         # in-enclave crates are pure Rust (TLS is rustls/ring, no
         # openssl/pcsclite -- those belong to the native CLI), so the
         # musl build only needs a musl C compiler for ring's C sources.
-        # Derived from the host platform: the in-enclave binaries build on
-        # x86_64 (customer enclaves) AND aarch64 (the Graviton
-        # synchronizer EIF), each targeting its own musl triple.
+        # Derived from the host platform, so these builds target the
+        # host's own musl triple. The Graviton (aarch64) synchronizer EIF
+        # does not use them: its binaries are cross-built from x86_64-linux
+        # further below.
         muslTarget = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-musl";
         muslTargetEnv = builtins.replaceStrings [ "-" ] [ "_" ] muslTarget;
         muslCc = pkgs.pkgsStatic.stdenv.cc;
@@ -171,6 +197,30 @@
           }
         );
 
+        # Debug-image builds of the two customer-image binaries that check the
+        # synchronizer's attestation: with `dangerous-skip-chain`, for QEMU's
+        # self-signing NSM. The builder puts these into `--debug` images only;
+        # production images carry `nbd-client` / `enclavia-server` above, which
+        # do not contain the skip-chain path. Each binary refuses to start when
+        # the measured `synchronizer.debug_attestation` disagrees with its
+        # build. They reuse the default-feature deps artifacts: only the crates
+        # the feature touches recompile.
+        nbdClientDebug = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
+          // {
+            pname = "nbd-client-debug";
+            cargoExtraArgs = "-p nbd-client --features dangerous-skip-chain";
+          }
+        );
+
+        enclaviaServerDebug = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
+          // {
+            pname = "enclavia-server-debug";
+            cargoExtraArgs = "-p enclavia-server --features dangerous-skip-chain";
+          }
+        );
+
         enclaviaEgress = craneLibMusl.buildPackage (
           individualMuslCrateArgs
           // {
@@ -261,6 +311,9 @@
         # share one PCR set — but a DIFFERENT one from the qemu build (the
         # measured payload differs), which is why customer configs'
         # `synchronizer.expected_pcrs` must pin THIS build's measurements.
+        # The production EIF carries the aarch64 cross build of it
+        # (`synchronizerNitroAarch64` below); this host-arch build stays
+        # available as the `synchronizer-nitro` package.
         synchronizerNitro = craneLibMusl.buildPackage (
           individualMuslSyncNitroCrateArgs
           // {
@@ -283,6 +336,80 @@
             cargoExtraArgs = "-p synchronizer-names-init";
           }
         );
+
+        # In-enclave clock-sync daemon (static musl build from the standalone
+        # nitro-timesync flake): keeps CLOCK_REALTIME on the Nitro hypervisor
+        # time read from /dev/nsm attestation documents.
+        nitroTimesync = nitro-timesync.packages.${system}.nitro-timesync-static;
+
+        # --- aarch64 (Graviton) cross builds ------------------------------
+        #
+        # The production synchronizer runs on Graviton, so every binary in
+        # `synchronizer-eif-nitro` is a static aarch64-unknown-linux-musl
+        # binary cross-built on x86_64-linux. The cross build is the
+        # canonical one: it is what third parties run to reproduce the
+        # production PCRs, on ordinary x86_64 machines. Only used by the
+        # x86_64-linux outputs (see the EIF section below).
+        aarch64Cross = pkgs.pkgsCross.aarch64-multiplatform;
+        muslTargetAarch64 = "aarch64-unknown-linux-musl";
+        muslCcAarch64 = aarch64Cross.pkgsStatic.stdenv.cc;
+        craneLibMuslAarch64 = (crane.mkLib pkgs).overrideToolchain (p:
+          p.rust-bin.stable."1.88.0".default.override {
+            targets = [ muslTargetAarch64 ];
+          });
+
+        # Cross C compiler and archiver for ring's C sources, and the
+        # linker for the final binaries.
+        muslCrossArgsAarch64 = {
+          strictDeps = true;
+          doCheck = false;
+          CARGO_BUILD_TARGET = muslTargetAarch64;
+          CC_aarch64_unknown_linux_musl = "${muslCcAarch64}/bin/${muslCcAarch64.targetPrefix}cc";
+          AR_aarch64_unknown_linux_musl = "${muslCcAarch64.bintools.bintools}/bin/${muslCcAarch64.targetPrefix}ar";
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "${muslCcAarch64}/bin/${muslCcAarch64.targetPrefix}cc";
+        };
+
+        muslCommonArgsAarch64 = muslCrossArgsAarch64 // {
+          src = rustSrc;
+          inherit (craneLibMuslAarch64.crateNameFromCargoToml { src = rustSrc; }) version;
+        };
+
+        # Production synchronizer node (`--features enclave,raft`, see
+        # `synchronizerNitro` above), for aarch64. Own deps-only build for
+        # the same reason as the x86_64 one: no qemu-feature fingerprint in
+        # the production build graph.
+        synchronizerNitroAarch64 = craneLibMuslAarch64.buildPackage (muslCommonArgsAarch64 // {
+          pname = "enclavia-synchronizer-nitro-aarch64";
+          cargoArtifacts = craneLibMuslAarch64.buildDepsOnly (muslCommonArgsAarch64 // {
+            pname = "enclavia-synchronizer-nitro-musl-aarch64";
+            cargoExtraArgs = "-p synchronizer --features synchronizer/enclave,synchronizer/raft";
+          });
+          cargoExtraArgs = "-p synchronizer --features enclave,raft";
+        });
+
+        synchronizerNamesInitAarch64 = craneLibMuslAarch64.buildPackage (muslCommonArgsAarch64 // {
+          pname = "synchronizer-names-init-aarch64";
+          cargoArtifacts = craneLibMuslAarch64.buildDepsOnly (muslCommonArgsAarch64 // {
+            pname = "synchronizer-names-init-musl-aarch64";
+            cargoExtraArgs = "-p synchronizer-names-init";
+          });
+          cargoExtraArgs = "-p synchronizer-names-init";
+        });
+
+        # nitro-timesync's flake only builds for its own host, so the
+        # aarch64 binary is cross-built here from the same pinned source,
+        # the same way (static musl, same Rust version, no C dependencies).
+        # Unlike the x86_64 binary it is not byte-identical to one the
+        # builder ships.
+        nitroTimesyncSrcAarch64 = craneLibMuslAarch64.cleanCargoSource nitro-timesync;
+        nitroTimesyncArgsAarch64 = muslCrossArgsAarch64 // {
+          src = nitroTimesyncSrcAarch64;
+          pname = "nitro-timesync-aarch64";
+          inherit (craneLibMuslAarch64.crateNameFromCargoToml { src = nitroTimesyncSrcAarch64; }) version;
+        };
+        nitroTimesyncAarch64 = craneLibMuslAarch64.buildPackage (nitroTimesyncArgsAarch64 // {
+          cargoArtifacts = craneLibMuslAarch64.buildDepsOnly nitroTimesyncArgsAarch64;
+        });
 
         # --- enclavia-wasm: the client SDK compiled to wasm --------------
         #
@@ -316,7 +443,12 @@
         # or vendor. wasm-bindgen-cli's version must equal the crate's pinned
         # `wasm-bindgen` (the ABI schema must match) — both currently 0.2.121,
         # via nixpkgs and enclavia-wasm/Cargo.toml respectively.
-        enclaviaWasm = craneLib.buildPackage (wasmCommonArgs // {
+        mkEnclaviaWasm = { pname, features ? [ ] }: craneLib.buildPackage (wasmCommonArgs // {
+          inherit pname;
+          cargoExtraArgs = pkgs.lib.concatStringsSep " " (
+            [ "-p enclavia-wasm" ]
+            ++ pkgs.lib.optional (features != [ ]) "--features ${pkgs.lib.concatStringsSep "," features}"
+          );
           cargoArtifacts = cargoArtifactsWasm;
           nativeBuildInputs = rustCommonArgs.nativeBuildInputs ++ [
             pkgs.wasm-bindgen-cli
@@ -330,6 +462,17 @@
           '';
         });
 
+        # The production build: no skip-chain path, so `debugMode` is refused.
+        enclaviaWasm = mkEnclaviaWasm { pname = "enclavia-wasm"; };
+
+        # Development build for debug (QEMU) enclaves: `debugMode` validates
+        # their self-signed attestation without the AWS Nitro certificate
+        # chain. Never the published @enclavia/client-wasm.
+        enclaviaWasmDev = mkEnclaviaWasm {
+          pname = "enclavia-wasm-dev";
+          features = [ "dangerous-skip-chain" ];
+        };
+
         # The publish-ready npm package: the reproducible wasm build plus
         # package.json and README. `npm publish result/` (or `npm pack`) from
         # the output. Kept as a separate derivation so the artifact build
@@ -341,46 +484,95 @@
           cp ${./enclavia-wasm/README.md} $out/README.md
         '';
 
-        # --- Dedicated synchronizer EIF ---------------------------------
+        # The development build as its own npm package, renamed so it can
+        # never be published as @enclavia/client-wasm.
+        enclaviaWasmNpmDev = pkgs.runCommand "enclavia-client-wasm-npm-dev" {
+          nativeBuildInputs = [ pkgs.jq ];
+        } ''
+          mkdir -p $out
+          cp ${enclaviaWasmDev}/* $out/
+          jq '.name = "@enclavia/client-wasm-dev"
+              | .description = "DEVELOPMENT build of @enclavia/client-wasm for debug (QEMU) enclaves: debugMode accepts attestation documents without the AWS Nitro certificate chain. Never use it against production enclaves."' \
+            ${./enclavia-wasm/npm/package.json} > $out/package.json
+          cp ${./enclavia-wasm/README.md} $out/README.md
+        '';
+
+        # --- Dedicated synchronizer EIFs --------------------------------
         #
         # NOT the builder's OCI pipeline: the synchronizer is the entire
         # in-enclave payload, so we assemble a minimal EIF directly with
-        # monzo's nitroLib.buildEif, reusing the builder's prebuilt
-        # kernel/init blobs and its patched (CID-2 heartbeat) init for
-        # QEMU debug. See nix/synchronizer-eif.nix for the rationale.
+        # monzo's nitroLib.buildEif, from the builder's minimal kernel and
+        # its patched (CID 2 + CID 3 heartbeat) init. See
+        # nix/synchronizer-eif.nix for the rationale.
+        #
+        # The builder only builds on x86_64-linux, which is also the one
+        # host the synchronizer EIFs are defined for: that is the build
+        # third parties reproduce the PCRs with.
         nitroLib = nitro-util.lib.${system};
 
+        # nixpkgs as the builder's flake.nix imports it, at the rev the
+        # builder's flake.lock pins. `nixpkgs-builder` must be that rev.
+        builderLock = builtins.fromJSON (builtins.readFile "${builder-src}/flake.lock");
+        builderNixpkgsRev = builderLock.nodes.${builderLock.nodes.root.inputs.nixpkgs}.locked.rev;
+        builderNixpkgs =
+          if (nixpkgs-builder.rev or builderNixpkgsRev) == builderNixpkgsRev
+          then import nixpkgs-builder { system = "x86_64-linux"; }
+          else throw "nixpkgs-builder is at ${nixpkgs-builder.rev}, but builder-src pins nixpkgs ${builderNixpkgsRev}; move them together";
+
+        # The builder's minimal kernels (x86_64 and the aarch64 cross
+        # build) and its x86_64 and static aarch64 inits, built from its
+        # source and nixpkgs.
+        builderKernels = import ./nix/builder-kernels.nix {
+          pkgs = builderNixpkgs;
+          builderSrc = builder-src;
+        };
+
         # Two REAL, distinct EIFs, one per synchronizer binary variant
-        # above. The patched init heartbeats both CIDs (3 + 2), so each EIF
-        # BOOTS on either transport — but they are not interchangeable, and
-        # the difference is the whole security boundary:
+        # above, with separate PCRs. They are not interchangeable, and the
+        # difference is the whole security boundary:
         #
-        # * `synchronizer-eif` (qemu binary): DEV/TEST ONLY. Attestation
-        #   verification skips the AWS Nitro CA chain / COSE signature so it
-        #   can run under QEMU's self-signing NSM. On real Nitro it would
-        #   accept forged attestation documents, letting a malicious host
-        #   join the Raft mesh and fabricate committed anti-rollback state.
-        # * `synchronizer-eif-nitro` (enclave binary): PRODUCTION. Full AWS
-        #   Nitro CA chain verification; this is the only EIF a real
-        #   deployment may run.
+        # * `synchronizer-eif` (qemu binary, x86_64): DEV/TEST ONLY, for the
+        #   local QEMU cluster (QEMU's nitro-enclave machine is x86_64-only).
+        #   Attestation verification skips the AWS Nitro CA chain / COSE
+        #   signature so it can run under QEMU's self-signing NSM. On real
+        #   Nitro it would accept forged attestation documents, letting a
+        #   malicious host join the Raft mesh and fabricate committed
+        #   anti-rollback state.
+        # * `synchronizer-eif-nitro` (enclave binary, aarch64): PRODUCTION,
+        #   for Graviton Nitro Enclaves. Full AWS Nitro CA chain
+        #   verification; this is the only EIF a real deployment may run.
         #
-        # The two images measure DIFFERENTLY (different binaries -> different
-        # PCR0/1/2), so customer configs' `synchronizer.expected_pcrs` must
-        # pin the NITRO build's measurements; pinning the dev build's PCRs
-        # would re-open the forged-attestation hole above.
+        # The two images measure DIFFERENTLY (different binaries and
+        # architectures -> different PCR0/1/2), so customer configs'
+        # `synchronizer.expected_pcrs` must pin the NITRO build's
+        # measurements; pinning the dev build's PCRs would re-open the
+        # forged-attestation hole above.
         synchronizerEif = pkgs.callPackage ./nix/synchronizer-eif.nix {
           inherit pkgs nitroLib;
+          arch = "x86_64";
+          # The builder's minimal non-storage kernel.
+          kernel = "${builderKernels.kernel}/bzImage";
+          kernelConfig = "${builderKernels.kernelConfig}/config";
+          init = "${builderKernels.init}/bin/init";
           synchronizerPkg = synchronizer;
           namesInitPkg = synchronizerNamesInit;
-          builderSrc = builder-src;
+          timesyncPkg = nitroTimesync;
+          busyboxPkg = pkgs.pkgsStatic.busybox;
         };
 
         synchronizerEifNitro = pkgs.callPackage ./nix/synchronizer-eif.nix {
           inherit pkgs nitroLib;
           eifName = "synchronizer-enclave-nitro";
-          synchronizerPkg = synchronizerNitro;
-          namesInitPkg = synchronizerNamesInit;
-          builderSrc = builder-src;
+          arch = "aarch64";
+          # The builder's minimal aarch64 kernel (base profile) and its
+          # static aarch64 init, both cross-built on x86_64-linux.
+          kernel = "${builderKernels.kernelAarch64}/Image";
+          kernelConfig = "${builderKernels.kernelConfigAarch64}/config";
+          init = "${builderKernels.initAarch64}/bin/init";
+          synchronizerPkg = synchronizerNitroAarch64;
+          namesInitPkg = synchronizerNamesInitAarch64;
+          timesyncPkg = nitroTimesyncAarch64;
+          busyboxPkg = aarch64Cross.pkgsStatic.busybox;
         };
 
       in
@@ -426,6 +618,9 @@
 
         packages = {
           nbd-client = nbdClient;
+          # Debug-image (QEMU) builds, with the skip-chain path; see above.
+          nbd-client-debug = nbdClientDebug;
+          enclavia-server-debug = enclaviaServerDebug;
           enclavia-egress = enclaviaEgress;
           mock-kms = mockKms;
           enclavia-crypto = enclaviaCrypto;
@@ -442,6 +637,10 @@
           # The same, assembled as the @enclavia/client-wasm npm package:
           # `nix build .#enclavia-wasm-npm && npm publish result/`.
           enclavia-wasm-npm = enclaviaWasmNpm;
+          # Development flavours with `debugMode` (skip-chain) for debug
+          # enclaves; the npm one is named @enclavia/client-wasm-dev.
+          enclavia-wasm-dev = enclaviaWasmDev;
+          enclavia-wasm-npm-dev = enclaviaWasmNpmDev;
 
           # Synchronizer node binaries + their runtime identity fetcher,
           # plus the dedicated EIFs that wrap them. `synchronizer` /
@@ -454,8 +653,17 @@
           synchronizer = synchronizer;
           synchronizer-nitro = synchronizerNitro;
           synchronizer-names-init = synchronizerNamesInit;
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # Built on the builder's kernels, which build on x86_64-linux
+          # only (see above).
+          # `synchronizer-eif` is x86_64 (QEMU dev cluster);
+          # `synchronizer-eif-nitro` is aarch64 (Graviton production),
+          # cross-built here, as are the aarch64 binaries it carries.
           synchronizer-eif = synchronizerEif;
           synchronizer-eif-nitro = synchronizerEifNitro;
+          synchronizer-nitro-aarch64 = synchronizerNitroAarch64;
+          synchronizer-names-init-aarch64 = synchronizerNamesInitAarch64;
+          nitro-timesync-aarch64 = nitroTimesyncAarch64;
         };
 
         # `nix run` shorthand and `nix profile install` default.

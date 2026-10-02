@@ -15,6 +15,15 @@ categories = ["cryptography", "network-programming", "api-bindings"]
 [features]
 default = []
 json = ["serde_json"]
+# `ClientBuilder::debug_mode`: validate the enclave's attestation without the
+# AWS Nitro certificate chain (QEMU enclaves, whose NSM self-signs). Any
+# well-formed document then passes, so the path exists only in builds that
+# ask for it: development against debug enclaves. Without the feature a
+# debug-mode connection is refused. The npm and Dart packages have dev
+# flavours with it (the flake's `enclavia-wasm-npm-dev`, enclavia-dart's
+# `dangerous_skip_chain` user-define); their production builds, like this
+# crate's default, do not contain it.
+dangerous-skip-chain = ["enclavia-protocol/dangerous-skip-chain"]
 
 [dependencies]
 # enclavia-protocol owns the shared attestation verifier. The SDK uses
@@ -77,6 +86,11 @@ uuid = { version = "1", features = ["js"] }
 # async-transport helpers (perform_cbor_handshake_as_responder + CborTransport)
 # plus the `test-utils` FakeAttestation builder for the debug-mode handshake.
 enclavia-protocol = { path = "../enclavia-protocol", version = "0.2.0", features = ["test-utils"] }
+# The tests and examples connect to FakeAttestation responders in debug mode,
+# so they build this crate with the skip-chain path. Dev-dependencies only:
+# the library build, and a published crate (path-only dev-dependencies are
+# stripped), keep the default features.
+enclavia = { path = ".", features = ["dangerous-skip-chain"] }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time", "sync"] }
 bytes = { workspace = true }
 tokio-tungstenite = { workspace = true }

@@ -126,6 +126,14 @@ pub struct StagedUpgradeJson {
     /// staged before this field existed or built without the wiring.
     #[serde(default)]
     pub synchronizer_enabled: bool,
+    /// Whether `--upgrade-target` was passed to the builder for this EIF
+    /// (`synchronizer.upgrade_target = true` in the measured config): the
+    /// image obtains its synchronizer pin only by the `Transition` out of
+    /// the version it upgrades, never by registering a fresh volume. The
+    /// backend sets it when the version being upgraded has the
+    /// synchronizer wiring on. Replayed by `enclavia reproduce --upgrade`.
+    #[serde(default)]
+    pub upgrade_target: bool,
     /// Wall-clock time this upgrade record was created.
     pub created_at: DateTime<Utc>,
 }
@@ -159,6 +167,7 @@ mod tests {
                 pcr2: "ff".repeat(48),
             }]),
             synchronizer_enabled: true,
+            upgrade_target: true,
             created_at: Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         }
     }
@@ -243,6 +252,7 @@ mod tests {
             crates_rev: None,
             synchronizer_pcrs: None,
             synchronizer_enabled: false,
+            upgrade_target: false,
             created_at: Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         };
         let v = serde_json::to_value(&building).unwrap();

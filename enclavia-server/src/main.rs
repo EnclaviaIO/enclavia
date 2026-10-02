@@ -3,12 +3,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use enclavia_protocol::attestation::ValidatedAttestation;
 use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
 use enclavia_protocol::{
     CHAIN_LINK_ACK, ClientMessage, ControlCommand, RekeyParams, ServerMessage, StreamHalf,
     perform_cbor_handshake_as_responder,
 };
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use enclavia_protocol::signing::{
+    ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
+};
+use p256::ecdsa::VerifyingKey;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,6 +22,7 @@ use tracing::{error, info, instrument, trace, warn};
 
 mod attestation;
 mod config;
+mod sync_revoke;
 
 use tokio_vsock::VsockListener;
 use tokio_vsock::VsockStream;
@@ -166,7 +171,9 @@ async fn submit_chain_link_to_host(link: &ChainLink) -> Result<(), String> {
 /// `user_data = sha256(payload)`. Talks to `/dev/nsm` in both
 /// environments: real hardware on Nitro, QEMU's emulated NSM device in
 /// debug (same wire shape, self-signed instead of AWS-CA-signed).
-fn build_chain_attestation(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn build_chain_attestation(
+    payload: &[u8],
+) -> Result<ValidatedAttestation, enclavia_protocol::attestation::LocalAttestationError> {
     let user_data: [u8; 32] = {
         let mut h = Sha256::new();
         h.update(payload);
@@ -177,7 +184,7 @@ fn build_chain_attestation(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error
     // it with random bytes to avoid a deterministic value.
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    attestation::get_chain_attestation(&user_data, &nonce)
+    attestation::chain_attestation(&user_data, &nonce)
 }
 
 /// Verify and dispatch a signed control command. Returns the user-visible
@@ -209,17 +216,20 @@ async fn handle_control(
 
     // Locked-in wire format (#47): 64-byte raw `r || s`, each 32 B
     // big-endian zero-padded. DER signatures from PIV/OpenSSL must be
-    // re-encoded to this shape by the signer before being shipped.
-    let sig = match Signature::from_slice(signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "signature must be 64 bytes raw r||s".into()),
-    };
-
-    if pubkey.verify(payload, &sig).is_err() {
-        return (false, "signature verification failed".into());
+    // re-encoded to this shape by the signer before being shipped. The
+    // envelope is signed in the control-command domain, so no payload
+    // signature can stand in for it.
+    match verify_control_signature(pubkey, SignedDomain::ControlCommand, payload, signature) {
+        Ok(()) => {}
+        Err(ControlSignatureError::Shape) => {
+            return (false, "signature must be 64 bytes raw r||s".into());
+        }
+        Err(ControlSignatureError::Invalid) => {
+            return (false, "signature verification failed".into());
+        }
     }
 
-    let cmd: ControlCommand = match ciborium::from_reader(payload) {
+    let cmd: ControlCommand = match decode_canonical(payload) {
         Ok(c) => c,
         Err(e) => return (false, format!("malformed payload: {e}")),
     };
@@ -265,6 +275,25 @@ async fn handle_control(
     }
 }
 
+/// Check a chain payload's control-key signature (64-byte raw `r || s`)
+/// in its domain. The error is the user-visible message.
+fn verify_payload_signature(
+    pubkey: &VerifyingKey,
+    domain: SignedDomain,
+    chain_payload: &[u8],
+    payload_signature: &[u8],
+) -> Result<(), String> {
+    match verify_control_signature(pubkey, domain, chain_payload, payload_signature) {
+        Ok(()) => Ok(()),
+        Err(ControlSignatureError::Shape) => {
+            Err("payload_signature must be 64 bytes raw r||s".into())
+        }
+        Err(ControlSignatureError::Invalid) => {
+            Err("payload_signature does not verify under the control pubkey".into())
+        }
+    }
+}
+
 /// Tolerance subtracted from the minimum-upgrade-delay floor to absorb
 /// host/backend clock skew: the backend stamps `valid_from = its_now +
 /// min_delay` moments before we check against our own clock, so a floor
@@ -294,10 +323,13 @@ fn violates_min_upgrade_delay(
 
 /// Execute the `PrepareUpgrade` flow:
 /// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
-/// 2. Validate the CBOR payload decodes as `UpgradePayload`.
+/// 2. Validate the CBOR payload decodes as `UpgradePayload`, with
+///    `valid_until` at least `UPGRADE_WINDOW_MIN` after `valid_from`.
 /// 3. Enforce the measured minimum upgrade delay on `valid_from`.
-/// 4. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
-/// 5. Get a chain attestation binding `sha256(payload)`.
+/// 4. Get a chain attestation binding `sha256(payload)`, and require the pin
+///    identity it carries (PCR0-2 plus user PCRs 16-31) to equal the
+///    payload's `from`.
+/// 5. Optionally run `enclavia-crypto prepare-upgrade` (storage enclaves).
 /// 6. Submit the `Upgrade` chain link to `chain-host`; wait for ACK.
 ///
 /// The chain link is submitted BEFORE returning success so the backend sees
@@ -316,21 +348,20 @@ async fn run_prepare_upgrade(
     bin: &str,
     min_upgrade_delay_secs: u64,
 ) -> (bool, String) {
-    // Defence-in-depth: verify payload_signature against the control pubkey.
-    let sig = match Signature::from_slice(payload_signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
-    };
-    if pubkey.verify(chain_payload, &sig).is_err() {
-        return (
-            false,
-            "payload_signature does not verify under the control pubkey".into(),
-        );
+    // The inner signature is what the synchronizer and the chain verify:
+    // it must be an upgrade-payload signature under the control key.
+    if let Err(e) = verify_payload_signature(
+        pubkey,
+        SignedDomain::UpgradePayload,
+        chain_payload,
+        payload_signature,
+    ) {
+        return (false, e);
     }
 
     // Validate the chain payload shape. Fail before touching storage.
     let payload =
-        match ciborium::from_reader::<enclavia_protocol::chain::UpgradePayload, _>(chain_payload) {
+        match decode_canonical::<enclavia_protocol::chain::UpgradePayload>(chain_payload) {
             Ok(p) => p,
             Err(e) => {
                 return (
@@ -340,6 +371,19 @@ async fn run_prepare_upgrade(
             }
         };
 
+    // A window no Transition can use would only produce a dead link.
+    if !enclavia_protocol::chain::upgrade_window_is_valid(payload.valid_from, payload.valid_until) {
+        return (
+            false,
+            format!(
+                "upgrade payload window {} to {} is shorter than the minimum of {} s",
+                payload.valid_from,
+                payload.valid_until,
+                enclavia_protocol::chain::UPGRADE_WINDOW_MIN.num_seconds()
+            ),
+        );
+    }
+
     // The measured minimum upgrade delay. `valid_from` is checked
     // against this enclave's OWN clock, not the signer-supplied
     // `issued_at`, so a compromised control key cannot fast-track an
@@ -348,9 +392,11 @@ async fn run_prepare_upgrade(
     // backend stamps `valid_from = its_now + min_delay` moments before
     // we check); it is negligible against delays measured in hours.
     // Enforced BEFORE the storage re-key and chain submission so a
-    // rejected activation leaves no trace. Caveat (documented in the
-    // issue): the guest clock is host-influenced, so a host that warps
-    // the clock forward can shrink the effective delay.
+    // rejected activation leaves no trace. Caveat: the guest clock is
+    // host-influenced, and a guest clock set BACK admits a `valid_from`
+    // earlier than the delay intends (the floor is computed from it); the
+    // synchronizer's `valid_from` gate on NSM time is the barrier that
+    // does not depend on it.
     if min_upgrade_delay_secs > 0 {
         let now = chrono::Utc::now();
         if violates_min_upgrade_delay(payload.valid_from, now, min_upgrade_delay_secs) {
@@ -367,15 +413,35 @@ async fn run_prepare_upgrade(
         }
     }
 
-    // Storage re-key (only for storage enclaves). The signed payload's
-    // `to_pcrs` is forwarded so `enclavia-crypto` can verify the NEW KMS
-    // key's policy gates Decrypt to exactly the enclave version being
-    // upgraded to (see the binary's `--expected-pcr*` args).
+    // Chain attestation, taken before the storage re-key: the synchronizer
+    // and the chain validator only honour an upgrade link whose attestation
+    // carries exactly the payload's `from` identity, so a payload naming any
+    // other identity is refused here, before storage is touched.
+    let attestation = match build_chain_attestation(chain_payload) {
+        Ok(a) => a,
+        Err(e) => return (false, format!("chain attestation failed: {e}")),
+    };
+    if *attestation.identity() != payload.from {
+        return (
+            false,
+            format!(
+                "upgrade payload `from` identity does not match this enclave: \
+                 payload {:?}, attested {:?}",
+                payload.from,
+                attestation.identity()
+            ),
+        );
+    }
+
+    // Storage re-key (only for storage enclaves). The PCR0-2 of the signed
+    // payload's `to` identity are forwarded so `enclavia-crypto` can verify
+    // the NEW KMS key's policy gates Decrypt to exactly the enclave version
+    // being upgraded to (see the binary's `--expected-pcr*` args).
     if let Some(rk) = rekey {
         let (ok, msg) = run_enclavia_crypto_prepare_upgrade(
             &rk.new_public_key,
             &rk.new_key_id,
-            &payload.to_pcrs,
+            &payload.to.image_pcrs_hex(),
             bin,
         )
         .await;
@@ -386,18 +452,12 @@ async fn run_prepare_upgrade(
         info!("storage re-key succeeded");
     }
 
-    // Get chain attestation.
-    let attestation = match build_chain_attestation(chain_payload) {
-        Ok(a) => a,
-        Err(e) => return (false, format!("chain attestation failed: {e}")),
-    };
-
     let link = ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: chain_payload.to_vec(),
-        attestation,
+        attestation: attestation.into_bytes(),
         signature: Some(payload_signature.to_vec()),
     };
 
@@ -412,12 +472,32 @@ async fn run_prepare_upgrade(
     )
 }
 
+/// The measured config's synchronizer trust anchors, set once in `main`.
+/// `None` inside means this enclave does not pin its storage to the
+/// synchronizer; unset (tests) is treated the same.
+static SYNCHRONIZER: std::sync::OnceLock<Option<config::SynchronizerTrust>> =
+    std::sync::OnceLock::new();
+
+fn synchronizer_trust() -> Option<&'static config::SynchronizerTrust> {
+    SYNCHRONIZER.get().and_then(Option::as_ref)
+}
+
 /// Execute the `RevokeUpgrade` flow:
 /// 1. Defence-in-depth: verify `payload_signature` against the control pubkey.
 /// 2. Validate the CBOR payload decodes as `RevocationPayload`.
-/// 3. Optionally run `enclavia-crypto revoke-upgrade` (storage enclaves).
-/// 4. Get a chain attestation.
-/// 5. Submit the `Revocation` chain link to `chain-host`; wait for ACK.
+/// 3. Get a chain attestation and build the `Revocation` chain link.
+/// 4. If this enclave pins its storage to the synchronizer, commit the
+///    revocation there and wait for its acknowledgement.
+/// 5. Optionally run `enclavia-crypto revoke-upgrade` (storage enclaves).
+/// 6. Submit the `Revocation` chain link to `chain-host`; wait for ACK.
+///
+/// Step 4 comes before anything else changes: the host keeps a copy of the
+/// signed upgrade link, and only the synchronizer refusing it stops the host
+/// from restoring the pre-upgrade LUKS header and completing the upgrade
+/// anyway once `valid_from` passes. If the synchronizer does not commit the
+/// revocation (including a synchronizer that does not support revocations),
+/// the command fails and nothing is reported as revoked; the revocation is
+/// idempotent there, so the operator's retry is safe.
 async fn run_revoke_upgrade(
     pubkey: &VerifyingKey,
     chain_payload: &[u8],
@@ -425,32 +505,22 @@ async fn run_revoke_upgrade(
     rollback: bool,
     bin: &str,
 ) -> (bool, String) {
-    let sig = match Signature::from_slice(payload_signature) {
-        Ok(s) => s,
-        Err(_) => return (false, "payload_signature must be 64 bytes raw r||s".into()),
-    };
-    if pubkey.verify(chain_payload, &sig).is_err() {
-        return (
-            false,
-            "payload_signature does not verify under the control pubkey".into(),
-        );
+    if let Err(e) = verify_payload_signature(
+        pubkey,
+        SignedDomain::RevocationPayload,
+        chain_payload,
+        payload_signature,
+    ) {
+        return (false, e);
     }
 
     if let Err(e) =
-        ciborium::from_reader::<enclavia_protocol::chain::RevocationPayload, _>(chain_payload)
+        decode_canonical::<enclavia_protocol::chain::RevocationPayload>(chain_payload)
     {
         return (
             false,
             format!("chain payload is not a valid RevocationPayload: {e}"),
         );
-    }
-
-    if rollback {
-        let (ok, msg) = run_enclavia_crypto_revoke_upgrade(bin).await;
-        if !ok {
-            return (false, format!("storage rollback failed: {msg}"));
-        }
-        info!("storage rollback succeeded");
     }
 
     let attestation = match build_chain_attestation(chain_payload) {
@@ -463,9 +533,30 @@ async fn run_revoke_upgrade(
         sequence: None,
         kind: ChainLinkKind::Revocation,
         payload: chain_payload.to_vec(),
-        attestation,
+        attestation: attestation.into_bytes(),
         signature: Some(payload_signature.to_vec()),
     };
+
+    if let Some(trust) = synchronizer_trust() {
+        let mut control_pubkey = [0u8; 65];
+        control_pubkey.copy_from_slice(pubkey.to_encoded_point(false).as_bytes());
+        if let Err(e) = sync_revoke::commit_revocation(trust, control_pubkey, &link).await {
+            return (
+                false,
+                format!("synchronizer did not commit the revocation, upgrade NOT revoked: {e}"),
+            );
+        }
+    } else {
+        info!("storage is not pinned to a synchronizer; no revocation to commit there");
+    }
+
+    if rollback {
+        let (ok, msg) = run_enclavia_crypto_revoke_upgrade(bin).await;
+        if !ok {
+            return (false, format!("storage rollback failed: {msg}"));
+        }
+        info!("storage rollback succeeded");
+    }
 
     if let Err(e) = submit_chain_link_to_host(&link).await {
         return (false, format!("chain-host submission failed: {e}"));
@@ -637,8 +728,8 @@ fn format_enclavia_crypto_failure(subcommand: &str, output: &std::process::Outpu
 
 /// Spawn `enclavia-crypto prepare-upgrade` and translate its exit status into
 /// a user-visible result. The new public key is base64-encoded for the CLI;
-/// the key id is passed through unchanged. `to_pcrs` (from the signed
-/// `UpgradePayload`) is forwarded so the binary can require the NEW KMS key's
+/// the key id is passed through unchanged. `to_pcrs` (PCR0-2 of the signed
+/// `UpgradePayload`'s `to` identity) is forwarded so the binary can require the NEW KMS key's
 /// policy to gate `kms:Decrypt` to exactly those measurements before it seals
 /// anything under the key (the upgrade-time counterpart of the boot-time
 /// policy check; without it a compromised control key could seal the fresh
@@ -1031,7 +1122,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 match msg {
                     ClientMessage::RequestAttestation => {
                         let control_nonce = *nonce.lock().await;
-                        let attestation_data = attestation::get_attestation_with_data(
+                        let attestation_data = attestation::session_attestation(
                             &handshake_hash,
                             &control_nonce,
                         )?;
@@ -1214,12 +1305,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_clients = max_concurrent_clients();
     let semaphore = Arc::new(Semaphore::new(max_clients));
 
-    let server_config = config::load(Path::new(config::CONFIG_PATH)).unwrap_or_else(|e| {
-        warn!(error = %e, "Failed to load enclavia config, control channel will be disabled");
-        config::ServerConfig::default()
-    });
+    let server_config = match config::load(Path::new(config::CONFIG_PATH)) {
+        Ok(c) => c,
+        Err(e) if e.is::<config::BuildFlavourMismatch>() => {
+            error!(error = %e, "refusing to start");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to load enclavia config, control channel will be disabled");
+            config::ServerConfig::default()
+        }
+    };
     let control_pubkey = server_config.control_public_key.map(Arc::new);
     let min_upgrade_delay_secs = server_config.min_upgrade_delay_secs;
+    let synchronizer_enabled = server_config.synchronizer.is_some();
+    let _ = SYNCHRONIZER.set(server_config.synchronizer);
     let nonce: ControlNonce = Arc::new(Mutex::new(fresh_nonce()));
     // The re-key binary path is a fixed, compiled-in constant: it receives
     // the freshly injected KMS creds and drives the LUKS re-key, so it must
@@ -1232,6 +1332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_clients,
         control_enabled = control_pubkey.is_some(),
         min_upgrade_delay_secs,
+        synchronizer_enabled,
         crypto_bin = %crypto_bin,
         "Starting enclavia server",
     );
@@ -1343,7 +1444,8 @@ mod tests {
     //! chain-host. The nonce rotation and rejection paths don't need it.
     use super::*;
     use enclavia_protocol::ControlCommand;
-    use p256::ecdsa::{SigningKey, signature::Signer};
+    use enclavia_protocol::signing::SignedDomain;
+    use p256::ecdsa::SigningKey;
 
     pub(super) fn fixed_pair() -> (SigningKey, VerifyingKey) {
         // Deterministic 32-byte scalar in (0, n). Seeds with `i+1` so
@@ -1359,13 +1461,9 @@ mod tests {
         (sk, pk)
     }
 
-    /// Type-annotated wrapper around `sk.sign(...)`. `p256::ecdsa::SigningKey`
-    /// implements `Signer<Signature>` and `Signer<DerSignature>`; without
-    /// annotating the return type the compiler can't pick one. Tests
-    /// uniformly want the 64-byte raw r||s form we've locked in (#47).
-    fn sign_raw(sk: &SigningKey, msg: &[u8]) -> Vec<u8> {
-        let sig: p256::ecdsa::Signature = sk.sign(msg);
-        sig.to_bytes().to_vec()
+    /// The 64-byte raw r||s signature (#47) over `msg` in `domain`.
+    fn sign_raw(sk: &SigningKey, domain: SignedDomain, msg: &[u8]) -> Vec<u8> {
+        enclavia_protocol::signing::sign_control(sk, domain, msg).to_vec()
     }
 
     fn cbor_encode<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -1375,18 +1473,16 @@ mod tests {
     }
 
     fn sample_upgrade_payload(nonce_seed: u8) -> Vec<u8> {
-        use enclavia_protocol::chain::{PcrsHex, UpgradePayload};
-        let pcrs = PcrsHex {
-            pcr0: "aa".repeat(24),
-            pcr1: "bb".repeat(24),
-            pcr2: "cc".repeat(24),
-        };
+        use enclavia_protocol::chain::UpgradePayload;
+        use enclavia_protocol::pin_identity::{PinIdentity, ZERO_USER_PCRS};
+        let identity = PinIdentity::new([[0xaa; 48], [0xbb; 48], [0xcc; 48]], ZERO_USER_PCRS);
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs.clone(),
-            to_pcrs: pcrs,
+            from: identity.clone(),
+            to: identity,
             image_digest: "sha256:test".into(),
             valid_from: chrono::Utc::now() + chrono::Duration::days(1),
+            valid_until: (chrono::Utc::now() + chrono::Duration::days(1)) + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![nonce_seed; 32],
         };
@@ -1402,6 +1498,7 @@ mod tests {
             revokes: uuid::Uuid::new_v4(),
             issued_at: chrono::Utc::now(),
             nonce: vec![nonce_seed; 32],
+            revokes_link: [nonce_seed; 32],
         };
         let mut out = Vec::new();
         ciborium::into_writer(&payload, &mut out).unwrap();
@@ -1414,7 +1511,7 @@ mod tests {
         chain_payload: Vec<u8>,
         rekey: Option<RekeyParams>,
     ) -> Vec<u8> {
-        let payload_signature = sign_raw(sk, &chain_payload);
+        let payload_signature = sign_raw(sk, SignedDomain::UpgradePayload, &chain_payload);
         cbor_encode(&ControlCommand::PrepareUpgrade {
             payload: chain_payload,
             payload_signature,
@@ -1429,7 +1526,7 @@ mod tests {
         chain_payload: Vec<u8>,
         rollback: bool,
     ) -> Vec<u8> {
-        let payload_signature = sign_raw(sk, &chain_payload);
+        let payload_signature = sign_raw(sk, SignedDomain::RevocationPayload, &chain_payload);
         cbor_encode(&ControlCommand::RevokeUpgrade {
             payload: chain_payload,
             payload_signature,
@@ -1445,7 +1542,7 @@ mod tests {
         let (sk, _) = fixed_pair();
         let chain_payload = sample_upgrade_payload(0x01);
         let payload = make_prepare_upgrade_command(nonce_value, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, None, &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
@@ -1481,11 +1578,54 @@ mod tests {
         let wrong_sk = SigningKey::from_slice(&wrong_seed).unwrap();
         let chain_payload = sample_upgrade_payload(0x03);
         let payload = make_prepare_upgrade_command(nonce_value, &wrong_sk, chain_payload, None);
-        let signature = sign_raw(&wrong_sk, &payload);
+        let signature = sign_raw(&wrong_sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
         assert!(msg.contains("signature verification"), "msg = {msg}");
+    }
+
+    /// Each signature counts only in its own domain: an envelope signed as
+    /// a payload, or an inner payload signed as a revocation, is refused.
+    #[tokio::test]
+    async fn rejects_signatures_from_another_domain() {
+        let nonce_value = [0x51u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let cmd = make_prepare_upgrade_command(nonce_value, &sk, sample_upgrade_payload(0x0a), None);
+        let signature = sign_raw(&sk, SignedDomain::UpgradePayload, &cmd);
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("signature verification"), "msg = {msg}");
+
+        let server_nonce = *nonce.lock().await;
+        let chain_payload = sample_upgrade_payload(0x0b);
+        let cmd = cbor_encode(&ControlCommand::PrepareUpgrade {
+            payload_signature: sign_raw(&sk, SignedDomain::RevocationPayload, &chain_payload),
+            payload: chain_payload,
+            rekey: None,
+            nonce: server_nonce,
+        });
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("payload_signature does not verify"), "msg = {msg}");
+    }
+
+    /// A correctly signed command that is not the canonical encoding of
+    /// what it decodes to is refused before it is executed.
+    #[tokio::test]
+    async fn rejects_non_canonical_command() {
+        let nonce_value = [0x52u8; 32];
+        let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
+        let (sk, pk) = fixed_pair();
+        let mut cmd =
+            make_prepare_upgrade_command(nonce_value, &sk, sample_upgrade_payload(0x0c), None);
+        cmd.push(0x00);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
+        let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+        assert!(!ok);
+        assert!(msg.contains("malformed payload"), "msg = {msg}");
     }
 
     #[tokio::test]
@@ -1494,7 +1634,7 @@ mod tests {
         let nonce: ControlNonce = Arc::new(Mutex::new(nonce_value));
         let (sk, pk) = fixed_pair();
         let bogus = b"\xff\xff\xff not cbor".to_vec();
-        let signature = sign_raw(&sk, &bogus);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &bogus);
 
         let (ok, msg) = handle_control(&bogus, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
@@ -1510,7 +1650,7 @@ mod tests {
         // Sign a payload bearing the *wrong* nonce — server must reject it.
         let chain_payload = sample_upgrade_payload(0x04);
         let payload = make_prepare_upgrade_command([0u8; 32], &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
@@ -1528,7 +1668,7 @@ mod tests {
         // Nonce rotation does not depend on downstream success.
         let chain_payload = sample_upgrade_payload(0x05);
         let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
         let _ = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
 
         // Server nonce should have rotated to something new.
@@ -1549,7 +1689,7 @@ mod tests {
 
         let chain_payload = sample_upgrade_payload(0x06);
         let payload = make_prepare_upgrade_command(initial, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
         // `false` exits 1 — verifies that enclavia-crypto failure is
         // reported back rather than silently masked.
         // Chain attestation (NSM) also fails in unit-test context (no /dev/nsm),
@@ -1572,7 +1712,7 @@ mod tests {
 
         let chain_payload = sample_revocation_payload(0x07);
         let payload = make_revoke_upgrade_command([0u8; 32], &sk, chain_payload, false);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) = handle_control(&payload, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok);
@@ -1587,14 +1727,14 @@ mod tests {
 
         // Use an UpgradePayload as the chain payload for a RevokeUpgrade command.
         let wrong_payload = sample_upgrade_payload(0x08);
-        let payload_signature = sign_raw(&sk, &wrong_payload);
+        let payload_signature = sign_raw(&sk, SignedDomain::RevocationPayload, &wrong_payload);
         let cmd = cbor_encode(&ControlCommand::RevokeUpgrade {
             payload: wrong_payload,
             payload_signature,
             rollback: false,
             nonce: server_nonce,
         });
-        let signature = sign_raw(&sk, &cmd);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
 
         let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
@@ -1613,14 +1753,14 @@ mod tests {
         let sk2 = SigningKey::from_slice(&wrong_seed).unwrap();
 
         let chain_payload = sample_upgrade_payload(0x09);
-        let wrong_payload_sig = sign_raw(&sk2, &chain_payload);
+        let wrong_payload_sig = sign_raw(&sk2, SignedDomain::UpgradePayload, &chain_payload);
         let cmd = cbor_encode(&ControlCommand::PrepareUpgrade {
             payload: chain_payload,
             payload_signature: wrong_payload_sig,
             rekey: None,
             nonce: server_nonce,
         });
-        let signature = sign_raw(&sk, &cmd);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
 
         let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
         assert!(!ok, "msg = {msg}");
@@ -1675,7 +1815,7 @@ mod tests {
         // BEFORE any enclavia-crypto / chain-host dispatch is attempted.
         let chain_payload = sample_upgrade_payload(0x0A);
         let payload = make_prepare_upgrade_command(server_nonce, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) =
             handle_control(&payload, &signature, Some(&pk), &nonce, "true", 2 * 86_400).await;
@@ -1684,6 +1824,37 @@ mod tests {
             msg.contains("measured minimum upgrade delay"),
             "msg = {msg}"
         );
+    }
+
+    /// An upgrade payload whose window is empty or one millisecond shorter
+    /// than the minimum is refused before anything else happens; a window of
+    /// exactly the minimum gets past the check.
+    #[tokio::test]
+    async fn prepare_upgrade_rejects_a_short_window() {
+        use enclavia_protocol::chain::UPGRADE_WINDOW_MIN;
+        let one_ms = chrono::Duration::milliseconds(1);
+        for (window, refused) in [
+            (chrono::Duration::zero(), true),
+            (UPGRADE_WINDOW_MIN - one_ms, true),
+            (UPGRADE_WINDOW_MIN, false),
+        ] {
+            let server_nonce = [0x12u8; 32];
+            let nonce: ControlNonce = Arc::new(Mutex::new(server_nonce));
+            let (sk, pk) = fixed_pair();
+            let mut payload: enclavia_protocol::chain::UpgradePayload =
+                ciborium::from_reader(sample_upgrade_payload(0x0B).as_slice()).unwrap();
+            payload.valid_until = payload.valid_from + window;
+            let cmd =
+                make_prepare_upgrade_command(server_nonce, &sk, cbor_encode(&payload), None);
+            let signature = sign_raw(&sk, SignedDomain::ControlCommand, &cmd);
+            let (ok, msg) = handle_control(&cmd, &signature, Some(&pk), &nonce, "true", 0).await;
+            assert!(!ok, "msg = {msg}");
+            assert_eq!(
+                msg.contains("shorter than the minimum"),
+                refused,
+                "window {window}: msg = {msg}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1697,7 +1868,7 @@ mod tests {
         // attestation / chain-host (no NSM or daemon in unit tests).
         let chain_payload = sample_upgrade_payload(0x0B);
         let payload = make_prepare_upgrade_command(server_nonce, &sk, chain_payload, None);
-        let signature = sign_raw(&sk, &payload);
+        let signature = sign_raw(&sk, SignedDomain::ControlCommand, &payload);
 
         let (ok, msg) =
             handle_control(&payload, &signature, Some(&pk), &nonce, "true", 3_600).await;

@@ -6,12 +6,13 @@
 //! `ciborium` over its existing Noise transport (the same one
 //! `enclavia-server` already runs).
 //!
-//! Each request maps onto one [`crate::Op`] (with some shaping, `Pin`
-//! distinguishes "first pin" from "subsequent pin" only at the state-machine
-//! level via the [`crate::Op::Register`] / [`crate::Op::Pin`] split, but on
-//! the wire we expose a single `Pin` RPC and let the server decide which
-//! state-machine op to apply based on whether the key is already
-//! registered).
+//! Each request maps onto one [`crate::Op`]. `Register` and `Pin` are
+//! separate RPCs: an enclave registers its key once, from its boot
+//! decision, for a blank volume; a `Pin` on a key the oracle does not know
+//! answers `NotFound` and never registers. A client therefore never takes
+//! "the oracle does not know me" for "register me", which is what would let
+//! a reconnect that lands on another cluster silently start a second
+//! history there.
 //!
 //! ## Transition credential = #47 upgrade chain link
 //!
@@ -20,7 +21,8 @@
 //! enclave over `old_key || new_key`) was impossible as built: enclaves
 //! verify control signatures but never hold the private key. The credential
 //! is now a #47 upgrade [`ChainLink`] (kind [`ChainLinkKind::Upgrade`])
-//! whose CBOR [`UpgradePayload`] already binds `from_pcrs -> to_pcrs` under
+//! whose CBOR [`UpgradePayload`] already binds `from -> to` (full pin
+//! identities, see [`enclavia_protocol::pin_identity`]) under
 //! the OLD enclave's control-key signature and carries the OLD enclave's
 //! own hardware attestation. See [`verify_transition_link`] for the exact
 //! verification contract.
@@ -39,22 +41,44 @@
 //! The link itself, however, is emitted by the OLD enclave during its
 //! `PrepareUpgrade` flow (enclavia#30, `enclavia-server::run_prepare_upgrade`
 //! calling `build_chain_attestation`): its `signature` is the OLD control
-//! key's signature over the payload, and its `attestation` is the OLD
-//! enclave's NSM document, so the link's PCRs equal `from_pcrs`. This
+//! key's signature over the payload (upgrade-payload domain, see
+//! `enclavia_protocol::signing`), and its `attestation` is the OLD
+//! enclave's NSM document, so the link's identity equals `from`. This
 //! mirrors `enclavia_protocol::chain`'s rule that upgrade / revocation
 //! links validate against the in-force state, attested by the enclave
 //! version running at the time.
 //!
-//! **Wire-compatibility note.** This breaks the previous `Transition`
-//! shape (`{ old_key, new_key, signature }`). The single-node binary has
-//! no deployed users, so the break is free; this mirrors enclavia#30, which
-//! did the same for `PrepareUpgrade`. There is no migration path because
-//! there is nothing to migrate.
+//! ## Versioning and capabilities
+//!
+//! The protocol is deployed: customer enclaves (nbd-client) talk to a
+//! running synchronizer cluster, and the two are built and rolled out
+//! separately. Both ends therefore advertise a [`PROTOCOL_VERSION`] and a
+//! capability set in their [`Frame::Authenticate`]; a session may use an
+//! optional feature only if BOTH ends advertised it
+//! ([`negotiate_capabilities`], [`PeerProtocol`]). Rules for changing the
+//! wire format:
+//!
+//! * Never remove or rename a field or variant, never change a field's
+//!   type, and never reuse a capability name.
+//! * A new field on an existing frame gets `#[serde(default)]`, so frames
+//!   from older peers still decode (unknown fields are already ignored).
+//! * A new [`Request`], [`Response`] or [`RpcError`] variant, or any new
+//!   behaviour a peer has to understand, is gated on a capability: an
+//!   older peer fails to decode a variant it does not know, so it must
+//!   only be sent to a peer that advertised support.
+//! * Bump [`PROTOCOL_VERSION`] only for a change a capability cannot
+//!   express.
+//!
+//! A peer that predates versioning decodes as version 0 with no
+//! capabilities and ignores the new fields, so the exchange itself is
+//! backward compatible in both directions.
 //!
 //! Errors are flattened into a small `RpcError` enum that the client can
 //! match against without depending on the state machine's
 //! [`crate::ValidationError`] type, the synchronizer is allowed to evolve
 //! the internal validation surface without breaking wire compatibility.
+
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +86,9 @@ use crate::{Commitment, PcrKey, ValidationError, Version};
 
 // Re-exported so callers of `verify_transition_link` have one import site.
 pub use enclavia_protocol::chain::{ChainLink, ChainLinkKind, UpgradePayload};
+use enclavia_protocol::signing::{
+    ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
+};
 
 /// Maximum size (bytes) of an ENCRYPTED frame on the wire, in either
 /// direction.
@@ -100,8 +127,9 @@ pub enum Frame {
     /// rejected).
     ///
     /// Client→server (first client frame): the listener verifies the doc,
-    /// extracts PCR0/1/2, and binds the session to
-    /// `PcrKey = SHA-256(PCR0||PCR1||PCR2)`.
+    /// reads its pin identity (PCR0-2 and user PCRs 16-31, see
+    /// [`enclavia_protocol::pin_identity`]), and binds the session to
+    /// `PcrKey = PinIdentity::key()`.
     ///
     /// Server→client (first server frame, sent only after the client's
     /// `Authenticate` verified): the client verifies the doc and checks
@@ -112,9 +140,23 @@ pub enum Frame {
     /// as a fake oracle: `Noise_NN` is unauthenticated DH, so without
     /// the server attesting back the customer would have no idea who is
     /// on the other end.
+    ///
+    /// Both ends also advertise their protocol version and capability set
+    /// here (see "Versioning and capabilities" in the module docs). Both
+    /// fields default when absent, so a peer that predates them decodes
+    /// as version 0 with no capabilities, and a peer that predates them
+    /// ignores them.
     Authenticate {
         /// Raw NSM attestation document bytes.
         nsm_doc: Vec<u8>,
+        /// The sender's [`PROTOCOL_VERSION`]; 0 when absent.
+        #[serde(default)]
+        protocol_version: u32,
+        /// The optional features the sender supports (see
+        /// [`SUPPORTED_CAPABILITIES`]). Names the receiver does not know
+        /// are ignored.
+        #[serde(default)]
+        capabilities: BTreeSet<String>,
     },
 
     /// Subsequent frame: an RPC [`Request`] to dispatch against the
@@ -123,6 +165,90 @@ pub enum Frame {
         /// RPC payload to dispatch against the session's bound key.
         request: Request,
     },
+}
+
+impl Frame {
+    /// This build's [`Frame::Authenticate`]: `nsm_doc` plus our
+    /// [`PROTOCOL_VERSION`] and [`SUPPORTED_CAPABILITIES`].
+    pub fn authenticate(nsm_doc: Vec<u8>) -> Self {
+        Frame::Authenticate {
+            nsm_doc,
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: supported_capabilities(),
+        }
+    }
+}
+
+/// Version of the customer protocol this build speaks, advertised in both
+/// ends' [`Frame::Authenticate`].
+///
+/// * 0: a peer that sends no version (built before versioning existed).
+/// * 1: adds the version / capability exchange itself. The frames,
+///   requests and responses are otherwise those of version 0.
+///
+/// Bump it only for a change that cannot be expressed as a capability;
+/// prefer a capability.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Capability: the server stores revocations of upgrade links and refuses a
+/// `Transition` whose link a revocation names ([`Request::Revoke`],
+/// [`Response::RevokeOk`], [`RpcError::TransitionRevoked`],
+/// [`RpcError::RevocationRejected`]).
+///
+/// A customer that revokes an upgrade MUST check the server advertised this
+/// before reporting the revocation as done: a server without it would let the
+/// revoked link through.
+pub const CAPABILITY_REVOCATION: &str = "revocation";
+
+/// Optional features this build supports, advertised in
+/// [`Frame::Authenticate`].
+///
+/// Adding a feature: give it a stable, never-reused name, add it here, and
+/// only use it on a session where [`negotiate_capabilities`] says BOTH ends
+/// support it.
+pub const SUPPORTED_CAPABILITIES: &[&str] = &[CAPABILITY_REVOCATION];
+
+/// [`SUPPORTED_CAPABILITIES`] as the set carried on the wire.
+pub fn supported_capabilities() -> BTreeSet<String> {
+    SUPPORTED_CAPABILITIES
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// The capabilities a session may use: those both this build and the peer
+/// advertised. Unknown names from the peer drop out here.
+pub fn negotiate_capabilities(peer: &BTreeSet<String>) -> BTreeSet<String> {
+    SUPPORTED_CAPABILITIES
+        .iter()
+        .filter(|c| peer.contains(**c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// What the other end of a session advertised in its
+/// [`Frame::Authenticate`], and the capability set the session negotiated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerProtocol {
+    /// The peer's advertised [`PROTOCOL_VERSION`] (0 if it sent none).
+    pub version: u32,
+    /// The capabilities both ends support ([`negotiate_capabilities`]).
+    pub capabilities: BTreeSet<String>,
+}
+
+impl PeerProtocol {
+    /// Build from the peer's advertised version and capability set.
+    pub fn from_advertised(version: u32, capabilities: &BTreeSet<String>) -> Self {
+        Self {
+            version,
+            capabilities: negotiate_capabilities(capabilities),
+        }
+    }
+
+    /// Whether the session may use `capability`.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.contains(capability)
+    }
 }
 
 /// Compile-time check that the pure core's [`crate::CONTROL_PUBKEY_LEN`]
@@ -157,19 +283,32 @@ pub enum Request {
         key: PcrKey,
     },
 
-    /// Write a new freshness commitment for `key`.
+    /// Create the pin slot for `key`, at version 0, holding `commitment`.
     ///
-    /// On the wire this is a single RPC, internally the synchronizer maps
-    /// it to [`crate::Op::Register`] (first pin for an unseen key) or
-    /// [`crate::Op::Pin`] (subsequent pin) depending on the committed
-    /// state. The result includes the resulting version so the caller can
-    /// distinguish them: `Version(0)` means this was the registration.
+    /// Sent only by an enclave's boot decision, for a volume that is blank
+    /// and unknown to the oracle ([`crate::Op::Register`]). It never stands
+    /// in for a [`Request::Pin`]: a client that finds its key unknown after
+    /// boot has lost its oracle state and must stop, not register again.
+    /// A key already registered answers [`RpcError::AlreadyRegistered`]
+    /// (the client checks with a `Get` whether that registration was its
+    /// own earlier attempt); a retired key answers
+    /// [`RpcError::OperationRejected`].
+    Register {
+        /// PCR set being registered; must be the session's key.
+        key: PcrKey,
+        /// The volume's commitment at registration.
+        commitment: Commitment,
+    },
+
+    /// Write a new freshness commitment for the registered `key`
+    /// ([`crate::Op::Pin`]).
+    ///
+    /// A key the oracle does not know answers [`RpcError::NotFound`]: a Pin
+    /// never registers.
     Pin {
         /// PCR set whose commitment is being updated.
         key: PcrKey,
-        /// Compare-and-swap guard, checked only when the pin maps to
-        /// [`crate::Op::Pin`] (ignored for a first-time `Register`, which
-        /// is inherently a CAS on non-existence): the pin applies only
+        /// Compare-and-swap guard: the pin applies only
         /// when the key's current version equals this. The client learns
         /// the version from the boot `Get` and every `PinOk`. Two live
         /// writers for one key (a host-booted clone pair sharing the
@@ -186,25 +325,48 @@ pub enum Request {
     /// Authorize and execute a PCR transition for an enclave upgrade.
     ///
     /// Submitted by the NEW enclave: the session that sends this RPC is
-    /// authenticated as `new_key` (`sha256(payload.to_pcrs)`), the
+    /// authenticated as `new_key` (`payload.to.key()`), the
     /// successor adopting the old key's pinned state. The old enclave is
     /// gone by cutover and could never submit it itself.
     ///
     /// `link` is a #47 upgrade [`ChainLink`] (kind
     /// [`ChainLinkKind::Upgrade`]) the new enclave read out of its own
-    /// chain. Its CBOR-decoded [`UpgradePayload`] names `from_pcrs ->
-    /// to_pcrs`; the link's `signature` is the OLD enclave's 64-byte raw
-    /// r||s ECDSA P-256 control signature over the payload, and its
+    /// chain. Its CBOR-decoded [`UpgradePayload`] names `from ->
+    /// to`; the link's `signature` is the OLD enclave's 64-byte raw
+    /// r||s ECDSA P-256 control signature over the payload in the
+    /// upgrade-payload domain, and its
     /// `attestation` is the OLD enclave's NSM document bound to
-    /// `sha256(payload)` (so its PCRs equal `from_pcrs`). The synchronizer
+    /// `sha256(payload)` (so its identity equals `from`). The synchronizer
     /// derives `old_key`/`new_key` from the payload, verifies the link via
     /// [`verify_transition_link`] against the control pubkey frozen for the
-    /// derived `old_key` at its registration, then retires `old_key`,
+    /// derived `old_key` at its registration (which also refuses the link
+    /// before the payload's `valid_from`), then retires `old_key`,
     /// registers `new_key` (which must itself have produced an attestation
     /// in this session, the submitting session does), and carries the
     /// existing commitment + version forward.
     Transition {
         /// The #47 upgrade chain link authorizing the transition.
+        link: ChainLink,
+    },
+
+    /// Revoke one upgrade link out of the session's own key
+    /// ([`CAPABILITY_REVOCATION`]; send only to a server that advertised it).
+    ///
+    /// Submitted by the enclave that currently holds the pin (the OLD image,
+    /// during the upgrade delay): the session must be authenticated as the
+    /// key being revoked. `link` is the #47 revocation [`ChainLink`] (kind
+    /// [`ChainLinkKind::Revocation`]) the enclave emits for the customer's
+    /// revoke command; its `signature` is the control key's 64-byte raw r||s
+    /// P-256 signature over the CBOR `RevocationPayload` in the
+    /// revocation-payload domain, verified against the
+    /// control pubkey frozen for the session's key, and its `revokes_link`
+    /// names the revoked link (see [`verify_revocation_link`]).
+    ///
+    /// On success a `Transition` out of the session's key presenting that
+    /// exact link is refused, for good. Any other link (a re-approved
+    /// upgrade) still goes through.
+    Revoke {
+        /// The #47 revocation chain link.
         link: ChainLink,
     },
 }
@@ -221,11 +383,13 @@ pub enum Response {
         version: Version,
     },
 
+    /// Successful [`Request::Register`]: the key is registered at version 0.
+    RegisterOk,
+
     /// Successful [`Request::Pin`].
     ///
-    /// `version` is `Version(0)` if this Pin registered the key for the
-    /// first time, `Version(n+1)` if it bumped an existing pin from
-    /// version `n`.
+    /// `version` is `Version(n+1)`: the pin bumped the key from the
+    /// `expected_version` `n`.
     PinOk {
         /// Per-key monotonic version after this pin.
         version: Version,
@@ -240,6 +404,10 @@ pub enum Response {
         /// Per-key monotonic version (unchanged across transition).
         version: Version,
     },
+
+    /// Successful [`Request::Revoke`]: the revocation is committed (on a
+    /// quorum, in the replicated deployment) and the server enforces it.
+    RevokeOk,
 
     /// Failure response. Carries a structured [`RpcError`] so the client
     /// can branch on the failure category without parsing strings.
@@ -268,6 +436,12 @@ pub enum RpcError {
     #[error("key not found")]
     NotFound,
 
+    /// `Register` for a key that is already registered. The caller's own
+    /// earlier attempt may have committed (outcome unknown after
+    /// `Unavailable`); it tells the two apart with a `Get`.
+    #[error("key already registered")]
+    AlreadyRegistered,
+
     /// `Transition` was rejected: the chain link failed verification
     /// (bad control signature, attestation/payload binding mismatch,
     /// PCR-hash mismatch), the target key hasn't attested in this session,
@@ -295,6 +469,17 @@ pub enum RpcError {
     /// Reads may still succeed; clients should back off and retry.
     #[error("synchronizer cluster unavailable")]
     Unavailable,
+
+    /// `Transition` was refused because a committed revocation names the
+    /// presented link ([`CAPABILITY_REVOCATION`]).
+    #[error("transition link revoked")]
+    TransitionRevoked,
+
+    /// `Revoke` was refused: the link failed verification, or the session's
+    /// key is not currently registered (never pinned, or the upgrade already
+    /// activated). The revocation did NOT take effect ([`CAPABILITY_REVOCATION`]).
+    #[error("revocation rejected")]
+    RevocationRejected,
 }
 
 impl From<ValidationError> for RpcError {
@@ -312,6 +497,7 @@ impl From<ValidationError> for RpcError {
             ValidationError::NoTransitionAuthorization => RpcError::TransitionRejected,
             ValidationError::NewKeyAlreadyExists => RpcError::TransitionRejected,
             ValidationError::OldKeyEqualsNew => RpcError::TransitionRejected,
+            ValidationError::TransitionRevoked => RpcError::TransitionRevoked,
 
             // KeyNotCurrent surfaces from Pin/Get on an unregistered key
             // (NotFound for the caller) AND from Transition on an
@@ -324,7 +510,7 @@ impl From<ValidationError> for RpcError {
             // run the Get-disambiguation (own lost write vs genuine fork).
             ValidationError::StalePin { .. } => RpcError::VersionConflict,
 
-            ValidationError::AlreadyRegistered => RpcError::OperationRejected,
+            ValidationError::AlreadyRegistered => RpcError::AlreadyRegistered,
             ValidationError::KeyRetired => RpcError::OperationRejected,
         }
     }
@@ -335,8 +521,9 @@ impl From<ValidationError> for RpcError {
 // ---------------------------------------------------------------------------
 
 // Re-exported so policy construction has one import site alongside the
-// verifier that consumes it.
-pub use enclavia_protocol::attestation::Pcrs;
+// verifier that consumes it, and so rejection sites can name the classified
+// cause without importing enclavia-protocol themselves.
+pub use enclavia_protocol::attestation::{Pcrs, RejectionReason};
 
 /// Which synchronizer measurements a customer accepts when the oracle
 /// attests back to it (#208).
@@ -370,6 +557,11 @@ pub enum ServerPcrPolicy {
     /// triples exactly. The list normally has one entry (the deployed
     /// synchronizer cluster runs a single image) and only changes when a
     /// new cluster is stood up. An EMPTY list admits nothing.
+    ///
+    /// The server's user PCRs (16-31) are not part of the anchor: only the
+    /// synchronizer's own measured code could extend them, that code is
+    /// pinned by PCR0-2, and it extends none. See
+    /// [`enclavia_protocol::attestation::ValidatedAttestation::require_pcrs_in`].
     Expected(Vec<Pcrs>),
 }
 
@@ -392,12 +584,22 @@ pub enum ServerAuthError {
     /// `nonce` that does not bind this session's handshake hash (a
     /// replayed capture from another session).
     #[error("server attestation document invalid: {0}")]
-    Attestation(String),
+    Attestation(enclavia_protocol::attestation::AttestationError),
     /// The document verified, but its PCRs are not admitted by the
     /// caller's [`ServerPcrPolicy`]: whatever is on the other end of
     /// this session, it is not the synchronizer the caller trusts.
     #[error("server attestation PCRs are not the expected synchronizer measurements")]
     PcrRejected,
+}
+
+impl ServerAuthError {
+    /// The classified cause of the rejection.
+    pub fn reason(&self) -> RejectionReason {
+        match self {
+            ServerAuthError::Attestation(e) => e.reason(),
+            ServerAuthError::PcrRejected => RejectionReason::PcrMismatch,
+        }
+    }
 }
 
 /// Verify the server's `Authenticate` document for one customer session
@@ -418,18 +620,15 @@ pub fn verify_server_attestation(
 ) -> Result<Pcrs, ServerAuthError> {
     use enclavia_protocol::attestation::AttestationError;
     let ServerPcrPolicy::Expected(expected) = policy;
-    // The PCR comparison happens INSIDE the protocol verifier (its
-    // `expected` parameter is mandatory), so no code path can verify a
-    // server document without committing to an identity.
-    match enclavia_protocol::attestation::verify_and_extract_pcrs(
-        nsm_doc,
-        handshake_hash,
-        expected,
-        enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
-    ) {
+    let doc = crate::attest::validate_session(nsm_doc, handshake_hash, debug_mode)
+        .map_err(ServerAuthError::Attestation)?;
+    // Authenticity alone admits any genuine enclave, including a reflection
+    // of the caller's own document: the policy check is what commits to an
+    // identity, and this function never returns without it.
+    match doc.require_pcrs_in(expected) {
         Ok(pcrs) => Ok(pcrs),
         Err(AttestationError::PcrsNotExpected) => Err(ServerAuthError::PcrRejected),
-        Err(e) => Err(ServerAuthError::Attestation(e.to_string())),
+        Err(e) => Err(ServerAuthError::Attestation(e)),
     }
 }
 
@@ -456,8 +655,8 @@ pub enum TransitionLinkError {
     SignatureShape,
     /// The frozen control pubkey for the derived `old_key` did not decode
     /// as uncompressed SEC1 P-256. Indicates the stored pubkey is corrupt;
-    /// should be unreachable for a key registered from a real
-    /// `AttestedIdentity`.
+    /// should be unreachable for a key registered from a validated
+    /// document (`ValidatedAttestation::control_pubkey`).
     #[error("frozen control pubkey for old_key does not decode as SEC1 P-256")]
     BadControlPubkey,
     /// `signature` does not verify against the frozen control pubkey for
@@ -467,24 +666,75 @@ pub enum TransitionLinkError {
     /// The link's `payload` did not CBOR-decode as an [`UpgradePayload`].
     #[error("transition link payload is not a decodable UpgradePayload: {0}")]
     PayloadDecode(String),
-    /// `verify_chain_attestation` rejected the link (attestation invalid,
-    /// or `user_data != sha256(payload)`, or PCRs disagree with
-    /// `from_pcrs`).
+    /// The link's attestation was rejected: invalid document,
+    /// `user_data != sha256(payload)`, or an identity (PCR0-2 or any user
+    /// PCR 16-31) other than the payload's `from`.
     #[error("transition link attestation failed: {0}")]
-    Attestation(String),
-    /// A PCR string inside `from_pcrs` / `to_pcrs` was not valid hex / not
-    /// a usable length.
-    #[error("transition link payload carries a malformed PCR set: {0}")]
-    BadPayloadPcrs(String),
-    /// `sha256(payload.to_pcrs)` (the derived `new_key`) did not equal the
+    Attestation(enclavia_protocol::attestation::AttestationError),
+    /// `payload.to.key()` (the derived `new_key`) did not equal the
     /// submitting session's bound key. The NEW enclave submits the
     /// transition, so the session must authenticate as `new_key`.
-    #[error("transition link to_pcrs does not hash to the submitting session key")]
+    #[error("transition link `to` identity is not the submitting session's identity")]
     SessionKeyMismatch,
     /// The derived `new_key` equals the derived `old_key`
-    /// (`from_pcrs == to_pcrs`): a self-transition is never legitimate.
-    #[error("transition link to_pcrs equals from_pcrs (self-transition)")]
+    /// (`from == to`): a self-transition is never legitimate.
+    #[error("transition link `to` equals `from` (self-transition)")]
     SelfTransition,
+    /// The payload's `valid_from` is still in the future: the verifier's
+    /// trusted `now` is earlier than `valid_from` minus
+    /// [`TRANSITION_CLOCK_TOLERANCE_MS`].
+    #[error(
+        "transition link is not valid yet (valid_from {valid_from_ms} ms, now {now_ms} ms, \
+         tolerance {TRANSITION_CLOCK_TOLERANCE_MS} ms)"
+    )]
+    NotYetValid {
+        /// The payload's `valid_from`, milliseconds since the Unix epoch.
+        valid_from_ms: i64,
+        /// The verifier's trusted `now`, milliseconds since the Unix epoch.
+        now_ms: u64,
+    },
+    /// The payload's `valid_until` has passed: the verifier's trusted `now`
+    /// is later than `valid_until` plus [`TRANSITION_CLOCK_TOLERANCE_MS`].
+    #[error(
+        "transition link has expired (valid_until {valid_until_ms} ms, now {now_ms} ms, \
+         tolerance {TRANSITION_CLOCK_TOLERANCE_MS} ms)"
+    )]
+    Expired {
+        /// The payload's `valid_until`, milliseconds since the Unix epoch.
+        valid_until_ms: i64,
+        /// The verifier's trusted `now`, milliseconds since the Unix epoch.
+        now_ms: u64,
+    },
+    /// The payload's window `valid_until - valid_from` is shorter than
+    /// [`enclavia_protocol::chain::UPGRADE_WINDOW_MIN`] (or empty, or inverted).
+    #[error("transition link window (valid_from to valid_until) is shorter than the minimum")]
+    WindowInvalid,
+}
+
+/// How far ahead of the payload's `valid_from`, and how far past its
+/// `valid_until`, a `Transition` is still accepted, in milliseconds.
+///
+/// Equal to `CLOCK_SKEW_TOLERANCE_SECS` (60 s) in `enclavia-server`, the
+/// slack of the only `valid_from` check on the enclave side: the measured
+/// minimum upgrade delay, enforced against the guest clock when the old
+/// enclave processes `PrepareUpgrade`. The enclave does not swap images;
+/// the backend's cutover sweep does, and this gate is what holds a link
+/// to its schedule whatever the backend or host does. The
+/// synchronizer's `now` is its own NSM attestation timestamp (hypervisor
+/// time), so the tolerance only has to absorb the difference between two
+/// Nitro hosts' clocks and the whole-second stamps of QEMU's emulated NSM.
+pub const TRANSITION_CLOCK_TOLERANCE_MS: u64 = 60_000;
+
+impl TransitionLinkError {
+    /// The classified cause when the link's attestation document was
+    /// rejected; `None` for the non-attestation checks (signature shape,
+    /// key derivation, session binding, `valid_from`).
+    pub fn attestation_reason(&self) -> Option<RejectionReason> {
+        match self {
+            TransitionLinkError::Attestation(e) => Some(e.reason()),
+            _ => None,
+        }
+    }
 }
 
 impl From<TransitionLinkError> for RpcError {
@@ -499,15 +749,15 @@ impl From<TransitionLinkError> for RpcError {
 /// The node uses [`Self::old_key`] to look up the frozen control pubkey it
 /// must verify the link's signature against, before calling
 /// [`verify_transition_link`]. Both keys are re-derived from the payload's
-/// own PCR triples (`sha256(PCR0||PCR1||PCR2)`), never taken from an
-/// untrusted wire field.
+/// own pin identities ([`enclavia_protocol::pin_identity::PinIdentity::key`]),
+/// never taken from an untrusted wire field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedTransition {
-    /// `sha256(payload.from_pcrs)`, the retiring (OLD) enclave's key. The
+    /// `payload.from.key()`, the retiring (OLD) enclave's key. The
     /// link's signature is verified against the control pubkey frozen for
     /// THIS key at its registration.
     pub old_key: PcrKey,
-    /// `sha256(payload.to_pcrs)`, the successor (NEW) enclave's key. Must
+    /// `payload.to.key()`, the successor (NEW) enclave's key. Must
     /// equal the submitting session's bound key.
     pub new_key: PcrKey,
 }
@@ -519,22 +769,14 @@ pub struct DecodedTransition {
 /// and then applies [`crate::Op::Transition`] with the same pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedTransition {
-    /// `sha256(payload.from_pcrs)`, the retiring (OLD) enclave's key.
+    /// `payload.from.key()`, the retiring (OLD) enclave's key.
     pub old_key: PcrKey,
-    /// `sha256(payload.to_pcrs)`, the successor key adopted by the
+    /// `payload.to.key()`, the successor key adopted by the
     /// transition. Equals the submitting session's bound key.
     pub new_key: PcrKey,
-}
-
-/// Derive a [`PcrKey`] from a chain payload's hex-PCR triple, matching
-/// `Pcrs::digest()` (SHA-256 over the raw `PCR0 || PCR1 || PCR2` bytes).
-fn pcr_key_from_hex(
-    pcrs: &enclavia_protocol::chain::PcrsHex,
-) -> Result<PcrKey, TransitionLinkError> {
-    let raw = pcrs
-        .to_pcrs()
-        .map_err(|e| TransitionLinkError::BadPayloadPcrs(e.to_string()))?;
-    Ok(PcrKey(raw.digest()))
+    /// [`upgrade_link_hash`] of the link's payload: the identity a
+    /// committed revocation of `old_key` names to refuse this link.
+    pub link_hash: [u8; 32],
 }
 
 /// Phase one of transition-link verification: structural checks plus the
@@ -546,14 +788,15 @@ fn pcr_key_from_hex(
 /// 1. The link must be an [`ChainLinkKind::Upgrade`] link.
 /// 2. It must carry a non-empty `signature` (verified later, in
 ///    [`verify_transition_link`]).
-/// 3. Its `payload` must CBOR-decode as an [`UpgradePayload`].
+/// 3. Its `payload` must be the canonical CBOR encoding of an
+///    [`UpgradePayload`] (`enclavia_protocol::signing::decode_canonical`).
 ///
 /// Returns the derived `(old_key, new_key)`. The payload is decoded here
 /// before its signature is verified, which is safe: the node uses the
 /// derived `old_key` only to *look up* a frozen pubkey, and
 /// [`verify_transition_link`] then verifies the 64-byte signature over the
 /// exact payload bytes against that pubkey. A payload that lies about
-/// `from_pcrs` would have to carry a signature valid under some OTHER key's
+/// `from` would have to carry a signature valid under some OTHER key's
 /// frozen pubkey, which it cannot.
 pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, TransitionLinkError> {
     if link.kind != ChainLinkKind::Upgrade {
@@ -564,11 +807,12 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
     if link.signature.is_none() {
         return Err(TransitionLinkError::MissingSignature);
     }
-    let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
+    let payload: UpgradePayload = decode_canonical(&link.payload)
         .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
-    let old_key = pcr_key_from_hex(&payload.from_pcrs)?;
-    let new_key = pcr_key_from_hex(&payload.to_pcrs)?;
-    Ok(DecodedTransition { old_key, new_key })
+    Ok(DecodedTransition {
+        old_key: PcrKey(payload.from.key()),
+        new_key: PcrKey(payload.to.key()),
+    })
 }
 
 /// Phase two: cryptographically verify a [`Request::Transition`]'s #47
@@ -586,24 +830,44 @@ pub fn decode_transition_link(link: &ChainLink) -> Result<DecodedTransition, Tra
 ///    session, this is why the credential, not a live old-key session,
 ///    authorizes the move.)
 /// 2. **Not a self-transition.** `decoded.new_key != decoded.old_key`
-///    (`from_pcrs != to_pcrs`). The state machine also rejects this, but a
+///    (`from != to`). The state machine also rejects this, but a
 ///    self-transition link is never legitimate.
 /// 3. **Control signature.** The link's 64-byte raw r||s ECDSA P-256
-///    `signature` must verify over the payload bytes against
+///    `signature` must verify over the payload bytes, in the upgrade-payload
+///    domain (`enclavia_protocol::signing`, so a signature made for a
+///    revocation or a command never counts), against
 ///    `old_control_pubkey`, the 65-byte SEC1 P-256 key the synchronizer
 ///    froze for `decoded.old_key` at its Register time
-///    (`AttestedIdentity::control_pubkey`). This proves the retiring
+///    (`ValidatedAttestation::control_pubkey`). This proves the retiring
 ///    enclave authorized this exact `from -> to` pair; control-pubkey
 ///    substitution is defeated because the pubkey is frozen, and the
 ///    decode-before-verify ordering is safe because the signature covers
-///    `from_pcrs`.
-/// 4. **Chain attestation.** `verify_chain_attestation` must accept the
-///    link's `attestation` against its `payload`, i.e. the attestation's
-///    `user_data == sha256(payload)` and its PCRs equal `from_pcrs` (the
-///    OLD enclave emitted the link, so it attested its OWN measurements,
-///    matching `enclavia_protocol::chain`'s "attested by the enclave
-///    version running at the time" rule). `debug_mode` selects the
+///    `from`.
+/// 4. **Chain attestation.** The link's `attestation` must validate as a
+///    chain link's document for its `payload` and carry exactly `from`, i.e.
+///    the attestation's `user_data == sha256(payload)` and its full pin
+///    identity (PCR0-2 and every user PCR 16-31) equals `from` (the OLD
+///    enclave emitted the link, so it attested its OWN identity, matching
+///    `enclavia_protocol::chain`'s "attested by the enclave version
+///    running at the time" rule). Since `old_key` is `from.key()`, this
+///    ties the moved pin to the enclave that emitted the link. `debug_mode` selects the
 ///    skip-cert-chain (QEMU / test) vs full-Nitro-CA path.
+/// 5. **Activation window.** The payload's `valid_until` must be at least
+///    `UPGRADE_WINDOW_MIN` after its `valid_from`; `valid_from` must not be later than
+///    `now_ms + TRANSITION_CLOCK_TOLERANCE_MS`; and `valid_until` must not be
+///    earlier than `now_ms - TRANSITION_CLOCK_TOLERANCE_MS`. The chain
+///    attestation is validated at the document's own timestamp, so without
+///    these gates a link would be usable from the moment it is emitted, not
+///    from the time its owner scheduled, and forever after, even once the
+///    owner has abandoned the upgrade. Both bounds are covered by the
+///    control signature (step 3), so they are trusted once that passes. The
+///    gates apply in both verification modes: they read signed payload
+///    fields, not the attestation envelope.
+///
+/// `now_ms` is the verifier's trusted current time in milliseconds since
+/// the Unix epoch. The node reads it from its own NSM attestation document
+/// (hypervisor time, see `crate::trusted_time`), never from the system
+/// clock, so correctness does not depend on the enclave's clock sync.
 ///
 /// On success returns the `(old_key, new_key)` the caller should observe
 /// and apply. The state machine still enforces the remaining structural
@@ -615,8 +879,9 @@ pub fn verify_transition_link(
     session_key: PcrKey,
     old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
     debug_mode: bool,
+    now_ms: u64,
 ) -> Result<VerifiedTransition, TransitionLinkError> {
-    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use p256::ecdsa::VerifyingKey;
 
     // 1. The NEW enclave submits; the session must be bound to new_key.
     if decoded.new_key != session_key {
@@ -636,41 +901,166 @@ pub fn verify_transition_link(
         .ok_or(TransitionLinkError::MissingSignature)?;
     let verifying = VerifyingKey::from_sec1_bytes(old_control_pubkey)
         .map_err(|_| TransitionLinkError::BadControlPubkey)?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| TransitionLinkError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| TransitionLinkError::SignatureInvalid)?;
+    verify_control_signature(&verifying, SignedDomain::UpgradePayload, &link.payload, sig_bytes)
+        .map_err(|e| match e {
+            ControlSignatureError::Shape => TransitionLinkError::SignatureShape,
+            ControlSignatureError::Invalid => TransitionLinkError::SignatureInvalid,
+        })?;
+
+    let payload: UpgradePayload = decode_canonical(&link.payload)
+        .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
+
+    // 5. Activation window. Checked ahead of the attestation (step 4) so the
+    //    outcome does not depend on the verification mode. The payload is
+    //    authenticated by the signature above, so `valid_from` and
+    //    `valid_until` are the owner's schedule.
+    if !enclavia_protocol::chain::upgrade_window_is_valid(payload.valid_from, payload.valid_until) {
+        return Err(TransitionLinkError::WindowInvalid);
+    }
+    let valid_from_ms = payload.valid_from.timestamp_millis();
+    let earliest_ms = i128::from(valid_from_ms) - i128::from(TRANSITION_CLOCK_TOLERANCE_MS);
+    if i128::from(now_ms) < earliest_ms {
+        return Err(TransitionLinkError::NotYetValid {
+            valid_from_ms,
+            now_ms,
+        });
+    }
+    //    Expiry, same trusted time and tolerance: a link not executed by
+    //    `valid_until` never moves the pin.
+    let valid_until_ms = payload.valid_until.timestamp_millis();
+    let latest_ms = i128::from(valid_until_ms) + i128::from(TRANSITION_CLOCK_TOLERANCE_MS);
+    if i128::from(now_ms) > latest_ms {
+        return Err(TransitionLinkError::Expired {
+            valid_until_ms,
+            now_ms,
+        });
+    }
 
     // 4. Chain attestation binds the document to sha256(payload) and to
-    //    the OLD enclave's measurements (from_pcrs): the old enclave
-    //    emitted the link, so it attested its own PCRs.
-    let payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice())
-        .map_err(|e| TransitionLinkError::PayloadDecode(e.to_string()))?;
-    let expected_pcrs = payload
-        .from_pcrs
-        .to_pcrs()
-        .map_err(|e| TransitionLinkError::BadPayloadPcrs(e.to_string()))?;
-    enclavia_protocol::attestation::verify_chain_attestation(
-        &link.attestation,
-        &link.payload,
-        &expected_pcrs,
-        enclavia_protocol::attestation::VerificationMode::from_debug_flag(debug_mode),
-    )
-    .map_err(|e| TransitionLinkError::Attestation(e.to_string()))?;
+    //    the OLD enclave's full identity (`from`, user PCRs included): the
+    //    old enclave emitted the link, so it attested its own identity.
+    crate::attest::validate_chain_link(&link.attestation, &link.payload, debug_mode)
+        .and_then(|doc| doc.require_identity(&payload.from))
+        .map_err(TransitionLinkError::Attestation)?;
 
     Ok(VerifiedTransition {
         old_key: decoded.old_key,
         new_key: decoded.new_key,
+        link_hash: upgrade_link_hash(&link.payload),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Revocation-link verifier (pure; called by the node before applying a Revoke)
+// ---------------------------------------------------------------------------
+
+pub use enclavia_protocol::chain::{RevocationPayload, upgrade_link_hash};
+
+/// Why a [`Request::Revoke`]'s chain link failed verification. Every variant
+/// folds to [`RpcError::RevocationRejected`] on the wire.
+#[derive(Debug, thiserror::Error)]
+pub enum RevocationLinkError {
+    /// The link's `kind` is not [`ChainLinkKind::Revocation`].
+    #[error("revocation link has the wrong kind ({0:?})")]
+    NotARevocationLink(ChainLinkKind),
+    /// The link carried no `signature`.
+    #[error("revocation link is missing the control-key signature")]
+    MissingSignature,
+    /// `signature` is not 64 bytes raw r||s ECDSA P-256.
+    #[error("revocation link signature is not 64 bytes raw r||s P-256")]
+    SignatureShape,
+    /// The frozen control pubkey does not decode as SEC1 P-256.
+    #[error("frozen control pubkey does not decode as SEC1 P-256")]
+    BadControlPubkey,
+    /// `signature` does not verify against the frozen control pubkey.
+    #[error("revocation link signature does not verify under the key's frozen control pubkey")]
+    SignatureInvalid,
+    /// The payload does not CBOR-decode as a [`RevocationPayload`].
+    #[error("revocation link payload is not a decodable RevocationPayload: {0}")]
+    PayloadDecode(String),
+}
+
+impl From<RevocationLinkError> for RpcError {
+    fn from(_: RevocationLinkError) -> Self {
+        RpcError::RevocationRejected
+    }
+}
+
+/// Successful output of [`verify_revocation_link`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedRevocation {
+    /// [`upgrade_link_hash`] of the revoked upgrade link.
+    pub link_hash: [u8; 32],
+}
+
+/// Verify a [`Request::Revoke`]'s #47 revocation chain link against the
+/// control pubkey frozen for the key being revoked. The caller has already
+/// required that key to be the submitting session's own, currently registered
+/// key.
+///
+/// Who may revoke: the same authority that approves upgrades. An upgrade link
+/// counts because the enclave's CONTROL key signed its payload; a revocation
+/// counts only if that same key, as frozen in the key's `KeyState` at
+/// registration, signed the `RevocationPayload`. The host holds no control
+/// key, so it cannot mint a revocation (it could only deny service, which it
+/// can already do by withholding the upgrade), and because revoked hashes are
+/// only ever added, nobody can undo one.
+///
+/// What is revoked is exactly the link whose payload hashes to the signed
+/// `revokes_link`: nothing the backend stamps (timestamps, chain ids) decides
+/// it. A signer who checked that hash against a link it verified itself knows
+/// precisely which upgrade stops working.
+///
+/// Checks, in order:
+/// 1. `kind` is [`ChainLinkKind::Revocation`] and a signature is present.
+/// 2. The 64-byte raw r||s P-256 signature verifies over the exact payload
+///    bytes, in the revocation-payload domain, against `control_pubkey`,
+///    the key's FROZEN pubkey (never the session's announced one).
+/// 3. The payload is the canonical encoding of a [`RevocationPayload`];
+///    its `revokes_link` is the revoked link.
+///
+/// Not checked, deliberately:
+/// * The link's `attestation`: the old enclave's document for the public
+///   chain's auditors. The synchronizer already holds a fresher proof of the
+///   same fact, the session's own attestation as the key.
+/// * `revokes` (the backend's chain entry id) and `issued_at`: both are
+///   stamped by the backend and say nothing the hash does not.
+/// * `enclave_id`: the key is already bound to the session, and a mismatch
+///   check could only make a genuine revocation silently ineffective.
+pub fn verify_revocation_link(
+    link: &ChainLink,
+    control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
+) -> Result<VerifiedRevocation, RevocationLinkError> {
+    use p256::ecdsa::VerifyingKey;
+
+    if link.kind != ChainLinkKind::Revocation {
+        return Err(RevocationLinkError::NotARevocationLink(link.kind));
+    }
+    let sig_bytes = link
+        .signature
+        .as_deref()
+        .ok_or(RevocationLinkError::MissingSignature)?;
+    let verifying = VerifyingKey::from_sec1_bytes(control_pubkey)
+        .map_err(|_| RevocationLinkError::BadControlPubkey)?;
+    verify_control_signature(&verifying, SignedDomain::RevocationPayload, &link.payload, sig_bytes)
+        .map_err(|e| match e {
+            ControlSignatureError::Shape => RevocationLinkError::SignatureShape,
+            ControlSignatureError::Invalid => RevocationLinkError::SignatureInvalid,
+        })?;
+    let payload: RevocationPayload = decode_canonical(&link.payload)
+        .map_err(|e| RevocationLinkError::PayloadDecode(e.to_string()))?;
+    Ok(VerifiedRevocation {
+        link_hash: payload.revokes_link,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enclavia_protocol::attestation::Pcrs;
-    use enclavia_protocol::attestation::test_utils::FakeChainAttestation;
-    use enclavia_protocol::chain::PcrsHex;
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use enclavia_protocol::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
+    use enclavia_protocol::pin_identity::{PinIdentity, ZERO_USER_PCRS};
+    use enclavia_protocol::signing::sign_control;
+    use p256::ecdsa::SigningKey;
 
     fn k(b: u8) -> PcrKey {
         PcrKey([b; 32])
@@ -692,22 +1082,17 @@ mod tests {
 
     // --- shared transition-link fixtures ------------------------------
 
-    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-        PcrsHex {
-            pcr0: hex::encode(vec![seed; 48]),
-            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-        }
+    /// The PcrKey of `identity_from_seed(seed)`: PCR0-2 from the seed, no
+    /// user PCRs.
+    fn key_from_seed(seed: u8) -> PcrKey {
+        PcrKey(identity_from_seed(seed).key())
     }
 
-    /// The PcrKey a seed's PcrsHex hashes to, matching `Pcrs::digest()`.
-    fn key_from_seed(seed: u8) -> PcrKey {
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        PcrKey(raw.digest())
+    /// `identity_from_seed(seed)` with PCR16 set to `pcr16`.
+    fn identity_with_pcr16(seed: u8, pcr16: u8) -> PinIdentity {
+        let mut user = ZERO_USER_PCRS;
+        user[0] = [pcr16; 48];
+        identity_from_seed(seed).with_user_pcrs(user)
     }
 
     /// Deterministic P-256 keypair; returns the signing key and the
@@ -734,12 +1119,35 @@ mod tests {
     /// the OLD measurements (`from_seed`): the old enclave emits the link
     /// during its PrepareUpgrade flow, so it attests its own PCRs.
     fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+        upgrade_link_valid_from(from_seed, to_seed, signing, chrono::Utc::now())
+    }
+
+    /// [`upgrade_link`] with an explicit `valid_from` (and the default window).
+    fn upgrade_link_valid_from(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
+        let valid_until = valid_from + enclavia_protocol::chain::UPGRADE_WINDOW_DEFAULT;
+        upgrade_link_window(from_seed, to_seed, signing, valid_from, valid_until)
+    }
+
+    /// [`upgrade_link`] with an explicit `valid_from` and `valid_until`.
+    fn upgrade_link_window(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: chrono::DateTime<chrono::Utc>,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
-            valid_from: chrono::Utc::now(),
+            valid_from,
+            valid_until,
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
@@ -748,14 +1156,14 @@ mod tests {
         // Attestation is the OLD enclave's: PCRs = from_seed, user_data =
         // sha256(payload).
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -769,8 +1177,39 @@ mod tests {
         old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
         debug_mode: bool,
     ) -> Result<VerifiedTransition, TransitionLinkError> {
+        decode_and_verify_at(link, session_key, old_control_pubkey, debug_mode, now_ms())
+    }
+
+    /// [`decode_and_verify`] at an explicit trusted `now`.
+    fn decode_and_verify_at(
+        link: &ChainLink,
+        session_key: PcrKey,
+        old_control_pubkey: &[u8; crate::CONTROL_PUBKEY_LEN],
+        debug_mode: bool,
+        now_ms: u64,
+    ) -> Result<VerifiedTransition, TransitionLinkError> {
         let decoded = decode_transition_link(link)?;
-        verify_transition_link(link, decoded, session_key, old_control_pubkey, debug_mode)
+        verify_transition_link(
+            link,
+            decoded,
+            session_key,
+            old_control_pubkey,
+            debug_mode,
+            now_ms,
+        )
+    }
+
+    fn now_ms() -> u64 {
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap()
+    }
+
+    /// Fixed instant for the `valid_from` gate tests.
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(1_790_000_000_000).unwrap()
+    }
+
+    fn ms(t: chrono::DateTime<chrono::Utc>) -> u64 {
+        u64::try_from(t.timestamp_millis()).unwrap()
     }
 
     // --- wire round-trips ---------------------------------------------
@@ -778,6 +1217,18 @@ mod tests {
     #[test]
     fn request_get_roundtrip() {
         roundtrip(&Request::Get { key: k(1) });
+    }
+
+    #[test]
+    fn request_register_roundtrip() {
+        roundtrip(&Request::Register {
+            key: k(7),
+            commitment: c(0xab),
+        });
+        roundtrip(&Response::RegisterOk);
+        roundtrip(&Response::Err {
+            error: RpcError::AlreadyRegistered,
+        });
     }
 
     #[test]
@@ -826,10 +1277,13 @@ mod tests {
         for code in [
             RpcError::Unauthorized,
             RpcError::NotFound,
+            RpcError::AlreadyRegistered,
             RpcError::TransitionRejected,
             RpcError::OperationRejected,
             RpcError::VersionConflict,
             RpcError::Unavailable,
+            RpcError::TransitionRevoked,
+            RpcError::RevocationRejected,
         ] {
             roundtrip(&Response::Err { error: code });
         }
@@ -844,7 +1298,7 @@ mod tests {
             (ValidationError::NotAttested, RpcError::TransitionRejected),
             (
                 ValidationError::AlreadyRegistered,
-                RpcError::OperationRejected,
+                RpcError::AlreadyRegistered,
             ),
             (ValidationError::KeyRetired, RpcError::OperationRejected),
             (ValidationError::KeyNotCurrent, RpcError::NotFound),
@@ -870,6 +1324,10 @@ mod tests {
             (
                 ValidationError::OldKeyEqualsNew,
                 RpcError::TransitionRejected,
+            ),
+            (
+                ValidationError::TransitionRevoked,
+                RpcError::TransitionRevoked,
             ),
         ];
         for (input, expected) in cases {
@@ -898,6 +1356,83 @@ mod tests {
             })
             .expect("type discriminator present");
         assert_eq!(ty, "Get");
+    }
+
+    // --- protocol version / capabilities --------------------------------
+
+    /// The `Authenticate` shape of a peer built before versioning existed.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "frame")]
+    enum LegacyFrame {
+        Authenticate { nsm_doc: Vec<u8> },
+    }
+
+    fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(v, &mut buf).unwrap();
+        buf
+    }
+
+    /// A pre-versioning client's `Authenticate` still decodes, as version 0
+    /// with no capabilities.
+    #[test]
+    fn legacy_authenticate_decodes_as_version_zero() {
+        let legacy = LegacyFrame::Authenticate {
+            nsm_doc: vec![1, 2, 3],
+        };
+        let frame: Frame = ciborium::from_reader(cbor(&legacy).as_slice()).unwrap();
+        match frame {
+            Frame::Authenticate {
+                nsm_doc,
+                protocol_version,
+                capabilities,
+            } => {
+                assert_eq!(nsm_doc, vec![1, 2, 3]);
+                assert_eq!(protocol_version, 0);
+                assert!(capabilities.is_empty());
+            }
+            other => panic!("expected Authenticate, got {other:?}"),
+        }
+    }
+
+    /// A pre-versioning peer decodes our `Authenticate`, ignoring the new
+    /// fields.
+    #[test]
+    fn versioned_authenticate_decodes_on_a_legacy_peer() {
+        let frame = Frame::authenticate(vec![4, 5, 6]);
+        let legacy: LegacyFrame = ciborium::from_reader(cbor(&frame).as_slice()).unwrap();
+        assert_eq!(
+            legacy,
+            LegacyFrame::Authenticate {
+                nsm_doc: vec![4, 5, 6]
+            }
+        );
+    }
+
+    /// Our `Authenticate` carries this build's version and capabilities
+    /// and round-trips; unknown capability names from a newer peer survive
+    /// decoding and drop out of the negotiated set.
+    #[test]
+    fn authenticate_advertises_and_negotiates() {
+        let frame = Frame::authenticate(vec![7]);
+        let back: Frame = ciborium::from_reader(cbor(&frame).as_slice()).unwrap();
+        let Frame::Authenticate {
+            protocol_version,
+            capabilities,
+            ..
+        } = back
+        else {
+            panic!("expected Authenticate");
+        };
+        assert_eq!(protocol_version, PROTOCOL_VERSION);
+        assert_eq!(capabilities, supported_capabilities());
+
+        let mut newer: BTreeSet<String> = supported_capabilities();
+        newer.insert("from-a-future-release".to_string());
+        let peer = PeerProtocol::from_advertised(PROTOCOL_VERSION + 1, &newer);
+        assert_eq!(peer.version, PROTOCOL_VERSION + 1);
+        assert_eq!(peer.capabilities, supported_capabilities());
+        assert!(!peer.supports("from-a-future-release"));
     }
 
     // --- verify_server_attestation (#208) ------------------------------
@@ -954,6 +1489,7 @@ mod tests {
         let policy = ServerPcrPolicy::Expected(Vec::new());
         let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
         assert!(matches!(err, ServerAuthError::PcrRejected), "{err:?}");
+        assert_eq!(err.reason(), RejectionReason::PcrMismatch);
     }
 
     /// Nonce binding: a document captured from ANOTHER session (replay)
@@ -964,6 +1500,7 @@ mod tests {
         let policy = ServerPcrPolicy::Expected(vec![pcrs_from_seed(0x56)]);
         let err = verify_server_attestation(&doc, &hh(), &policy, true).unwrap_err();
         assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
+        assert_eq!(err.reason(), RejectionReason::NonceMismatch);
     }
 
     /// Garbage bytes are rejected as a malformed document (before any
@@ -974,6 +1511,7 @@ mod tests {
         let err =
             verify_server_attestation(&[0xde, 0xad, 0xbe, 0xef], &hh(), &policy, true).unwrap_err();
         assert!(matches!(err, ServerAuthError::Attestation(_)), "{err:?}");
+        assert_eq!(err.reason(), RejectionReason::Malformed);
     }
 
     /// A correctly-bound, expected-PCR document verifies, and the SAME
@@ -1042,13 +1580,13 @@ mod tests {
         );
     }
 
-    /// to_pcrs hashes to something other than the submitting session's
+    /// `to` hashes to something other than the submitting session's
     /// key: the NEW enclave isn't the one presenting the link.
     #[test]
     fn transition_link_session_key_mismatch_rejected() {
         let (sk, pk) = keypair(0x33);
         let link = upgrade_link(0x33, 0x43, &sk);
-        // Caller's session is bound to a key the payload's to_pcrs does
+        // Caller's session is bound to a key the payload's `to` does
         // not hash to.
         let wrong_session = key_from_seed(0x99);
         let err = decode_and_verify(&link, wrong_session, &pk, true).unwrap_err();
@@ -1058,7 +1596,7 @@ mod tests {
         );
     }
 
-    /// to_pcrs equals from_pcrs (self-transition) is rejected.
+    /// `to` equals `from` (self-transition) is rejected.
     #[test]
     fn transition_link_to_equals_from_rejected() {
         let (sk, pk) = keypair(0x34);
@@ -1098,12 +1636,11 @@ mod tests {
         );
     }
 
-    /// The OLD bug shape: the link is attested with the TARGET (to_pcrs)
-    /// measurements instead of the source (from_pcrs). The corrected
-    /// verifier checks the attestation against from_pcrs, so this is now
-    /// rejected by `verify_chain_attestation`.
+    /// The link is attested with the TARGET (`to`) measurements instead of
+    /// the source (`from`). The verifier checks the attestation against
+    /// `from`, so this is rejected.
     #[test]
-    fn transition_link_attested_with_to_pcrs_rejected() {
+    fn transition_link_attested_with_to_identity_rejected() {
         let (sk, pk) = keypair(0x36);
         // upgrade_link attests with from_seed (correct); rebuild the
         // attestation with the to_seed (0x46) to reproduce the old bug.
@@ -1119,13 +1656,13 @@ mod tests {
     }
 
     /// Tampering the attestation so its PCRs match neither from nor to is
-    /// caught by `verify_chain_attestation`.
+    /// caught by the chain-link attestation check.
     #[test]
     fn transition_link_attestation_pcr_mismatch_rejected() {
         let (sk, pk) = keypair(0x38);
         let mut link = upgrade_link(0x38, 0x48, &sk);
         // Re-attest the same payload under PCRs (0x77) that match neither
-        // from_pcrs (0x38) nor to_pcrs (0x48). user_data still binds the
+        // `from` (0x38) nor `to` (0x48). user_data still binds the
         // payload, so this isolates the PCR-equality check.
         let payload_bytes = link.payload.clone();
         link.attestation = FakeChainAttestation::for_payload(0x77, &payload_bytes).encode();
@@ -1135,5 +1672,449 @@ mod tests {
             matches!(err, TransitionLinkError::Attestation(_)),
             "{err:?}"
         );
+        assert_eq!(err.attestation_reason(), Some(RejectionReason::PcrMismatch));
+        // A non-attestation failure carries no attestation reason.
+        assert_eq!(
+            TransitionLinkError::SelfTransition.attestation_reason(),
+            None
+        );
+    }
+
+    /// An upgrade link between two identities that carry a PCR16, attested
+    /// by a document whose PCR16 is `doc_pcr16`.
+    fn user_pcr_upgrade_link(
+        from: &PinIdentity,
+        to: &PinIdentity,
+        doc_seed: u8,
+        doc_pcr16: Option<u8>,
+        signing: &SigningKey,
+    ) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from: from.clone(),
+            to: to.clone(),
+            image_digest: "sha256:to".into(),
+            valid_from: chrono::Utc::now(),
+            valid_until: chrono::Utc::now() + chrono::Duration::days(7),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x5b; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let mut fake = FakeChainAttestation::for_payload(doc_seed, &payload_bytes);
+        if let Some(b) = doc_pcr16 {
+            fake = fake.with_user_pcr(16, vec![b; 48]);
+        }
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation: fake.encode(),
+            signature: Some(sig.to_vec()),
+        }
+    }
+
+    /// Keys come from the full identities: a link between two enclaves'
+    /// identities that share PCR0-2 with other enclaves names only the
+    /// PCR16-specific keys, and verifies when the attestation carries the
+    /// same PCR16.
+    #[test]
+    fn transition_link_keys_include_user_pcrs() {
+        let (sk, pk) = keypair(0x39);
+        let from = identity_with_pcr16(0x39, 0xa1);
+        let to = identity_with_pcr16(0x49, 0xa1);
+        let link = user_pcr_upgrade_link(&from, &to, 0x39, Some(0xa1), &sk);
+
+        let decoded = decode_transition_link(&link).unwrap();
+        assert_eq!(decoded.old_key, PcrKey(from.key()));
+        assert_eq!(decoded.new_key, PcrKey(to.key()));
+        assert_ne!(decoded.old_key, key_from_seed(0x39));
+        assert_ne!(decoded.new_key, key_from_seed(0x49));
+
+        let verified = decode_and_verify(&link, PcrKey(to.key()), &pk, true).unwrap();
+        assert_eq!(verified.old_key, PcrKey(from.key()));
+        // A session of the same image without the PCR16 is another enclave.
+        let err = decode_and_verify(&link, key_from_seed(0x49), &pk, true).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::SessionKeyMismatch),
+            "{err:?}"
+        );
+    }
+
+    /// The link's attestation must carry the user PCRs its `from` claims:
+    /// same PCR0-2 but a different (or missing) PCR16 is refused.
+    #[test]
+    fn transition_link_with_mismatching_user_pcrs_rejected() {
+        let (sk, pk) = keypair(0x3a);
+        let from = identity_with_pcr16(0x3a, 0xa1);
+        let to = identity_with_pcr16(0x4a, 0xa1);
+        for doc_pcr16 in [Some(0xb2), None] {
+            let link = user_pcr_upgrade_link(&from, &to, 0x3a, doc_pcr16, &sk);
+            let err = decode_and_verify(&link, PcrKey(to.key()), &pk, true).unwrap_err();
+            assert!(
+                matches!(err, TransitionLinkError::Attestation(_)),
+                "{doc_pcr16:?}: {err:?}"
+            );
+            assert_eq!(err.attestation_reason(), Some(RejectionReason::PcrMismatch));
+        }
+        // And a document that locked a PCR16 the payload leaves at zero.
+        let plain_from = identity_from_seed(0x3a);
+        let link = user_pcr_upgrade_link(&plain_from, &to, 0x3a, Some(0xa1), &sk);
+        let err = decode_and_verify(&link, PcrKey(to.key()), &pk, true).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::Attestation(_)),
+            "{err:?}"
+        );
+    }
+
+    // --- valid_from gate ------------------------------------------------
+
+    const TOL: u64 = TRANSITION_CLOCK_TOLERANCE_MS;
+
+    /// A link whose valid_from is an hour ahead of the trusted `now` is
+    /// refused, even though every other check would pass.
+    #[test]
+    fn transition_link_before_valid_from_rejected() {
+        let (sk, pk) = keypair(0x60);
+        let link = upgrade_link_valid_from(0x60, 0x61, &sk, t0());
+        let now = ms(t0()) - 3_600_000;
+        let err = decode_and_verify_at(&link, key_from_seed(0x61), &pk, true, now).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransitionLinkError::NotYetValid { valid_from_ms, now_ms }
+                    if valid_from_ms == t0().timestamp_millis() && now_ms == now
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// From valid_from to valid_until the link is accepted.
+    #[test]
+    fn transition_link_inside_its_window_is_accepted() {
+        let (sk, pk) = keypair(0x62);
+        let link = upgrade_link_valid_from(0x62, 0x63, &sk, t0());
+        let until = t0() + enclavia_protocol::chain::UPGRADE_WINDOW_DEFAULT;
+        for now in [ms(t0()), ms(t0()) + 1, ms(until)] {
+            decode_and_verify_at(&link, key_from_seed(0x63), &pk, true, now)
+                .unwrap_or_else(|e| panic!("now = {now}: {e:?}"));
+        }
+    }
+
+    /// The tolerance edge: exactly `valid_from - tolerance` is accepted,
+    /// one millisecond earlier is not.
+    #[test]
+    fn transition_link_valid_from_tolerance_edge() {
+        let (sk, pk) = keypair(0x64);
+        let link = upgrade_link_valid_from(0x64, 0x65, &sk, t0());
+        let edge = ms(t0()) - TOL;
+        decode_and_verify_at(&link, key_from_seed(0x65), &pk, true, edge)
+            .expect("exactly at valid_from - tolerance");
+        let err =
+            decode_and_verify_at(&link, key_from_seed(0x65), &pk, true, edge - 1).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::NotYetValid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The gate is independent of the verification mode: an early link is
+    /// refused as `NotYetValid` in production mode too, before the
+    /// (here fake, so otherwise failing) chain attestation is looked at.
+    #[test]
+    fn transition_link_valid_from_gate_in_both_modes() {
+        let (sk, pk) = keypair(0x66);
+        let link = upgrade_link_valid_from(0x66, 0x67, &sk, t0());
+        let early = ms(t0()) - TOL - 1;
+        for debug_mode in [true, false] {
+            let err = decode_and_verify_at(&link, key_from_seed(0x67), &pk, debug_mode, early)
+                .unwrap_err();
+            assert!(
+                matches!(err, TransitionLinkError::NotYetValid { .. }),
+                "debug_mode = {debug_mode}: {err:?}"
+            );
+        }
+        // On time, skip-chain mode accepts; production mode now gets as far
+        // as the attestation and rejects the fake document there.
+        decode_and_verify_at(&link, key_from_seed(0x67), &pk, true, ms(t0())).expect("on time");
+        let err =
+            decode_and_verify_at(&link, key_from_seed(0x67), &pk, false, ms(t0())).unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::Attestation(_)),
+            "{err:?}"
+        );
+    }
+
+    /// Exactly `valid_until + tolerance` is still accepted; one millisecond
+    /// later the link has expired.
+    #[test]
+    fn transition_link_valid_until_tolerance_edge() {
+        let (sk, pk) = keypair(0x6a);
+        let until = t0() + chrono::Duration::hours(1);
+        let link = upgrade_link_window(0x6a, 0x6b, &sk, t0(), until);
+        let edge = ms(until) + TOL;
+        decode_and_verify_at(&link, key_from_seed(0x6b), &pk, true, edge)
+            .expect("exactly at valid_until + tolerance");
+        let err =
+            decode_and_verify_at(&link, key_from_seed(0x6b), &pk, true, edge + 1).unwrap_err();
+        assert!(matches!(err, TransitionLinkError::Expired { .. }), "{err:?}");
+        assert_eq!(RpcError::from(err), RpcError::TransitionRejected);
+    }
+
+    /// The expiry gate does not depend on the verification mode either: an
+    /// expired link is refused as `Expired` in production mode, before the
+    /// (fake) chain attestation is looked at.
+    #[test]
+    fn transition_link_valid_until_gate_in_both_modes() {
+        let (sk, pk) = keypair(0x6c);
+        let until = t0() + chrono::Duration::hours(1);
+        let link = upgrade_link_window(0x6c, 0x6d, &sk, t0(), until);
+        for debug_mode in [true, false] {
+            let err = decode_and_verify_at(
+                &link,
+                key_from_seed(0x6d),
+                &pk,
+                debug_mode,
+                ms(until) + TOL + 1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TransitionLinkError::Expired { .. }),
+                "debug_mode = {debug_mode}: {err:?}"
+            );
+        }
+    }
+
+    /// A window that is empty, inverted or one millisecond shorter than the
+    /// minimum is refused, whatever the time; exactly the minimum is not.
+    #[test]
+    fn transition_link_empty_window_is_rejected() {
+        use enclavia_protocol::chain::UPGRADE_WINDOW_MIN;
+        let (sk, pk) = keypair(0x6e);
+        let min_link = upgrade_link_window(0x6e, 0x6f, &sk, t0(), t0() + UPGRADE_WINDOW_MIN);
+        decode_and_verify_at(&min_link, key_from_seed(0x6f), &pk, true, ms(t0()))
+            .expect("a window of exactly the minimum is valid");
+        for until in [
+            t0(),
+            t0() - chrono::Duration::seconds(1),
+            t0() + UPGRADE_WINDOW_MIN - chrono::Duration::milliseconds(1),
+        ] {
+            let link = upgrade_link_window(0x6e, 0x6f, &sk, t0(), until);
+            let err =
+                decode_and_verify_at(&link, key_from_seed(0x6f), &pk, true, ms(t0())).unwrap_err();
+            assert!(matches!(err, TransitionLinkError::WindowInvalid), "{err:?}");
+        }
+    }
+
+    /// `valid_until` is signature-covered: extending it without the owner's
+    /// signature fails on the signature.
+    #[test]
+    fn transition_link_valid_until_is_signature_covered() {
+        let (sk, pk) = keypair(0x70);
+        let until = t0() + chrono::Duration::hours(1);
+        let mut link = upgrade_link_window(0x70, 0x71, &sk, t0(), until);
+        let mut payload: UpgradePayload = decode_canonical(&link.payload).unwrap();
+        payload.valid_until = t0() + chrono::Duration::days(365);
+        link.payload = enclavia_protocol::signing::encode(&payload);
+        let err = decode_and_verify_at(&link, key_from_seed(0x71), &pk, true, ms(until) + TOL + 1)
+            .unwrap_err();
+        assert!(matches!(err, TransitionLinkError::SignatureInvalid), "{err:?}");
+    }
+
+    /// The gate reads the SIGNED payload: a forged link that moves
+    /// valid_from without a valid signature fails on the signature.
+    #[test]
+    fn transition_link_valid_from_is_signature_covered() {
+        let (sk, pk) = keypair(0x68);
+        let mut link = upgrade_link_valid_from(0x68, 0x69, &sk, t0());
+        // Re-encode the payload with an earlier valid_from, keep the old
+        // signature.
+        let mut payload: UpgradePayload = ciborium::from_reader(link.payload.as_slice()).unwrap();
+        payload.valid_from = t0() - chrono::Duration::days(30);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes).unwrap();
+        link.payload = bytes;
+        let err = decode_and_verify_at(&link, key_from_seed(0x69), &pk, true, ms(t0()) - 3_600_000)
+            .unwrap_err();
+        assert!(
+            matches!(err, TransitionLinkError::SignatureInvalid),
+            "{err:?}"
+        );
+    }
+
+    // --- revocation ------------------------------------------------------
+
+    /// A #47 revocation chain link signed by `signing`, naming the revoked
+    /// link by `revokes_link`. The attestation is a placeholder: the synchronizer does not check it (the session's own
+    /// attestation already proves the key).
+    fn revocation_link(signing: &SigningKey, revokes_link: [u8; 32]) -> ChainLink {
+        let payload = RevocationPayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            revokes: uuid::Uuid::new_v4(),
+            issued_at: t0(),
+            nonce: vec![0x6b; 32],
+            revokes_link,
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Revocation,
+            payload: payload_bytes,
+            attestation: vec![],
+            signature: Some(sig.to_vec()),
+        }
+    }
+
+    #[test]
+    fn revoke_request_and_response_roundtrip() {
+        let (sk, _) = keypair(0x30);
+        roundtrip(&Request::Revoke {
+            link: revocation_link(&sk, [1; 32]),
+        });
+        roundtrip(&Response::RevokeOk);
+    }
+
+    /// This build advertises the revocation capability, and a session only
+    /// negotiates it when the peer advertised it too.
+    #[test]
+    fn revocation_capability_is_advertised() {
+        assert!(supported_capabilities().contains(CAPABILITY_REVOCATION));
+        let both = PeerProtocol::from_advertised(PROTOCOL_VERSION, &supported_capabilities());
+        assert!(both.supports(CAPABILITY_REVOCATION));
+        let legacy = PeerProtocol::from_advertised(0, &BTreeSet::new());
+        assert!(!legacy.supports(CAPABILITY_REVOCATION));
+    }
+
+    #[test]
+    fn revocation_link_verifies_under_the_frozen_key() {
+        let (sk, pk) = keypair(0x31);
+        let v = verify_revocation_link(&revocation_link(&sk, [9; 32]), &pk).unwrap();
+        assert_eq!(v.link_hash, [9; 32]);
+    }
+
+    /// Signed by any key other than the frozen control key: rejected. This
+    /// is what keeps the host (which holds no control key) from revoking.
+    #[test]
+    fn revocation_link_signed_by_another_key_is_rejected() {
+        let (_, frozen) = keypair(0x32);
+        let (other, _) = keypair(0x33);
+        assert!(matches!(
+            verify_revocation_link(&revocation_link(&other, [9; 32]), &frozen),
+            Err(RevocationLinkError::SignatureInvalid)
+        ));
+    }
+
+    /// The signature covers `revokes_link`: pointing the revocation at
+    /// another link breaks it.
+    #[test]
+    fn revokes_link_is_signature_covered() {
+        let (sk, pk) = keypair(0x34);
+        let mut link = revocation_link(&sk, [9; 32]);
+        let mut payload: RevocationPayload =
+            ciborium::from_reader(link.payload.as_slice()).unwrap();
+        payload.revokes_link = [8; 32];
+        link.payload.clear();
+        ciborium::into_writer(&payload, &mut link.payload).unwrap();
+        assert!(matches!(
+            verify_revocation_link(&link, &pk),
+            Err(RevocationLinkError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn revocation_link_shape_errors() {
+        let (sk, pk) = keypair(0x35);
+
+        let mut unsigned = revocation_link(&sk, [9; 32]);
+        unsigned.signature = None;
+        assert!(matches!(
+            verify_revocation_link(&unsigned, &pk),
+            Err(RevocationLinkError::MissingSignature)
+        ));
+
+        let mut short = revocation_link(&sk, [9; 32]);
+        short.signature = Some(vec![0u8; 10]);
+        assert!(matches!(
+            verify_revocation_link(&short, &pk),
+            Err(RevocationLinkError::SignatureShape)
+        ));
+
+        // An upgrade link, even one validly signed by the same key, is not a
+        // revocation.
+        let upgrade = upgrade_link(0x10, 0x20, &sk);
+        assert!(matches!(
+            verify_revocation_link(&upgrade, &pk),
+            Err(RevocationLinkError::NotARevocationLink(ChainLinkKind::Upgrade))
+        ));
+
+        // A signed payload that is not a RevocationPayload.
+        let mut garbage = revocation_link(&sk, [9; 32]);
+        garbage.payload = vec![0xff, 0x00];
+        garbage.signature =
+            Some(sign_control(&sk, SignedDomain::RevocationPayload, &garbage.payload).to_vec());
+        assert!(matches!(
+            verify_revocation_link(&garbage, &pk),
+            Err(RevocationLinkError::PayloadDecode(_))
+        ));
+
+        assert_eq!(
+            RpcError::from(RevocationLinkError::SignatureInvalid),
+            RpcError::RevocationRejected
+        );
+    }
+
+    /// A signature made in another domain does not authorize anything, even
+    /// over bytes that decode as the right payload: an upgrade payload signed
+    /// as a revocation (or as a command) is no transition authority, and a
+    /// revocation payload signed as an upgrade is no revocation.
+    #[test]
+    fn signatures_from_another_domain_are_refused() {
+        let (sk, pk) = keypair(0x39);
+        for domain in [SignedDomain::RevocationPayload, SignedDomain::ControlCommand] {
+            let mut link = upgrade_link(0x42, 0x43, &sk);
+            link.signature = Some(sign_control(&sk, domain, &link.payload).to_vec());
+            assert!(matches!(
+                decode_and_verify(&link, key_from_seed(0x43), &pk, true),
+                Err(TransitionLinkError::SignatureInvalid)
+            ));
+        }
+        let mut revocation = revocation_link(&sk, [9; 32]);
+        revocation.signature =
+            Some(sign_control(&sk, SignedDomain::UpgradePayload, &revocation.payload).to_vec());
+        assert!(matches!(
+            verify_revocation_link(&revocation, &pk),
+            Err(RevocationLinkError::SignatureInvalid)
+        ));
+    }
+
+    /// A transition link whose payload is signed and attested but not the
+    /// canonical encoding of what it decodes to is refused.
+    #[test]
+    fn non_canonical_transition_payload_is_refused() {
+        let (sk, _) = keypair(0x3a);
+        let mut link = upgrade_link(0x44, 0x45, &sk);
+        link.payload.push(0x00);
+        link.attestation = FakeChainAttestation::for_payload(0x44, &link.payload).encode();
+        link.signature =
+            Some(sign_control(&sk, SignedDomain::UpgradePayload, &link.payload).to_vec());
+        assert!(matches!(
+            decode_transition_link(&link),
+            Err(TransitionLinkError::PayloadDecode(_))
+        ));
+    }
+
+    /// The verified transition carries the hash of the exact signed payload,
+    /// the identity revocations name.
+    #[test]
+    fn verified_transition_carries_the_link_hash() {
+        let (sk, pk) = keypair(0x36);
+        let link = upgrade_link(0x40, 0x41, &sk);
+        let v = decode_and_verify(&link, key_from_seed(0x41), &pk, true).unwrap();
+        assert_eq!(v.link_hash, upgrade_link_hash(&link.payload));
     }
 }

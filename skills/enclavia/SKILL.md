@@ -106,11 +106,25 @@ Identifiers: `<id>` accepts a unique id prefix anywhere a full UUID works.
 - `enclavia upgrade list <id> --json`
   -> ARRAY of staged-upgrade objects `{id,status,docker_image,image_digest?,valid_from?,created_at}`.
 
-- `enclavia upgrade chain <id> --json`
+- `enclavia upgrade chain <id> [--debug-enclave] --json`
   -> `{enclave_id,upgradable,image_digest,pcrs,control_public_key?,debug_mode,tip_matches_row,links:[{kind,sequence,validation,...}]}` (locally re-verified).
+  `--debug-enclave` (also on `upgrade confirm`) only for a debug (QEMU) enclave the user
+  created as one: its attestations are then checked without the AWS Nitro certificate
+  chain. The CLI refuses when the backend reports another mode; never add the flag
+  because the backend says the enclave is debug.
 
 - `enclavia upgrade confirm <id> <upgrade-id> [--at RFC3339 | --immediate] --json`
   -> updated staged-upgrade object. Default schedule is now + 7 days.
+  Self-hosted custody also needs `--reproduce` (local rebuild) or `--expect-pcrs FILE|JSON`
+  (target PCR0-2), optionally `--expect-digest sha256:...`; the CLI refuses to sign an
+  upgrade payload that does not match them. Anti-rollback cannot change on an upgrade:
+  with `--reproduce` it also refuses a target whose anti-rollback setting differs from
+  the running version's (read from the running image's attested boot link): turned on
+  or off, or with it on, not built as an upgrade target, another synchronizer
+  attestation mode, or no trusted synchronizer. A target trusting other
+  synchronizer builds (a rotation) is shown and refused unless
+  `--accept-synchronizer-change`; only pass it when the user confirms the new
+  cluster holds the enclave's pin (otherwise the upgraded image fail-stops at boot).
 
 - `enclavia upgrade revoke <id> <upgrade-id> --json`
   -> updated staged-upgrade object (cancelled).

@@ -21,6 +21,11 @@
 //! 4. Subsequent frames: [`Frame::Rpc`] requests, each answered with one
 //!    CBOR [`Response`].
 //!
+//! Both `Authenticate` frames also carry the sender's protocol version and
+//! capability set; [`Client::server_protocol`] exposes what the server
+//! advertised and what the session negotiated (see the `wire` module's
+//! "Versioning and capabilities").
+//!
 //! ## SECURITY: where the expected server PCRs MUST come from
 //!
 //! The [`ServerPcrPolicy`] is the trust anchor of the whole oracle
@@ -40,21 +45,22 @@
 //! `AsyncRead + AsyncWrite` transport (vsock in production, UDS or
 //! `tokio::io::duplex` in tests).
 //!
-//! ## Wire shape note: there is no separate Register RPC
+//! ## Register and Pin are separate
 //!
-//! On the wire a first-time registration IS a [`Request::Pin`]: the
-//! server maps it to the state machine's `Register` op when the key is
-//! unseen and reports it back as `PinOk { version: Version(0) }`. The
-//! [`Client::pin`] return value carries that version so the caller can
-//! distinguish registration from a subsequent pin.
+//! [`Client::register`] creates the key's pin slot; the customer sends it
+//! only from its boot decision, for a blank volume the oracle does not
+//! know. [`Client::pin`] only ever updates a registered key: on a key the
+//! oracle does not know it fails with [`RpcError::NotFound`], which a
+//! running enclave must treat as fatal (its oracle lost its state, or it
+//! is talking to another cluster), never as a cue to register.
 //!
 //! ## Durability
 //!
-//! In the replicated deployment the server answers `PinOk` only after
-//! `client_write_durable` has replicated the entry to EVERY voter (see
-//! `crate::raft::serve`). Awaiting [`Client::pin`]'s response therefore
-//! IS the durable-replication ack the anti-rollback gate in `nbd-client`
-//! relies on.
+//! In the replicated deployment the server answers `PinOk` only after the
+//! entry is committed on a quorum of voters (see `crate::raft`'s "Majority
+//! ACK"), which survives the loss of any single node. Awaiting
+//! [`Client::pin`]'s response therefore IS the durable-replication ack the
+//! anti-rollback gate in `nbd-client` relies on.
 //!
 //! ## vsock write sizing
 //!
@@ -67,7 +73,10 @@
 use enclavia_protocol::{NoiseTransport, perform_handshake_as_initiator};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::wire::{ChainLink, Frame, MAX_FRAME_SIZE, Request, Response, RpcError};
+use crate::wire::{
+    CAPABILITY_REVOCATION, ChainLink, Frame, MAX_FRAME_SIZE, PeerProtocol, Request, Response,
+    RpcError,
+};
 use crate::{Commitment, PcrKey, Version};
 
 // Re-exported so callers (nbd-client) construct the policy and match its
@@ -119,7 +128,7 @@ pub enum ClientError {
     /// handshake hash (a replayed capture). Whoever is on the other end,
     /// it has not proven it is an enclave on THIS channel; fail-stop.
     #[error("server attestation invalid: {0}")]
-    ServerAttestation(String),
+    ServerAttestation(enclavia_protocol::attestation::AttestationError),
     /// The server's attestation verified but its PCRs are not admitted
     /// by the caller's [`ServerPcrPolicy`]: the other end is a real,
     /// channel-bound enclave, but NOT the synchronizer the caller
@@ -130,6 +139,10 @@ pub enum ClientError {
     /// far end does not speak the mutual-authentication protocol.
     #[error("server's first frame was not its Authenticate")]
     ServerAuthMissing,
+    /// The server did not advertise a capability this operation requires
+    /// (see [`crate::wire::SUPPORTED_CAPABILITIES`]). Nothing was sent.
+    #[error("the synchronizer does not support `{0}`")]
+    MissingCapability(&'static str),
 }
 
 /// A completed Noise handshake, waiting for the caller to produce the
@@ -196,7 +209,7 @@ where
         write_frame(
             &mut self.stream,
             &mut self.transport,
-            &Frame::Authenticate { nsm_doc },
+            &Frame::authenticate(nsm_doc),
         )
         .await?;
 
@@ -206,19 +219,27 @@ where
         let plaintext = read_plaintext_frame(&mut self.stream, &mut self.transport).await?;
         let frame: Frame = ciborium::from_reader(plaintext.as_slice())
             .map_err(|e| ClientError::Cbor(e.to_string()))?;
-        let server_doc = match frame {
-            Frame::Authenticate { nsm_doc } => nsm_doc,
+        let (server_doc, server_protocol) = match frame {
+            Frame::Authenticate {
+                nsm_doc,
+                protocol_version,
+                capabilities,
+            } => (
+                nsm_doc,
+                PeerProtocol::from_advertised(protocol_version, &capabilities),
+            ),
             _ => return Err(ClientError::ServerAuthMissing),
         };
         verify_server_attestation(&server_doc, &self.handshake_hash, server_policy, debug_mode)
             .map_err(|e| match e {
-                ServerAuthError::Attestation(msg) => ClientError::ServerAttestation(msg),
+                ServerAuthError::Attestation(e) => ClientError::ServerAttestation(e),
                 ServerAuthError::PcrRejected => ClientError::ServerPcrRejected,
             })?;
 
         Ok(Client {
             stream: self.stream,
             transport: self.transport,
+            server_protocol,
         })
     }
 }
@@ -230,26 +251,54 @@ where
 pub struct Client<S> {
     stream: S,
     transport: NoiseTransport,
+    server_protocol: PeerProtocol,
 }
 
 impl<S> Client<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Pin `commitment` under `key` (which must equal the session's
-    /// attested key). Returns the resulting per-key version:
-    /// `Version(0)` means this Pin REGISTERED the key (first pin for an
-    /// unseen key); `Version(n+1)` bumped an existing pin.
+    /// The server's advertised protocol version and the capabilities this
+    /// session negotiated. Optional features may only be used when
+    /// [`PeerProtocol::supports`] says so.
+    pub fn server_protocol(&self) -> &PeerProtocol {
+        &self.server_protocol
+    }
+
+    /// Register `key` (which must equal the session's attested key) at
+    /// version 0 with `commitment`. Only the boot decision calls this, for
+    /// a blank volume the oracle does not know.
     ///
-    /// `expected_version` is the compare-and-swap guard: for a re-pin it
-    /// must equal the key's current version (learned from the boot `Get`
-    /// and every `PinOk`), or the pin fails with
-    /// [`RpcError::VersionConflict`]. It is ignored when the pin maps to
-    /// a first-time Register (which is inherently a CAS on
-    /// non-existence); pass `Version(0)` there by convention.
+    /// [`RpcError::AlreadyRegistered`] means the key exists: a `Get`
+    /// tells whether it holds this registration (an earlier attempt whose
+    /// answer was lost) or someone else's state. A retired key fails with
+    /// [`RpcError::OperationRejected`].
     ///
     /// In the replicated deployment the response only arrives after the
-    /// entry is replicated to every voter, so awaiting this is the
+    /// entry is committed on a quorum of voters.
+    pub async fn register(
+        &mut self,
+        key: PcrKey,
+        commitment: Commitment,
+    ) -> Result<(), ClientError> {
+        match self.rpc(Request::Register { key, commitment }).await? {
+            Response::RegisterOk => Ok(()),
+            Response::Err { error } => Err(ClientError::Rpc(error)),
+            _ => Err(ClientError::UnexpectedResponse("expected RegisterOk")),
+        }
+    }
+
+    /// Pin `commitment` under the registered `key` (which must equal the
+    /// session's attested key). Returns the resulting per-key version,
+    /// `expected_version + 1`.
+    ///
+    /// `expected_version` is the compare-and-swap guard: it must equal the
+    /// key's current version (learned from the boot `Get` and every
+    /// `PinOk`), or the pin fails with [`RpcError::VersionConflict`]. A key
+    /// the oracle does not know fails with [`RpcError::NotFound`].
+    ///
+    /// In the replicated deployment the response only arrives after the
+    /// entry is committed on a quorum of voters, so awaiting this is the
     /// durable ack.
     pub async fn pin(
         &mut self,
@@ -302,6 +351,30 @@ where
             Response::TransitionOk { version } => Ok(version),
             Response::Err { error } => Err(ClientError::Rpc(error)),
             _ => Err(ClientError::UnexpectedResponse("expected TransitionOk")),
+        }
+    }
+
+    /// Commit a #47 revocation [`ChainLink`] for this session's own key:
+    /// afterwards the server refuses every `Transition` out of the key whose
+    /// upgrade link was issued at or before the revocation's `issued_at`.
+    /// Submitted by the enclave that holds the pin (the OLD image, during the
+    /// upgrade delay); the server verifies the link's control signature
+    /// against the pubkey it froze for the key.
+    ///
+    /// Fails with [`ClientError::MissingCapability`] WITHOUT sending anything
+    /// when the server did not advertise [`CAPABILITY_REVOCATION`]: such a
+    /// server would not enforce the revocation, and the caller must not
+    /// report it as done. [`RpcError::RevocationRejected`] means it did not
+    /// take effect; [`RpcError::Unavailable`] means the outcome is unknown,
+    /// and since a revocation is idempotent the caller retries.
+    pub async fn revoke(&mut self, link: ChainLink) -> Result<(), ClientError> {
+        if !self.server_protocol.supports(CAPABILITY_REVOCATION) {
+            return Err(ClientError::MissingCapability(CAPABILITY_REVOCATION));
+        }
+        match self.rpc(Request::Revoke { link }).await? {
+            Response::RevokeOk => Ok(()),
+            Response::Err { error } => Err(ClientError::Rpc(error)),
+            _ => Err(ClientError::UnexpectedResponse("expected RevokeOk")),
         }
     }
 

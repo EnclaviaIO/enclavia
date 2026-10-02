@@ -1209,6 +1209,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ciborium",
+ "enclavia",
  "enclavia-protocol",
  "futures-util",
  "getrandom 0.2.17",
@@ -1284,7 +1285,6 @@ dependencies = [
 name = "enclavia-crypto"
 version = "0.2.0"
 dependencies = [
- "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -1350,6 +1350,7 @@ version = "0.2.0"
 dependencies = [
  "aes",
  "attestation-doc-validation",
+ "aws-nitro-enclaves-cose",
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "cbc",
@@ -1360,6 +1361,7 @@ dependencies = [
  "hex",
  "ipnet",
  "p256",
+ "p384",
  "rand 0.8.6",
  "rsa",
  "serde",
@@ -1373,6 +1375,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "webpki",
  "x509-cert",
 ]
 
@@ -1393,7 +1396,6 @@ dependencies = [
 name = "enclavia-server"
 version = "0.2.0"
 dependencies = [
- "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "chrono",
  "ciborium",
@@ -1404,6 +1406,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synchronizer",
  "tokio",
  "tokio-vsock",
  "tracing",
@@ -2463,8 +2466,8 @@ dependencies = [
 name = "nbd-client"
 version = "0.2.0"
 dependencies = [
- "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
+ "chrono",
  "ciborium",
  "enclavia-protocol",
  "enclavia-vsock",
@@ -2477,6 +2480,7 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3973,7 +3977,6 @@ name = "synchronizer"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "aws-nitro-enclaves-nsm-api",
  "chrono",
  "ciborium",
  "enclavia-protocol",
@@ -3993,6 +3996,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "synchronizer-metrics-host"
+version = "0.2.0"
+dependencies = [
+ "enclavia-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -8,9 +8,9 @@
 //!    handshake hash with its per-boot mesh identity key, then sends both as a
 //!    [`MeshFrame::Authenticate`].
 //! 2. Reads the peer's `Authenticate` and verifies, in order:
-//!    * the attestation document with
-//!      [`enclavia_protocol::attestation::verify_and_extract`] (which enforces
-//!      the handshake-hash binding, so a captured document cannot be replayed,
+//!    * the attestation document, validated as a session document
+//!      ([`enclavia_protocol::attestation::UnvalidatedAttestation::validate_session`],
+//!      which enforces the handshake-hash binding, so a captured document cannot be replayed,
 //!      and yields the peer's PCRs + 65-byte SEC1 mesh pubkey);
 //!    * the peer's PCR digest against the self-PCR allowlist (it must be
 //!      running our image);
@@ -220,7 +220,7 @@ pub enum HandshakeError {
     /// The peer's attestation document failed verification (bad nonce
     /// binding, malformed document, or missing/short `user_data`).
     #[error("peer attestation: {0}")]
-    PeerAttestation(String),
+    PeerAttestation(attestation::AttestationError),
     /// The peer attested, but its PCR digest is not in the self-PCR
     /// allowlist: it is not running our image, so it is not a cluster peer.
     #[error("peer PCR digest not in allowlist (peer is not running our image)")]
@@ -244,6 +244,23 @@ pub enum HandshakeError {
         /// The deadline that elapsed.
         after: Duration,
     },
+}
+
+impl HandshakeError {
+    /// The classified cause when the peer itself was refused: its
+    /// attestation document was rejected, its PCRs are not ours
+    /// ([`RejectionReason::PcrMismatch`](attestation::RejectionReason::PcrMismatch)),
+    /// or its identity signature over the handshake hash failed
+    /// ([`RejectionReason::Signature`](attestation::RejectionReason::Signature)).
+    /// `None` for transport, framing, timeout and local failures.
+    pub fn peer_rejection(&self) -> Option<attestation::RejectionReason> {
+        match self {
+            HandshakeError::PeerAttestation(e) => Some(e.reason()),
+            HandshakeError::PcrNotAllowed => Some(attestation::RejectionReason::PcrMismatch),
+            HandshakeError::IdentitySignature(_) => Some(attestation::RejectionReason::Signature),
+            _ => None,
+        }
+    }
 }
 
 /// Run `fut` under `after`, mapping an elapsed deadline to
@@ -349,17 +366,28 @@ where
     };
 
     // 3. Verify the peer's attestation document (nonce binds it to this
-    //    session, yields PCRs + mesh pubkey).
-    let extracted = attestation::verify_and_extract(
-        &peer_doc,
-        &handshake_hash,
-        attestation::VerificationMode::from_debug_flag(debug_mode),
-    )
-    .map_err(|e| HandshakeError::PeerAttestation(e.to_string()))?;
-    let pcr_digest = PcrKey(extracted.pcrs.digest());
+    //    session, yields the pin identity + mesh pubkey). Same identity
+    //    derivation as for customers (PCR0-2 plus user PCRs 16-31), so the
+    //    allowlist compares full identities.
+    let (pcr_digest, peer_pubkey) =
+        crate::attest::validate_session(&peer_doc, &handshake_hash, debug_mode)
+            .and_then(|doc| Ok((PcrKey(doc.identity().key()), doc.control_pubkey()?)))
+            .map_err(|e| {
+                tracing::warn!(reason = %e.reason(), error = %e, "mesh peer attestation rejected");
+                crate::metrics::record_rejection(crate::metrics::RejectionSource::Peer, e.reason());
+                HandshakeError::PeerAttestation(e)
+            })?;
 
     // 4. Self-PCR allowlist: the peer must be running our image.
     if !allowlist.admits(&pcr_digest) {
+        crate::metrics::record_rejection(
+            crate::metrics::RejectionSource::Peer,
+            attestation::RejectionReason::PcrMismatch,
+        );
+        tracing::warn!(
+            reason = %attestation::RejectionReason::PcrMismatch,
+            "mesh peer attestation rejected: PCR digest not in the self-PCR allowlist"
+        );
         return Err(HandshakeError::PcrNotAllowed);
     }
 
@@ -368,17 +396,28 @@ where
     //    is what stops a relay from splicing a captured attestation onto a
     //    channel it terminates: it does not hold the private mesh key.
     enclavia_protocol::mesh::verify_mesh_identity(
-        &extracted.control_pubkey,
+        &peer_pubkey,
         &peer_sig,
         &handshake_hash,
     )
-    .map_err(|e| HandshakeError::IdentitySignature(e.to_string()))?;
+    .map_err(|e| {
+        crate::metrics::record_rejection(
+            crate::metrics::RejectionSource::Peer,
+            attestation::RejectionReason::Signature,
+        );
+        tracing::warn!(
+            reason = %attestation::RejectionReason::Signature,
+            error = %e,
+            "mesh peer rejected: identity signature over the handshake hash failed"
+        );
+        HandshakeError::IdentitySignature(e.to_string())
+    })?;
 
     Ok((
         transport,
         PeerIdentity {
             pcr_digest,
-            mesh_pubkey: extracted.control_pubkey,
+            mesh_pubkey: peer_pubkey,
         },
     ))
 }
@@ -562,6 +601,11 @@ mod tests {
         let (ra, rb) = (ta.await.unwrap(), tb.await.unwrap());
         assert!(matches!(ra, Err(HandshakeError::PcrNotAllowed)));
         assert!(matches!(rb, Err(HandshakeError::PcrNotAllowed)));
+        let Err(e) = ra else { unreachable!() };
+        assert_eq!(
+            e.peer_rejection(),
+            Some(attestation::RejectionReason::PcrMismatch)
+        );
     }
 
     /// A peer whose attestation announces a mesh pubkey it does NOT hold the
@@ -601,7 +645,10 @@ mod tests {
         // `NoiseTransport` is not `Debug`, so match instead of formatting the
         // whole `Result`.
         match ra {
-            Err(HandshakeError::IdentitySignature(_)) => {}
+            Err(e @ HandshakeError::IdentitySignature(_)) => assert_eq!(
+                e.peer_rejection(),
+                Some(attestation::RejectionReason::Signature)
+            ),
             Err(other) => panic!("expected IdentitySignature, got {other:?}"),
             Ok(_) => panic!("expected the stolen-attestation handshake to be rejected"),
         }

@@ -17,11 +17,14 @@
 
 use std::sync::Arc;
 
-use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
+use enclavia_protocol::attestation::test_utils::{
+    FakeAttestation, FakeChainAttestation, identity_from_seed,
+};
 use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
-use enclavia_protocol::chain::PcrsHex;
+use enclavia_protocol::chain::RevocationPayload;
 use enclavia_protocol::perform_handshake_as_responder;
-use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use enclavia_protocol::signing::{SignedDomain, sign_control};
+use p256::ecdsa::SigningKey;
 use synchronizer::client::{ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::listener::{FakeSessionAttestor, handle_connection};
 use synchronizer::node::Node;
@@ -65,9 +68,9 @@ fn pubkey(seed: u8) -> [u8; CONTROL_PUBKEY_LEN] {
 }
 
 /// The PcrKey a seed's FakeAttestation binds the session to, matching
-/// the listener's `PcrKey(identity.pcrs.digest())` derivation.
+/// the listener's `PcrKey(identity.identity.key())` derivation.
 fn key_from_seed(seed: u8) -> PcrKey {
-    PcrKey(pcrs_from_seed(seed).digest())
+    PcrKey(identity_from_seed(seed).key())
 }
 
 /// The PCR triple `FakeAttestation::with_seed(seed)` (and
@@ -137,24 +140,33 @@ where
     }
 }
 
-/// Happy path: mutual authentication succeeds, then first Pin registers
-/// (Version 0), second bumps to 1, Get returns the latest commitment +
-/// version.
+/// Happy path: mutual authentication succeeds; a Pin before the key is
+/// registered is NotFound, Register creates it (a second Register is
+/// AlreadyRegistered), a Pin bumps it to 1, Get returns the latest
+/// commitment + version.
 #[tokio::test]
-async fn pin_register_then_bump_then_get() {
+async fn register_then_pin_then_get() {
     let node = Arc::new(Node::with_debug_mode(true));
     let (mut client, key, task) = connect_as(node, 0x42).await;
 
-    let v0 = client
-        .pin(key, Version(0), c(0xaa))
-        .await
-        .expect("first pin");
-    assert_eq!(v0, Version(0), "first pin must be the registration");
+    // The server advertised this build's protocol version.
+    assert_eq!(
+        client.server_protocol().version,
+        synchronizer::wire::PROTOCOL_VERSION
+    );
 
-    let v1 = client
-        .pin(key, Version(0), c(0xbb))
-        .await
-        .expect("second pin");
+    // A Pin never registers.
+    let err = client.pin(key, Version(0), c(0xaa)).await.unwrap_err();
+    assert!(matches!(err, ClientError::Rpc(RpcError::NotFound)), "{err:?}");
+
+    client.register(key, c(0xaa)).await.expect("register");
+    let err = client.register(key, c(0xaa)).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc(RpcError::AlreadyRegistered)),
+        "{err:?}"
+    );
+
+    let v1 = client.pin(key, Version(0), c(0xbb)).await.expect("pin");
     assert_eq!(v1, Version(1));
 
     let (commitment, version) = client.get(key).await.expect("get");
@@ -202,7 +214,7 @@ async fn second_session_reads_first_sessions_pin() {
     let node = Arc::new(Node::with_debug_mode(true));
 
     let (mut client, key, _task) = connect_as(Arc::clone(&node), 0x45).await;
-    client.pin(key, Version(0), c(0xcd)).await.expect("pin");
+    client.register(key, c(0xcd)).await.expect("register");
     drop(client);
 
     let (mut client2, key2, _task2) = connect_as(node, 0x45).await;
@@ -212,53 +224,43 @@ async fn second_session_reads_first_sessions_pin() {
     assert_eq!(version, Version(0));
 }
 
-/// The PcrsHex triple `FakeAttestation::with_seed(seed)` measures, in
-/// the hex form transition-link payloads carry.
-fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-    PcrsHex {
-        pcr0: hex::encode(vec![seed; 48]),
-        pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-        pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-    }
-}
-
 /// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by the
 /// OLD enclave's control key and attested for the OLD measurements
 /// (mirrors the in-crate listener test fixture).
 fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
     let payload = UpgradePayload {
         enclave_id: uuid::Uuid::new_v4(),
-        from_pcrs: pcrs_hex_from_seed(from_seed),
-        to_pcrs: pcrs_hex_from_seed(to_seed),
+        from: identity_from_seed(from_seed),
+        to: identity_from_seed(to_seed),
         image_digest: "sha256:to".into(),
         valid_from: chrono::Utc::now(),
+        valid_until: chrono::Utc::now() + chrono::Duration::days(7),
         issued_at: chrono::Utc::now(),
         nonce: vec![0x5a; 32],
     };
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
     let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-    let sig: Signature = signing.sign(&payload_bytes);
+    let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
     ChainLink {
         id: None,
         sequence: None,
         kind: ChainLinkKind::Upgrade,
         payload: payload_bytes,
         attestation,
-        signature: Some(sig.to_bytes().to_vec()),
+        signature: Some(sig.to_vec()),
     }
 }
 
-/// Seed an OLD enclave's key into the node (attest + Pin), modelling its
+/// Seed an OLD enclave's key into the node (attest + Register), modelling its
 /// earlier, now-stopped session, so its control pubkey is frozen.
 async fn register_old(node: &Node, seed: u8, control_pubkey: [u8; CONTROL_PUBKEY_LEN]) -> PcrKey {
     let key_old = key_from_seed(seed);
     node.observe_attestation(key_old, control_pubkey).await;
     node.handle_request(
         key_old,
-        Request::Pin {
+        Request::Register {
             key: key_old,
-            expected_version: Version(0),
             commitment: c(0xee),
         },
     )
@@ -463,9 +465,7 @@ fn encode_frame(frame: &Frame) -> Vec<u8> {
 async fn garbled_server_attestation_is_rejected() {
     let (client_stream, server_stream) = duplex(64 * 1024);
     let host = tokio::spawn(scripted_server(server_stream, |_hash| {
-        encode_frame(&Frame::Authenticate {
-            nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
-        })
+        encode_frame(&Frame::authenticate(vec![0xde, 0xad, 0xbe, 0xef]))
     }));
 
     let hs = Handshake::start(client_stream)
@@ -489,9 +489,9 @@ async fn replayed_server_attestation_is_rejected() {
     let (client_stream, server_stream) = duplex(64 * 1024);
     let host = tokio::spawn(scripted_server(server_stream, |_hash| {
         // Bound to some other session, NOT the live hash.
-        encode_frame(&Frame::Authenticate {
-            nsm_doc: FakeAttestation::with_seed(SERVER_SEED, vec![0xab; 32]).encode(),
-        })
+        encode_frame(&Frame::authenticate(
+            FakeAttestation::with_seed(SERVER_SEED, vec![0xab; 32]).encode(),
+        ))
     }));
 
     let hs = Handshake::start(client_stream)
@@ -556,5 +556,136 @@ async fn server_closing_instead_of_attesting_is_rejected() {
             .encode();
     let err = expect_auth_err(hs, doc, &server_policy()).await;
     assert!(matches!(err, ClientError::ConnectionClosed), "{err:?}");
+    host.await.unwrap();
+}
+
+// --- revocation (client half) -----------------------------------------------
+
+/// An upgrade link like [`upgrade_link`] but issued (and valid) at an
+/// explicit time.
+fn upgrade_link_issued_at(
+    from_seed: u8,
+    to_seed: u8,
+    signing: &SigningKey,
+    issued_at: chrono::DateTime<chrono::Utc>,
+) -> ChainLink {
+    let payload = UpgradePayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        from: identity_from_seed(from_seed),
+        to: identity_from_seed(to_seed),
+        image_digest: "sha256:to".into(),
+        valid_from: issued_at,
+        valid_until: issued_at + chrono::Duration::days(7),
+        issued_at,
+        nonce: vec![0x5a; 32],
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+    let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Upgrade,
+        payload: payload_bytes,
+        attestation,
+        signature: Some(sig.to_vec()),
+    }
+}
+
+/// A #47 v2 revocation link of exactly `target`, signed by `signing`.
+fn revocation_link(signing: &SigningKey, target: &ChainLink) -> ChainLink {
+    let payload = RevocationPayload {
+        enclave_id: uuid::Uuid::new_v4(),
+        revokes: uuid::Uuid::new_v4(),
+        issued_at: chrono::Utc::now(),
+        nonce: vec![0x6b; 32],
+        revokes_link: synchronizer::wire::upgrade_link_hash(&target.payload),
+    };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+    let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
+    ChainLink {
+        id: None,
+        sequence: None,
+        kind: ChainLinkKind::Revocation,
+        payload: payload_bytes,
+        attestation: vec![],
+        signature: Some(sig.to_vec()),
+    }
+}
+
+/// `Client::revoke` round trip: the old enclave (holding the pin) commits
+/// the revocation; the new enclave's Transition with the revoked link then
+/// surfaces as the typed `TransitionRevoked` (this client negotiated the
+/// capability), and the pin stays under the old key.
+#[tokio::test]
+async fn revoke_then_the_revoked_link_cannot_transition() {
+    let node = Arc::new(Node::with_debug_mode(true));
+    let (sk_old, pk_old) = keypair(0x70);
+    let old_key = register_old(&node, 0x70, pk_old).await;
+    let issued = chrono::Utc::now() - chrono::Duration::hours(2);
+    let revoked = upgrade_link_issued_at(0x70, 0x71, &sk_old, issued);
+
+    let (mut old_session, _, _task) = connect_as(Arc::clone(&node), 0x70).await;
+    assert!(
+        old_session
+            .server_protocol()
+            .supports(synchronizer::wire::CAPABILITY_REVOCATION)
+    );
+    old_session
+        .revoke(revocation_link(&sk_old, &revoked))
+        .await
+        .expect("revocation committed");
+
+    let (mut new_session, _, _task) = connect_as(Arc::clone(&node), 0x71).await;
+    let err = new_session
+        .transition(revoked)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc(RpcError::TransitionRevoked)),
+        "{err:?}"
+    );
+    let (commitment, _) = old_session.get(old_key).await.expect("pin still there");
+    assert_eq!(commitment, c(0xee));
+}
+
+/// A server that does not advertise the revocation capability would not
+/// enforce a revocation, so `Client::revoke` refuses up front, without
+/// sending anything (the scripted server answers only the handshake).
+#[tokio::test]
+async fn revoke_without_the_server_capability_fails_loudly() {
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let host = tokio::spawn(scripted_server(server_stream, |hash| {
+        encode_frame(&Frame::Authenticate {
+            nsm_doc: FakeAttestation::with_seed(SERVER_SEED, hash.to_vec()).encode(),
+            protocol_version: 1,
+            capabilities: Default::default(),
+        })
+    }));
+    let hs = Handshake::start(client_stream)
+        .await
+        .expect("noise handshake");
+    let doc =
+        FakeAttestation::with_seed_and_pubkey(0x72, hs.handshake_hash().to_vec(), pubkey(0x72))
+            .encode();
+    let mut client = hs
+        .authenticate(doc, &server_policy(), true)
+        .await
+        .expect("mutual authenticate");
+    let (sk, _) = keypair(0x72);
+    let target = upgrade_link_issued_at(0x72, 0x73, &sk, chrono::Utc::now());
+    let err = client
+        .revoke(revocation_link(&sk, &target))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ClientError::MissingCapability(synchronizer::wire::CAPABILITY_REVOCATION)
+        ),
+        "{err:?}"
+    );
     host.await.unwrap();
 }

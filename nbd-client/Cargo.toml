@@ -14,6 +14,16 @@ license.workspace = true
 repository.workspace = true
 description = "In-enclave NBD client over vsock: backs the encrypted filesystem on top of the host-side storage relay."
 
+[features]
+default = []
+# Validate the synchronizer's attestation without the AWS Nitro certificate
+# chain (QEMU deployments, whose NSM self-signs). Only debug images carry a
+# build with it (the flake's `nbd-client-debug`); production images carry
+# the default build, which does not contain the path. Loading the
+# synchronizer trust anchors fail-stops unless the measured
+# `synchronizer.debug_attestation` equals whether the feature is compiled in.
+dangerous-skip-chain = ["synchronizer/dangerous-skip-chain"]
+
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
@@ -27,16 +37,14 @@ tokio-vsock = { workspace = true }
 # The `client` feature deliberately pulls in NO mesh / NSM driver /
 # openraft; see synchronizer/Cargo.toml.
 synchronizer = { path = "../synchronizer", features = ["client"] }
-# `extract_own_pcrs` (derive our own PcrKey from the doc we just minted)
-# and the synchronizer relay port constant. The async Noise plumbing
-# lives behind the synchronizer client, so default features stay off.
-enclavia-protocol = { path = "../enclavia-protocol", default-features = false }
+# `ValidatedAttestation::request_local` (`nsm`: our own document, from which
+# we derive our PcrKey) and the synchronizer relay port constant. The async
+# Noise plumbing lives behind the synchronizer client, so default features
+# stay off.
+enclavia-protocol = { path = "../enclavia-protocol", default-features = false, features = ["nsm"] }
 enclavia-vsock = { path = "../enclavia-vsock" }
 # SHA-256 of the primary btrfs superblock region: the pinned commitment.
 sha2.workspace = true
-# Drive /dev/nsm for the real attestation document (`nix` turns the
-# driver syscalls on; the workspace pin strips it by default).
-aws-nitro-enclaves-nsm-api = { workspace = true, features = ["nix"] }
 # Read the #47 control pubkey out of /etc/enclavia/config.json (the same
 # field enclavia-server reads).
 serde.workspace = true
@@ -47,6 +55,9 @@ base64.workspace = true
 ciborium.workspace = true
 
 [dev-dependencies]
+# Upgrade-link fixtures for the boot-verify tests.
+chrono = { workspace = true }
+uuid = { workspace = true }
 # `tokio::time::pause` / `#[tokio::test(start_paused = true)]`: the
 # Unavailable-budget tests span five minutes of wall clock, which only
 # the paused test clock makes tractable. Test-only, never in the EIF.

@@ -208,9 +208,42 @@ pub struct StateMachineStore {
     state: RwLock<(StateMachine, AppliedState)>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    /// Size counters for the metrics exporter, updated wherever the state or
+    /// the snapshot changes, so reading them never takes the locks above.
+    live_keys: AtomicU64,
+    retired_keys: AtomicU64,
+    snapshot_bytes: AtomicU64,
+}
+
+/// State and snapshot sizes, read without locking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    /// Keys currently registered.
+    pub live_keys: u64,
+    /// Keys retired by a transition.
+    pub retired_keys: u64,
+    /// Size of the current snapshot blob; `None` before the first snapshot.
+    pub snapshot_bytes: Option<u64>,
 }
 
 impl StateMachineStore {
+    /// State and snapshot sizes, from counters kept current by `apply`,
+    /// `install_snapshot` and the snapshot builder. Lock-free.
+    pub fn stats(&self) -> StoreStats {
+        let snapshot_bytes = self.snapshot_bytes.load(Ordering::Relaxed);
+        StoreStats {
+            live_keys: self.live_keys.load(Ordering::Relaxed),
+            retired_keys: self.retired_keys.load(Ordering::Relaxed),
+            snapshot_bytes: (snapshot_bytes != 0).then_some(snapshot_bytes),
+        }
+    }
+
+    fn record_sizes(&self, sm: &StateMachine) {
+        self.live_keys.store(sm.head_len() as u64, Ordering::Relaxed);
+        self.retired_keys
+            .store(sm.retired_len() as u64, Ordering::Relaxed);
+    }
+
     /// Leader-local (NOT linearized) lookup of `key`'s current state. The
     /// serving read path uses [`RaftHandle::linearizable_get`](crate::raft::RaftHandle::linearizable_get);
     /// this is for tests / the NodeViewConsistent harness comparing views.
@@ -223,6 +256,12 @@ impl StateMachineStore {
     pub async fn head_view(&self) -> BTreeMap<PcrKey, KeyState> {
         let sm = &self.state.read().await.0;
         sm.head_keys().map(|k| (*k, *sm.get(k).unwrap())).collect()
+    }
+
+    /// `key`'s revoked link hashes on this replica, sorted (leader-local,
+    /// NOT linearized). For tests comparing replicas.
+    pub async fn revoked_links(&self, key: &PcrKey) -> Vec<[u8; 32]> {
+        self.state.read().await.0.revoked_links(key).copied().collect()
     }
 
     /// The set of retired keys. Used by the NodeViewConsistent harness.
@@ -259,19 +298,27 @@ impl StateMachineStore {
                 old_key,
                 new_key,
                 new_control_pubkey,
+                link_hash,
             } => {
                 // The new key's attestation was observed by the leader from the
                 // submitting session; record it so the pure core's
                 // NewKeyNotAttested check passes. The old key's attestation is
                 // already present from its earlier Register entry. Then record
-                // the (verified) transition authorization and apply.
+                // the (verified) transition authorization and apply; the apply
+                // refuses a link covered by a revocation committed earlier in
+                // the log.
                 sm.observe_attestation(*new_key, *new_control_pubkey);
                 sm.observe_transition(*old_key, *new_key);
                 sm.apply(Op::Transition {
                     old_key: *old_key,
                     new_key: *new_key,
+                    link_hash: *link_hash,
                 })
             }
+            ReplicatedOp::Revoke { key, link_hash } => sm.apply(Op::Revoke {
+                key: *key,
+                link_hash: *link_hash,
+            }),
         };
         match result {
             Ok(state) => ReplicatedOpResult::Applied(state),
@@ -305,6 +352,8 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             last_membership,
             snapshot_id,
         };
+        self.snapshot_bytes
+            .store(data.len() as u64, Ordering::Relaxed);
         *self.current_snapshot.write().await = Some(StoredSnapshot {
             meta: meta.clone(),
             data: data.clone(),
@@ -366,6 +415,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                 }
             }
         }
+        self.record_sizes(sm);
         Ok(results)
     }
 
@@ -386,9 +436,12 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         {
             let mut guard = self.state.write().await;
             guard.0.restore_from_snapshot(restored);
+            self.record_sizes(&guard.0);
             guard.1.last_applied_log = meta.last_log_id;
             guard.1.last_membership = meta.last_membership.clone();
         }
+        self.snapshot_bytes
+            .store(data.len() as u64, Ordering::Relaxed);
         *self.current_snapshot.write().await = Some(StoredSnapshot {
             meta: meta.clone(),
             data,

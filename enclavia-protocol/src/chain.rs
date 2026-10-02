@@ -11,14 +11,21 @@
 //!
 //! * [`ChainLinkKind::Boot`] — one per successful boot of a new image
 //!   digest. Payload binds `pcrs / image_digest / enclave_id /
-//!   booted_at / nonce`. The attestation's `user_data` is
-//!   `sha256(payload)` (checked by [`super::attestation::verify_chain_attestation`]).
+//!   booted_at / nonce / anti_rollback`, the last being the image's
+//!   anti-rollback setting from its measured config
+//!   ([`AntiRollbackSetting`]); a boot of a new image must keep the
+//!   previous image's setting. The attestation's `user_data` is
+//!   `sha256(payload)` (checked by
+//!   [`super::attestation::UnvalidatedAttestation::validate_chain_link`]).
 //! * [`ChainLinkKind::Upgrade`] — emitted by the OLD enclave after the
 //!   backend signs and ships a `PrepareUpgrade` control command.
-//!   Payload binds `from_pcrs / to_pcrs / image_digest / valid_from /
-//!   issued_at / nonce`. The link's `signature` is the backend's
-//!   ECDSA P-256 sig over the payload, verifiable against the enclave's
-//!   baked-in control pubkey.
+//!   Payload binds `from / to / image_digest / valid_from / issued_at /
+//!   nonce`, where `from` and `to` are full pin identities (PCR0-2 and
+//!   user PCRs 16-31, see [`crate::pin_identity`]); the link's
+//!   attestation must carry exactly `from`. The link's `signature` is the
+//!   control key's ECDSA P-256 signature over the payload in the
+//!   upgrade-payload domain (see [`crate::signing`]), verifiable against
+//!   the enclave's baked-in control pubkey.
 //! * [`ChainLinkKind::Revocation`] — emitted by the OLD enclave on a
 //!   pre-activation revoke. Payload binds the chain entry id being
 //!   cancelled + `issued_at / nonce`. Same signature treatment as
@@ -53,11 +60,17 @@
 
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::attestation::{AttestationError, Pcrs, verify_chain_attestation};
+use crate::attestation::{
+    AttestationError, Pcrs, UnvalidatedAttestation, ValidatedAttestation,
+};
+use crate::pin_identity::PinIdentity;
+use crate::signing::{
+    ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
+};
 
 /// Kind of a chain entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,8 +109,9 @@ pub struct ChainLink {
     #[serde(with = "serde_bytes")]
     pub attestation: Vec<u8>,
     /// 64-byte raw `r || s` ECDSA P-256 signature over `payload` under
-    /// the enclave's control private key. Required for upgrade /
-    /// revocation, absent on boot.
+    /// the enclave's control private key, in the domain of `kind` (see
+    /// [`crate::signing`]). Required for upgrade / revocation, absent on
+    /// boot. `kind`, `id` and `sequence` are outside every signature.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -162,7 +176,11 @@ pub struct ChainLinkJson {
 }
 
 /// Payload shape for a [`ChainLinkKind::Boot`] link.
+///
+/// Hashed into the boot attestation (`user_data = sha256(payload)`), so
+/// readers decode it with [`decode_canonical`]: one value, one encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootPayload {
     /// Enclave identifier. Must equal the expected id in the
     /// validator's context (the URL path id on ingest, the
@@ -178,23 +196,177 @@ pub struct BootPayload {
     /// 32-byte freshly-generated nonce.
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+    /// The anti-rollback setting in the booted image's measured config.
+    /// The attestation binds the payload, so this is the enclave's own
+    /// statement of how it protects its storage, not the backend's.
+    pub anti_rollback: AntiRollbackSetting,
+}
+
+/// An image's anti-rollback setting, read from its measured config
+/// (`/etc/enclavia/config.json`, covered by the attested PCRs). The boot
+/// link carries it ([`BootPayload::anti_rollback`]), so a verifier learns
+/// the running version's setting from the enclave itself.
+///
+/// Anti-rollback is fixed when the enclave is created: an upgrade keeps it
+/// ([`AntiRollbackSetting::check_successor`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AntiRollbackSetting {
+    /// The image pins its storage to the synchronizer: the config enables
+    /// storage AND `synchronizer.enabled`, the two conditions under which
+    /// the image's init starts nbd-client with the synchronizer wiring.
+    pub enabled: bool,
+    /// `synchronizer.upgrade_target`: the image takes over an existing pin
+    /// with a Transition and never registers a fresh volume.
+    pub upgrade_target: bool,
+    /// `synchronizer.debug_attestation`: the image accepts the
+    /// synchronizer's attestation without the AWS Nitro certificate chain
+    /// (QEMU dev clusters).
+    pub debug_attestation: bool,
+    /// `synchronizer.expected_pcrs`: the synchronizer measurements the image
+    /// trusts, in config order. Empty when the config has no synchronizer
+    /// section.
+    pub synchronizer_pcrs: Vec<PcrsHex>,
+}
+
+/// How an upgrade's anti-rollback setting departs from the running
+/// version's (see [`AntiRollbackSetting::check_successor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AntiRollbackChange {
+    #[error("the upgrade turns anti-rollback off")]
+    TurnedOff,
+    #[error("the upgrade turns anti-rollback on")]
+    TurnedOn,
+    #[error(
+        "the upgraded image is not built as an upgrade target, so on a blank disk it would \
+         register a fresh volume instead of taking over the enclave's pin"
+    )]
+    NotUpgradeTarget,
+    #[error(
+        "the upgrade changes how the synchronizer's attestation is checked (debug_attestation)"
+    )]
+    DebugAttestationChanged,
+    #[error("the upgraded image has anti-rollback on but trusts no synchronizer")]
+    NoTrustedSynchronizer,
+}
+
+impl AntiRollbackSetting {
+    /// The setting of an image without the anti-rollback wiring or its
+    /// synchronizer section.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            upgrade_target: false,
+            debug_attestation: false,
+            synchronizer_pcrs: Vec::new(),
+        }
+    }
+
+    /// Whether an image with setting `next` may succeed one with `self`
+    /// through an upgrade. Anti-rollback is fixed at creation:
+    ///
+    /// - `enabled` is unchanged (neither turned off nor on);
+    /// - with it enabled, `next` is built as an upgrade target (it never
+    ///   registers), checks the synchronizer's attestation the same way, and
+    ///   trusts at least one synchronizer measurement.
+    ///
+    /// Which synchronizers `next` trusts may differ from `self`'s: moving to
+    /// another cluster is a synchronizer rotation, authorized by the owner's
+    /// control-key signature over the target's PCRs, which cover its measured
+    /// trust list. Signers show such a change before signing.
+    ///
+    /// Without the wiring an image does not use the other fields, so they
+    /// are not compared.
+    pub fn check_successor(&self, next: &AntiRollbackSetting) -> Result<(), AntiRollbackChange> {
+        match (self.enabled, next.enabled) {
+            (false, false) => return Ok(()),
+            (true, false) => return Err(AntiRollbackChange::TurnedOff),
+            (false, true) => return Err(AntiRollbackChange::TurnedOn),
+            (true, true) => {}
+        }
+        if !next.upgrade_target {
+            return Err(AntiRollbackChange::NotUpgradeTarget);
+        }
+        if next.debug_attestation != self.debug_attestation {
+            return Err(AntiRollbackChange::DebugAttestationChanged);
+        }
+        if next.synchronizer_pcrs.is_empty() {
+            return Err(AntiRollbackChange::NoTrustedSynchronizer);
+        }
+        Ok(())
+    }
 }
 
 /// Payload shape for a [`ChainLinkKind::Upgrade`] link.
+///
+/// Signed by the control key in [`SignedDomain::UpgradePayload`] and
+/// decoded with [`decode_canonical`] (see [`crate::signing`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpgradePayload {
     pub enclave_id: Uuid,
-    pub from_pcrs: PcrsHex,
-    pub to_pcrs: PcrsHex,
+    /// Full pin identity (PCR0-2 and user PCRs 16-31, see
+    /// [`crate::pin_identity`]) of the enclave that emits the link. The
+    /// link's attestation must carry exactly this identity.
+    pub from: PinIdentity,
+    /// Full pin identity the upgraded enclave will attest as. The
+    /// synchronizer moves the pin held under `from`'s key to this key.
+    pub to: PinIdentity,
     pub image_digest: String,
+    /// Earliest time the link may move the pin (the synchronizer refuses a
+    /// `Transition` before it, minus a clock tolerance).
     pub valid_from: DateTime<Utc>,
+    /// Latest time the link may move the pin: the synchronizer refuses a
+    /// `Transition` after it, plus the same tolerance. Must be at least
+    /// [`UPGRADE_WINDOW_MIN`] after `valid_from`. An upgrade that was not executed in this window
+    /// cannot be executed later, so a link the owner has since abandoned
+    /// is not a bearer credential forever. The backend sets it to
+    /// `valid_from + `[`UPGRADE_WINDOW_DEFAULT`]; a self-custody signer
+    /// refuses a window longer than [`UPGRADE_WINDOW_MAX`].
+    pub valid_until: DateTime<Utc>,
     pub issued_at: DateTime<Utc>,
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
 }
 
+/// How far ahead the backend puts `valid_from` when the owner names no
+/// activation time (or later, for an enclave whose minimum upgrade delay is
+/// longer). A self-custody signer that named no time accepts nothing
+/// earlier.
+pub const UPGRADE_DELAY_DEFAULT: Duration = Duration::days(7);
+
+/// The window `valid_until - valid_from` the backend gives an upgrade link.
+pub const UPGRADE_WINDOW_DEFAULT: Duration = Duration::days(7);
+
+/// The longest window `valid_until - valid_from` a self-custody signer
+/// accepts in a payload the backend built.
+pub const UPGRADE_WINDOW_MAX: Duration = Duration::days(30);
+
+/// The shortest window `valid_until - valid_from` any verifier accepts.
+///
+/// The window has to be usable: the new image must boot, open a
+/// synchronizer session and submit its `Transition`, retrying through a
+/// leader election or a node restart, all while the synchronizer's NSM time
+/// is inside the window widened by its 60 s clock tolerance. A window of a
+/// few minutes would be consumed by the tolerance and one slow boot, and the
+/// upgrade could never complete. One hour is far above that and far below
+/// [`UPGRADE_WINDOW_DEFAULT`].
+pub const UPGRADE_WINDOW_MIN: Duration = Duration::hours(1);
+
+/// Whether `[valid_from, valid_until]` is a window an upgrade link may
+/// carry: at least [`UPGRADE_WINDOW_MIN`] long (so never empty or
+/// inverted). Every verifier of an upgrade payload applies this rule.
+pub fn upgrade_window_is_valid(valid_from: DateTime<Utc>, valid_until: DateTime<Utc>) -> bool {
+    valid_until - valid_from >= UPGRADE_WINDOW_MIN
+}
+
+
 /// Payload shape for a [`ChainLinkKind::Revocation`] link.
+///
+/// Signed by the control key in [`SignedDomain::RevocationPayload`] and
+/// decoded with [`decode_canonical`] (see [`crate::signing`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationPayload {
     pub enclave_id: Uuid,
     /// Chain entry id of the upgrade link this revocation cancels.
@@ -202,6 +374,24 @@ pub struct RevocationPayload {
     pub issued_at: DateTime<Utc>,
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+    /// [`upgrade_link_hash`] of the cancelled upgrade link's payload. The
+    /// signature covers it, so a revocation cancels exactly one signed
+    /// upgrade, whatever the backend-assigned `revokes` id or the
+    /// timestamps say. A signer must check it against a link it verified
+    /// itself before signing.
+    #[serde(with = "serde_bytes")]
+    pub revokes_link: [u8; 32],
+}
+
+/// Canonical identity of an upgrade link: SHA-256 of its CBOR payload bytes.
+///
+/// These are the exact bytes the control key signs and the attestation binds
+/// (`user_data == sha256(payload)`), so the hash names one signed upgrade and
+/// nothing else: a different upgrade (even to the same target, e.g. a
+/// re-approval with a later `valid_from`) has a different payload and hash.
+pub fn upgrade_link_hash(payload: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(payload).into()
 }
 
 /// Failure decoding a [`ChainLinkJson`] wire link into a [`ChainLink`].
@@ -290,6 +480,13 @@ pub struct PcrsHex {
 }
 
 impl PcrsHex {
+    /// Whether both name the same PCR0-2 (hex compared case-insensitively).
+    pub fn same_as(&self, other: &PcrsHex) -> bool {
+        self.pcr0.eq_ignore_ascii_case(&other.pcr0)
+            && self.pcr1.eq_ignore_ascii_case(&other.pcr1)
+            && self.pcr2.eq_ignore_ascii_case(&other.pcr2)
+    }
+
     /// Decode to raw bytes for the attestation verifier.
     pub fn to_pcrs(&self) -> Result<Pcrs, ChainValidationError> {
         let pcr0 =
@@ -412,7 +609,8 @@ pub enum Outcome {
 #[derive(Debug, thiserror::Error)]
 pub enum ChainValidationError {
     /// Bottom-line attestation verification (see
-    /// [`super::attestation::verify_chain_attestation`]).
+    /// [`super::attestation::UnvalidatedAttestation::validate_chain_link`]),
+    /// or the document's PCR0-2 are not the recorded ones.
     #[error("{0}")]
     Attestation(#[from] AttestationError),
     /// `attestation` byte vec is empty.
@@ -430,6 +628,14 @@ pub enum ChainValidationError {
     /// recorded post-build.
     #[error("boot payload PCRs do not match the enclave's recorded PCRs")]
     PcrMismatch,
+    /// Upgrade link whose `from` identity is not the identity its own
+    /// attestation carries (PCR0-2 or any user PCR 16-31 differ).
+    #[error("upgrade payload `from` identity does not match the link's attestation")]
+    UpgradeFromMismatch,
+    /// Upgrade link whose window `valid_until - valid_from` is shorter than
+    /// [`UPGRADE_WINDOW_MIN`] (or empty, or inverted).
+    #[error("upgrade payload window (valid_from to valid_until) is shorter than the minimum")]
+    UpgradeWindowInvalid,
     /// Boot link's `image_digest` disagrees with `enclaves.image_digest`.
     #[error("boot payload image_digest does not match the enclave's pinned digest")]
     ImageDigestMismatch,
@@ -458,6 +664,11 @@ pub enum ChainValidationError {
     /// Boot of a fresh image digest on a non-upgradable enclave.
     #[error("non-upgradable enclaves cannot record a second boot")]
     NonUpgradableSecondBoot,
+    /// Boot of a new image whose anti-rollback setting is not a valid
+    /// successor of the previous boot's
+    /// ([`AntiRollbackSetting::check_successor`]).
+    #[error("boot changes the enclave's anti-rollback setting: {0}")]
+    AntiRollbackChanged(AntiRollbackChange),
     /// Upgrade or revocation submitted before any genesis boot exists.
     #[error("first chain entry must be a boot — no upgrade or revocation can precede the genesis")]
     NoGenesisYet,
@@ -475,6 +686,11 @@ pub enum ChainValidationError {
     /// upgrade.
     #[error("upgrade has already been revoked")]
     AlreadyRevoked,
+    /// A revocation's `revokes_link` is not the [`upgrade_link_hash`] of the
+    /// upgrade link its `revokes` id resolves to: the signed payload cancels a
+    /// different upgrade than the chain entry it points at.
+    #[error("revocation revokes_link does not match the payload of the upgrade it references")]
+    RevokeLinkHashMismatch,
     /// Walker-level rule: a signed (upgrade / revocation) link whose
     /// payload is byte-identical to an earlier signed link's payload.
     /// Ingest dedups such replays ([`Outcome::Dedup`]), so a chain a
@@ -494,6 +710,14 @@ pub enum ChainValidationError {
     /// the enclave-side min-upgrade-delay check.
     #[error("promotion boot predates the explaining upgrade's valid_from (minus clock skew)")]
     UpgradeNotYetActive,
+    /// Walker-level rule: a promotion boot whose self-reported `booted_at`
+    /// is later than the explaining upgrade's `valid_until` (plus the
+    /// clock-skew tolerance). The link had expired, so the synchronizer
+    /// refuses the transition; a history that shows the new image
+    /// promoted after it is not one the link authorized. Defence-in-depth,
+    /// like [`Self::UpgradeNotYetActive`].
+    #[error("promotion boot postdates the explaining upgrade's valid_until (plus clock skew)")]
+    UpgradeExpired,
     /// A stored chain entry's payload no longer CBOR-decodes (DB-side
     /// drift). Maps to 500.
     #[error("stored {0:?} payload corrupt: {1}")]
@@ -511,6 +735,11 @@ pub enum ChainValidationError {
 /// On `Ok(Outcome::Append { sequence })` the caller should INSERT the
 /// link assigning that sequence number. On `Ok(Outcome::Dedup)` the
 /// caller should not insert. On `Err(_)` the caller should reject.
+///
+/// `debug_mode` validates the attestation without its certificate chain, for
+/// links emitted under QEMU. It needs the `dangerous-skip-chain` feature;
+/// without it the link is refused with
+/// [`AttestationError::SkipChainNotCompiled`].
 pub fn validate_chain_link(
     link: &ChainLink,
     ctx: &ChainContext<'_>,
@@ -521,17 +750,46 @@ pub fn validate_chain_link(
         return Err(ChainValidationError::EmptyAttestation);
     }
     let recorded_pcrs = ctx.enclave_pcrs.to_pcrs()?;
-    verify_chain_attestation(
-        &link.attestation,
-        &link.payload,
-        &recorded_pcrs,
-        crate::attestation::VerificationMode::from_debug_flag(debug_mode),
-    )?;
+    let doc = link_attestation(link, debug_mode)?;
+    doc.require_pcrs(&recorded_pcrs)?;
 
     match link.kind {
         ChainLinkKind::Boot => validate_boot(link, ctx),
-        ChainLinkKind::Upgrade | ChainLinkKind::Revocation => validate_signed(link, ctx, now),
+        ChainLinkKind::Upgrade | ChainLinkKind::Revocation => {
+            validate_signed(link, ctx, doc.identity(), now)
+        }
     }
+}
+
+/// Validate a link's attestation in the chain-link context: the document
+/// is bound to the link's payload. `debug_mode` skips the certificate chain
+/// (documents from QEMU's self-signing NSM); a build without the
+/// `dangerous-skip-chain` feature refuses it.
+fn link_attestation(
+    link: &ChainLink,
+    debug_mode: bool,
+) -> Result<ValidatedAttestation, AttestationError> {
+    let doc = UnvalidatedAttestation::from_bytes(link.attestation.clone());
+    if debug_mode {
+        return skip_chain(&doc, &link.payload);
+    }
+    doc.validate_chain_link(&link.payload)
+}
+
+#[cfg(any(test, feature = "dangerous-skip-chain"))]
+fn skip_chain(
+    doc: &UnvalidatedAttestation,
+    payload: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    doc.validate_chain_link_skip_chain(payload)
+}
+
+#[cfg(not(any(test, feature = "dangerous-skip-chain")))]
+fn skip_chain(
+    _doc: &UnvalidatedAttestation,
+    _payload: &[u8],
+) -> Result<ValidatedAttestation, AttestationError> {
+    Err(AttestationError::SkipChainNotCompiled)
 }
 
 fn validate_boot(
@@ -541,7 +799,7 @@ fn validate_boot(
     if link.signature.is_some() {
         return Err(ChainValidationError::BootHasSignature);
     }
-    let parsed: BootPayload = ciborium::from_reader(link.payload.as_slice()).map_err(|e| {
+    let parsed: BootPayload = decode_canonical(&link.payload).map_err(|e| {
         ChainValidationError::PayloadDecode {
             kind: ChainLinkKind::Boot,
             msg: e.to_string(),
@@ -577,7 +835,7 @@ fn validate_boot(
             })
         }
         Some(prev) => {
-            let prev_payload: BootPayload = ciborium::from_reader(prev.payload.as_slice())
+            let prev_payload: BootPayload = decode_canonical(&prev.payload)
                 .map_err(|e| {
                     ChainValidationError::CorruptStoredPayload(ChainLinkKind::Boot, e.to_string())
                 })?;
@@ -587,6 +845,14 @@ fn validate_boot(
             if !ctx.upgradable {
                 return Err(ChainValidationError::NonUpgradableSecondBoot);
             }
+            // The new image's attested setting against the previous image's:
+            // an upgrade never changes the enclave's anti-rollback
+            // protection. Refusing the link at ingest fails the new image's
+            // chain-init, so an image that loosened it never serves.
+            prev_payload
+                .anti_rollback
+                .check_successor(&parsed.anti_rollback)
+                .map_err(ChainValidationError::AntiRollbackChanged)?;
             Ok(Outcome::Append {
                 sequence: ctx.prior_chain.len() as u64,
             })
@@ -597,6 +863,7 @@ fn validate_boot(
 fn validate_signed(
     link: &ChainLink,
     ctx: &ChainContext<'_>,
+    attested: &PinIdentity,
     now: DateTime<Utc>,
 ) -> Result<Outcome, ChainValidationError> {
     if !ctx.upgradable {
@@ -613,17 +880,25 @@ fn validate_signed(
     })?;
     let verifying = VerifyingKey::from_sec1_bytes(pubkey_bytes)
         .map_err(|e| ChainValidationError::BadControlPubkey(e.to_string()))?;
-    let sig = Signature::from_slice(sig_bytes).map_err(|_| ChainValidationError::SignatureShape)?;
-    verifying
-        .verify(&link.payload, &sig)
-        .map_err(|_| ChainValidationError::SignatureInvalid)?;
+    // The domain is the one of the kind this link is validated as, so a link
+    // whose unsigned `kind` label was changed carries a signature made in
+    // another domain and fails here.
+    let domain = match link.kind {
+        ChainLinkKind::Upgrade => SignedDomain::UpgradePayload,
+        ChainLinkKind::Revocation => SignedDomain::RevocationPayload,
+        ChainLinkKind::Boot => unreachable!("validate_signed not called for boot"),
+    };
+    verify_control_signature(&verifying, domain, &link.payload, sig_bytes).map_err(|e| match e {
+        ControlSignatureError::Shape => ChainValidationError::SignatureShape,
+        ControlSignatureError::Invalid => ChainValidationError::SignatureInvalid,
+    })?;
 
     // Payload-shape sanity, the enclave_id binding, replay dedup, and
     // per-kind cross-link checks.
     match link.kind {
         ChainLinkKind::Upgrade => {
             let parsed: UpgradePayload =
-                ciborium::from_reader(link.payload.as_slice()).map_err(|e| {
+                decode_canonical(&link.payload).map_err(|e| {
                     ChainValidationError::PayloadDecode {
                         kind: ChainLinkKind::Upgrade,
                         msg: e.to_string(),
@@ -631,6 +906,15 @@ fn validate_signed(
                 })?;
             if parsed.enclave_id != *ctx.enclave_id {
                 return Err(ChainValidationError::EnclaveIdMismatch);
+            }
+            if !upgrade_window_is_valid(parsed.valid_from, parsed.valid_until) {
+                return Err(ChainValidationError::UpgradeWindowInvalid);
+            }
+            // The link names the identity whose pin it moves (`from`), so
+            // the enclave that emitted it must have attested exactly that
+            // identity, user PCRs included.
+            if parsed.from != *attested {
+                return Err(ChainValidationError::UpgradeFromMismatch);
             }
             // Replayed-upgrade guard: a byte-identical payload already
             // on the chain is a captured re-submission (e.g. of a
@@ -647,7 +931,7 @@ fn validate_signed(
             }
         }
         ChainLinkKind::Revocation => {
-            let revoke: RevocationPayload = ciborium::from_reader(link.payload.as_slice())
+            let revoke: RevocationPayload = decode_canonical(&link.payload)
                 .map_err(|e| ChainValidationError::PayloadDecode {
                     kind: ChainLinkKind::Revocation,
                     msg: e.to_string(),
@@ -672,7 +956,10 @@ fn validate_signed(
             if target.kind != ChainLinkKind::Upgrade {
                 return Err(ChainValidationError::RevokeTargetWrongKind(target.kind));
             }
-            let target_upgrade: UpgradePayload = ciborium::from_reader(target.payload.as_slice())
+            if revoke.revokes_link != upgrade_link_hash(&target.payload) {
+                return Err(ChainValidationError::RevokeLinkHashMismatch);
+            }
+            let target_upgrade: UpgradePayload = decode_canonical(&target.payload)
                 .map_err(|e| {
                 ChainValidationError::CorruptStoredPayload(ChainLinkKind::Upgrade, e.to_string())
             })?;
@@ -684,7 +971,7 @@ fn validate_signed(
                     continue;
                 }
                 let existing_payload: RevocationPayload =
-                    ciborium::from_reader(existing.payload.as_slice()).map_err(|e| {
+                    decode_canonical(&existing.payload).map_err(|e| {
                         ChainValidationError::CorruptStoredPayload(
                             ChainLinkKind::Revocation,
                             e.to_string(),
@@ -786,7 +1073,7 @@ pub struct ChainWalk {
 ///   that payload in hardware.
 /// - Upgrade / revocation links validate against the in-force state:
 ///   they are attested by the enclave version running at the time.
-/// - A boot whose PCRs match the `to_pcrs` of a prior unrevoked
+/// - A boot whose PCRs match the PCR0-2 of the `to` identity of a prior unrevoked
 ///   upgrade link (with the same target image digest) is a promotion:
 ///   it validates against that upgrade's target state, and on success
 ///   the in-force state advances to it.
@@ -865,7 +1152,7 @@ pub fn validate_chain(
         // link validates (genesis anchor, promotion boot).
         let (ctx_pcrs, ctx_digest, promotes): (PcrsHex, String, bool) = match link.kind {
             ChainLinkKind::Boot if prior.is_empty() => {
-                match ciborium::from_reader::<BootPayload, _>(link.payload.as_slice()) {
+                match decode_canonical::<BootPayload>(&link.payload) {
                     Ok(p) => (p.pcrs, p.image_digest, true),
                     // Undecodable genesis: hand the row state to the
                     // validator so it reports the decode error.
@@ -874,7 +1161,7 @@ pub fn validate_chain(
             }
             ChainLinkKind::Boot => {
                 match (
-                    ciborium::from_reader::<BootPayload, _>(link.payload.as_slice()),
+                    decode_canonical::<BootPayload>(&link.payload),
                     in_force.as_ref(),
                 ) {
                     (Ok(p), Some((pcrs, digest))) => {
@@ -903,7 +1190,16 @@ pub fn validate_chain(
                                 prior.push(link.clone());
                                 continue;
                             }
-                            (target.to_pcrs, target.image_digest, true)
+                            // Nor POSTDATE its `valid_until` (plus skew): an
+                            // expired link moves no pin.
+                            if p.booted_at
+                                > target.valid_until + Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS)
+                            {
+                                outcomes.push(Err(ChainValidationError::UpgradeExpired));
+                                prior.push(link.clone());
+                                continue;
+                            }
+                            (target.to.image_pcrs_hex(), target.image_digest, true)
                         } else {
                             // No signed upgrade explains these PCRs;
                             // validate against the in-force state and
@@ -952,7 +1248,7 @@ pub fn validate_chain(
     }
 }
 
-/// Most recent prior unrevoked upgrade link whose `to_pcrs` and target
+/// Most recent prior unrevoked upgrade link whose `to` PCR0-2 and target
 /// image digest match the boot being explained. `None` when no signed
 /// upgrade accounts for a boot with these measurements.
 ///
@@ -974,7 +1270,7 @@ fn promotion_target(
     let revoked: Vec<Uuid> = prior
         .iter()
         .filter(|l| l.kind == ChainLinkKind::Revocation)
-        .filter_map(|l| ciborium::from_reader::<RevocationPayload, _>(l.payload.as_slice()).ok())
+        .filter_map(|l| decode_canonical::<RevocationPayload>(&l.payload).ok())
         .map(|p| p.revokes)
         .collect();
     for (i, l) in prior.iter().enumerate().rev() {
@@ -989,10 +1285,10 @@ fn promotion_target(
         if signed_payload_seen(l, &prior[..i]) {
             continue;
         }
-        let Ok(p) = ciborium::from_reader::<UpgradePayload, _>(l.payload.as_slice()) else {
+        let Ok(p) = decode_canonical::<UpgradePayload>(&l.payload) else {
             continue;
         };
-        if p.to_pcrs == *boot_pcrs && p.image_digest == boot_image_digest {
+        if p.to.image_pcrs_hex() == *boot_pcrs && p.image_digest == boot_image_digest {
             return Some(p);
         }
     }
@@ -1053,7 +1349,7 @@ pub enum PcrDescentError {
 /// the validator context (`row_*`, `control_public_key`, `upgradable`)
 /// from `GET /enclaves/{id}`. On success it returns the chain's TIP
 /// PCRs; the caller MUST then verify the LIVE attestation against
-/// exactly those PCRs (e.g. [`crate::attestation::verify_against`]) to
+/// exactly those PCRs (e.g. [`crate::attestation::ValidatedAttestation::require_pcrs`]) to
 /// bind the verified descendant version to the running Noise session.
 /// This function does not see the live attestation and so cannot make
 /// that binding itself.
@@ -1137,7 +1433,7 @@ pub fn verify_pcr_descent(
         if recorded.link.kind != ChainLinkKind::Boot {
             continue;
         }
-        let payload: BootPayload = ciborium::from_reader(recorded.link.payload.as_slice())
+        let payload: BootPayload = decode_canonical(&recorded.link.payload)
             .map_err(|_| PcrDescentError::BootPayloadUnreadable(position))?;
         let state = payload
             .pcrs
@@ -1157,9 +1453,10 @@ pub fn verify_pcr_descent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attestation::test_utils::FakeChainAttestation;
+    use crate::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
     use chrono::Duration;
-    use p256::ecdsa::{SigningKey, signature::Signer};
+    use crate::signing::sign_control;
+    use p256::ecdsa::SigningKey;
 
     fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
         PcrsHex {
@@ -1192,12 +1489,30 @@ mod tests {
         pcr_seed: u8,
         booted_at: DateTime<Utc>,
     ) -> ChainLink {
+        boot_link_with(
+            enclave_id,
+            image_digest,
+            pcr_seed,
+            booted_at,
+            AntiRollbackSetting::disabled(),
+        )
+    }
+
+    /// [`boot_link_at`] with an explicit anti-rollback setting.
+    fn boot_link_with(
+        enclave_id: Uuid,
+        image_digest: &str,
+        pcr_seed: u8,
+        booted_at: DateTime<Utc>,
+        anti_rollback: AntiRollbackSetting,
+    ) -> ChainLink {
         let payload = BootPayload {
             enclave_id,
             image_digest: image_digest.into(),
             pcrs: pcrs_hex_from_seed(pcr_seed),
             booted_at,
             nonce: vec![0x42; 32],
+            anti_rollback,
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
@@ -1219,33 +1534,51 @@ mod tests {
         signing: &SigningKey,
         valid_from: DateTime<Utc>,
     ) -> ChainLink {
-        let pcrs = pcrs_hex_from_seed(pcr_seed);
         let payload = UpgradePayload {
             enclave_id,
-            from_pcrs: pcrs.clone(),
-            to_pcrs: pcrs,
+            from: identity_from_seed(pcr_seed),
+            to: identity_from_seed(pcr_seed),
             image_digest: image_digest.into(),
             valid_from,
+            valid_until: valid_from + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x43; 32],
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(pcr_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
+    /// A revocation of `target` (by its chain id and payload hash).
     fn revocation_link(
         enclave_id: Uuid,
+        target: &ChainLink,
+        pcr_seed: u8,
+        signing: &SigningKey,
+    ) -> ChainLink {
+        revocation_link_to(
+            enclave_id,
+            target.id.unwrap(),
+            upgrade_link_hash(&target.payload),
+            pcr_seed,
+            signing,
+        )
+    }
+
+    /// A revocation naming chain id `revokes` and link hash `revokes_link`.
+    fn revocation_link_to(
+        enclave_id: Uuid,
         revokes: Uuid,
+        revokes_link: [u8; 32],
         pcr_seed: u8,
         signing: &SigningKey,
     ) -> ChainLink {
@@ -1254,18 +1587,19 @@ mod tests {
             revokes,
             issued_at: chrono::Utc::now(),
             nonce: vec![0x44; 32],
+            revokes_link,
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(pcr_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Revocation,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1411,6 +1745,131 @@ mod tests {
         assert!(matches!(err, ChainValidationError::NonUpgradableSecondBoot));
     }
 
+    fn anti_rollback_on(upgrade_target: bool, synchronizers: &[u8]) -> AntiRollbackSetting {
+        AntiRollbackSetting {
+            enabled: true,
+            upgrade_target,
+            debug_attestation: false,
+            synchronizer_pcrs: synchronizers.iter().map(|s| pcrs_hex_from_seed(*s)).collect(),
+        }
+    }
+
+    #[test]
+    fn anti_rollback_successor_rules() {
+        use AntiRollbackChange::*;
+        let off = AntiRollbackSetting::disabled();
+        let genesis = anti_rollback_on(false, &[0xa0, 0xb0]);
+        let target = anti_rollback_on(true, &[0xa0]);
+        assert_eq!(off.check_successor(&off), Ok(()));
+        // Fields an image without the wiring does not use are not compared.
+        let off_with_anchors = AntiRollbackSetting {
+            enabled: false,
+            ..anti_rollback_on(false, &[0xc0])
+        };
+        assert_eq!(off.check_successor(&off_with_anchors), Ok(()));
+        assert_eq!(genesis.check_successor(&target), Ok(()));
+        assert_eq!(target.check_successor(&target), Ok(()));
+        assert_eq!(genesis.check_successor(&off), Err(TurnedOff));
+        assert_eq!(off.check_successor(&target), Err(TurnedOn));
+        assert_eq!(
+            genesis.check_successor(&anti_rollback_on(false, &[0xa0])),
+            Err(NotUpgradeTarget)
+        );
+        let debug = AntiRollbackSetting {
+            debug_attestation: true,
+            ..target.clone()
+        };
+        assert_eq!(genesis.check_successor(&debug), Err(DebugAttestationChanged));
+        // Another trust list is a synchronizer rotation, which the owner's
+        // signature authorizes: not a chain-validation error.
+        assert_eq!(
+            genesis.check_successor(&anti_rollback_on(true, &[0xa0, 0xc0])),
+            Ok(())
+        );
+        assert_eq!(genesis.check_successor(&anti_rollback_on(true, &[0xc0])), Ok(()));
+        assert_eq!(
+            genesis.check_successor(&anti_rollback_on(true, &[])),
+            Err(NoTrustedSynchronizer)
+        );
+    }
+
+    /// A promotion boot must keep the previous boot's anti-rollback setting;
+    /// ingest refuses one that does not.
+    #[test]
+    fn promotion_boot_must_keep_anti_rollback() {
+        let (_, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let mut genesis =
+            boot_link_with(id, "sha256:v1", 0x15, now, anti_rollback_on(false, &[0xa0]));
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let prior = std::slice::from_ref(&genesis);
+        let promo_pcrs = pcrs_hex_from_seed(0x16);
+        let promote = |setting: AntiRollbackSetting| {
+            let link = boot_link_with(id, "sha256:v2", 0x16, now, setting);
+            validate_chain_link(
+                &link,
+                &ctx(&id, &promo_pcrs, "sha256:v2", Some(&pk), true, prior),
+                now,
+                true,
+            )
+        };
+        assert_eq!(
+            promote(anti_rollback_on(true, &[0xa0])).unwrap(),
+            Outcome::Append { sequence: 1 }
+        );
+        // A rotation to another synchronizer is accepted.
+        assert_eq!(
+            promote(anti_rollback_on(true, &[0xc0])).unwrap(),
+            Outcome::Append { sequence: 1 }
+        );
+        let debug = AntiRollbackSetting {
+            debug_attestation: true,
+            ..anti_rollback_on(true, &[0xa0])
+        };
+        for (setting, change) in [
+            (AntiRollbackSetting::disabled(), AntiRollbackChange::TurnedOff),
+            (anti_rollback_on(false, &[0xa0]), AntiRollbackChange::NotUpgradeTarget),
+            (debug, AntiRollbackChange::DebugAttestationChanged),
+            (anti_rollback_on(true, &[]), AntiRollbackChange::NoTrustedSynchronizer),
+        ] {
+            let err = promote(setting).unwrap_err();
+            assert!(
+                matches!(err, ChainValidationError::AntiRollbackChanged(c) if c == change),
+                "got {err}"
+            );
+        }
+    }
+
+    /// The setting is a required part of the attested payload: a boot payload
+    /// without it does not decode.
+    #[test]
+    fn boot_payload_without_anti_rollback_does_not_decode() {
+        #[derive(Serialize)]
+        struct WithoutSetting {
+            enclave_id: Uuid,
+            image_digest: String,
+            pcrs: PcrsHex,
+            booted_at: DateTime<Utc>,
+            #[serde(with = "serde_bytes")]
+            nonce: Vec<u8>,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &WithoutSetting {
+                enclave_id: Uuid::nil(),
+                image_digest: "sha256:v1".into(),
+                pcrs: pcrs_hex_from_seed(0x01),
+                booted_at: chrono::Utc::now(),
+                nonce: vec![0; 32],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(decode_canonical::<BootPayload>(&bytes).is_err());
+    }
+
     #[test]
     fn upgrade_rejects_on_non_upgradable() {
         let pcrs = pcrs_hex_from_seed(0x16);
@@ -1546,7 +2005,7 @@ mod tests {
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
 
-        let link = revocation_link(id, upgrade.id.unwrap(), 0x1a, &sk);
+        let link = revocation_link(id, &upgrade, 0x1a, &sk);
         let outcome = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1567,7 +2026,7 @@ mod tests {
         genesis.sequence = Some(0);
         let chain = vec![genesis];
 
-        let link = revocation_link(id, Uuid::new_v4(), 0x1b, &sk);
+        let link = revocation_link_to(id, Uuid::new_v4(), [0; 32], 0x1b, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1597,7 +2056,7 @@ mod tests {
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
 
-        let link = revocation_link(id, upgrade.id.unwrap(), 0x1c, &sk);
+        let link = revocation_link(id, &upgrade, 0x1c, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1625,12 +2084,12 @@ mod tests {
         );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut prior_revoke = revocation_link(id, upgrade.id.unwrap(), 0x1d, &sk);
+        let mut prior_revoke = revocation_link(id, &upgrade, 0x1d, &sk);
         prior_revoke.id = Some(Uuid::new_v4());
         prior_revoke.sequence = Some(2);
         let chain = vec![genesis, upgrade.clone(), prior_revoke];
 
-        let link = revocation_link(id, upgrade.id.unwrap(), 0x1d, &sk);
+        let link = revocation_link(id, &upgrade, 0x1d, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1700,6 +2159,119 @@ mod tests {
         assert!(matches!(err, ChainValidationError::EnclaveIdMismatch));
     }
 
+    /// An upgrade link built with a user-PCR-bearing identity, attested by
+    /// a document whose PCR16 is `doc_pcr16` (absent when `None`).
+    fn upgrade_link_with_user_pcr(
+        enclave_id: Uuid,
+        seed: u8,
+        from_pcr16: Option<u8>,
+        doc_pcr16: Option<u8>,
+        signing: &SigningKey,
+    ) -> ChainLink {
+        let mut user = crate::pin_identity::ZERO_USER_PCRS;
+        if let Some(b) = from_pcr16 {
+            user[0] = [b; 48];
+        }
+        let from = identity_from_seed(seed).with_user_pcrs(user);
+        let payload = UpgradePayload {
+            enclave_id,
+            to: from.clone(),
+            from,
+            image_digest: "sha256:v2".into(),
+            valid_from: chrono::Utc::now() + Duration::days(7),
+            valid_until: (chrono::Utc::now() + Duration::days(7)) + chrono::Duration::days(7),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0x46; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let mut fake = FakeChainAttestation::for_payload(seed, &payload_bytes);
+        if let Some(b) = doc_pcr16 {
+            fake = fake.with_user_pcr(16, vec![b; 48]);
+        }
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation: fake.encode(),
+            signature: Some(sig.to_vec()),
+        }
+    }
+
+    /// The upgrade link's `from` must be exactly the identity its own
+    /// attestation carries, user PCRs included; the image PCRs matching
+    /// is not enough.
+    #[test]
+    fn upgrade_from_identity_must_match_attested_user_pcrs() {
+        let pcrs = pcrs_hex_from_seed(0x2c);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let mut genesis = boot_link(id, "sha256:v1", 0x2c);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let prior = std::slice::from_ref(&genesis);
+        let check = |link: &ChainLink| {
+            validate_chain_link(
+                link,
+                &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, prior),
+                chrono::Utc::now(),
+                true,
+            )
+        };
+
+        let ok = upgrade_link_with_user_pcr(id, 0x2c, Some(0x16), Some(0x16), &sk);
+        assert!(matches!(check(&ok), Ok(Outcome::Append { sequence: 1 })));
+
+        // Document PCR16 differs from the payload's.
+        let wrong = upgrade_link_with_user_pcr(id, 0x2c, Some(0x16), Some(0x17), &sk);
+        assert!(matches!(
+            check(&wrong),
+            Err(ChainValidationError::UpgradeFromMismatch)
+        ));
+        // Payload claims PCR16, document has it absent (zero).
+        let absent = upgrade_link_with_user_pcr(id, 0x2c, Some(0x16), None, &sk);
+        assert!(matches!(
+            check(&absent),
+            Err(ChainValidationError::UpgradeFromMismatch)
+        ));
+        // Document locked PCR16, payload leaves it zero.
+        let unclaimed = upgrade_link_with_user_pcr(id, 0x2c, None, Some(0x16), &sk);
+        assert!(matches!(
+            check(&unclaimed),
+            Err(ChainValidationError::UpgradeFromMismatch)
+        ));
+    }
+
+    /// An upgrade payload in the old PCR0-2-only shape does not decode.
+    #[test]
+    fn upgrade_payload_without_full_identities_does_not_decode() {
+        #[derive(Serialize)]
+        struct Old {
+            enclave_id: Uuid,
+            from_pcrs: PcrsHex,
+            to_pcrs: PcrsHex,
+            image_digest: String,
+            valid_from: DateTime<Utc>,
+            issued_at: DateTime<Utc>,
+            #[serde(with = "serde_bytes")]
+            nonce: Vec<u8>,
+        }
+        let old = Old {
+            enclave_id: Uuid::new_v4(),
+            from_pcrs: pcrs_hex_from_seed(1),
+            to_pcrs: pcrs_hex_from_seed(2),
+            image_digest: "sha256:v2".into(),
+            valid_from: chrono::Utc::now(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![0; 32],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        assert!(ciborium::from_reader::<UpgradePayload, _>(bytes.as_slice()).is_err());
+    }
+
     /// And for a revocation link.
     #[test]
     fn revocation_rejects_enclave_id_mismatch() {
@@ -1721,7 +2293,7 @@ mod tests {
         upgrade.sequence = Some(1);
         let chain = vec![genesis, upgrade.clone()];
 
-        let link = revocation_link(other, upgrade.id.unwrap(), 0x24, &sk);
+        let link = revocation_link(other, &upgrade, 0x24, &sk);
         let err = validate_chain_link(
             &link,
             &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
@@ -1758,7 +2330,7 @@ mod tests {
         );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x25, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x25, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         let chain = vec![genesis, upgrade.clone(), revoke];
@@ -1798,7 +2370,7 @@ mod tests {
         );
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x26, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x26, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         let chain = vec![genesis, upgrade, revoke.clone()];
@@ -1835,24 +2407,25 @@ mod tests {
     ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id,
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: target_digest.into(),
             valid_from,
+            valid_until: valid_from + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x45; 32],
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
@@ -1976,7 +2549,7 @@ mod tests {
             transition_upgrade_link(id, "sha256:v2", 0x22, 0x32, &sk, now + Duration::days(7));
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x22, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x22, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         let mut rogue = boot_link(id, "sha256:v2", 0x32);
@@ -2028,7 +2601,7 @@ mod tests {
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
         // ...but the revocation was recorded 30 minutes BEFORE that.
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x23, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x23, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
 
@@ -2100,7 +2673,7 @@ mod tests {
             transition_upgrade_link(id, "sha256:v2", 0x40, 0x50, &sk, now + Duration::days(7));
         upgrade.id = Some(Uuid::new_v4());
         upgrade.sequence = Some(1);
-        let mut revoke = revocation_link(id, upgrade.id.unwrap(), 0x40, &sk);
+        let mut revoke = revocation_link(id, &upgrade, 0x40, &sk);
         revoke.id = Some(Uuid::new_v4());
         revoke.sequence = Some(2);
         // The replayed copy: identical payload/attestation/signature,
@@ -2303,6 +2876,95 @@ mod tests {
         );
         assert!(walk.tip_matches_row);
         assert_eq!(walk.final_pcrs, Some(row_pcrs));
+    }
+
+    /// A promotion boot later than the upgrade's `valid_until` plus the skew
+    /// tolerance is refused (the link had expired); at the edge it passes.
+    #[test]
+    fn walk_rejects_promotion_after_valid_until() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let valid_from = now - Duration::days(9);
+        let valid_until = valid_from + UPGRADE_WINDOW_DEFAULT;
+        let skew = Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS);
+        for (booted_at, ok) in [
+            (valid_until + skew, true),
+            (valid_until + skew + Duration::seconds(1), false),
+        ] {
+            let mut genesis = boot_link(id, "sha256:v1", 0x62);
+            genesis.id = Some(Uuid::new_v4());
+            genesis.sequence = Some(0);
+            let mut upgrade =
+                transition_upgrade_link(id, "sha256:v2", 0x62, 0x72, &sk, valid_from);
+            upgrade.id = Some(Uuid::new_v4());
+            upgrade.sequence = Some(1);
+            let mut promo = boot_link_at(id, "sha256:v2", 0x72, booted_at);
+            promo.id = Some(Uuid::new_v4());
+            promo.sequence = Some(2);
+            let links = vec![
+                recorded(genesis, now - Duration::days(10)),
+                recorded(upgrade, valid_from - Duration::days(1)),
+                recorded(promo, booted_at),
+            ];
+            let walk = validate_chain(
+                &links,
+                &id,
+                &pcrs_hex_from_seed(0x72),
+                "sha256:v2",
+                Some(&pk),
+                true,
+                now,
+                true,
+            );
+            if ok {
+                assert!(walk.outcomes.iter().all(Result::is_ok), "{:?}", walk.outcomes);
+            } else {
+                assert!(
+                    matches!(walk.outcomes[2], Err(ChainValidationError::UpgradeExpired)),
+                    "{:?}",
+                    walk.outcomes
+                );
+            }
+        }
+    }
+
+    /// An upgrade link whose window is empty, inverted or one millisecond
+    /// shorter than the minimum is refused; exactly the minimum is accepted.
+    #[test]
+    fn upgrade_with_an_empty_window_is_rejected() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, _) = chain_with_pending_upgrade(id, &sk);
+        for (window, ok) in [
+            (Duration::zero(), false),
+            (Duration::seconds(-1), false),
+            (UPGRADE_WINDOW_MIN - Duration::milliseconds(1), false),
+            (UPGRADE_WINDOW_MIN, true),
+        ] {
+            let mut link = upgrade_link(
+                id,
+                "sha256:v3",
+                0x1e,
+                &sk,
+                chrono::Utc::now() + Duration::days(8),
+            );
+            let mut payload: UpgradePayload = decode_canonical(&link.payload).unwrap();
+            payload.valid_until = payload.valid_from + window;
+            link.payload = crate::signing::encode(&payload);
+            link.attestation = FakeChainAttestation::for_payload(0x1e, &link.payload).encode();
+            link.signature =
+                Some(sign_control(&sk, SignedDomain::UpgradePayload, &link.payload).to_vec());
+            let result = validate_chain_link(
+                &link,
+                &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+                chrono::Utc::now(),
+                true,
+            );
+            let refused = matches!(result, Err(ChainValidationError::UpgradeWindowInvalid));
+            assert_eq!(refused, !ok, "window {window}: {result:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2627,5 +3289,166 @@ mod tests {
             "pcrs": { "PCR0": "00", "PCR1": "11", "PCR2": "22" },
         });
         assert!(serde_json::from_value::<EnclaveChainRow>(row).is_err());
+    }
+
+    // --- revokes_link ----------------------------------------------------
+
+    /// Genesis plus one pending upgrade, and the upgrade.
+    fn chain_with_pending_upgrade(id: Uuid, sk: &SigningKey) -> (Vec<ChainLink>, ChainLink) {
+        let mut genesis = boot_link(id, "sha256:v1", 0x1e);
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let mut upgrade = upgrade_link(
+            id,
+            "sha256:v2",
+            0x1e,
+            sk,
+            chrono::Utc::now() + Duration::days(7),
+        );
+        upgrade.id = Some(Uuid::new_v4());
+        upgrade.sequence = Some(1);
+        (vec![genesis, upgrade.clone()], upgrade)
+    }
+
+    /// A revocation whose hash names some other payload than the upgrade its
+    /// id points at is rejected: it would not cancel what the chain shows it
+    /// cancelling.
+    #[test]
+    fn revocation_with_other_link_hash_is_rejected() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, upgrade) = chain_with_pending_upgrade(id, &sk);
+        let link = revocation_link_to(id, upgrade.id.unwrap(), [0x99; 32], 0x1e, &sk);
+        let err = validate_chain_link(
+            &link,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ChainValidationError::RevokeLinkHashMismatch),
+            "{err:?}"
+        );
+    }
+
+    /// The link hash round-trips as a 32-byte CBOR byte string, and a
+    /// payload without it does not decode.
+    #[test]
+    fn revocation_payload_requires_the_link_hash() {
+        let payload = RevocationPayload {
+            enclave_id: Uuid::nil(),
+            revokes: Uuid::nil(),
+            issued_at: chrono::Utc::now(),
+            nonce: vec![1; 32],
+            revokes_link: [7; 32],
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes).unwrap();
+        let back: RevocationPayload = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.revokes_link, [7; 32]);
+
+        #[derive(Serialize)]
+        struct WithoutHash {
+            enclave_id: Uuid,
+            revokes: Uuid,
+            issued_at: DateTime<Utc>,
+            #[serde(with = "serde_bytes")]
+            nonce: Vec<u8>,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &WithoutHash {
+                enclave_id: Uuid::nil(),
+                revokes: Uuid::nil(),
+                issued_at: chrono::Utc::now(),
+                nonce: vec![1; 32],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(ciborium::from_reader::<RevocationPayload, _>(bytes.as_slice()).is_err());
+    }
+
+    // --- domain separation and canonical payloads -------------------------
+
+    /// `kind` is outside the signature, but the signature is made in the
+    /// domain of the kind it was signed for: relabeling a signed link fails
+    /// its signature check in both directions.
+    #[test]
+    fn relabeled_signed_link_fails_its_signature() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, upgrade) = chain_with_pending_upgrade(id, &sk);
+        let check = |link: &ChainLink| {
+            validate_chain_link(
+                link,
+                &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+                chrono::Utc::now(),
+                true,
+            )
+        };
+
+        let mut revocation = revocation_link(id, &upgrade, 0x1e, &sk);
+        assert!(matches!(check(&revocation), Ok(Outcome::Append { .. })));
+        revocation.kind = ChainLinkKind::Upgrade;
+        assert!(matches!(
+            check(&revocation),
+            Err(ChainValidationError::SignatureInvalid)
+        ));
+
+        let mut fresh_upgrade = upgrade_link(
+            id,
+            "sha256:v3",
+            0x1e,
+            &sk,
+            chrono::Utc::now() + Duration::days(8),
+        );
+        assert!(matches!(check(&fresh_upgrade), Ok(Outcome::Append { .. })));
+        fresh_upgrade.kind = ChainLinkKind::Revocation;
+        assert!(matches!(
+            check(&fresh_upgrade),
+            Err(ChainValidationError::SignatureInvalid)
+        ));
+    }
+
+    /// A signed, attested payload that is not the canonical encoding of what
+    /// it decodes to (here: one trailing byte) is refused.
+    #[test]
+    fn non_canonical_signed_payload_is_rejected() {
+        let pcrs = pcrs_hex_from_seed(0x1e);
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let (chain, _) = chain_with_pending_upgrade(id, &sk);
+        let mut link = upgrade_link(
+            id,
+            "sha256:v3",
+            0x1e,
+            &sk,
+            chrono::Utc::now() + Duration::days(8),
+        );
+        link.payload.push(0x00);
+        link.attestation = FakeChainAttestation::for_payload(0x1e, &link.payload).encode();
+        link.signature =
+            Some(sign_control(&sk, SignedDomain::UpgradePayload, &link.payload).to_vec());
+        let err = validate_chain_link(
+            &link,
+            &ctx(&id, &pcrs, "sha256:v1", Some(&pk), true, &chain),
+            chrono::Utc::now(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ChainValidationError::PayloadDecode {
+                    kind: ChainLinkKind::Upgrade,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

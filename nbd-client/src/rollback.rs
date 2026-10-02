@@ -13,8 +13,10 @@
 //!   the region directly off the host stream and compare against the
 //!   cluster's pinned commitment. Any mismatch is rollback evidence and
 //!   the client REFUSES to serve (fail-stop). A blank (all-zero) region
-//!   with no pinned key is a fresh device: register it and proceed.
-//!   A WRITTEN region with no pinned key under our PCR key is either a
+//!   with no pinned key is a fresh device: register it and proceed,
+//!   unless the measured config marks this image as an upgrade target
+//!   ([`ImageRole::UpgradeTarget`]), which never registers and goes to the
+//!   Transition branch below like a written region.//!   A WRITTEN region with no pinned key under our PCR key is either a
 //!   rollback or the first boot after a staged upgrade (#46): the pin
 //!   then lives under the OLD image's key, and the disambiguator is the
 //!   #47 upgrade `ChainLink`, fetched best-effort from `chain-host` and
@@ -23,8 +25,8 @@
 //! * **Runtime:** every NBD write that covers the region is hashed on
 //!   the way through, a `Pin` RPC is issued, and the corresponding NBD
 //!   reply to the kernel is HELD until the cluster's durable `PinOk`
-//!   arrives (the replicated server only ACKs a Pin after the entry is
-//!   replicated to every voter, see `synchronizer::raft::serve`).
+//!   arrives (the replicated server only ACKs a Pin once the entry is
+//!   committed on a quorum of voters, see `synchronizer::raft::serve`).
 //!   Unrelated requests are never stalled: the reply pump parks only the
 //!   gated reply and keeps forwarding everything else.
 //!
@@ -66,7 +68,10 @@
 //! side-channels, kernel cmdline): a host that chooses the expected PCRs
 //! or flips `debug_attestation` can impersonate the oracle and the whole
 //! check is worthless. With [`ENV_SYNCHRONIZER_ENABLED`] set, a missing
-//! or empty `synchronizer.expected_pcrs` config is fail-stop.
+//! or empty `synchronizer.expected_pcrs` config is fail-stop. The
+//! skip-chain path `debug_attestation` selects is compiled only into the
+//! debug build, and a `debug_attestation` that disagrees with the build is
+//! fail-stop too, so a production image cannot skip the chain at all.
 //!
 //! ## Opt-in gate
 //!
@@ -90,7 +95,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
+use enclavia_protocol::attestation::ValidatedAttestation;
+use enclavia_protocol::chain::{ChainLink, ChainLinkKind, UpgradePayload};
+use enclavia_protocol::signing::decode_canonical;
 use sha2::{Digest, Sha256};
 use synchronizer::client::{Client, ClientError, Handshake, ServerPcrPolicy};
 use synchronizer::wire::RpcError;
@@ -130,8 +137,8 @@ pub const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time allowed for one synchronizer interaction: the Noise handshake +
 /// NSM attest + Authenticate at session setup, and each Get / Pin RPC
 /// afterwards. Generous because a Pin in the replicated deployment only
-/// ACKs after full replication (which may wait out a follower hiccup),
-/// but finite: expiry is treated exactly like the oracle being
+/// ACKs once a quorum has committed it (which may ride out a leader
+/// re-election), but finite: expiry is treated exactly like the oracle being
 /// unreachable, i.e. fail-stop.
 pub const SYNC_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -274,8 +281,8 @@ pub enum GetOutcome {
 pub enum BootDecision {
     /// Pinned commitment matches the device: serve.
     Serve,
-    /// Fresh device, unregistered key: register (first Pin) the blank
-    /// region's commitment, then serve.
+    /// Fresh device, unregistered key: `Register` the blank region's
+    /// commitment, then serve. The only place the client ever registers.
     RegisterThenServe,
     /// Written superblock, no pin under our key: either a rollback or
     /// the first boot after a staged upgrade (#46). Attempt a PCR
@@ -289,22 +296,40 @@ pub enum BootDecision {
     FailStop(String),
 }
 
+/// What this image may do with a key the oracle does not know. Read from
+/// the measured config (`synchronizer.upgrade_target`), set by the builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageRole {
+    /// The enclave's first image: a blank volume under an unknown key is a
+    /// fresh enclave, which registers.
+    Genesis,
+    /// An image built as the target of an upgrade. Its pin can only come
+    /// from the `Transition` out of its predecessor, which carries the
+    /// predecessor's state, so it never registers: otherwise the host could
+    /// boot it on a blank disk once the upgrade link exists, have it serve
+    /// an empty volume as the owner's designated successor while the
+    /// predecessor's data is acknowledged, and block the real `Transition`
+    /// for good (the successor key would already exist).
+    UpgradeTarget,
+}
+
 /// The boot-time decision table. Pure so it can be tested exhaustively;
 /// this is the heart of the rollback-protection kernel.
 ///
-/// | device region | synchronizer | verdict |
-/// |---------------|--------------|---------|
-/// | any           | Found, hash matches    | Serve |
-/// | any           | Found, hash mismatches | FailStop (rollback or corruption) |
-/// | blank         | NotFound               | RegisterThenServe (fresh device) |
-/// | non-blank     | NotFound               | TransitionOrFailStop (staged upgrade, #46, or rollback evidence) |
+/// | device region | synchronizer | image role | verdict |
+/// |---------------|--------------|------------|---------|
+/// | any           | Found, hash matches    | any | Serve |
+/// | any           | Found, hash mismatches | any | FailStop (rollback or corruption) |
+/// | blank         | NotFound               | genesis | RegisterThenServe (fresh device) |
+/// | blank         | NotFound               | upgrade target | TransitionOrFailStop (an upgrade target never registers) |
+/// | non-blank     | NotFound               | any | TransitionOrFailStop (staged upgrade, #46, or rollback evidence) |
 ///
 /// Note the blank + Found case falls out of the hash compare: a pinned
 /// commitment over a blank region (registered at first boot, no write
 /// yet) matches a still-blank device and serves; a pinned commitment
 /// over real data against a blanked device mismatches and fail-stops
 /// (a wiped/substituted disk is a rollback).
-pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
+pub fn boot_decision(region: &[u8], outcome: &GetOutcome, role: ImageRole) -> BootDecision {
     match outcome {
         GetOutcome::Found { commitment, .. } => {
             if commitment_of_region(region) == *commitment {
@@ -319,7 +344,15 @@ pub fn boot_decision(region: &[u8], outcome: &GetOutcome) -> BootDecision {
         }
         GetOutcome::NotFound => {
             if region_is_blank(region) {
-                BootDecision::RegisterThenServe
+                match role {
+                    ImageRole::Genesis => BootDecision::RegisterThenServe,
+                    ImageRole::UpgradeTarget => BootDecision::TransitionOrFailStop(
+                        "this image is an upgrade target and the synchronizer has no pinned \
+                         state for it: it can only adopt its predecessor's pin by a \
+                         Transition, never register a fresh volume; refusing to serve"
+                            .to_string(),
+                    ),
+                }
             } else {
                 BootDecision::TransitionOrFailStop(
                     "device carries a written superblock region but the synchronizer has no \
@@ -739,24 +772,23 @@ pub fn pin_error_is_retryable(e: &ClientError) -> bool {
 
 /// Whether the oracle answered the documented transient "no durable
 /// quorum right now" refusal. This is the ONE structured `Rpc` error the
-/// client retries: the synchronizer returns it while a Raft node is
-/// rejoining (the leader waits for all voters, and a node that is
-/// rejoining is not yet a voter), a condition that clears on its own in
-/// seconds to minutes without any state having changed.
+/// client retries: the synchronizer returns it while it cannot commit
+/// (no leader during an election, or quorum lost while nodes rejoin), a
+/// condition that clears on its own in seconds to minutes without any
+/// state having changed.
 pub fn pin_error_is_unavailable(e: &ClientError) -> bool {
     matches!(e, ClientError::Rpc(RpcError::Unavailable))
 }
 
 /// Wall-clock ceiling for tolerating `Rpc(Unavailable)` on one pin.
 ///
-/// A single oracle-node restart makes every durable write answer
-/// `Unavailable` until the rejoining node is re-admitted as a voter,
-/// which is observed to take up to several minutes. The pre-existing
-/// budget (3 reconnects x [`SYNC_RECONNECT_BACKOFF`] + RPC timeouts,
-/// ~96 s worst case) is shorter than that, so an entirely healthy
-/// cluster undergoing a planned restart used to fail-stop the device.
+/// The oracle answers `Unavailable` while it has no quorum to commit
+/// with, for example while restarted nodes are being re-admitted as
+/// voters, which can take minutes. The reconnect budget alone
+/// (3 reconnects x [`SYNC_RECONNECT_BACKOFF`] + RPC timeouts, ~96 s worst
+/// case) is shorter than that.
 ///
-/// Five minutes covers an observed rejoin with slack while keeping the
+/// Five minutes covers a rejoin with slack while keeping the
 /// fail-stop policy intact: the budget is a DEADLINE checked against the
 /// wall clock, not an attempt count, so the 30 s [`SYNC_RPC_TIMEOUT`]
 /// cannot inflate it, and once it expires the pin fails exactly as
@@ -831,18 +863,65 @@ pub struct SyncPinner<S> {
     reconnect: Option<Reconnector<S>>,
 }
 
-impl<S> SyncPinner<S>
+/// One pin RPC under [`SYNC_RPC_TIMEOUT`], naming `*expected` as the
+/// compare-and-swap version and advancing it on success.
+///
+/// A `VersionConflict` is resolved with [`disambiguate_conflict`]: did an
+/// earlier attempt of THIS pin commit before its ack was lost, or is a
+/// different writer ahead of us (a fork)? This is what makes a retry safe
+/// when the oracle answered an earlier attempt `Unavailable` (outcome
+/// unknown) and that attempt committed anyway: the retry names the same
+/// `expected`, fails the CAS, and the `Get` finds our own commitment.
+pub async fn pin_once_on<O>(
+    oracle: &mut O,
+    key: PcrKey,
+    expected: &mut Version,
+    commitment: [u8; 32],
+) -> Result<(), (PinFailure, String)>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    O: BootOracle,
 {
-    /// Disambiguate a `VersionConflict`: did an earlier attempt of THIS
-    /// pin commit before its ack was lost, or is a different writer
-    /// ahead of us (a fork)? Delegates to [`disambiguate_conflict`],
-    /// which the boot registration path shares.
-    async fn resolve_conflict(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
-        let version = disambiguate_conflict(&mut self.client, self.key, commitment).await?;
-        self.expected = version;
-        Ok(())
+    match tokio::time::timeout(
+        SYNC_RPC_TIMEOUT,
+        oracle.pin(key, *expected, Commitment(commitment)),
+    )
+    .await
+    {
+        Ok(Ok(version)) if version.0 == expected.0 + 1 => {
+            debug!(version = version.0, "superblock pin durably acknowledged");
+            *expected = version;
+            Ok(())
+        }
+        // A compare-and-swap from `expected` lands at exactly `expected + 1`;
+        // any other answer is not our pin.
+        Ok(Ok(version)) => Err((
+            PinFailure::Fatal,
+            format!(
+                "pin from version {} answered version {}: not the compare-and-swap \
+                 this client sent; refusing to keep serving",
+                expected.0, version.0
+            ),
+        )),
+        // The oracle does not know our key. A running enclave was
+        // registered (or transitioned) at boot, so this oracle has lost
+        // that state or is another cluster. Never re-register: that would
+        // start a second history of this volume.
+        Ok(Err(ClientError::Rpc(RpcError::NotFound))) => Err((
+            PinFailure::Fatal,
+            "pin answered NotFound: the synchronizer does not know this enclave's key \
+             (its state is lost, or this is another cluster); refusing to keep serving"
+                .to_string(),
+        )),
+        Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
+            *expected = disambiguate_conflict(oracle, key, commitment).await?;
+            Ok(())
+        }
+        Ok(Err(e)) => Err((classify_pin_error(&e), format!("pin rpc failed: {e}"))),
+        // A timeout is indistinguishable from a dead node: retryable.
+        Err(_) => Err((
+            PinFailure::Session,
+            format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
+        )),
     }
 }
 
@@ -868,28 +947,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
-        match tokio::time::timeout(
-            SYNC_RPC_TIMEOUT,
-            self.client
-                .pin(self.key, self.expected, Commitment(commitment)),
-        )
-        .await
-        {
-            Ok(Ok(version)) => {
-                debug!(version = version.0, "superblock pin durably acknowledged");
-                self.expected = version;
-                Ok(())
-            }
-            Ok(Err(ClientError::Rpc(RpcError::VersionConflict))) => {
-                self.resolve_conflict(commitment).await
-            }
-            Ok(Err(e)) => Err((classify_pin_error(&e), format!("pin rpc failed: {e}"))),
-            // A timeout is indistinguishable from a dead node: retryable.
-            Err(_) => Err((
-                PinFailure::Session,
-                format!("pin rpc timed out after {SYNC_RPC_TIMEOUT:?} (synchronizer unreachable)"),
-            )),
-        }
+        pin_once_on(&mut self.client, self.key, &mut self.expected, commitment).await
     }
 
     fn can_reconnect(&self) -> bool {
@@ -1435,7 +1493,9 @@ where
 pub trait BootOracle {
     /// `Client::get`.
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError>;
-    /// `Client::pin` (the CAS guard is ignored on a first-time Register).
+    /// `Client::register`: only the boot decision's fresh-device branch.
+    async fn register(&mut self, key: PcrKey, commitment: Commitment) -> Result<(), ClientError>;
+    /// `Client::pin` (compare-and-swap on a registered key).
     async fn pin(
         &mut self,
         key: PcrKey,
@@ -1452,6 +1512,9 @@ where
 {
     async fn get(&mut self, key: PcrKey) -> Result<(Commitment, Version), ClientError> {
         Client::get(self, key).await
+    }
+    async fn register(&mut self, key: PcrKey, commitment: Commitment) -> Result<(), ClientError> {
+        Client::register(self, key, commitment).await
     }
     async fn pin(
         &mut self,
@@ -1520,9 +1583,10 @@ where
 }
 
 /// Run the boot decision table against a live session: `Get`, compare,
-/// and on a fresh device register the blank region. On the
-/// written-but-unpinned verdict, attempt the #46 staged-upgrade
-/// `Transition` (see [`transition_and_reverify`]); `upgrade_link` is the
+/// and on a fresh device of a [`ImageRole::Genesis`] image register the
+/// blank region. On the written-but-unpinned verdict, and on any unpinned
+/// volume of an [`ImageRole::UpgradeTarget`] image, attempt the #46
+/// staged-upgrade `Transition` (see [`transition_and_reverify`]); `upgrade_link` is the
 /// LAZY chain-host fetch, awaited only on that branch. Any verdict other
 /// than serve / register / successful transition propagates as a fatal
 /// error.
@@ -1534,6 +1598,7 @@ where
 pub async fn verify_or_register<O, F>(
     oracle: &mut O,
     key: PcrKey,
+    role: ImageRole,
     region: &[u8],
     upgrade_link: F,
 ) -> Result<Version, FatalError>
@@ -1551,7 +1616,7 @@ where
     let outcome =
         get_outcome(result).map_err(|e| format!("boot verify: synchronizer Get failed: {e}"))?;
 
-    match boot_decision(region, &outcome) {
+    match boot_decision(region, &outcome, role) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches pinned commitment; serving");
             let GetOutcome::Found { version, .. } = outcome else {
@@ -1562,46 +1627,42 @@ where
         BootDecision::RegisterThenServe => {
             info!("boot verify: fresh device, registering with the synchronizer");
             let commitment = Commitment(commitment_of_region(region));
-            let result =
-                tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.pin(key, Version(0), commitment))
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "boot verify: registration Pin timed out after {SYNC_RPC_TIMEOUT:?} \
-                     (synchronizer unreachable)"
-                        )
-                    })?;
-            let version = match result {
-                Ok(version) => version,
-                // At-least-once, same as the runtime path: an earlier
-                // attempt of THIS registration can commit and still lose
-                // its ack (the oracle re-submits a Pin it answered
-                // `Unavailable`, and the re-submission passes the CAS).
-                // The next attempt then sees `VersionConflict` for a pin
-                // that is already ours. Disambiguate with a `Get`: our
-                // own commitment means the registration landed; ANY
-                // other commitment is a second writer and stays
-                // fail-stop, exactly as before.
-                Err(ClientError::Rpc(RpcError::VersionConflict)) => {
-                    disambiguate_conflict(oracle, key, commitment.0)
+            let result = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.register(key, commitment))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "boot verify: Register timed out after {SYNC_RPC_TIMEOUT:?} \
+                         (synchronizer unreachable)"
+                    )
+                })?;
+            match result {
+                Ok(()) => {}
+                // At-least-once, like a pin: an earlier attempt of THIS
+                // registration can commit and still lose its answer (the
+                // oracle re-submits a write it answered `Unavailable`), and
+                // the next attempt then finds the key registered. The `Get`
+                // settles it: our own commitment at version 0 is our
+                // registration; anything else is a second writer, fail-stop.
+                Err(ClientError::Rpc(RpcError::AlreadyRegistered)) => {
+                    let version = disambiguate_conflict(oracle, key, commitment.0)
                         .await
                         .map_err(|(_, msg)| {
-                            format!("boot verify: registration Pin conflicted: {msg}")
-                        })?
+                            format!("boot verify: Register found the key registered: {msg}")
+                        })?;
+                    if version != Version(0) {
+                        // Get said NotFound, but the key now holds our
+                        // commitment past version 0: another session
+                        // registered and pinned it in between. Two live
+                        // writers for one key can only corrupt each other.
+                        return Err(format!(
+                            "boot verify: registration raced (the key is at version {} \
+                             != 0); another session owns this key",
+                            version.0
+                        )
+                        .into());
+                    }
                 }
-                Err(e) => return Err(format!("boot verify: registration Pin failed: {e}").into()),
-            };
-            if version != Version(0) {
-                // Get said NotFound but the Pin did not register: another
-                // session squeezed a registration in between. Two live
-                // writers for one PcrKey can only corrupt each other;
-                // refuse to serve.
-                return Err(format!(
-                    "boot verify: registration raced (PinOk version {} != 0); another \
-                     session owns this key",
-                    version.0
-                )
-                .into());
+                Err(e) => return Err(format!("boot verify: Register failed: {e}").into()),
             }
             Ok(Version(0))
         }
@@ -1661,6 +1722,26 @@ where
         )
         .into());
     }
+    // The oracle verifies the link end to end; this only refuses, before
+    // submitting anything, a link that cannot be ours: not the canonical
+    // encoding of an upgrade payload, or one moving some other identity's pin.
+    match decode_canonical::<UpgradePayload>(&link.payload) {
+        Ok(payload) if PcrKey(payload.to.key()) == key => {}
+        Ok(_) => {
+            return Err(format!(
+                "boot verify: {fail_reason} (chain-host returned an upgrade link whose target \
+                 is not this enclave's identity)"
+            )
+            .into());
+        }
+        Err(e) => {
+            return Err(format!(
+                "boot verify: {fail_reason} (chain-host returned an upgrade link whose payload \
+                 is not a canonical UpgradePayload: {e})"
+            )
+            .into());
+        }
+    }
 
     info!("submitting PCR transition: adopting the pre-upgrade pinned state under this image");
     let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.transition(link))
@@ -1696,7 +1777,7 @@ where
         })?;
     let outcome =
         get_outcome(result).map_err(|e| format!("boot verify: post-transition Get failed: {e}"))?;
-    match boot_decision(region, &outcome) {
+    match boot_decision(region, &outcome, ImageRole::UpgradeTarget) {
         BootDecision::Serve => {
             info!("boot verify: superblock matches the migrated pinned commitment; serving");
             let GetOutcome::Found { version, .. } = outcome else {
@@ -1881,6 +1962,12 @@ struct RawSynchronizerSection {
     /// from the measured config and never from the environment.
     #[serde(default)]
     debug_attestation: bool,
+    /// `true` when the builder built this image as the target of an
+    /// upgrade ([`ImageRole::UpgradeTarget`]): it never registers. Absent
+    /// or `false` for an enclave's first image. Measured, like the rest of
+    /// the section.
+    #[serde(default)]
+    upgrade_target: bool,
 }
 
 /// The synchronizer trust anchors loaded from the MEASURED enclave
@@ -1897,6 +1984,9 @@ pub struct SynchronizerTrust {
     /// Verification mode for the server's document (see
     /// [`RawSynchronizerSection::debug_attestation`]).
     pub debug_attestation: bool,
+    /// What the boot decision may do with a key the oracle does not know
+    /// (see [`RawSynchronizerSection::upgrade_target`]).
+    pub role: ImageRole,
 }
 
 /// Load the 65-byte uncompressed SEC1 P-256 control pubkey from the
@@ -1944,11 +2034,17 @@ pub fn load_control_pubkey(path: &Path) -> Result<[u8; 65], FatalError> {
     Ok(out)
 }
 
+/// Whether this binary contains the path that checks the oracle's
+/// attestation without the AWS Nitro certificate chain. Debug (QEMU) images
+/// are built with it, production images without it.
+pub const SKIPS_CERTIFICATE_CHAIN: bool = cfg!(feature = "dangerous-skip-chain");
+
 /// Load every synchronizer trust anchor from the enclave config: the
 /// control pubkey, the expected oracle PCRs, and the verification mode.
 ///
 /// Fail-stop on a missing `synchronizer` section, an EMPTY
-/// `expected_pcrs` list, or any malformed PCR entry: with
+/// `expected_pcrs` list, any malformed PCR entry, or a `debug_attestation`
+/// other than [`SKIPS_CERTIFICATE_CHAIN`]: with
 /// `SYNCHRONIZER_ENABLED=1` the oracle MUST be verifiable, and serving
 /// with an unauthenticated oracle would reopen the host-impersonation
 /// rollback hole (#208). The config file is baked into the measured EIF,
@@ -1978,40 +2074,42 @@ pub fn load_synchronizer_trust(path: &Path) -> Result<SynchronizerTrust, FatalEr
         })?;
         expected.push(pcrs);
     }
+    // How the oracle's attestation is checked is measured (the builder
+    // writes `debug_attestation` from its `--debug`) and compiled: the
+    // skip-chain path exists only in the debug build of this binary, which
+    // only debug images carry. The two must agree, or the image was assembled
+    // from the wrong build.
+    if section.debug_attestation != SKIPS_CERTIFICATE_CHAIN {
+        return Err(format!(
+            "enclave config has synchronizer.debug_attestation = {}, but this nbd-client is \
+             the {} build; the image carries the wrong build (fail-stop)",
+            section.debug_attestation,
+            if SKIPS_CERTIFICATE_CHAIN { "debug (skip-chain)" } else { "production" },
+        )
+        .into());
+    }
 
     Ok(SynchronizerTrust {
         control_pubkey,
         server_policy: ServerPcrPolicy::Expected(expected),
         debug_attestation: section.debug_attestation,
+        role: if section.upgrade_target {
+            ImageRole::UpgradeTarget
+        } else {
+            ImageRole::Genesis
+        },
     })
 }
 
 /// Request one attestation document from this enclave's own `/dev/nsm`
 /// with `nonce = handshake_hash` (channel binding) and `user_data =
 /// control_pubkey` (#47). BLOCKING: call through `spawn_blocking`.
-/// Mirrors `synchronizer::mesh::attestation::request_own_attestation`,
-/// re-implemented here so nbd-client does not pull the mesh feature in.
-fn request_nsm_attestation(nonce: Vec<u8>, user_data: Vec<u8>) -> Result<Vec<u8>, FatalError> {
-    use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
-
-    let fd = nsm_init();
-    if fd == -1 {
-        return Err("nsm_init failed (is /dev/nsm present?)".into());
-    }
-    let request = Request::Attestation {
-        user_data: Some(user_data.into()),
-        nonce: Some(nonce.into()),
-        public_key: None,
-    };
-    let result = match nsm_process_request(fd, request) {
-        Response::Attestation { document } => Ok(document),
-        Response::Error(e) => Err(format!("NSM attestation error: {e:?}").into()),
-        _ => Err("unexpected NSM response".into()),
-    };
-    // Close the device on every exit path.
-    nsm_exit(fd);
-    result
+fn request_nsm_attestation(
+    nonce: Vec<u8>,
+    user_data: Vec<u8>,
+) -> Result<ValidatedAttestation, FatalError> {
+    ValidatedAttestation::request_local(Some(&nonce), Some(&user_data), None)
+        .map_err(|e| -> FatalError { format!("own NSM attestation: {e}").into() })
 }
 
 /// An authenticated synchronizer session plus the PCR key it is bound
@@ -2020,8 +2118,11 @@ fn request_nsm_attestation(nonce: Vec<u8>, user_data: Vec<u8>) -> Result<Vec<u8>
 pub struct SyncSession {
     /// RPC-ready client over the vsock relay.
     pub client: Client<tokio_vsock::VsockStream>,
-    /// `SHA-256(PCR0||PCR1||PCR2)` of this enclave.
+    /// This enclave's pin-identity key (PCR0-2 plus user PCRs 16-31, see
+    /// `enclavia_protocol::pin_identity`).
     pub key: PcrKey,
+    /// This image's role from the measured config.
+    pub role: ImageRole,
 }
 
 /// Dial the host-side relay (CID 2, vsock port
@@ -2059,19 +2160,23 @@ pub async fn connect_and_authenticate() -> Result<SyncSession, FatalError> {
             .map_err(|e| format!("NSM attestation task panicked: {e}"))??;
         // Derive our own PcrKey from the document we just minted; the
         // listener derives the session key the same way on its side, so
-        // RPC `key` fields match the session binding.
-        let pcrs = enclavia_protocol::attestation::extract_own_pcrs(&doc)
-            .map_err(|e| format!("cannot extract own PCRs from NSM document: {e}"))?;
-        let key = PcrKey(pcrs.digest());
+        // RPC `key` fields match the session binding. Any user PCR a boot
+        // feature uses must already be extended and locked here: it is part
+        // of the key from this first contact on.
+        let key = PcrKey(doc.identity().key());
         // Mutual auth: send our document, then verify the oracle's
         // answering attestation (nonce-bound to this session) against
         // the measured-config policy. A server that cannot prove it is
         // the expected synchronizer is fail-stop.
         let client = hs
-            .authenticate(doc, &trust.server_policy, trust.debug_attestation)
+            .authenticate(doc.into_bytes(), &trust.server_policy, trust.debug_attestation)
             .await?;
         info!("synchronizer session mutually authenticated (oracle PCRs verified)");
-        Ok::<_, FatalError>(SyncSession { client, key })
+        Ok::<_, FatalError>(SyncSession {
+            client,
+            key,
+            role: trust.role,
+        })
     })
     .await
     .map_err(|_| {
@@ -2114,6 +2219,7 @@ where
     let version = verify_or_register(
         &mut session.client,
         session.key,
+        session.role,
         &region,
         fetch_latest_upgrade_link(),
     )
@@ -2135,8 +2241,11 @@ where
 /// attestation. Boot verification is deliberately NOT re-run on
 /// reconnect: the device has been live and gated the whole time, so the
 /// pinned state cannot have moved under us; the key-continuity check in
-/// [`SyncPinner`] guards the only thing that could change. The CAS
-/// version likewise survives reconnects (same enclave, same state).
+/// [`SyncPinner`] guards the only thing that could change. An oracle
+/// that does not know our key (another cluster, or one that lost its state)
+/// answers the next Pin `NotFound`, which is fatal: the client registers
+/// only from the boot decision, never after. The CAS version likewise
+/// survives reconnects (same enclave, same state).
 pub fn into_pinner(boot: BootResult) -> SyncPinner<tokio_vsock::VsockStream> {
     SyncPinner {
         client: boot.session.client,
@@ -2317,7 +2426,7 @@ mod tests {
             commitment: commitment_of_region(&region),
             version: Version(0),
         };
-        assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
+        assert_eq!(boot_decision(&region, &outcome, ImageRole::Genesis), BootDecision::Serve);
     }
 
     #[test]
@@ -2328,7 +2437,7 @@ mod tests {
             version: Version(0),
         };
         assert!(matches!(
-            boot_decision(&region, &outcome),
+            boot_decision(&region, &outcome, ImageRole::Genesis),
             BootDecision::FailStop(_)
         ));
     }
@@ -2337,9 +2446,38 @@ mod tests {
     fn decision_blank_not_found_registers() {
         let region = vec![0u8; SB_REGION_LEN];
         assert_eq!(
-            boot_decision(&region, &GetOutcome::NotFound),
+            boot_decision(&region, &GetOutcome::NotFound, ImageRole::Genesis),
             BootDecision::RegisterThenServe
         );
+    }
+
+    /// An upgrade target never registers: a blank volume its key has no pin
+    /// for goes to the Transition branch, like a written one. A pinned key
+    /// is judged by the hash compare, whatever the role.
+    #[test]
+    fn decision_upgrade_target_never_registers() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        assert!(matches!(
+            boot_decision(&blank, &GetOutcome::NotFound, ImageRole::UpgradeTarget),
+            BootDecision::TransitionOrFailStop(_)
+        ));
+        let region = region_with_data();
+        assert!(matches!(
+            boot_decision(&region, &GetOutcome::NotFound, ImageRole::UpgradeTarget),
+            BootDecision::TransitionOrFailStop(_)
+        ));
+        let pinned = GetOutcome::Found {
+            commitment: commitment_of_region(&blank),
+            version: Version(0),
+        };
+        assert_eq!(
+            boot_decision(&blank, &pinned, ImageRole::UpgradeTarget),
+            BootDecision::Serve
+        );
+        assert!(matches!(
+            boot_decision(&region, &pinned, ImageRole::UpgradeTarget),
+            BootDecision::FailStop(_)
+        ));
     }
 
     #[test]
@@ -2349,7 +2487,7 @@ mod tests {
         // upgrade link it still fail-stops (see the transition tests).
         let region = region_with_data();
         assert!(matches!(
-            boot_decision(&region, &GetOutcome::NotFound),
+            boot_decision(&region, &GetOutcome::NotFound, ImageRole::Genesis),
             BootDecision::TransitionOrFailStop(_)
         ));
     }
@@ -2363,7 +2501,7 @@ mod tests {
             commitment: commitment_of_region(&region),
             version: Version(0),
         };
-        assert_eq!(boot_decision(&region, &outcome), BootDecision::Serve);
+        assert_eq!(boot_decision(&region, &outcome, ImageRole::Genesis), BootDecision::Serve);
     }
 
     #[test]
@@ -2375,7 +2513,7 @@ mod tests {
             version: Version(0),
         };
         assert!(matches!(
-            boot_decision(&region, &outcome),
+            boot_decision(&region, &outcome, ImageRole::Genesis),
             BootDecision::FailStop(_)
         ));
     }
@@ -2390,7 +2528,7 @@ mod tests {
             version: Version(0),
         };
         assert!(matches!(
-            boot_decision(&region, &outcome),
+            boot_decision(&region, &outcome, ImageRole::Genesis),
             BootDecision::FailStop(_)
         ));
     }
@@ -2433,10 +2571,10 @@ mod tests {
     /// Scripted [`BootOracle`]: pops pre-programmed RPC results in order
     /// and records every Transition link. `expect` panics double as the
     /// "this RPC must never be issued on this path" assertions (e.g. no
-    /// Pin/Register on a written region).
+    /// Register on a written region; boot never pins at all).
     pub(super) struct ScriptedOracle {
         gets: std::collections::VecDeque<Result<(Commitment, Version), ClientError>>,
-        pins: std::collections::VecDeque<Result<Version, ClientError>>,
+        registers: std::collections::VecDeque<Result<(), ClientError>>,
         transitions: std::collections::VecDeque<Result<Version, ClientError>>,
         pub(super) seen_transitions: Vec<ChainLink>,
     }
@@ -2444,12 +2582,12 @@ mod tests {
     impl ScriptedOracle {
         pub(super) fn new(
             gets: Vec<Result<(Commitment, Version), ClientError>>,
-            pins: Vec<Result<Version, ClientError>>,
+            registers: Vec<Result<(), ClientError>>,
             transitions: Vec<Result<Version, ClientError>>,
         ) -> Self {
             Self {
                 gets: gets.into_iter().collect(),
-                pins: pins.into_iter().collect(),
+                registers: registers.into_iter().collect(),
                 transitions: transitions.into_iter().collect(),
                 seen_transitions: Vec::new(),
             }
@@ -2460,13 +2598,20 @@ mod tests {
         async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
             self.gets.pop_front().expect("unexpected Get")
         }
+        async fn register(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<(), ClientError> {
+            self.registers.pop_front().expect("unexpected Register")
+        }
         async fn pin(
             &mut self,
             _key: PcrKey,
             _expected_version: Version,
             _commitment: Commitment,
         ) -> Result<Version, ClientError> {
-            self.pins.pop_front().expect("unexpected Pin")
+            panic!("boot verification never pins")
         }
         async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
             self.seen_transitions.push(link);
@@ -2474,26 +2619,57 @@ mod tests {
         }
     }
 
+    /// This enclave's identity in the boot tests.
+    fn test_identity() -> enclavia_protocol::pin_identity::PinIdentity {
+        enclavia_protocol::pin_identity::PinIdentity::new(
+            [[0x42; 48], [0x43; 48], [0x44; 48]],
+            enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+        )
+    }
+
     pub(super) fn test_key() -> PcrKey {
-        PcrKey([0x42; 32])
+        PcrKey(test_identity().key())
     }
 
     pub(super) fn not_found() -> Result<(Commitment, Version), ClientError> {
         Err(ClientError::Rpc(RpcError::NotFound))
     }
 
-    /// A structurally plausible #47 upgrade link. The contents are
-    /// opaque to the client (the ORACLE verifies them), so dummy bytes
-    /// are exactly as good as a real signed link here.
-    fn test_upgrade_link(sequence: u64) -> ChainLink {
+    /// A #47 upgrade link to `to`. The signature and attestation are
+    /// opaque to the client (the ORACLE verifies them), so dummy bytes are
+    /// exactly as good as real ones here; the client only checks that the
+    /// payload is a canonical upgrade payload naming its own identity.
+    fn upgrade_link_to(
+        sequence: u64,
+        to: enclavia_protocol::pin_identity::PinIdentity,
+    ) -> ChainLink {
+        use chrono::TimeZone as _;
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::from_u128(0xe1),
+            from: enclavia_protocol::pin_identity::PinIdentity::new(
+                [[0x52; 48], [0x53; 48], [0x54; 48]],
+                enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+            ),
+            to,
+            image_digest: "sha256:next".into(),
+            valid_from: chrono::Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            valid_until: (chrono::Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap()) + chrono::Duration::days(7),
+            issued_at: chrono::Utc.with_ymd_and_hms(2026, 9, 24, 0, 0, 0).unwrap(),
+            nonce: vec![0x5c; 32],
+        };
         ChainLink {
             id: None,
             sequence: Some(sequence),
             kind: ChainLinkKind::Upgrade,
-            payload: vec![0x01, 0x02, 0x03],
+            payload: enclavia_protocol::signing::encode(&payload),
             attestation: vec![0x04, 0x05],
             signature: Some(vec![0xab; 64]),
         }
+    }
+
+    /// An upgrade link to this enclave.
+    fn test_upgrade_link(sequence: u64) -> ChainLink {
+        upgrade_link_to(sequence, test_identity())
     }
 
     /// The staged-upgrade happy path: written region, Get says NotFound,
@@ -2510,7 +2686,7 @@ mod tests {
             vec![Ok(Version(7))],
         );
 
-        verify_or_register(&mut oracle, test_key(), &region, async {
+        verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2527,7 +2703,7 @@ mod tests {
         let region = region_with_data();
         let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { None })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback evidence"), "{err}");
@@ -2546,7 +2722,7 @@ mod tests {
             vec![Err(ClientError::Rpc(RpcError::TransitionRejected))],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2567,7 +2743,7 @@ mod tests {
             vec![Ok(Version(7))],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2584,7 +2760,7 @@ mod tests {
         let mut oracle =
             ScriptedOracle::new(vec![not_found(), not_found()], vec![], vec![Ok(Version(7))]);
 
-        let err = verify_or_register(&mut oracle, test_key(), &region, async {
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(3))
         })
         .await
@@ -2605,10 +2781,102 @@ mod tests {
 
         let mut link = test_upgrade_link(3);
         link.kind = ChainLinkKind::Boot;
-        let err = verify_or_register(&mut oracle, test_key(), &region, async { Some(link) })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { Some(link) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback evidence"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+    }
+
+    /// The squatting the role closes: an upgrade target booted on a blank
+    /// disk before its predecessor transitioned. Without a link it fail-stops
+    /// (and never registers: the scripted Register deque is empty); with the
+    /// link it adopts the predecessor's pin and serves only if the volume is
+    /// what that pin holds.
+    #[tokio::test]
+    async fn upgrade_target_on_a_blank_disk_never_registers() {
+        let blank = vec![0u8; SB_REGION_LEN];
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+        let err = verify_or_register(
+            &mut oracle,
+            test_key(),
+            ImageRole::UpgradeTarget,
+            &blank,
+            async { None },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("upgrade target"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+
+        // The predecessor holds written data: the migrated pin does not
+        // match the blank disk, fail-stop.
+        let mut oracle = ScriptedOracle::new(
+            vec![
+                not_found(),
+                Ok((Commitment(commitment_of_region(&region_with_data())), Version(5))),
+            ],
+            vec![],
+            vec![Ok(Version(5))],
+        );
+        let err = verify_or_register(
+            &mut oracle,
+            test_key(),
+            ImageRole::UpgradeTarget,
+            &blank,
+            async { Some(test_upgrade_link(4)) },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
+
+        // The predecessor never wrote: its blank pin moves over and serves.
+        let mut oracle = ScriptedOracle::new(
+            vec![
+                not_found(),
+                Ok((Commitment(commitment_of_region(&blank)), Version(0))),
+            ],
+            vec![],
+            vec![Ok(Version(0))],
+        );
+        let v = verify_or_register(
+            &mut oracle,
+            test_key(),
+            ImageRole::UpgradeTarget,
+            &blank,
+            async { Some(test_upgrade_link(4)) },
+        )
+        .await
+        .expect("the predecessor's blank pin, transitioned, serves");
+        assert_eq!(v, Version(0));
+        assert_eq!(oracle.seen_transitions.len(), 1);
+    }
+
+    /// A link that moves another identity's pin, or whose payload is not
+    /// the canonical encoding of an upgrade payload, is never submitted.
+    #[tokio::test]
+    async fn transition_with_foreign_or_malformed_link_fail_stops() {
+        let region = region_with_data();
+
+        let other = enclavia_protocol::pin_identity::PinIdentity::new(
+            [[0x62; 48], [0x63; 48], [0x64; 48]],
+            enclavia_protocol::pin_identity::ZERO_USER_PCRS,
+        );
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+        let foreign = upgrade_link_to(3, other);
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { Some(foreign) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not this enclave"), "{err}");
+        assert!(oracle.seen_transitions.is_empty());
+
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![], vec![]);
+        let mut trailing = test_upgrade_link(3);
+        trailing.payload.push(0x00);
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async { Some(trailing) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("canonical"), "{err}");
         assert!(oracle.seen_transitions.is_empty());
     }
 
@@ -2623,15 +2891,15 @@ mod tests {
             vec![],
             vec![],
         );
-        verify_or_register(&mut oracle, test_key(), &region, async {
+        verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             panic!("matching pin must not fetch the upgrade link")
         })
         .await
         .expect("matching pin must serve");
 
         let blank = vec![0u8; SB_REGION_LEN];
-        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
-        verify_or_register(&mut oracle, test_key(), &blank, async {
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(())], vec![]);
+        verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async {
             panic!("fresh device must not fetch the upgrade link")
         })
         .await
@@ -2651,7 +2919,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             panic!("matching pin must not fetch the upgrade link")
         })
         .await
@@ -2660,8 +2928,8 @@ mod tests {
 
         // Register: exactly Version(0).
         let blank = vec![0u8; SB_REGION_LEN];
-        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(Version(0))], vec![]);
-        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let mut oracle = ScriptedOracle::new(vec![not_found()], vec![Ok(())], vec![]);
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap();
         assert_eq!(v, Version(0));
@@ -2675,7 +2943,7 @@ mod tests {
             vec![],
             vec![Ok(Version(3))],
         );
-        let v = verify_or_register(&mut oracle, test_key(), &region, async {
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
             Some(test_upgrade_link(9))
         })
         .await
@@ -3295,7 +3563,7 @@ mod tests {
                     "expected_pcrs": [
                         {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
                     ],
-                    "debug_attestation": true
+                    "debug_attestation": {SKIPS_CERTIFICATE_CHAIN}
                 }}
             }}"#,
             control_pubkey_b64(),
@@ -3308,7 +3576,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(trust.control_pubkey[0], 0x04);
-        assert!(trust.debug_attestation);
+        assert_eq!(trust.debug_attestation, SKIPS_CERTIFICATE_CHAIN);
         let listed = enclavia_protocol::attestation::Pcrs {
             pcr0: vec![0xa5; 48],
             pcr1: vec![0xa6; 48],
@@ -3323,9 +3591,60 @@ mod tests {
         assert!(!trust.server_policy.admits(&other));
     }
 
+    /// `synchronizer.upgrade_target` selects the upgrade-target role; absent
+    /// (an enclave's first image) it is genesis.
+    #[test]
+    fn trust_reads_the_image_role() {
+        for (flag, role) in [
+            ("", ImageRole::Genesis),
+            (r#","upgrade_target": false"#, ImageRole::Genesis),
+            (r#","upgrade_target": true"#, ImageRole::UpgradeTarget),
+        ] {
+            let config = format!(
+                r#"{{"control_public_key": "{}", "synchronizer": {{"debug_attestation": {SKIPS_CERTIFICATE_CHAIN}, "expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]{flag}}}}}"#,
+                control_pubkey_b64(),
+                hex48(0xa5),
+                hex48(0xa6),
+                hex48(0xa7),
+            );
+            let path = write_config(&format!("role-{}", flag.len()), &config);
+            let trust = load_synchronizer_trust(&path).expect("load");
+            std::fs::remove_file(&path).ok();
+            assert_eq!(trust.role, role, "config {config}");
+        }
+    }
+
+    /// A measured `debug_attestation` that disagrees with how this binary
+    /// was built is fail-stop: a production build never runs with the flag
+    /// set, a debug build never without it.
+    #[test]
+    fn trust_debug_attestation_must_match_the_build() {
+        let config = format!(
+            r#"{{
+                "control_public_key": "{}",
+                "synchronizer": {{
+                    "expected_pcrs": [
+                        {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
+                    ],
+                    "debug_attestation": {}
+                }}
+            }}"#,
+            control_pubkey_b64(),
+            hex48(0x10),
+            hex48(0x11),
+            hex48(0x12),
+            !SKIPS_CERTIFICATE_CHAIN,
+        );
+        let path = write_config("wrong-build", &config);
+        let err = load_synchronizer_trust(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("wrong build"), "{err}");
+    }
+
     /// `debug_attestation` defaults to FALSE (production full-chain
     /// verification) when omitted: forgetting the flag can only make
-    /// verification stricter, never weaker.
+    /// verification stricter, never weaker. (A debug build then refuses the
+    /// config as built for production.)
     #[test]
     fn trust_debug_attestation_defaults_to_false() {
         let config = format!(
@@ -3343,9 +3662,13 @@ mod tests {
             hex48(0x12),
         );
         let path = write_config("default-debug", &config);
-        let trust = load_synchronizer_trust(&path).expect("load");
+        let loaded = load_synchronizer_trust(&path);
         std::fs::remove_file(&path).ok();
-        assert!(!trust.debug_attestation);
+        if SKIPS_CERTIFICATE_CHAIN {
+            assert!(loaded.is_err());
+        } else {
+            assert!(!loaded.expect("load").debug_attestation);
+        }
     }
 
     /// The decision the wiring hinges on: SYNCHRONIZER_ENABLED=1 with NO
@@ -3414,6 +3737,7 @@ mod tests {
         let config = format!(
             r#"{{
                 "synchronizer": {{
+                    "debug_attestation": {SKIPS_CERTIFICATE_CHAIN},
                     "expected_pcrs": [
                         {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
                     ]
@@ -3945,23 +4269,200 @@ mod retry_budget_tests {
         assert_eq!(session.reconnects, 1);
         assert_eq!(session.attempts, 4);
     }
+
+    /// A CAS oracle model. `lost_acks` pins commit (the CAS is applied) but
+    /// are answered `Unavailable`, the synchronizer's answer when its commit
+    /// wait times out and the entry commits afterwards.
+    struct CasOracle {
+        commitment: Commitment,
+        version: Version,
+        lost_acks: usize,
+        pins: usize,
+    }
+
+    impl BootOracle for CasOracle {
+        async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
+            Ok((self.commitment, self.version))
+        }
+        async fn register(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<(), ClientError> {
+            unreachable!("no registration on the pin path")
+        }
+        async fn pin(
+            &mut self,
+            _key: PcrKey,
+            expected_version: Version,
+            commitment: Commitment,
+        ) -> Result<Version, ClientError> {
+            self.pins += 1;
+            if expected_version != self.version {
+                return Err(ClientError::Rpc(RpcError::VersionConflict));
+            }
+            self.commitment = commitment;
+            self.version = Version(self.version.0 + 1);
+            if self.lost_acks > 0 {
+                self.lost_acks -= 1;
+                return Err(ClientError::Rpc(RpcError::Unavailable));
+            }
+            Ok(self.version)
+        }
+        async fn transition(&mut self, _link: ChainLink) -> Result<Version, ClientError> {
+            unreachable!("no transition on the pin path")
+        }
+    }
+
+    /// The production pin attempt ([`pin_once_on`]) over the model.
+    struct ModelPinner {
+        oracle: CasOracle,
+        expected: Version,
+    }
+
+    impl PinAttempt for ModelPinner {
+        async fn pin_once(&mut self, commitment: [u8; 32]) -> Result<(), (PinFailure, String)> {
+            pin_once_on(
+                &mut self.oracle,
+                super::tests::test_key(),
+                &mut self.expected,
+                commitment,
+            )
+            .await
+        }
+        fn can_reconnect(&self) -> bool {
+            false
+        }
+        async fn reconnect_session(&mut self) -> Result<(), (PinFailure, String)> {
+            unreachable!("no reconnect in this model")
+        }
+    }
+
+    /// "Timed out but committed": the oracle answers a pin `Unavailable`
+    /// although the pin committed. The retry names the same CAS version,
+    /// hits `VersionConflict`, the `Get` finds our own commitment, and the
+    /// pinner continues from the committed version, so the NEXT pin's CAS
+    /// is right and succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_but_committed_pin_resolves_and_next_cas_succeeds() {
+        let mut pinner = ModelPinner {
+            oracle: CasOracle {
+                commitment: Commitment([0x01; 32]),
+                version: Version(4),
+                lost_acks: 1,
+                pins: 0,
+            },
+            expected: Version(4),
+        };
+        pin_with_retries(&mut pinner, [0x02; 32])
+            .await
+            .expect("our own committed pin must resolve, not fail-stop");
+        assert_eq!(pinner.expected, Version(5));
+        assert_eq!(pinner.oracle.pins, 2);
+
+        pin_with_retries(&mut pinner, [0x03; 32]).await.unwrap();
+        assert_eq!(pinner.expected, Version(6));
+        assert_eq!(pinner.oracle.commitment, Commitment([0x03; 32]));
+    }
+
+    /// An oracle that answers one pin with a fixed result.
+    struct OneAnswer(Option<Result<Version, ClientError>>);
+
+    impl BootOracle for OneAnswer {
+        async fn get(&mut self, _key: PcrKey) -> Result<(Commitment, Version), ClientError> {
+            unreachable!("no Get on these paths")
+        }
+        async fn register(
+            &mut self,
+            _key: PcrKey,
+            _commitment: Commitment,
+        ) -> Result<(), ClientError> {
+            unreachable!("a running enclave never registers")
+        }
+        async fn pin(
+            &mut self,
+            _key: PcrKey,
+            _expected_version: Version,
+            _commitment: Commitment,
+        ) -> Result<Version, ClientError> {
+            self.0.take().expect("one pin only")
+        }
+        async fn transition(&mut self, _link: ChainLink) -> Result<Version, ClientError> {
+            unreachable!("no transition on the pin path")
+        }
+    }
+
+    /// After boot the client never treats an unknown key as success: a
+    /// runtime pin answered `NotFound` (an oracle that lost our state, or
+    /// another cluster the host routed us to) is fatal at once, and so is
+    /// any `PinOk` that is not `expected + 1` (say, version 0 from an oracle
+    /// that registered the key afresh). Neither moves `expected`.
+    #[tokio::test]
+    async fn runtime_pin_never_accepts_an_unknown_key() {
+        let key = PcrKey([0x42; 32]);
+        let mut expected = Version(3);
+        let not_found = Err(ClientError::Rpc(RpcError::NotFound));
+        let (failure, msg) = pin_once_on(&mut OneAnswer(Some(not_found)), key, &mut expected, [1; 32])
+            .await
+            .unwrap_err();
+        assert_eq!(failure, PinFailure::Fatal);
+        assert!(msg.contains("NotFound"), "{msg}");
+        assert_eq!(expected, Version(3));
+
+        for answered in [0, 3, 5] {
+            let (failure, msg) =
+                pin_once_on(&mut OneAnswer(Some(Ok(Version(answered)))), key, &mut expected, [1; 32])
+                    .await
+                    .unwrap_err();
+            assert_eq!(failure, PinFailure::Fatal);
+            assert!(msg.contains("not the compare-and-swap"), "{msg}");
+            assert_eq!(expected, Version(3));
+        }
+
+        pin_once_on(&mut OneAnswer(Some(Ok(Version(4)))), key, &mut expected, [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(expected, Version(4));
+    }
+
+    /// The same unknown outcome, but another writer's pin is what landed:
+    /// the retry's CAS fails, the `Get` shows a foreign commitment, and the
+    /// pin fail-stops as a fork.
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_then_foreign_commit_is_a_fork() {
+        let mut pinner = ModelPinner {
+            oracle: CasOracle {
+                commitment: Commitment([0x01; 32]),
+                version: Version(4),
+                lost_acks: 0,
+                pins: 0,
+            },
+            expected: Version(4),
+        };
+        // Another writer pinned in between.
+        pinner.oracle.commitment = Commitment([0x77; 32]);
+        pinner.oracle.version = Version(5);
+        let err = pin_with_retries(&mut pinner, [0x02; 32])
+            .await
+            .unwrap_err();
+        assert!(err.contains("fork"), "{err}");
+    }
 }
 
-/// The boot registration path's `VersionConflict` handling: our own
+/// The boot registration path's `AlreadyRegistered` handling: our own
 /// already-committed registration must serve, anything else fail-stops.
 #[cfg(test)]
 mod boot_conflict_tests {
     use super::tests::{ScriptedOracle, not_found, test_key};
     use super::*;
 
-    fn conflict() -> Result<Version, ClientError> {
-        Err(ClientError::Rpc(RpcError::VersionConflict))
+    fn conflict() -> Result<(), ClientError> {
+        Err(ClientError::Rpc(RpcError::AlreadyRegistered))
     }
 
-    /// The boot brick: on a fresh device the registration Pin is
-    /// answered `Unavailable`, the oracle re-submits it, the
-    /// re-submission commits, and the next attempt sees
-    /// `VersionConflict`. The disambiguating `Get` returns OUR OWN
+    /// The boot brick: on a fresh device the Register is answered
+    /// `Unavailable`, the oracle re-submits it, the re-submission
+    /// commits, and the next attempt sees `AlreadyRegistered`. The disambiguating `Get` returns OUR OWN
     /// commitment, so the registration did land: serve.
     #[tokio::test]
     async fn boot_registration_conflict_with_own_commitment_serves() {
@@ -3973,7 +4474,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let v = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let v = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .expect("our own already-committed registration must not brick the boot");
         assert_eq!(v, Version(0));
@@ -3991,11 +4492,11 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("registration Pin conflicted"), "{msg}");
+        assert!(msg.contains("Register found the key registered"), "{msg}");
         assert!(msg.contains("DIFFERENT commitment"), "{msg}");
     }
 
@@ -4010,7 +4511,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         assert!(
@@ -4020,7 +4521,7 @@ mod boot_conflict_tests {
         );
     }
 
-    /// A registration Pin refused for any OTHER reason keeps failing on
+    /// A Register refused for any OTHER reason keeps failing on
     /// the first answer, with no Get issued (the scripted deque holds
     /// only the boot Get, so a second one would panic).
     #[tokio::test]
@@ -4032,10 +4533,10 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("registration Pin failed"), "{err}");
+        assert!(err.to_string().contains("Register failed"), "{err}");
     }
 
     /// The conflict tolerance does NOT weaken the registration-race
@@ -4051,7 +4552,7 @@ mod boot_conflict_tests {
             vec![],
         );
 
-        let err = verify_or_register(&mut oracle, test_key(), &blank, async { None })
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &blank, async { None })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("registration raced"), "{err}");

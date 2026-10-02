@@ -524,6 +524,13 @@ enum UpgradeCmd {
     Chain {
         /// Target enclave id. Accepts a unique prefix.
         enclave_id: String,
+        /// The enclave is a debug (QEMU) enclave: check its attestations
+        /// without the AWS Nitro certificate chain (QEMU's NSM self-signs,
+        /// so they prove nothing about hardware). Say it only for an enclave
+        /// you created in debug mode; the CLI never takes this from the
+        /// backend, and refuses if the backend reports a different mode.
+        #[arg(long)]
+        debug_enclave: bool,
     },
 
     /// List all staged upgrades for an enclave, newest first. Shows the
@@ -541,6 +548,12 @@ enum UpgradeCmd {
     /// passes; no further CLI action is needed.
     ///
     /// --at and --immediate are mutually exclusive.
+    ///
+    /// Self-hosted custody: the backend builds the payload your key signs,
+    /// so pass --reproduce or --expect-pcrs to say what the upgraded enclave
+    /// must measure. The CLI also checks that the upgrade starts from the
+    /// enclave's verified current state, is not scheduled earlier than you
+    /// asked, and expires; it shows everything and refuses on a mismatch.
     Confirm {
         /// Target enclave id. Accepts a unique prefix.
         enclave_id: String,
@@ -557,6 +570,39 @@ enum UpgradeCmd {
         /// earlier than now + the enclave's measured minimum delay.
         #[arg(long, conflicts_with = "at")]
         immediate: bool,
+        /// Self-hosted custody: rebuild the staged image locally (as
+        /// `enclavia reproduce --upgrade` does) and sign only an upgrade
+        /// whose target has the PCRs the rebuild produces. Needs a local
+        /// `builder` (BUILDER_PATH) and Nix.
+        #[arg(long, conflicts_with = "expect_pcrs")]
+        reproduce: bool,
+        /// Self-hosted custody: sign only an upgrade whose target has these
+        /// PCR0-2: a pcr.json path, or inline JSON
+        /// `{"PCR0":"..","PCR1":"..","PCR2":".."}`. Use PCRs from your own
+        /// build or an earlier `enclavia reproduce --upgrade`, never ones
+        /// the backend reported.
+        #[arg(long, value_name = "FILE|JSON")]
+        expect_pcrs: Option<String>,
+        /// Self-hosted custody: the image digest you pushed
+        /// (`sha256:...`); the upgrade must be built from it. Defaults to
+        /// the staged upgrade's digest, which the PCRs then bind.
+        #[arg(long, value_name = "DIGEST")]
+        expect_digest: Option<String>,
+        /// Self-hosted custody: sign even though the upgraded image trusts
+        /// another set of synchronizer measurements than the running version
+        /// (a synchronizer rotation); the CLI shows the sets removed and
+        /// added. Until a migration protocol exists, the upgraded image works
+        /// only if the cluster it trusts holds this enclave's pin: an upgrade
+        /// target cannot register, so against a cluster without the pin it
+        /// fail-stops at boot and the enclave stays down.
+        #[arg(long)]
+        accept_synchronizer_change: bool,
+        /// Self-hosted custody: the enclave is a debug (QEMU) enclave, so its
+        /// chain is checked without the AWS Nitro certificate chain (see
+        /// `upgrade chain --debug-enclave`). Never taken from the backend;
+        /// the CLI refuses if the backend reports a different mode.
+        #[arg(long)]
+        debug_enclave: bool,
     },
 
     /// Revoke a confirmed upgrade before it fires. The running enclave
@@ -1386,10 +1432,13 @@ fn print_enclave_logs(v: &serde_json::Value) {
 
 async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
     match cmd {
-        UpgradeCmd::Chain { enclave_id } => {
+        UpgradeCmd::Chain {
+            enclave_id,
+            debug_enclave,
+        } => {
             let client = ApiClient::new()?;
             let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
-            let summary = upgrade::chain(&client, &enclave_id).await?;
+            let summary = upgrade::chain(&client, &enclave_id, debug_enclave).await?;
             emit(json, &summary, || print_chain(&summary));
             Ok(())
         }
@@ -1400,7 +1449,17 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             emit(json, &rows, || print_upgrade_list(&rows));
             Ok(())
         }
-        UpgradeCmd::Confirm { enclave_id, upgrade_id, at, immediate } => {
+        UpgradeCmd::Confirm {
+            enclave_id,
+            upgrade_id,
+            at,
+            immediate,
+            reproduce,
+            expect_pcrs,
+            expect_digest,
+            accept_synchronizer_change,
+            debug_enclave,
+        } => {
             let valid_from: Option<chrono::DateTime<chrono::Utc>> = if immediate {
                 Some(chrono::Utc::now())
             } else if let Some(ts) = at {
@@ -1413,9 +1472,36 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             };
             let client = ApiClient::new()?;
             let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
-            let result =
-                upgrade::confirm_upgrade(&client, &enclave_id, &upgrade_id, valid_from)
-                    .await?;
+            let target = match (reproduce, expect_pcrs) {
+                (true, _) => Some(upgrade::TargetPcrs::Reproduce),
+                (false, Some(arg)) => Some(upgrade::TargetPcrs::Expected(
+                    upgrade::parse_expected_pcrs(&arg)?,
+                )),
+                (false, None) => None,
+            }
+            .map(|pcrs| upgrade::UpgradeTarget {
+                pcrs,
+                image_digest: expect_digest.clone(),
+                accept_synchronizer_change,
+                debug_enclave,
+            });
+            if target.is_none()
+                && (expect_digest.is_some() || accept_synchronizer_change || debug_enclave)
+            {
+                return Err(CliError::Other(
+                    "--expect-digest, --accept-synchronizer-change and --debug-enclave need \
+                     --reproduce or --expect-pcrs"
+                        .into(),
+                ));
+            }
+            let result = upgrade::confirm_upgrade(
+                &client,
+                &enclave_id,
+                &upgrade_id,
+                valid_from,
+                target,
+            )
+            .await?;
             emit(json, &result, || print_upgrade_confirm(&result));
             Ok(())
         }
@@ -1505,17 +1591,24 @@ fn print_chain_link(link: &upgrade::VerifiedLink) {
             println!("      PCR0:        {}", p.pcrs.pcr0);
             println!("      PCR1:        {}", p.pcrs.pcr1);
             println!("      PCR2:        {}", p.pcrs.pcr2);
+            for line in upgrade::anti_rollback_lines(&p.anti_rollback) {
+                println!("      {line}");
+            }
         }
         Some(upgrade::DecodedPayload::Upgrade(p)) => {
             println!("      target:      {}", p.image_digest);
             println!("      valid_from:  {}", p.valid_from.format("%Y-%m-%d %H:%M:%S UTC"));
             println!("      issued_at:   {}", p.issued_at.format("%Y-%m-%d %H:%M:%S UTC"));
-            println!("      to.PCR0:     {}", p.to_pcrs.pcr0);
-            println!("      to.PCR1:     {}", p.to_pcrs.pcr1);
-            println!("      to.PCR2:     {}", p.to_pcrs.pcr2);
+            for line in upgrade::identity_lines("to.", &p.to) {
+                println!("      {line}");
+            }
         }
         Some(upgrade::DecodedPayload::Revocation(p)) => {
             println!("      revokes:     {}", p.revokes);
+            println!(
+                "      link hash:   {}",
+                p.revokes_link.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
             println!("      issued_at:   {}", p.issued_at.format("%Y-%m-%d %H:%M:%S UTC"));
         }
         None => {

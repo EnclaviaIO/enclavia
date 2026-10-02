@@ -9,12 +9,13 @@
 //!   CBOR-encoded [`Frame`].
 //! - First plaintext frame on the connection MUST be [`Frame::Authenticate`],
 //!   which carries the raw bytes of a Nitro NSM attestation document.
-//!   The listener calls
-//!   [`enclavia_protocol::attestation::verify_and_extract`] with the
-//!   Noise handshake hash as the expected nonce, derives
-//!   `PcrKey = SHA-256(PCR0||PCR1||PCR2)` from the verified document,
+//!   The listener validates it as a session document
+//!   ([`enclavia_protocol::attestation::UnvalidatedAttestation::validate_session`])
+//!   with the Noise handshake hash as the expected nonce, derives
+//!   `PcrKey = PinIdentity::key()` (PCR0-2 plus user PCRs 16-31, see
+//!   [`enclavia_protocol::pin_identity`]) from the verified document,
 //!   pulls the 65-byte SEC1 P-256 control pubkey out of the doc's
-//!   `user_data` (`AttestedIdentity::control_pubkey`), and binds the
+//!   `user_data` (`ValidatedAttestation::control_pubkey`), and binds the
 //!   session to that key for life.
 //! - The SERVER then authenticates back (#208): it requests a fresh NSM
 //!   document from its own `/dev/nsm` with `nonce = handshake_hash`
@@ -79,7 +80,8 @@
 use enclavia_protocol::{NoiseTransport, attestation, perform_handshake_as_responder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::wire::{Request, Response, RpcError};
+use crate::metrics::Answered;
+use crate::wire::{PeerProtocol, Request, Response, RpcError};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey};
 
 // Frame + MAX_FRAME_SIZE moved to `crate::wire` so the customer client
@@ -126,7 +128,8 @@ impl SessionAttestor for NsmSessionAttestor {
     async fn attest(&self, handshake_hash: &[u8]) -> Result<Vec<u8>, String> {
         let nonce = handshake_hash.to_vec();
         tokio::task::spawn_blocking(move || {
-            crate::mesh::attestation::request_own_attestation(Some(nonce), None)
+            attestation::ValidatedAttestation::request_local(Some(&nonce), None, None)
+                .map(attestation::ValidatedAttestation::into_bytes)
                 .map_err(|e| e.to_string())
         })
         .await
@@ -168,19 +171,21 @@ impl SessionAttestor for FakeSessionAttestor {
 /// control_pubkey, request)` triple here. The implementor owns whatever happens
 /// next (observe + apply locally, or route to the leader). The 65-byte
 /// `control_pubkey` is the session's announced
-/// `AttestedIdentity::control_pubkey`; the single-node path observes it before
+/// `ValidatedAttestation::control_pubkey`; the single-node path observes it before
 /// applying, and the replicated path carries it into the `ReplicatedOp` so
 /// followers can freeze / record it without re-attesting.
 #[async_trait::async_trait]
 pub trait SessionDispatch: Send + Sync {
     /// Handle one request from a session authenticated as `session_key` with
-    /// `control_pubkey`. Returns the wire [`Response`] to send back.
+    /// `control_pubkey`. Returns the wire [`Response`] to send back, plus
+    /// whether it is an `Unavailable` produced by an elapsed deadline (the
+    /// metrics count those separately; see [`Answered`]).
     async fn dispatch(
         &self,
         session_key: PcrKey,
         control_pubkey: [u8; CONTROL_PUBKEY_LEN],
         request: Request,
-    ) -> Response;
+    ) -> Answered;
 }
 
 /// The single-node [`Node`](crate::Node) is a [`SessionDispatch`]: it observes
@@ -194,9 +199,9 @@ impl SessionDispatch for crate::node::Node {
         session_key: PcrKey,
         control_pubkey: [u8; CONTROL_PUBKEY_LEN],
         request: Request,
-    ) -> Response {
+    ) -> Answered {
         self.observe_attestation(session_key, control_pubkey).await;
-        self.handle_request(session_key, request).await
+        Answered::new(self.handle_request(session_key, request).await)
     }
 }
 
@@ -219,7 +224,7 @@ pub enum ConnError {
     /// Attestation document failed validation, or did not bind to the
     /// Noise handshake hash via its `nonce` field.
     #[error("attestation: {0}")]
-    Attestation(String),
+    Attestation(attestation::AttestationError),
     /// Producing this node's OWN attestation document for the mandatory
     /// server-authentication step (#208) failed. The session cannot
     /// proceed unauthenticated, so the connection is torn down.
@@ -235,6 +240,17 @@ pub enum ConnError {
     /// Noise transport-mode encrypt or decrypt failed mid-session.
     #[error("noise crypto: {0}")]
     Crypto(String),
+}
+
+impl ConnError {
+    /// The classified cause when the connection was refused because the
+    /// customer's attestation document was rejected.
+    pub fn attestation_rejection(&self) -> Option<attestation::RejectionReason> {
+        match self {
+            ConnError::Attestation(e) => Some(e.reason()),
+            _ => None,
+        }
+    }
 }
 
 /// Drive one accepted connection to completion. Performs the Noise
@@ -278,7 +294,7 @@ where
     //    session is a NEW enclave submitting a Transition, the
     //    `new_key == session_key` and NewKeyNotAttested checks pass.
     //
-    //    The pubkey is `AttestedIdentity::control_pubkey` verbatim, the
+    //    The pubkey is `ValidatedAttestation::control_pubkey` verbatim, the
     //    same 65-byte uncompressed SEC1 ECDSA P-256 key (#21/#47) the
     //    `Transition` chain-link verifier checks the upgrade payload's
     //    signature against (it checks it against the OLD key's frozen
@@ -287,15 +303,33 @@ where
     //    credential IS the #47 upgrade link, so one P-256 key serves
     //    throughout.
     let (session_key, control_pubkey) = match read_frame(&mut stream, &mut transport).await? {
-        Some(Frame::Authenticate { nsm_doc }) => {
-            let identity = attestation::verify_and_extract(
-                &nsm_doc,
-                &handshake_hash,
-                attestation::VerificationMode::from_debug_flag(debug_mode),
-            )
-                .map_err(|e| ConnError::Attestation(e.to_string()))?;
-            let key = PcrKey(identity.pcrs.digest());
-            (key, identity.control_pubkey)
+        Some(Frame::Authenticate {
+            nsm_doc,
+            protocol_version,
+            capabilities,
+        }) => {
+            // What the client advertised, logged for diagnosis; see the wire
+            // module's "Versioning and capabilities".
+            let client_protocol = PeerProtocol::from_advertised(protocol_version, &capabilities);
+            tracing::debug!(
+                client_version = client_protocol.version,
+                capabilities = ?client_protocol.capabilities,
+                "customer session protocol"
+            );
+            crate::attest::validate_session(&nsm_doc, &handshake_hash, debug_mode)
+                .and_then(|doc| Ok((PcrKey(doc.identity().key()), doc.control_pubkey()?)))
+                .map_err(|e| {
+                    tracing::warn!(
+                        reason = %e.reason(),
+                        error = %e,
+                        "customer attestation rejected"
+                    );
+                    crate::metrics::record_rejection(
+                        crate::metrics::RejectionSource::Client,
+                        e.reason(),
+                    );
+                    ConnError::Attestation(e)
+                })?
         }
         Some(_) => return Err(ConnError::Protocol("first frame must be Authenticate")),
         None => return Ok(()),
@@ -316,12 +350,7 @@ where
         .attest(&handshake_hash)
         .await
         .map_err(ConnError::LocalAttestation)?;
-    write_cbor_frame(
-        &mut stream,
-        &mut transport,
-        &Frame::Authenticate { nsm_doc: own_doc },
-    )
-    .await?;
+    write_cbor_frame(&mut stream, &mut transport, &Frame::authenticate(own_doc)).await?;
 
     // 2. Subsequent frames: RPC dispatch. The dispatcher owns observing the
     //    attestation (single-node) / carrying the verified facts to the leader
@@ -344,10 +373,15 @@ where
             }
         };
 
-        let response = dispatch
+        let kind = crate::metrics::RpcKind::of_request(&request);
+        let started = std::time::Instant::now();
+        let answered = dispatch
             .dispatch(session_key, control_pubkey, request)
             .await;
-        write_response(&mut stream, &mut transport, &response).await?;
+        crate::metrics::global()
+            .rpc
+            .record_answered(kind, &answered, started.elapsed());
+        write_response(&mut stream, &mut transport, &answered.response).await?;
     }
 
     Ok(())
@@ -432,11 +466,13 @@ mod tests {
     use crate::node::Node;
     use crate::wire::{ChainLink, ChainLinkKind, UpgradePayload};
     use crate::{Commitment, Version};
-    use enclavia_protocol::attestation::test_utils::{FakeAttestation, FakeChainAttestation};
+    use enclavia_protocol::attestation::test_utils::{
+        FakeAttestation, FakeChainAttestation, identity_from_seed,
+    };
     use enclavia_protocol::attestation::{CONTROL_PUBKEY_LEN, Pcrs};
-    use enclavia_protocol::chain::PcrsHex;
     use enclavia_protocol::perform_handshake_as_initiator;
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use enclavia_protocol::signing::{SignedDomain, sign_control};
+    use p256::ecdsa::SigningKey;
     use std::sync::Arc;
     use tokio::io::duplex;
 
@@ -464,30 +500,18 @@ mod tests {
         (sk, pk)
     }
 
-    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-        PcrsHex {
-            pcr0: hex::encode(vec![seed; 48]),
-            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-        }
-    }
-
-    /// The PcrKey a seed's PcrsHex hashes to. Matches both `FakeAttestation::
-    /// with_seed(seed)`'s PCRs and `verify_transition_link`'s derivation.
+    /// The PcrKey of a seed's identity. Matches both `FakeAttestation::
+    /// with_seed(seed)` (no user PCRs) and `verify_transition_link`'s
+    /// derivation.
     fn key_from_seed(seed: u8) -> PcrKey {
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        PcrKey(raw.digest())
+        PcrKey(identity_from_seed(seed).key())
     }
 
     /// Build a [`Frame::Authenticate`] from a [`FakeAttestation`] whose
     /// nonce is the supplied handshake hash and whose `user_data` carries a
     /// real 65-byte SEC1 P-256 pubkey, so a Transition link signed by the
-    /// matching key verifies. The session key is `sha256` over the seed's
-    /// PCR triple, equal to `key_from_seed(seed)`.
+    /// matching key verifies. The session key is the seed identity's key,
+    /// `key_from_seed(seed)`.
     fn auth_frame(
         seed: u8,
         handshake_hash: &[u8],
@@ -495,12 +519,7 @@ mod tests {
     ) -> (Frame, PcrKey) {
         let fake = FakeAttestation::with_seed_and_pubkey(seed, handshake_hash.to_vec(), pubkey);
         let key = key_from_seed(seed);
-        (
-            Frame::Authenticate {
-                nsm_doc: fake.encode(),
-            },
-            key,
-        )
+        (Frame::authenticate(fake.encode()), key)
     }
 
     /// Build a #47 upgrade chain link `from_seed -> to_seed`, signed by the
@@ -510,29 +529,30 @@ mod tests {
     fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
             valid_from: chrono::Utc::now(),
+            valid_until: chrono::Utc::now() + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
     /// Register an OLD enclave's key into a shared node: attest it with the
-    /// supplied control pubkey and Pin it so its `KeyState.control_pubkey`
+    /// supplied control pubkey and Register it so its `KeyState.control_pubkey`
     /// is frozen. Models the old enclave's earlier (now-stopped) session.
     async fn register_old(
         node: &Node,
@@ -543,9 +563,8 @@ mod tests {
         node.observe_attestation(key_old, control_pubkey).await;
         node.handle_request(
             key_old,
-            Request::Pin {
+            Request::Register {
                 key: key_old,
-                expected_version: crate::Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -606,7 +625,14 @@ mod tests {
         let pt_len = transport.read_message(&ciphertext, &mut plaintext).unwrap();
         let frame: Frame = ciborium::from_reader(&plaintext[..pt_len]).unwrap();
         match frame {
-            Frame::Authenticate { nsm_doc } => {
+            Frame::Authenticate {
+                nsm_doc,
+                protocol_version,
+                capabilities,
+            } => {
+                // The server always advertises its version and capabilities.
+                assert_eq!(protocol_version, crate::wire::PROTOCOL_VERSION);
+                assert_eq!(capabilities, crate::wire::supported_capabilities());
                 let expected = Pcrs {
                     pcr0: vec![SERVER_SEED; 48],
                     pcr1: vec![SERVER_SEED.wrapping_add(1); 48],
@@ -653,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_authenticate_pin_get() {
+    async fn happy_path_authenticate_register_get() {
         let (mut client, mut ct, hash, server_task) = connect().await;
 
         let (_, pk) = keypair(0x11);
@@ -666,21 +692,15 @@ mod tests {
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Pin {
+                request: Request::Register {
                     key,
-                    expected_version: crate::Version(0),
                     commitment: c(0xaa),
                 },
             },
         )
         .await;
         let resp = read_response(&mut client, &mut ct).await;
-        assert_eq!(
-            resp,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
+        assert_eq!(resp, Response::RegisterOk);
 
         write_frame(
             &mut client,
@@ -775,6 +795,10 @@ mod tests {
             matches!(result, Err(ConnError::Attestation(_))),
             "expected Attestation error, got {result:?}"
         );
+        assert_eq!(
+            result.unwrap_err().attestation_rejection(),
+            Some(attestation::RejectionReason::NonceMismatch)
+        );
     }
 
     /// Random bytes that are not a valid NSM document are rejected.
@@ -785,9 +809,7 @@ mod tests {
         write_frame(
             &mut client,
             &mut ct,
-            &Frame::Authenticate {
-                nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
-            },
+            &Frame::authenticate(vec![0xde, 0xad, 0xbe, 0xef]),
         )
         .await;
         drop(client);
@@ -796,6 +818,10 @@ mod tests {
         assert!(
             matches!(result, Err(ConnError::Attestation(_))),
             "expected Attestation error, got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap_err().attestation_rejection(),
+            Some(attestation::RejectionReason::Malformed)
         );
     }
 
@@ -881,9 +907,7 @@ mod tests {
         write_frame(
             &mut client,
             &mut ct,
-            &Frame::Authenticate {
-                nsm_doc: vec![0xde, 0xad, 0xbe, 0xef],
-            },
+            &Frame::authenticate(vec![0xde, 0xad, 0xbe, 0xef]),
         )
         .await;
 
@@ -927,6 +951,82 @@ mod tests {
 
         drop(client);
         let _ = server_task.await.unwrap();
+    }
+
+    /// Open a session on `node` as an enclave with image `seed` and PCR16 =
+    /// `pcr16`, send one RPC and return the response and the session key.
+    async fn rpc_as_user_pcr_enclave(
+        node: &Arc<Node>,
+        seed: u8,
+        pcr16: u8,
+        request: impl FnOnce(PcrKey) -> Request,
+    ) -> (Response, PcrKey) {
+        let (mut client, mut ct, hash, server_task) = connect_with_node(node.clone()).await;
+        let (_, pk) = keypair(pcr16);
+        let fake = FakeAttestation::with_seed_and_pubkey(seed, hash.clone(), pk)
+            .with_user_pcr(16, vec![pcr16; 48]);
+        let mut user = enclavia_protocol::pin_identity::ZERO_USER_PCRS;
+        user[0] = [pcr16; 48];
+        let key = PcrKey(identity_from_seed(seed).with_user_pcrs(user).key());
+        write_frame(&mut client, &mut ct, &Frame::authenticate(fake.encode())).await;
+        read_and_verify_server_auth(&mut client, &mut ct, &hash).await;
+        write_frame(
+            &mut client,
+            &mut ct,
+            &Frame::Rpc {
+                request: request(key),
+            },
+        )
+        .await;
+        let resp = read_response(&mut client, &mut ct).await;
+        drop(client);
+        let _ = server_task.await.unwrap();
+        (resp, key)
+    }
+
+    /// Two enclaves built from the same image (identical PCR0-2) but with
+    /// different PCR16 get different pin slots: one's pin is invisible to,
+    /// and unreachable from, the other.
+    #[tokio::test]
+    async fn same_image_different_user_pcr_gets_its_own_pin_slot() {
+        let node = Arc::new(Node::with_debug_mode(true));
+        let register = |commitment: Commitment| move |key| Request::Register { key, commitment };
+
+        let (resp, key_a) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, register(c(0xaa))).await;
+        assert_eq!(resp, Response::RegisterOk);
+
+        // Enclave B: same image, other PCR16. Its own slot is empty...
+        let (resp, key_b) =
+            rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, |key| Request::Get { key }).await;
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_b, key_from_seed(0x5c));
+        assert_eq!(
+            resp,
+            Response::Err {
+                error: RpcError::NotFound
+            }
+        );
+        // ...it cannot read A's...
+        let (resp, _) =
+            rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, |_| Request::Get { key: key_a }).await;
+        assert_eq!(
+            resp,
+            Response::Err {
+                error: RpcError::Unauthorized
+            }
+        );
+        // ...and registering its own first version does not touch A's.
+        let (resp, _) = rpc_as_user_pcr_enclave(&node, 0x5c, 0xb2, register(c(0xbb))).await;
+        assert_eq!(resp, Response::RegisterOk);
+        let (resp, _) =
+            rpc_as_user_pcr_enclave(&node, 0x5c, 0xa1, |key| Request::Get { key }).await;
+        assert_eq!(
+            resp,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
+            }
+        );
     }
 
     /// End-to-end success: the OLD enclave (0x77) is already registered

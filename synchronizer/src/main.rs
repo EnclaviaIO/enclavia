@@ -7,8 +7,9 @@
 //! follows the same pattern):
 //!
 //! - `debug` listens on a Unix domain socket (env: `LISTEN_PATH`). The
-//!   attestation verifier uses the `decode_attestation_document` debug
-//!   path (skip cert chain), matching what QEMU's self-signing NSM emits.
+//!   attestation verifier skips the certificate chain (the
+//!   `dangerous-skip-chain` validation), matching what QEMU's self-signing
+//!   NSM emits.
 //! - `enclave` listens on vsock (env: `VSOCK_PORT`, default
 //!   [`SYNCHRONIZER_CLIENT_PORT`] = 5010). The verifier requires a full
 //!   Nitro CA-chain-signed attestation document.
@@ -126,15 +127,16 @@ struct MeshEnv {
 ///
 /// ## Self-PCR digest: derived from `/dev/nsm`, never from the host
 ///
-/// The self-PCR allowlist admits a peer only when the peer's attested PCR
-/// digest equals THIS node's own image measurements. Those measurements are
-/// obtained here by requesting a fresh attestation document from the node's own
-/// `/dev/nsm` (with an arbitrary nonce / user_data, since there is no session or
-/// peer to bind to) and reading back PCR0/1/2 with
-/// [`extract_own_pcrs`](enclavia_protocol::attestation::extract_own_pcrs). The
-/// host is the adversary: a host-supplied digest (the old `MESH_SELF_PCR*` env
-/// vars) would let it choose an allowlist that admits a rogue image into the
-/// mesh and Raft. The local NSM device is inside the node's TCB and measures
+/// The self-PCR allowlist admits a peer only when the peer's attested identity
+/// key equals THIS node's own. That key is obtained here by requesting a fresh
+/// attestation document from the node's own `/dev/nsm` (with an arbitrary nonce
+/// / user_data, since there is no session or peer to bind to) and reading back
+/// its pin identity (PCR0-2 plus user PCRs 16-31, the same derivation the
+/// listener applies to customers) from the
+/// [`ValidatedAttestation`](enclavia_protocol::attestation::ValidatedAttestation)
+/// that `request_local` returns. The host is the adversary: a host-supplied
+/// digest (the old `MESH_SELF_PCR*` env vars) would let it choose an allowlist
+/// that admits a rogue image into the mesh and Raft. The local NSM device is inside the node's TCB and measures
 /// this exact VM identically on real Nitro and under QEMU's nitro-enclave
 /// machine, so no cert-chain trust is needed (the node is reading its own
 /// hardware, not authenticating a remote party). If the NSM request or parse
@@ -142,10 +144,9 @@ struct MeshEnv {
 /// config is refused with a loud error log (fatal in a `raft` build).
 #[cfg(any(feature = "mesh", feature = "raft"))]
 fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
-    use enclavia_protocol::attestation::extract_own_pcrs;
+    use enclavia_protocol::attestation::ValidatedAttestation;
     use enclavia_protocol::mesh::{MESH_VSOCK_PORT, SYNCHRONIZER_BOOTSTRAP_PORT};
     use synchronizer::PcrKey;
-    use synchronizer::mesh::attestation::request_own_attestation;
     use synchronizer::mesh::config::MeshConfig;
     use synchronizer::mesh::identity::MeshIdentity;
     use synchronizer::mesh::transport::{VsockMeshAcceptor, VsockMeshDialer};
@@ -177,24 +178,17 @@ fn read_mesh_env(host_cid: u32) -> Option<MeshEnv> {
     }
 
     // Self-attestation: request a document from our own /dev/nsm and read back
-    // our hardware-measured PCRs. nonce/user_data are irrelevant here (no
+    // our hardware-measured identity. nonce/user_data are irrelevant here (no
     // session, no peer to bind to), so we pass placeholders. No env fallback on
     // failure: the host must not be able to pick this digest.
-    let self_doc = match request_own_attestation(None, None) {
+    let self_doc = match ValidatedAttestation::request_local(None, None, None) {
         Ok(doc) => doc,
         Err(e) => {
             error!(error = %e, "self-attestation from /dev/nsm failed; refusing the mesh config");
             return None;
         }
     };
-    let self_pcrs = match extract_own_pcrs(&self_doc) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(error = %e, "failed to parse own /dev/nsm attestation document; refusing the mesh config");
-            return None;
-        }
-    };
-    let self_digest = PcrKey(self_pcrs.digest());
+    let self_digest = PcrKey(self_doc.identity().key());
     info!("derived self-PCR digest from /dev/nsm for the mesh allowlist");
 
     let config = MeshConfig::new(self_name.clone(), peers, self_digest);
@@ -400,8 +394,50 @@ async fn start_replicated_from_env(host_cid: u32) -> Option<(
     Some((mesh, raft, dispatch))
 }
 
+/// Start the one-way metrics exporter (see [`synchronizer::metrics`]).
+///
+/// `enclave` builds deliver to the parent on vsock
+/// [`SYNCHRONIZER_METRICS_PORT`](enclavia_protocol::synchronizer_metrics::SYNCHRONIZER_METRICS_PORT).
+/// The `debug` dev listener delivers to the Unix socket named by
+/// `METRICS_UDS_PATH`, and exports nothing when it is unset. The exporter
+/// runs on its own task for the life of the process; a missing receiver only
+/// drops samples.
+#[cfg(feature = "raft")]
+fn start_metrics_exporter(
+    raft: &synchronizer::raft::RaftHandle,
+    mesh: &Arc<synchronizer::mesh::Mesh>,
+    host_cid: u32,
+    started: std::time::Instant,
+) {
+    use synchronizer::metrics::{MetricsSink, ReplicatedCollector, spawn_replicated_exporter};
+
+    #[cfg(feature = "enclave")]
+    let sink = Some(MetricsSink::Vsock {
+        cid: host_cid,
+        port: enclavia_protocol::synchronizer_metrics::SYNCHRONIZER_METRICS_PORT,
+    });
+    #[cfg(feature = "debug")]
+    let sink = {
+        let _ = host_cid;
+        std::env::var_os("METRICS_UDS_PATH").map(|p| MetricsSink::Uds(p.into()))
+    };
+
+    match sink {
+        Some(sink) => {
+            info!(sink = ?sink, "starting metrics exporter");
+            let collector = ReplicatedCollector::new(raft.clone(), Arc::clone(mesh), started);
+            // Detached: the task runs for the life of the runtime.
+            drop(spawn_replicated_exporter(collector, sink));
+        }
+        None => info!("metrics exporter disabled (no sink configured)"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "raft")]
+    let started = std::time::Instant::now();
+
     // Cap `openraft` at WARN, even when RUST_LOG is set (the enclave init
     // exports RUST_LOG=info): stdout is the emulated serial console inside
     // the guest, where a write is a vmexit storm. openraft's snapshot path
@@ -444,6 +480,7 @@ async fn main() {
         match start_replicated_from_env(host_cid).await {
             Some((mesh, raft, replicated)) => {
                 info!("serving customer RPC through the replicated cluster");
+                start_metrics_exporter(&raft, &mesh, host_cid, started);
                 (Arc::new(replicated), mesh, raft)
             }
             None => {

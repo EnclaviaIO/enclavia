@@ -3,9 +3,9 @@
 //! Maps a customer enclave's [`wire::Request`] onto the Raft layer. This is the
 //! replicated successor to the single-node [`Node`](crate::Node): instead of
 //! mutating one in-memory [`StateMachine`](crate::StateMachine) behind a Mutex,
-//! it submits verified [`ReplicatedOp`]s through
-//! [`RaftHandle::client_write_durable`] (which replicates them to EVERY node
-//! before ACKing, see "Full-replication ACK" below) and serves reads through
+//! it submits verified [`ReplicatedOp`]s through [`RaftHandle::client_write`]
+//! (which ACKs once the entry is committed on a quorum of voters, see
+//! "Majority ACK" below) and serves reads through
 //! [`RaftHandle::linearizable_get`] (which refuses to answer off a stale
 //! follower).
 //!
@@ -28,7 +28,7 @@
 //!
 //! ## Leader-only writes + linearizable reads
 //!
-//! Both `client_write_durable` and `linearizable_get` are leader-only by
+//! Both `client_write` and `linearizable_get` are leader-only by
 //! construction: openraft rejects a write on a follower (`ForwardToLeader`) and
 //! refuses to confirm linearizability off a non-leader. So [`handle_on_leader`]
 //! only ever succeeds when this node is the leader; a non-leader's caller must
@@ -36,27 +36,37 @@
 //! [`super::forward`]). The freshness-oracle rule, never serve a stale read,
 //! falls out of using `linearizable_get` for every `Get`.
 //!
-//! ## Full-replication ACK
+//! ## Majority ACK
 //!
-//! Writes (`Pin` / `Register` / `Transition`) go through
-//! [`RaftHandle::client_write_durable`], NOT the majority-ACK
-//! [`RaftHandle::client_write`]. A Raft commit is a majority (2 of 3): an entry
-//! can be majority-committed (and ACKed) while the third node never saw it, and
-//! with no persistence that is a bounded rollback window a freshness oracle must
-//! not have (re-seeding from the wrong survivor after a catastrophic loss would
-//! drop the most recent pins, see the [`crate::raft`] module docs). So a client
-//! write is ACKed only after EVERY node holds the entry. The price: while any
-//! single node is down, writes stall and fail with
-//! [`RpcError::Unavailable`] (mapped from
-//! [`RaftHandleError::NotFullyReplicated`]) until the cluster is whole; the
-//! client retries (at-least-once: a duplicate Pin is recovered via the
-//! `VersionConflict` Get-disambiguation — the earlier attempt committed — a
-//! duplicate
-//! Transition surfaces `TransitionRejected` and the client confirms via `Get`).
-//! Linearizable reads are unaffected: they still need only a fresh quorum.
+//! Writes (`Register` / `Pin` / `Transition` / `Revoke`) are ACKed once
+//! [`RaftHandle::client_write`] returns, i.e. once the entry is committed on a
+//! quorum of voters (2 of 3) and applied on the leader. That ACK survives the
+//! loss of any single node; the argument is in the [`crate::raft`] module docs'
+//! "Majority ACK" section. One node down therefore does not stop writes. Losing
+//! quorum does: openraft cannot commit, and after
+//! [`COMMIT_TIMEOUT`](crate::raft::COMMIT_TIMEOUT) the client gets
+//! [`RpcError::Unavailable`] rather than an ACK.
+//!
+//! ## `Unavailable` after a write means "outcome unknown"
+//!
+//! A write that timed out stays in the leader's log and may still commit. The
+//! answer is therefore never "not applied", and the client must treat it as
+//! "maybe applied". It does: a retried Pin names the same `expected_version`,
+//! so if the first attempt committed the retry fails the compare-and-swap with
+//! `VersionConflict`, and the client's `Get` finds its own commitment; a
+//! retried Register fails with `AlreadyRegistered` and is resolved the same
+//! way; a
+//! retried Transition or Revoke is rejected or idempotent in the same way, and
+//! the client confirms with `Get`. Timed-out writes are not retried on the
+//! server side (see [`super::forward`]), so a lost quorum does not pile up
+//! duplicate entries.
 
+use crate::metrics::Answered;
 use crate::raft::{RaftHandle, RaftHandleError, ReplicatedOp};
-use crate::wire::{Request, Response, RpcError, decode_transition_link, verify_transition_link};
+use crate::wire::{
+    Request, Response, RpcError, decode_transition_link, verify_revocation_link,
+    verify_transition_link,
+};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
 
 /// Run one client [`Request`] from a session authenticated as `session_key`
@@ -71,35 +81,78 @@ use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
 /// fails because this node is not the leader / quorum is lost surfaces as
 /// [`RpcError::Unavailable`]; the caller (the listener on a node that thought it
 /// was leader but raced a step-down) should not normally see it because it only
-/// calls this after `is_leader`, but it is mapped defensively. The
-/// non-leader-forwarding path lives in [`super::forward`].
+/// calls this after `is_leader`, but it is mapped defensively. When no quorum
+/// answers within the commit timeout the response is also `Unavailable`, with
+/// [`Answered::timed_out`] set: the write's outcome is unknown and the caller
+/// must not resubmit it. The non-leader-forwarding path lives in
+/// [`super::forward`].
 pub async fn handle_on_leader(
     raft: &RaftHandle,
     session_key: PcrKey,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     req: Request,
     debug_mode: bool,
-) -> Response {
+) -> Answered {
     match req {
         Request::Get { key } => handle_get(raft, session_key, key).await,
+        Request::Register { key, commitment } => {
+            handle_register(raft, session_key, key, commitment, control_pubkey).await
+        }
         Request::Pin {
             key,
             expected_version,
             commitment,
-        } => {
-            handle_pin(
-                raft,
-                session_key,
-                key,
-                expected_version,
-                commitment,
-                control_pubkey,
-            )
-            .await
-        }
+        } => handle_pin(raft, session_key, key, expected_version, commitment).await,
         Request::Transition { link } => {
             handle_transition(raft, session_key, control_pubkey, link, debug_mode).await
         }
+        Request::Revoke { link } => handle_revoke(raft, session_key, link).await,
+    }
+}
+
+/// Verify a `Revoke`'s revocation chain link and submit a
+/// [`ReplicatedOp::Revoke`] for the session's own key.
+///
+/// The session must hold the pin: its key must be registered in the replicated
+/// state, and the link must carry the control signature of that key's FROZEN
+/// pubkey ([`verify_revocation_link`]). The lookup reads the leader-local state
+/// for the pubkey only; the committed `apply` checks again that the key is
+/// still current. Anything but `RevokeOk` means the revocation did not take
+/// effect, except a timed-out `Unavailable`, whose outcome is unknown (a
+/// revocation is idempotent, so the client simply retries).
+async fn handle_revoke(
+    raft: &RaftHandle,
+    session_key: PcrKey,
+    link: crate::wire::ChainLink,
+) -> Answered {
+    let control_pubkey = match raft.state_machine().get(&session_key).await {
+        Some(state) => state.control_pubkey,
+        None => return err(RpcError::RevocationRejected),
+    };
+    let verified = match verify_revocation_link(&link, &control_pubkey) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "revocation link rejected");
+            return err(RpcError::RevocationRejected);
+        }
+    };
+    match raft
+        .client_write(ReplicatedOp::Revoke {
+            key: session_key,
+            link_hash: verified.link_hash,
+        })
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                link_hash = %hex_of(&verified.link_hash),
+                "upgrade link out of the session key revoked"
+            );
+            Answered::new(Response::RevokeOk)
+        }
+        Err(RaftHandleError::Rejected(_)) => err(RpcError::RevocationRejected),
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("revoke"),
+        Err(_) => err(RpcError::Unavailable),
     }
 }
 
@@ -107,136 +160,101 @@ pub async fn handle_on_leader(
 /// so this uses [`RaftHandle::linearizable_get`] (leader + fresh quorum) and
 /// NEVER a follower-local read. The redundant `key` must match the session's
 /// bound key (belt-and-braces, same as the single-node path).
-async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Response {
+async fn handle_get(raft: &RaftHandle, session_key: PcrKey, key: PcrKey) -> Answered {
     if key != session_key {
         return err(RpcError::Unauthorized);
     }
     match raft.linearizable_get(&key).await {
-        Ok(Some(state)) => Response::GetOk {
+        Ok(Some(state)) => Answered::new(Response::GetOk {
             commitment: state.commitment,
             version: state.version,
-        },
+        }),
         Ok(None) => err(RpcError::NotFound),
         // Not the leader / quorum lost: cannot guarantee freshness. The caller
         // forwards to the leader before reaching here, so on the leader this is
         // a transient quorum loss the client retries.
-        Err(RaftHandleError::NotLinearizable(_)) => err(RpcError::Unavailable),
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("get"),
         Err(_) => err(RpcError::Unavailable),
     }
 }
 
-/// Map the single wire `Pin` RPC onto a replicated `Register` (first pin) or
-/// `Pin` (re-pin), deciding from the CURRENT leader state (the replicated state
-/// machine), then submit it.
+/// Submit a replicated `Register` for the session's own key.
 ///
-/// The `expected_version` compare-and-swap guard is enforced by the pure
-/// core's deterministic `apply` on the committed entry (identically on every
-/// replica), never by this pre-check: it is what stops two live writers for
-/// one key (a host-booted clone pair shares the image's PCRs) from forking
-/// the pinned history — the loser's first divergent pin is rejected with
-/// `VersionConflict` instead of silently last-write-winning. For a first
-/// pin the op maps to `Register`, which is inherently a CAS on
-/// non-existence, so the guard is ignored there.
+/// The client sends it only from its boot decision, for a blank volume the
+/// oracle does not know. The pure core's `apply` decides on the committed
+/// entry, identically on every replica: a key already registered is
+/// rejected [`ValidationError::AlreadyRegistered`] (the client then checks
+/// with a `Get` whether that registration was its own earlier attempt), a
+/// retired key [`ValidationError::KeyRetired`]. The session's control
+/// pubkey is the one frozen for the key.
+async fn handle_register(
+    raft: &RaftHandle,
+    session_key: PcrKey,
+    key: PcrKey,
+    commitment: crate::Commitment,
+    control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+) -> Answered {
+    if key != session_key {
+        return err(RpcError::Unauthorized);
+    }
+    match raft
+        .client_write(ReplicatedOp::Register {
+            key,
+            commitment,
+            control_pubkey,
+        })
+        .await
+    {
+        Ok(_) => Answered::new(Response::RegisterOk),
+        Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
+        // No quorum within the bound: the entry may still commit, so the
+        // answer is "outcome unknown", never an ACK.
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("register"),
+        // Not the leader any more / quorum lost: the write is not known to
+        // be committed on a quorum, so the oracle must not ACK it.
+        Err(_) => err(RpcError::Unavailable),
+    }
+}
+
+/// Submit a replicated compare-and-swap `Pin` for a registered key.
 ///
-/// ## The concurrent-first-pin race
-///
-/// Two enclaves cannot share a `PcrKey` (it is the SHA-256 of their PCR triple),
-/// so a key is only ever pinned by one identity. But the SAME enclave can hold
-/// two sessions (e.g. a client retry that overlaps the original), and both can
-/// observe the key as unregistered and submit `Register`. Only one such
-/// `Register` commits; the other is applied as a committed entry that the pure
-/// core deterministically rejects with [`ValidationError::AlreadyRegistered`]
-/// (the rejection replicates identically on every node). That losing `Register`
-/// is a benign race, not a client error: the key IS now registered, so we retry
-/// it ONCE as a `Pin`, which is exactly what the client wanted (write a fresh
-/// commitment). A second `AlreadyRegistered` cannot happen (the key is live and
-/// `Pin` does not check registration that way), so one retry is sufficient and
-/// bounded.
+/// The `expected_version` guard is enforced by the pure core's deterministic
+/// `apply` on the committed entry (identically on every replica): it is what
+/// stops two live writers for one key (a host-booted clone pair shares the
+/// image's PCRs) from forking the pinned history, since the loser's first
+/// divergent pin is rejected with `VersionConflict` instead of silently
+/// last-write-winning. A key the replicated state does not hold is
+/// [`ValidationError::KeyNotCurrent`], answered `NotFound`: a Pin never
+/// registers, so a client whose key is unknown here (a cluster that lost
+/// its state, or another cluster altogether) is told so instead of having
+/// a fresh history started for it.
 async fn handle_pin(
     raft: &RaftHandle,
     session_key: PcrKey,
     key: PcrKey,
     expected_version: crate::Version,
     commitment: crate::Commitment,
-    control_pubkey: [u8; CONTROL_PUBKEY_LEN],
-) -> Response {
+) -> Answered {
     if key != session_key {
         return err(RpcError::Unauthorized);
     }
-
-    // Decide Register vs Pin from the leader's LOCAL applied state. This used
-    // to be a `linearizable_get`, which costs a full ReadIndex quorum round on
-    // the mesh per Pin; that made the pre-check the most expensive part of the
-    // steady-state Pin path. The local read is safe because the decision is
-    // only a HINT: the authoritative check is the deterministic pure-core
-    // `apply` on the committed entry, and both stale directions are handled:
-    //
-    // * Local "unregistered" but actually registered (another session's
-    //   Register raced us): the committed `Register` is rejected
-    //   `AlreadyRegistered` and retried ONCE as a `Pin` below (pre-existing
-    //   path).
-    // * Local "registered" is always a committed fact (applied state is a
-    //   prefix of committed history), and a live key only leaves via that same
-    //   enclave's `Transition`; a Pin racing its own retirement surfaces the
-    //   core's rejection, exactly as it would have with the linearized read.
-    let is_registered = raft.state_machine().get(&key).await.is_some();
-
-    let first_op = if is_registered {
-        ReplicatedOp::Pin {
+    match raft
+        .client_write(ReplicatedOp::Pin {
             key,
             expected_version,
             commitment,
-        }
-    } else {
-        ReplicatedOp::Register {
-            key,
-            commitment,
-            control_pubkey,
-        }
-    };
-
-    match raft.client_write_durable(first_op).await {
-        Ok(state) => Response::PinOk {
+        })
+        .await
+    {
+        Ok(state) => Answered::new(Response::PinOk {
             version: state.version,
-        },
-        // Concurrent first-pin race: our Register lost to another session's
-        // Register for the same key. The key is now registered, so retry ONCE
-        // as a Pin (bounded, deterministic: a live key's Pin cannot itself hit
-        // AlreadyRegistered).
-        //
-        // The retried Pin carries the caller's `expected_version`, which the
-        // CAS then enforces against the just-registered key. This is only
-        // reachable in the concurrent-first-pin race (the wire has one Pin
-        // RPC for both Register and re-pin), and it is contained: both
-        // racers booted from the same snapshot, so their commitments are
-        // identical in practice; even in the divergent case the fallback
-        // pin wins the CAS (v0 matches) but the loser's client sees
-        // `version != 0` and fail-stops, and the "winner"'s next pin hits
-        // VersionConflict with a foreign commitment and fail-stops too —
-        // conservative stop on both sides, never a silent rollback.
-        Err(RaftHandleError::Rejected(ValidationError::AlreadyRegistered)) => {
-            match raft
-                .client_write_durable(ReplicatedOp::Pin {
-                    key,
-                    expected_version,
-                    commitment,
-                })
-                .await
-            {
-                Ok(state) => Response::PinOk {
-                    version: state.version,
-                },
-                Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-                // NotFullyReplicated and any other write failure: a node is down
-                // or quorum was lost, so we cannot confirm the write reached
-                // every replica. Surface Unavailable rather than a false ACK.
-                Err(_) => err(RpcError::Unavailable),
-            }
-        }
+        }),
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-        // Covers NotFullyReplicated (write committed on a majority but not on
-        // every node) and Raft errors (not leader / quorum lost): the freshness
-        // oracle must not ACK a write it cannot guarantee on all replicas.
+        // No quorum within the bound: the entry may still commit, so the
+        // answer is "outcome unknown", never an ACK.
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("pin"),
+        // Raft errors (not the leader any more / quorum lost): the write is not
+        // known to be committed on a quorum, so the oracle must not ACK it.
         Err(_) => err(RpcError::Unavailable),
     }
 }
@@ -251,7 +269,8 @@ async fn handle_pin(
 /// 2. Look up `old_key`'s FROZEN control pubkey in the replicated state machine
 ///    (`state_machine().get(old_key)`); a transition can only retire a live key.
 /// 3. `verify_transition_link` against that frozen pubkey + the session key
-///    (the NEW enclave submits, so `new_key == session_key`).
+///    (the NEW enclave submits, so `new_key == session_key`), with the
+///    leader's own NSM time as `now` for the payload's `valid_from` gate.
 /// 4. Submit `ReplicatedOp::Transition { old_key, new_key, new_control_pubkey:
 ///    control_pubkey }`, where `control_pubkey` is the submitting (new-enclave)
 ///    session's announced key. The verifier requires `new_key == session_key`,
@@ -273,7 +292,7 @@ async fn handle_transition(
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     link: crate::wire::ChainLink,
     debug_mode: bool,
-) -> Response {
+) -> Answered {
     // Phase one: structurally decode the (still-untrusted) link.
     let decoded = match decode_transition_link(&link) {
         Ok(d) => d,
@@ -288,17 +307,43 @@ async fn handle_transition(
         None => return err(RpcError::TransitionRejected),
     };
 
+    // Trusted time for the link's `valid_from` gate: the leader's own NSM
+    // timestamp, never its system clock. Without it the gate cannot be
+    // evaluated, so the transition is refused (retryable).
+    let now_ms = match crate::trusted_time::now_ms().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "transition refused: trusted time unavailable");
+            return err(RpcError::Unavailable);
+        }
+    };
+
     // Phase two: cryptographically verify the link against old_key's frozen
-    // pubkey and the submitting session key.
+    // pubkey and the submitting session key, and check that its `valid_from`
+    // has been reached.
     let verified = match verify_transition_link(
         &link,
         decoded,
         session_key,
         &old_control_pubkey,
         debug_mode,
+        now_ms,
     ) {
         Ok(v) => v,
-        Err(_) => return err(RpcError::TransitionRejected),
+        Err(e) => {
+            if let Some(reason) = e.attestation_reason() {
+                crate::metrics::record_rejection(
+                    crate::metrics::RejectionSource::TransitionLink,
+                    reason,
+                );
+            }
+            tracing::warn!(
+                reason = e.attestation_reason().map(|r| r.as_str()),
+                error = %e,
+                "transition link rejected"
+            );
+            return err(RpcError::TransitionRejected);
+        }
     };
 
     // The submitting (NEW enclave) session's announced control pubkey: the
@@ -307,29 +352,46 @@ async fn handle_transition(
     // record it (observe_attestation) before applying the Transition so the pure
     // core's NewKeyNotAttested check passes.
     match raft
-        .client_write_durable(ReplicatedOp::Transition {
+        .client_write(ReplicatedOp::Transition {
             old_key: verified.old_key,
             new_key: verified.new_key,
             new_control_pubkey: control_pubkey,
+            link_hash: verified.link_hash,
         })
         .await
     {
-        Ok(state) => Response::TransitionOk {
+        Ok(state) => Answered::new(Response::TransitionOk {
             version: state.version,
-        },
+        }),
         // KeyNotCurrent from a Transition means the old key isn't registered:
         // a transition rejection, not a Get-style NotFound.
         Err(RaftHandleError::Rejected(ValidationError::KeyNotCurrent)) => {
             err(RpcError::TransitionRejected)
         }
         Err(RaftHandleError::Rejected(e)) => err(RpcError::from(e)),
-        // NotFullyReplicated (majority-committed but a node is behind) or a Raft
-        // error (not leader / quorum lost): cannot confirm the transition on
-        // every replica, so do not ACK it.
+        // No quorum within the bound: the transition may still commit.
+        Err(RaftHandleError::CommitTimeout(_)) => timed_out("transition"),
+        // Raft error (not the leader any more / quorum lost): the transition is
+        // not known to be committed on a quorum, so do not ACK it.
         Err(_) => err(RpcError::Unavailable),
     }
 }
 
-fn err(error: RpcError) -> Response {
-    Response::Err { error }
+fn err(error: RpcError) -> Answered {
+    Answered::new(Response::Err { error })
+}
+
+/// `Unavailable` after the commit timeout. For a write the outcome is
+/// unknown, which is what the flag records.
+fn timed_out(op: &'static str) -> Answered {
+    tracing::warn!(
+        op,
+        "no quorum within the commit timeout; answering Unavailable (a write may still commit)"
+    );
+    Answered::deadline_elapsed()
+}
+
+/// Lowercase hex, for logging a link hash.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

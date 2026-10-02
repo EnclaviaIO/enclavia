@@ -32,8 +32,12 @@
 //! [`MeshMessage`](super::network::MeshMessage) enum so the same handler
 //! dispatches both Raft RPCs and forwarded client requests cleanly.
 
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::Answered;
 use crate::raft::RaftHandle;
 use crate::wire::{Request, Response, RpcError};
 use crate::{CONTROL_PUBKEY_LEN, PcrKey};
@@ -56,7 +60,7 @@ pub(crate) const FORWARD_MAX_RETRIES: usize = 60;
 /// Delay between leader-hint re-checks while forwarding. 20 * 50ms = 1s total,
 /// comfortably longer than the cluster's election timeout (300-600ms) so a
 /// normal re-election completes inside the window.
-pub(crate) const FORWARD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+pub(crate) const FORWARD_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// A client request forwarded from a non-leader to the leader, carrying the
 /// verified session facts the leader needs (the leader did not see the client's
@@ -64,7 +68,7 @@ pub(crate) const FORWARD_RETRY_DELAY: std::time::Duration = std::time::Duration:
 /// docs' trust argument).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardedClientRequest {
-    /// The session's attested [`PcrKey`] (SHA-256 of its verified PCR triple).
+    /// The session's attested [`PcrKey`] (the key of its verified pin identity).
     pub session_key: PcrKey,
     /// The session's 65-byte SEC1 P-256 control pubkey (from the attestation
     /// document's `user_data`). Needed for a `Register` (frozen into `KeyState`)
@@ -75,17 +79,72 @@ pub struct ForwardedClientRequest {
     pub request: Request,
 }
 
-/// The leader's response to a [`ForwardedClientRequest`], relayed verbatim back
-/// to the customer by the forwarding node.
+/// The leader's response to a [`ForwardedClientRequest`], relayed back to the
+/// customer by the forwarding node.
+///
+/// Mesh-internal (every member runs the same image), so it can carry more than
+/// the wire [`Response`]: `timed_out` tells the forwarder that the leader gave
+/// up waiting for a quorum. The forwarder must then relay the `Unavailable`
+/// instead of forwarding the request again, because the timed-out write may
+/// still commit and a resubmission would only add a duplicate entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForwardedClientResponse(pub Response);
+pub struct ForwardedClientResponse {
+    /// The customer response.
+    pub response: Response,
+    /// See [`Answered::timed_out`].
+    pub timed_out: bool,
+}
+
+impl From<Answered> for ForwardedClientResponse {
+    fn from(answered: Answered) -> Self {
+        Self {
+            response: answered.response,
+            timed_out: answered.timed_out,
+        }
+    }
+}
+
+impl From<ForwardedClientResponse> for Answered {
+    fn from(resp: ForwardedClientResponse) -> Self {
+        Self {
+            response: resp.response,
+            timed_out: resp.timed_out,
+        }
+    }
+}
+
+/// Upper bound on one forwarded mesh call: the leader's own
+/// [`COMMIT_TIMEOUT`](crate::raft::COMMIT_TIMEOUT) plus a second for the mesh
+/// round trip and the leader's local work. The leader answers within its
+/// commit timeout whenever it is responsive, so a call that outlives this bound
+/// means the leader is stuck; the forwarder then answers `Unavailable` (outcome
+/// unknown) rather than forwarding again.
+pub(crate) const FORWARD_CALL_TIMEOUT: Duration =
+    Duration::from_secs(crate::raft::COMMIT_TIMEOUT.as_secs() + 1);
+
+/// Upper bound on routing one customer request, whatever happens: elections,
+/// forwarding, and the leader's commit wait together.
+///
+/// It must cover the no-leader retry budget ([`FORWARD_MAX_RETRIES`] x
+/// [`FORWARD_RETRY_DELAY`] = 3 s) and one forwarded write that uses its full
+/// commit timeout, and it must stay well below the customer's 30 s RPC timeout
+/// (nbd-client's `SYNC_RPC_TIMEOUT`), so that the customer receives a
+/// structured `Unavailable`, which it retries on the same session, rather than
+/// timing the RPC out and tearing the session down.
+pub const ROUTE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Route one client request to the leader and return the response.
 ///
 /// If this node IS the leader, run it locally ([`super::serve::handle_on_leader`]).
 /// Otherwise forward it over the mesh to the current leader and relay the reply.
 /// Handles a missing leader (election in progress) with a bounded retry, then
-/// gives up with [`RpcError::Unavailable`].
+/// gives up with [`RpcError::Unavailable`]. The whole call is bounded by
+/// [`ROUTE_DEADLINE`].
+///
+/// A request the leader answered with a timed-out `Unavailable` (no quorum
+/// within the commit timeout) is NOT retried: the write may still commit, and
+/// the customer is the one that knows how to resolve an unknown outcome (its
+/// compare-and-swap retry and `Get`).
 ///
 /// `debug_mode` is only consulted on the LEADER (it verifies the `Transition`
 /// chain link); a forwarding follower passes the request through untouched, the
@@ -97,11 +156,33 @@ pub async fn route_client_request(
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     request: Request,
     debug_mode: bool,
-) -> Response {
+) -> Answered {
+    let route = route_with_retries(raft, mesh, session_key, control_pubkey, request, debug_mode);
+    match tokio::time::timeout(ROUTE_DEADLINE, route).await {
+        Ok(answered) => answered,
+        Err(_) => {
+            routes().unavailable.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                deadline = ?ROUTE_DEADLINE,
+                "client request not answered within the routing deadline; answering Unavailable"
+            );
+            Answered::deadline_elapsed()
+        }
+    }
+}
+
+async fn route_with_retries(
+    raft: &RaftHandle,
+    mesh: &crate::mesh::Mesh,
+    session_key: PcrKey,
+    control_pubkey: [u8; CONTROL_PUBKEY_LEN],
+    request: Request,
+    debug_mode: bool,
+) -> Answered {
     for _ in 0..FORWARD_MAX_RETRIES {
         // Leader fast path: serve locally.
         if raft.is_leader().await {
-            let resp = super::serve::handle_on_leader(
+            let answered = super::serve::handle_on_leader(
                 raft,
                 session_key,
                 control_pubkey,
@@ -111,9 +192,10 @@ pub async fn route_client_request(
             .await;
             // A transient Unavailable means we raced a step-down between the
             // is_leader check and the write/read; retry (we may now know a new
-            // leader to forward to).
-            if !is_transient(&resp) {
-                return resp;
+            // leader to forward to). A timed-out one is final.
+            if !is_retryable(&answered) {
+                routes().local.fetch_add(1, Ordering::Relaxed);
+                return answered;
             }
             tokio::time::sleep(FORWARD_RETRY_DELAY).await;
             continue;
@@ -122,46 +204,74 @@ pub async fn route_client_request(
         // Non-leader: forward to whoever we currently believe is the leader. A
         // `None` leader hint means an election is in progress, wait and
         // re-check. A forwarded reply that is itself transient (the leader
-        // stepped down / lost quorum mid-call) or a failed mesh call (the leader
-        // is unreachable / mid-reconnect) also falls through to a retry, where
-        // the hint may have changed.
+        // stepped down mid-call, or rejected us as a non-voter) or a failed mesh
+        // call (the leader is unreachable / mid-reconnect) also falls through
+        // to a retry, where the hint may have changed.
         if let Some(leader) = raft.leader_name().await {
-            if let Ok(resp) =
-                forward_to(mesh, &leader, session_key, control_pubkey, request.clone()).await
-            {
-                if !is_transient(&resp) {
-                    return resp;
+            match forward_to(mesh, &leader, session_key, control_pubkey, request.clone()).await {
+                Forwarded::Answer(answered) if !is_retryable(&answered) => {
+                    routes().forwarded.fetch_add(1, Ordering::Relaxed);
+                    return answered;
+                }
+                Forwarded::Answer(_) | Forwarded::Failed => {}
+                Forwarded::TimedOut => {
+                    routes().unavailable.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        leader = %leader,
+                        timeout = ?FORWARD_CALL_TIMEOUT,
+                        "forwarded request not answered in time; answering Unavailable"
+                    );
+                    return Answered::deadline_elapsed();
                 }
             }
         }
         tokio::time::sleep(FORWARD_RETRY_DELAY).await;
     }
-    Response::Err {
+    routes().unavailable.fetch_add(1, Ordering::Relaxed);
+    Answered::new(Response::Err {
         error: RpcError::Unavailable,
-    }
+    })
 }
 
-/// Whether a response is a transient failure worth retrying (re-resolve the
-/// leader and try again) rather than a definitive answer to relay to the client.
-fn is_transient(resp: &Response) -> bool {
-    matches!(
-        resp,
-        Response::Err {
-            error: RpcError::Unavailable
-        }
-    )
+/// The process-wide routing counters.
+fn routes() -> &'static crate::metrics::RouteStats {
+    &crate::metrics::global().routes
+}
+
+/// Whether an answer is a transient failure worth retrying (re-resolve the
+/// leader and try again) rather than a definitive answer to relay to the
+/// client. A timed-out `Unavailable` is definitive: the write may still commit.
+fn is_retryable(answered: &Answered) -> bool {
+    !answered.timed_out
+        && matches!(
+            answered.response,
+            Response::Err {
+                error: RpcError::Unavailable
+            }
+        )
+}
+
+/// How one forwarded call ended.
+enum Forwarded {
+    /// The leader answered.
+    Answer(Answered),
+    /// Transport or decode failure before any answer: safe to retry, the
+    /// leader never produced a result the customer could act on.
+    Failed,
+    /// No answer within [`FORWARD_CALL_TIMEOUT`]: the leader may be applying
+    /// the request, so the outcome is unknown.
+    TimedOut,
 }
 
 /// CBOR-encode a [`ForwardedClientRequest`] into the outer [`MeshMessage`],
 /// send it to `leader` over the mesh, decode the [`ForwardedClientResponse`].
-/// Returns `Err(())` on any transport / decode failure (the caller retries).
 async fn forward_to(
     mesh: &crate::mesh::Mesh,
     leader: &str,
     session_key: PcrKey,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     request: Request,
-) -> Result<Response, ()> {
+) -> Forwarded {
     use crate::raft::network::MeshMessage;
 
     let msg = MeshMessage::ForwardClient(ForwardedClientRequest {
@@ -171,14 +281,20 @@ async fn forward_to(
     });
     let mut buf = Vec::new();
     if ciborium::into_writer(&msg, &mut buf).is_err() {
-        return Err(());
+        return Forwarded::Failed;
     }
-    let reply = mesh.call(leader, buf).await.map_err(|_| ())?;
+    let reply = match tokio::time::timeout(FORWARD_CALL_TIMEOUT, mesh.call(leader, buf)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => return Forwarded::Failed,
+        Err(_) => return Forwarded::TimedOut,
+    };
     // The leader answers a forwarded client request with a bare
     // ForwardedClientResponse (NOT wrapped in MeshMessage): the reply channel is
     // unambiguous, the request kind already told the handler what to produce.
-    let resp: ForwardedClientResponse = ciborium::from_reader(reply.as_slice()).map_err(|_| ())?;
-    Ok(resp.0)
+    match ciborium::from_reader::<ForwardedClientResponse, _>(reply.as_slice()) {
+        Ok(resp) => Forwarded::Answer(resp.into()),
+        Err(_) => Forwarded::Failed,
+    }
 }
 
 /// The replicated [`SessionDispatch`](crate::listener::SessionDispatch): backs
@@ -227,7 +343,7 @@ impl crate::listener::SessionDispatch for ReplicatedDispatch {
         session_key: PcrKey,
         control_pubkey: [u8; CONTROL_PUBKEY_LEN],
         request: Request,
-    ) -> Response {
+    ) -> Answered {
         route_client_request(
             &self.raft,
             &self.mesh,
@@ -282,9 +398,12 @@ mod tests {
     /// The forwarded response CBOR-round-trips.
     #[test]
     fn forwarded_response_cbor_round_trips() {
-        let resp = ForwardedClientResponse(Response::PinOk {
-            version: crate::Version(3),
-        });
+        let resp = ForwardedClientResponse {
+            response: Response::PinOk {
+                version: crate::Version(3),
+            },
+            timed_out: true,
+        };
         let mut buf = Vec::new();
         ciborium::into_writer(&resp, &mut buf).unwrap();
         let back: ForwardedClientResponse = ciborium::from_reader(&buf[..]).unwrap();
