@@ -1305,10 +1305,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_clients = max_concurrent_clients();
     let semaphore = Arc::new(Semaphore::new(max_clients));
 
-    let server_config = config::load(Path::new(config::CONFIG_PATH)).unwrap_or_else(|e| {
-        warn!(error = %e, "Failed to load enclavia config, control channel will be disabled");
-        config::ServerConfig::default()
-    });
+    let server_config = match config::load(Path::new(config::CONFIG_PATH)) {
+        Ok(c) => c,
+        Err(e) if e.is::<config::BuildFlavourMismatch>() => {
+            error!(error = %e, "refusing to start");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to load enclavia config, control channel will be disabled");
+            config::ServerConfig::default()
+        }
+    };
     let control_pubkey = server_config.control_public_key.map(Arc::new);
     let min_upgrade_delay_secs = server_config.min_upgrade_delay_secs;
     let synchronizer_enabled = server_config.synchronizer.is_some();

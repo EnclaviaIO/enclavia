@@ -68,7 +68,10 @@
 //! side-channels, kernel cmdline): a host that chooses the expected PCRs
 //! or flips `debug_attestation` can impersonate the oracle and the whole
 //! check is worthless. With [`ENV_SYNCHRONIZER_ENABLED`] set, a missing
-//! or empty `synchronizer.expected_pcrs` config is fail-stop.
+//! or empty `synchronizer.expected_pcrs` config is fail-stop. The
+//! skip-chain path `debug_attestation` selects is compiled only into the
+//! debug build, and a `debug_attestation` that disagrees with the build is
+//! fail-stop too, so a production image cannot skip the chain at all.
 //!
 //! ## Opt-in gate
 //!
@@ -2031,11 +2034,17 @@ pub fn load_control_pubkey(path: &Path) -> Result<[u8; 65], FatalError> {
     Ok(out)
 }
 
+/// Whether this binary contains the path that checks the oracle's
+/// attestation without the AWS Nitro certificate chain. Debug (QEMU) images
+/// are built with it, production images without it.
+pub const SKIPS_CERTIFICATE_CHAIN: bool = cfg!(feature = "dangerous-skip-chain");
+
 /// Load every synchronizer trust anchor from the enclave config: the
 /// control pubkey, the expected oracle PCRs, and the verification mode.
 ///
 /// Fail-stop on a missing `synchronizer` section, an EMPTY
-/// `expected_pcrs` list, or any malformed PCR entry: with
+/// `expected_pcrs` list, any malformed PCR entry, or a `debug_attestation`
+/// other than [`SKIPS_CERTIFICATE_CHAIN`]: with
 /// `SYNCHRONIZER_ENABLED=1` the oracle MUST be verifiable, and serving
 /// with an unauthenticated oracle would reopen the host-impersonation
 /// rollback hole (#208). The config file is baked into the measured EIF,
@@ -2064,6 +2073,20 @@ pub fn load_synchronizer_trust(path: &Path) -> Result<SynchronizerTrust, FatalEr
             format!("enclave config `synchronizer.expected_pcrs[{i}]` is malformed: {e}")
         })?;
         expected.push(pcrs);
+    }
+    // How the oracle's attestation is checked is measured (the builder
+    // writes `debug_attestation` from its `--debug`) and compiled: the
+    // skip-chain path exists only in the debug build of this binary, which
+    // only debug images carry. The two must agree, or the image was assembled
+    // from the wrong build.
+    if section.debug_attestation != SKIPS_CERTIFICATE_CHAIN {
+        return Err(format!(
+            "enclave config has synchronizer.debug_attestation = {}, but this nbd-client is \
+             the {} build; the image carries the wrong build (fail-stop)",
+            section.debug_attestation,
+            if SKIPS_CERTIFICATE_CHAIN { "debug (skip-chain)" } else { "production" },
+        )
+        .into());
     }
 
     Ok(SynchronizerTrust {
@@ -3540,7 +3563,7 @@ mod tests {
                     "expected_pcrs": [
                         {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
                     ],
-                    "debug_attestation": true
+                    "debug_attestation": {SKIPS_CERTIFICATE_CHAIN}
                 }}
             }}"#,
             control_pubkey_b64(),
@@ -3553,7 +3576,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(trust.control_pubkey[0], 0x04);
-        assert!(trust.debug_attestation);
+        assert_eq!(trust.debug_attestation, SKIPS_CERTIFICATE_CHAIN);
         let listed = enclavia_protocol::attestation::Pcrs {
             pcr0: vec![0xa5; 48],
             pcr1: vec![0xa6; 48],
@@ -3578,7 +3601,7 @@ mod tests {
             (r#","upgrade_target": true"#, ImageRole::UpgradeTarget),
         ] {
             let config = format!(
-                r#"{{"control_public_key": "{}", "synchronizer": {{"expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]{flag}}}}}"#,
+                r#"{{"control_public_key": "{}", "synchronizer": {{"debug_attestation": {SKIPS_CERTIFICATE_CHAIN}, "expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]{flag}}}}}"#,
                 control_pubkey_b64(),
                 hex48(0xa5),
                 hex48(0xa6),
@@ -3591,9 +3614,37 @@ mod tests {
         }
     }
 
+    /// A measured `debug_attestation` that disagrees with how this binary
+    /// was built is fail-stop: a production build never runs with the flag
+    /// set, a debug build never without it.
+    #[test]
+    fn trust_debug_attestation_must_match_the_build() {
+        let config = format!(
+            r#"{{
+                "control_public_key": "{}",
+                "synchronizer": {{
+                    "expected_pcrs": [
+                        {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
+                    ],
+                    "debug_attestation": {}
+                }}
+            }}"#,
+            control_pubkey_b64(),
+            hex48(0x10),
+            hex48(0x11),
+            hex48(0x12),
+            !SKIPS_CERTIFICATE_CHAIN,
+        );
+        let path = write_config("wrong-build", &config);
+        let err = load_synchronizer_trust(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("wrong build"), "{err}");
+    }
+
     /// `debug_attestation` defaults to FALSE (production full-chain
     /// verification) when omitted: forgetting the flag can only make
-    /// verification stricter, never weaker.
+    /// verification stricter, never weaker. (A debug build then refuses the
+    /// config as built for production.)
     #[test]
     fn trust_debug_attestation_defaults_to_false() {
         let config = format!(
@@ -3611,9 +3662,13 @@ mod tests {
             hex48(0x12),
         );
         let path = write_config("default-debug", &config);
-        let trust = load_synchronizer_trust(&path).expect("load");
+        let loaded = load_synchronizer_trust(&path);
         std::fs::remove_file(&path).ok();
-        assert!(!trust.debug_attestation);
+        if SKIPS_CERTIFICATE_CHAIN {
+            assert!(loaded.is_err());
+        } else {
+            assert!(!loaded.expect("load").debug_attestation);
+        }
     }
 
     /// The decision the wiring hinges on: SYNCHRONIZER_ENABLED=1 with NO
@@ -3682,6 +3737,7 @@ mod tests {
         let config = format!(
             r#"{{
                 "synchronizer": {{
+                    "debug_attestation": {SKIPS_CERTIFICATE_CHAIN},
                     "expected_pcrs": [
                         {{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}
                     ]

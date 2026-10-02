@@ -197,6 +197,30 @@
           }
         );
 
+        # Debug-image builds of the two customer-image binaries that check the
+        # synchronizer's attestation: with `dangerous-skip-chain`, for QEMU's
+        # self-signing NSM. The builder puts these into `--debug` images only;
+        # production images carry `nbd-client` / `enclavia-server` above, which
+        # do not contain the skip-chain path. Each binary refuses to start when
+        # the measured `synchronizer.debug_attestation` disagrees with its
+        # build. They reuse the default-feature deps artifacts: only the crates
+        # the feature touches recompile.
+        nbdClientDebug = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
+          // {
+            pname = "nbd-client-debug";
+            cargoExtraArgs = "-p nbd-client --features dangerous-skip-chain";
+          }
+        );
+
+        enclaviaServerDebug = craneLibMusl.buildPackage (
+          individualMuslCrateArgs
+          // {
+            pname = "enclavia-server-debug";
+            cargoExtraArgs = "-p enclavia-server --features dangerous-skip-chain";
+          }
+        );
+
         enclaviaEgress = craneLibMusl.buildPackage (
           individualMuslCrateArgs
           // {
@@ -594,6 +618,9 @@
 
         packages = {
           nbd-client = nbdClient;
+          # Debug-image (QEMU) builds, with the skip-chain path; see above.
+          nbd-client-debug = nbdClientDebug;
+          enclavia-server-debug = enclaviaServerDebug;
           enclavia-egress = enclaviaEgress;
           mock-kms = mockKms;
           enclavia-crypto = enclaviaCrypto;
