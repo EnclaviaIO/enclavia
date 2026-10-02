@@ -7,7 +7,9 @@
 //
 // Start the mock first (it prints its port):
 //   cargo run --example reconnect_mock_server -p enclavia
-// Then: dart run reconnect_smoke.dart <mock-port>
+// Then, from this directory (its pubspec selects the development build
+// with the skip-chain path the mock's self-signed attestation needs):
+//   dart pub get && dart run reconnect_smoke.dart <mock-port>
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';

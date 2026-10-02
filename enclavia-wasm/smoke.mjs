@@ -1,5 +1,8 @@
 // Smoke test: the wasm SDK against a real deployed enclave.
 // Env: ENCLAVE_URL, PCR0..2. Node >= 22 (global WebSocket).
+// It connects with `debugMode` (a debug/QEMU enclave), so ./pkg must be the
+// development flavour: the manual build in README.md with
+// `--features dangerous-skip-chain`. A default build refuses `debugMode`.
 import { readFileSync } from "node:fs";
 import init, { connect } from "./pkg/enclavia_wasm.js";
 

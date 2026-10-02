@@ -2,7 +2,9 @@
 // drops the connection after every answered request, so every fetch past
 // the first forces a transparent reconnect (full Noise + attestation
 // re-verify). Unlike smoke.mjs this needs NO deployed enclave, so CI runs
-// it against the nix-built publish artifact (`nix build .#enclavia-wasm-npm`).
+// it against the nix-built development package (`nix build
+// .#enclavia-wasm-npm-dev`, `@enclavia/client-wasm-dev`): the mock serves a
+// debug document, which only the development flavour accepts.
 //
 // Start the mock first (it prints its port):
 //   cargo run --example reconnect_mock_server -p enclavia

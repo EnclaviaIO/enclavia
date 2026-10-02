@@ -498,8 +498,9 @@ impl ClientBuilder {
     /// emulated NSM self-signs. The document's structure, clock-skew bound,
     /// session nonce and PCRs are still checked, but any well-formed document
     /// passes the rest, so never enable it against production Nitro enclaves.
-    /// Needs the `dangerous-skip-chain` feature (on by default); without it a
-    /// debug-mode connection is refused.
+    /// Needs the `dangerous-skip-chain` feature (off by default, for
+    /// development builds only); without it [`ClientBuilder::build`] refuses
+    /// debug mode before connecting.
     pub fn debug_mode(mut self, debug: bool) -> Self {
         self.debug_mode = debug;
         self
@@ -570,6 +571,15 @@ impl ClientBuilder {
     /// this identical sequence, re-verifying attestation against the SAME
     /// expectations. See [`ClientBuilder::auto_reconnect`].
     pub async fn build(self) -> Result<Client, Error> {
+        // A build without the skip-chain path refuses debug mode before any
+        // I/O; `validate_live` refuses it again on every connect.
+        #[cfg(not(feature = "dangerous-skip-chain"))]
+        if self.debug_mode {
+            return Err(Error::Attestation(
+                AttestationError::SkipChainNotCompiled.to_string(),
+            ));
+        }
+
         let pcrs = self.pcrs.unwrap_or(Pcrs {
             pcr0: Vec::new(),
             pcr1: Vec::new(),

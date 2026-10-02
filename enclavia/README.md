@@ -38,7 +38,7 @@ println!("body: {}", resp.text()?);                    // or resp.bytes() / resp
 # }
 ```
 
-For a debug/QEMU enclave (self-signed attestation), or to follow a signed upgrade chain, use the builder:
+For a debug/QEMU enclave (self-signed attestation), or to follow a signed upgrade chain, use the builder. `debug_mode(true)` needs the `dangerous-skip-chain` feature, which is off by default: enable it only in development builds that talk to debug enclaves, since it accepts attestation documents without the AWS Nitro certificate chain.
 
 ```rust
 use enclavia::{Client, Pcrs};

@@ -62,6 +62,19 @@ final response = await client.fetch(method: 'GET', path: '/health', options: nul
 print('${response.status}: ${utf8.decode(response.body)}');
 ```
 
+`debugMode: true` validates a debug (QEMU) enclave's self-signed attestation
+without the AWS Nitro certificate chain, so any well-formed document passes.
+The native library contains that path only in a development build, which the
+app selects in its own (root) `pubspec.yaml`; every other build refuses
+`debugMode: true`:
+
+```yaml
+hooks:
+  user_defines:
+    enclavia_dart:
+      dangerous_skip_chain: true
+```
+
 See `example/main.dart` for a runnable version (reads the endpoint and PCRs
 from `ENCLAVIA_URL` / `ENCLAVIA_PCR0/1/2` env vars):
 

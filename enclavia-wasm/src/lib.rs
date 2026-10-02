@@ -10,7 +10,7 @@
 //! await init();
 //! const client = await connect("wss://<id>.enclaves.beta.enclavia.io", {
 //!   pcr0: "...", pcr1: "...", pcr2: "...",   // hex, from `enclavia enclave status`
-//! }, { debugMode: true });                    // omit on production Nitro
+//! }, { debugMode: true });                    // debug enclaves, dev build only
 //! const resp = await client.fetch("GET", "/health");
 //! console.log(resp.status, new TextDecoder().decode(resp.body));
 //! ```
@@ -90,6 +90,9 @@ pub struct Client {
 ///     beta/QEMU debug attestation (nonce binding + PCR equality, no
 ///     signature). Leave unset on production Nitro, where the full COSE
 ///     ES384 + cert-chain validation runs — in wasm, same as natively.
+///     Only a development build (feature `dangerous-skip-chain`, the
+///     `@enclavia/client-wasm-dev` package) accepts it; the published
+///     package refuses the connection.
 ///   - `trustUpgrades`: `{ backendUrl, enclaveId }` — follow the enclave's
 ///     signed upgrade chain instead of pinning one immutable version.
 #[wasm_bindgen]

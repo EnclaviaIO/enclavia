@@ -25,7 +25,7 @@ await init();   // bundlers resolve the .wasm asset; for plain Node see below
 const client = await connect(
   "wss://<id>.enclaves.beta.enclavia.io",
   { pcr0: "...", pcr1: "...", pcr2: "..." },   // hex, from `enclavia enclave status`
-  { debugMode: true },                          // beta/QEMU only; omit on production Nitro
+  { debugMode: true },                          // debug (QEMU) enclaves, dev build only (below)
 );
 
 // HTTP through the encrypted channel:
@@ -40,6 +40,16 @@ const chunk = await stream.recv();   // Uint8Array | null on EOF
 
 `connect` also accepts `trustUpgrades: { backendUrl, enclaveId }`, mirroring
 the native `ClientBuilder::trust_upgrades`.
+
+`debugMode` validates a debug (QEMU) enclave's self-signed attestation without
+the AWS Nitro certificate chain, so any well-formed document passes. The
+published `@enclavia/client-wasm` does not contain that path and refuses
+`debugMode: true`. For development against debug enclaves, build the
+development flavour, packaged as `@enclavia/client-wasm-dev`:
+
+```bash
+nix build .#enclavia-wasm-npm-dev
+```
 
 In plain Node (no bundler), pass the wasm bytes to `init` yourself:
 
@@ -78,7 +88,10 @@ npm publish result/            # or `npm pack result/` to inspect the tarball
 ```
 
 Or by hand inside `nix develop` (the devshell ships the wasm32 toolchain,
-wasm-bindgen-cli, wasm-opt, and the clang env vars below preconfigured):
+wasm-bindgen-cli, wasm-opt, and the clang env vars below preconfigured). This
+is the production flavour, which refuses `debugMode`; add
+`--features dangerous-skip-chain` to the `cargo build` for the development
+flavour (what `smoke.mjs` needs against a debug enclave):
 
 ```bash
 cargo build -p enclavia-wasm --target wasm32-unknown-unknown --release
