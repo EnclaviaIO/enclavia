@@ -71,6 +71,16 @@ jobs:
       - name: cargo test (synchronizer full suite)
         run: nix develop --command cargo test -p synchronizer --features raft,test-utils,debug,client
 
+      # The debug builds of nbd-client and enclavia-server (flake
+      # `nbd-client-debug` / `enclavia-server-debug`, which only `--debug`
+      # customer images carry) compile the skip-chain path and the other
+      # side of each binary's build cross-check. The workspace run above
+      # tests only the production builds.
+      - name: cargo test (debug builds of nbd-client, enclavia-server)
+        run: |
+          nix develop --command cargo test -p nbd-client --features dangerous-skip-chain
+          nix develop --command cargo test -p enclavia-server --features dangerous-skip-chain
+
       # Clippy across the synchronizer's real build flavors. The
       # debug / enclave / qemu features pick the customer transport
       # and attestation-verification mode at compile time, so cfg
@@ -90,10 +100,12 @@ jobs:
       # certificate chain. `-e normal,features` leaves dev-dependencies out,
       # so each tree is the feature set the production artifact is built
       # with: the `enclave,raft` synchronizer (flake.nix
-      # `synchronizerNitro*`), and the client SDK and its bindings on their
+      # `synchronizerNitro*`), the client SDK and its bindings on their
       # default features (the published crate, `enclavia-wasm-npm`, the Dart
-      # package without its development user-define). Each development
-      # flavour must have it.
+      # package without its development user-define), and every binary a
+      # production customer image carries (flake `nbd-client`,
+      # `enclavia-server`, ...; the builder takes the `-debug` builds for
+      # `--debug` images only). Each development flavour must have it.
       - name: skip-chain absent from production builds
         run: |
           set -euo pipefail
@@ -109,14 +121,30 @@ jobs:
           present() { tree "$1" "$2" | grep -q dangerous-skip-chain; }
           absent synchronizer enclave,raft
           present synchronizer qemu,raft
-          for sdk in enclavia enclavia-wasm enclavia-ffi; do
-            absent "$sdk"
-            present "$sdk" dangerous-skip-chain
+          for pkg in enclavia enclavia-wasm enclavia-ffi nbd-client enclavia-server; do
+            absent "$pkg"
+            present "$pkg" dangerous-skip-chain
           done
+          for pkg in enclavia-chain-init enclavia-crypto enclavia-egress; do
+            absent "$pkg"
+          done
+          # enclavia-dart's native crate is its own workspace (excluded from
+          # this one), so `-p` cannot reach it; same checks through its
+          # manifest and lock file.
+          dart() { nix develop --command cargo tree --locked --manifest-path enclavia-dart/native/Cargo.toml ${1:+--features "$1"} -e normal,features -i enclavia-protocol; }
+          out=$(dart)
+          if grep -q dangerous-skip-chain <<<"$out"; then
+            echo "::error::enclavia-dart/native (default features) enables enclavia-protocol/dangerous-skip-chain"
+            echo "$out"
+            exit 1
+          fi
+          out=$(dart dangerous-skip-chain)
+          grep -q dangerous-skip-chain <<<"$out"
 
       # enclavia-protocol on its own default features, where the skip-chain
       # methods do not exist: its compile_fail doctests check that (the
-      # workspace-wide run below has the feature on through the SDK).
+      # workspace-wide run below has the feature on through test
+      # dev-dependencies).
       - name: cargo doc-tests (enclavia-protocol, default features)
         run: nix develop --command cargo test -p enclavia-protocol --doc
 

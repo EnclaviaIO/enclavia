@@ -68,12 +68,49 @@ pub struct ServerConfig {
     pub synchronizer: Option<SynchronizerTrust>,
 }
 
+/// Whether this binary contains the path that checks the synchronizer's
+/// attestation without the AWS Nitro certificate chain. Debug (QEMU) images
+/// are built with it, production images without it.
+pub const SKIPS_CERTIFICATE_CHAIN: bool = cfg!(feature = "dangerous-skip-chain");
+
+/// The measured config's `synchronizer.debug_attestation` disagrees with
+/// [`SKIPS_CERTIFICATE_CHAIN`]: the image carries the wrong build of this
+/// binary. Fatal: the server must not start.
+#[derive(Debug)]
+pub struct BuildFlavourMismatch(pub String);
+
+impl std::fmt::Display for BuildFlavourMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BuildFlavourMismatch {}
+
+/// Load the measured config. A [`BuildFlavourMismatch`] error is fatal; any
+/// other error leaves the control channel disabled.
 pub fn load(path: &Path) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let raw: RawConfig = match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ServerConfig::default()),
         Err(e) => return Err(Box::new(e)),
     };
+
+    // How the synchronizer's attestation is checked is measured (the builder
+    // writes `debug_attestation` from its `--debug`) and compiled: the
+    // skip-chain path exists only in the debug build of this binary, which
+    // only debug images carry. The two must agree, or the image was assembled
+    // from the wrong build.
+    if let Some(section) = &raw.synchronizer {
+        if section.debug_attestation != SKIPS_CERTIFICATE_CHAIN {
+            return Err(Box::new(BuildFlavourMismatch(format!(
+                "measured config has synchronizer.debug_attestation = {}, but this \
+                 enclavia-server is the {} build; the image carries the wrong build",
+                section.debug_attestation,
+                if SKIPS_CERTIFICATE_CHAIN { "debug (skip-chain)" } else { "production" },
+            ))));
+        }
+    }
 
     let control_public_key = match raw.control_public_key {
         Some(s) => {
@@ -176,18 +213,22 @@ mod tests {
         b.repeat(48)
     }
 
-    #[test]
-    fn enabled_synchronizer_section_parses() {
-        let json = format!(
-            r#"{{"synchronizer": {{"enabled": true, "debug_attestation": true,
+    fn section(enabled: bool, debug_attestation: bool) -> String {
+        format!(
+            r#"{{"synchronizer": {{"enabled": {enabled}, "debug_attestation": {debug_attestation},
                 "expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]}}}}"#,
             hex48("aa"),
             hex48("bb"),
             hex48("cc")
-        );
+        )
+    }
+
+    #[test]
+    fn enabled_synchronizer_section_parses() {
+        let json = section(true, SKIPS_CERTIFICATE_CHAIN);
         let cfg = load(&write_tmp("sync-on", &json)).unwrap();
         let trust = cfg.synchronizer.expect("enabled synchronizer");
-        assert!(trust.debug_attestation);
+        assert_eq!(trust.debug_attestation, SKIPS_CERTIFICATE_CHAIN);
         assert_eq!(trust.expected_pcrs.len(), 1);
         assert_eq!(trust.expected_pcrs[0].pcr0, vec![0xaa; 48]);
     }
@@ -196,20 +237,34 @@ mod tests {
     /// flow has nothing to commit there.
     #[test]
     fn disabled_or_absent_synchronizer_is_none() {
-        let json = format!(
-            r#"{{"synchronizer": {{"enabled": false,
-                "expected_pcrs": [{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}]}}}}"#,
-            hex48("aa"),
-            hex48("bb"),
-            hex48("cc")
-        );
+        let json = section(false, SKIPS_CERTIFICATE_CHAIN);
         assert!(load(&write_tmp("sync-off", &json)).unwrap().synchronizer.is_none());
         assert!(load_str("{}").synchronizer.is_none());
     }
 
     #[test]
     fn enabled_synchronizer_without_pcrs_is_an_error() {
-        let path = write_tmp("sync-empty", r#"{"synchronizer": {"enabled": true}}"#);
-        assert!(load(&path).is_err());
+        let path = write_tmp(
+            "sync-empty",
+            &format!(
+                r#"{{"synchronizer": {{"enabled": true, "debug_attestation": {SKIPS_CERTIFICATE_CHAIN}}}}}"#
+            ),
+        );
+        let err = load(&path).err().expect("an empty expected_pcrs is an error");
+        assert!(!err.is::<BuildFlavourMismatch>(), "{err}");
+    }
+
+    /// A measured `debug_attestation` that disagrees with how this binary
+    /// was built is the fatal BuildFlavourMismatch, whether or not the
+    /// wiring is enabled.
+    #[test]
+    fn debug_attestation_must_match_the_build() {
+        for enabled in [true, false] {
+            let json = section(enabled, !SKIPS_CERTIFICATE_CHAIN);
+            let err = load(&write_tmp(&format!("flavour-{enabled}"), &json))
+                .err()
+                .expect("a mismatched build is an error");
+            assert!(err.is::<BuildFlavourMismatch>(), "{err}");
+        }
     }
 }

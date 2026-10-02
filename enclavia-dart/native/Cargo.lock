@@ -854,6 +854,7 @@ version = "0.2.0"
 dependencies = [
  "aes",
  "attestation-doc-validation",
+ "aws-nitro-enclaves-cose",
  "aws-nitro-enclaves-nsm-api",
  "base64 0.22.1",
  "cbc",
@@ -863,6 +864,7 @@ dependencies = [
  "der",
  "hex",
  "p256",
+ "p384",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -873,6 +875,7 @@ dependencies = [
  "spki",
  "thiserror 2.0.19",
  "uuid",
+ "webpki",
  "x509-cert",
 ]
 
