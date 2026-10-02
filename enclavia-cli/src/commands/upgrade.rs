@@ -19,7 +19,7 @@
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
-    BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
+    AntiRollbackSetting, BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
     UpgradePayload, UPGRADE_WINDOW_MAX, UPGRADE_WINDOW_MIN, upgrade_window_is_valid, validate_chain,
 };
 use enclavia_protocol::pin_identity::PinIdentity;
@@ -502,6 +502,32 @@ pub struct RevocationTarget {
     pub upgrade: UpgradePayload,
 }
 
+/// Display lines for an image's anti-rollback setting (see
+/// [`AntiRollbackSetting`]): on or off, and with it on, whether the image is
+/// an upgrade target, how it checks the synchronizer's attestation, and the
+/// PCR0 of each synchronizer build it trusts.
+pub fn anti_rollback_lines(setting: &AntiRollbackSetting) -> Vec<String> {
+    let row = |name: &str, value: String| format!("{:<16}{value}", format!("{name}:"));
+    if !setting.enabled {
+        return vec![row("anti-rollback", "off".into())];
+    }
+    let role = if setting.upgrade_target {
+        "on, upgrade target (takes over the pin, never registers)"
+    } else {
+        "on, first image (registers a blank volume)"
+    };
+    let check = if setting.debug_attestation {
+        "DEBUG, no certificate chain (QEMU)"
+    } else {
+        "AWS Nitro certificate chain"
+    };
+    let mut lines = vec![row("anti-rollback", role.into()), row("synchronizer", check.into())];
+    for p in &setting.synchronizer_pcrs {
+        lines.push(row("  trusts PCR0", p.pcr0.clone()));
+    }
+    lines
+}
+
 /// Display lines for a pin identity: PCR0-2, then each nonzero user PCR, or
 /// one line saying user PCRs 16-31 are all zero. `label` prefixes each
 /// name (e.g. `to.`); names are padded to line values up in a column.
@@ -653,6 +679,7 @@ mod tests {
             pcrs: pcrs_fixture(),
             booted_at: Utc.with_ymd_and_hms(2026, 6, 9, 9, 54, 8).unwrap(),
             nonce: vec![0x42; 32],
+            anti_rollback: AntiRollbackSetting::disabled(),
         }
     }
 

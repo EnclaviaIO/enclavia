@@ -5,9 +5,9 @@
 //! "filesystems mounted + secrets injected" and "crun start":
 //!
 //! ```text
-//!   read /etc/enclavia/config.json -> { enclave_id, image_digest, pcrs ... }
+//!   read /etc/enclavia/config.json -> { enclave_id, image_digest, anti-rollback setting }
 //!     v
-//!   build BootPayload { enclave_id, image_digest, pcrs, booted_at, nonce }
+//!   build BootPayload { enclave_id, image_digest, pcrs, booted_at, nonce, anti_rollback }
 //!     v
 //!   CBOR-encode payload
 //!     v
@@ -104,6 +104,7 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
     info!(
         enclave_id = %cfg.enclave_id,
         image_digest = %cfg.image_digest,
+        anti_rollback = ?cfg.anti_rollback,
         "loaded chain-init config"
     );
 
@@ -127,6 +128,7 @@ async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send 
         },
         booted_at: chrono::Utc::now(),
         nonce: nonce_bytes.to_vec(),
+        anti_rollback: cfg.anti_rollback,
     };
 
     let mut payload_bytes = Vec::with_capacity(512);

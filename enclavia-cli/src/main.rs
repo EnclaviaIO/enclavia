@@ -1505,6 +1505,9 @@ fn print_chain_link(link: &upgrade::VerifiedLink) {
             println!("      PCR0:        {}", p.pcrs.pcr0);
             println!("      PCR1:        {}", p.pcrs.pcr1);
             println!("      PCR2:        {}", p.pcrs.pcr2);
+            for line in upgrade::anti_rollback_lines(&p.anti_rollback) {
+                println!("      {line}");
+            }
         }
         Some(upgrade::DecodedPayload::Upgrade(p)) => {
             println!("      target:      {}", p.image_digest);

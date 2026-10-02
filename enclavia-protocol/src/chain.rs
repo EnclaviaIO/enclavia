@@ -11,7 +11,10 @@
 //!
 //! * [`ChainLinkKind::Boot`] — one per successful boot of a new image
 //!   digest. Payload binds `pcrs / image_digest / enclave_id /
-//!   booted_at / nonce`. The attestation's `user_data` is
+//!   booted_at / nonce / anti_rollback`, the last being the image's
+//!   anti-rollback setting from its measured config
+//!   ([`AntiRollbackSetting`]); a boot of a new image must keep the
+//!   previous image's setting. The attestation's `user_data` is
 //!   `sha256(payload)` (checked by [`super::attestation::verify_chain_attestation`]).
 //! * [`ChainLinkKind::Upgrade`] — emitted by the OLD enclave after the
 //!   backend signs and ships a `PrepareUpgrade` control command.
@@ -190,6 +193,105 @@ pub struct BootPayload {
     /// 32-byte freshly-generated nonce.
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+    /// The anti-rollback setting in the booted image's measured config.
+    /// The attestation binds the payload, so this is the enclave's own
+    /// statement of how it protects its storage, not the backend's.
+    pub anti_rollback: AntiRollbackSetting,
+}
+
+/// An image's anti-rollback setting, read from its measured config
+/// (`/etc/enclavia/config.json`, covered by the attested PCRs). The boot
+/// link carries it ([`BootPayload::anti_rollback`]), so a verifier learns
+/// the running version's setting from the enclave itself.
+///
+/// Anti-rollback is fixed when the enclave is created: an upgrade keeps it
+/// ([`AntiRollbackSetting::check_successor`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AntiRollbackSetting {
+    /// The image pins its storage to the synchronizer: the config enables
+    /// storage AND `synchronizer.enabled`, the two conditions under which
+    /// the image's init starts nbd-client with the synchronizer wiring.
+    pub enabled: bool,
+    /// `synchronizer.upgrade_target`: the image takes over an existing pin
+    /// with a Transition and never registers a fresh volume.
+    pub upgrade_target: bool,
+    /// `synchronizer.debug_attestation`: the image accepts the
+    /// synchronizer's attestation without the AWS Nitro certificate chain
+    /// (QEMU dev clusters).
+    pub debug_attestation: bool,
+    /// `synchronizer.expected_pcrs`: the synchronizer measurements the image
+    /// trusts, in config order. Empty when the config has no synchronizer
+    /// section.
+    pub synchronizer_pcrs: Vec<PcrsHex>,
+}
+
+/// How an upgrade's anti-rollback setting departs from the running
+/// version's (see [`AntiRollbackSetting::check_successor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AntiRollbackChange {
+    #[error("the upgrade turns anti-rollback off")]
+    TurnedOff,
+    #[error("the upgrade turns anti-rollback on")]
+    TurnedOn,
+    #[error(
+        "the upgraded image is not built as an upgrade target, so on a blank disk it would \
+         register a fresh volume instead of taking over the enclave's pin"
+    )]
+    NotUpgradeTarget,
+    #[error(
+        "the upgrade changes how the synchronizer's attestation is checked (debug_attestation)"
+    )]
+    DebugAttestationChanged,
+    #[error("the upgraded image has anti-rollback on but trusts no synchronizer")]
+    NoTrustedSynchronizer,
+}
+
+impl AntiRollbackSetting {
+    /// The setting of an image without the anti-rollback wiring or its
+    /// synchronizer section.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            upgrade_target: false,
+            debug_attestation: false,
+            synchronizer_pcrs: Vec::new(),
+        }
+    }
+
+    /// Whether an image with setting `next` may succeed one with `self`
+    /// through an upgrade. Anti-rollback is fixed at creation:
+    ///
+    /// - `enabled` is unchanged (neither turned off nor on);
+    /// - with it enabled, `next` is built as an upgrade target (it never
+    ///   registers), checks the synchronizer's attestation the same way, and
+    ///   trusts at least one synchronizer measurement.
+    ///
+    /// Which synchronizers `next` trusts may differ from `self`'s: moving to
+    /// another cluster is a synchronizer rotation, authorized by the owner's
+    /// control-key signature over the target's PCRs, which cover its measured
+    /// trust list. Signers show such a change before signing.
+    ///
+    /// Without the wiring an image does not use the other fields, so they
+    /// are not compared.
+    pub fn check_successor(&self, next: &AntiRollbackSetting) -> Result<(), AntiRollbackChange> {
+        match (self.enabled, next.enabled) {
+            (false, false) => return Ok(()),
+            (true, false) => return Err(AntiRollbackChange::TurnedOff),
+            (false, true) => return Err(AntiRollbackChange::TurnedOn),
+            (true, true) => {}
+        }
+        if !next.upgrade_target {
+            return Err(AntiRollbackChange::NotUpgradeTarget);
+        }
+        if next.debug_attestation != self.debug_attestation {
+            return Err(AntiRollbackChange::DebugAttestationChanged);
+        }
+        if next.synchronizer_pcrs.is_empty() {
+            return Err(AntiRollbackChange::NoTrustedSynchronizer);
+        }
+        Ok(())
+    }
 }
 
 /// Payload shape for a [`ChainLinkKind::Upgrade`] link.
@@ -369,6 +471,13 @@ pub struct PcrsHex {
 }
 
 impl PcrsHex {
+    /// Whether both name the same PCR0-2 (hex compared case-insensitively).
+    pub fn same_as(&self, other: &PcrsHex) -> bool {
+        self.pcr0.eq_ignore_ascii_case(&other.pcr0)
+            && self.pcr1.eq_ignore_ascii_case(&other.pcr1)
+            && self.pcr2.eq_ignore_ascii_case(&other.pcr2)
+    }
+
     /// Decode to raw bytes for the attestation verifier.
     pub fn to_pcrs(&self) -> Result<Pcrs, ChainValidationError> {
         let pcr0 =
@@ -545,6 +654,11 @@ pub enum ChainValidationError {
     /// Boot of a fresh image digest on a non-upgradable enclave.
     #[error("non-upgradable enclaves cannot record a second boot")]
     NonUpgradableSecondBoot,
+    /// Boot of a new image whose anti-rollback setting is not a valid
+    /// successor of the previous boot's
+    /// ([`AntiRollbackSetting::check_successor`]).
+    #[error("boot changes the enclave's anti-rollback setting: {0}")]
+    AntiRollbackChanged(AntiRollbackChange),
     /// Upgrade or revocation submitted before any genesis boot exists.
     #[error("first chain entry must be a boot — no upgrade or revocation can precede the genesis")]
     NoGenesisYet,
@@ -689,6 +803,14 @@ fn validate_boot(
             if !ctx.upgradable {
                 return Err(ChainValidationError::NonUpgradableSecondBoot);
             }
+            // The new image's attested setting against the previous image's:
+            // an upgrade never changes the enclave's anti-rollback
+            // protection. Refusing the link at ingest fails the new image's
+            // chain-init, so an image that loosened it never serves.
+            prev_payload
+                .anti_rollback
+                .check_successor(&parsed.anti_rollback)
+                .map_err(ChainValidationError::AntiRollbackChanged)?;
             Ok(Outcome::Append {
                 sequence: ctx.prior_chain.len() as u64,
             })
@@ -1325,12 +1447,30 @@ mod tests {
         pcr_seed: u8,
         booted_at: DateTime<Utc>,
     ) -> ChainLink {
+        boot_link_with(
+            enclave_id,
+            image_digest,
+            pcr_seed,
+            booted_at,
+            AntiRollbackSetting::disabled(),
+        )
+    }
+
+    /// [`boot_link_at`] with an explicit anti-rollback setting.
+    fn boot_link_with(
+        enclave_id: Uuid,
+        image_digest: &str,
+        pcr_seed: u8,
+        booted_at: DateTime<Utc>,
+        anti_rollback: AntiRollbackSetting,
+    ) -> ChainLink {
         let payload = BootPayload {
             enclave_id,
             image_digest: image_digest.into(),
             pcrs: pcrs_hex_from_seed(pcr_seed),
             booted_at,
             nonce: vec![0x42; 32],
+            anti_rollback,
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
@@ -1561,6 +1701,131 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ChainValidationError::NonUpgradableSecondBoot));
+    }
+
+    fn anti_rollback_on(upgrade_target: bool, synchronizers: &[u8]) -> AntiRollbackSetting {
+        AntiRollbackSetting {
+            enabled: true,
+            upgrade_target,
+            debug_attestation: false,
+            synchronizer_pcrs: synchronizers.iter().map(|s| pcrs_hex_from_seed(*s)).collect(),
+        }
+    }
+
+    #[test]
+    fn anti_rollback_successor_rules() {
+        use AntiRollbackChange::*;
+        let off = AntiRollbackSetting::disabled();
+        let genesis = anti_rollback_on(false, &[0xa0, 0xb0]);
+        let target = anti_rollback_on(true, &[0xa0]);
+        assert_eq!(off.check_successor(&off), Ok(()));
+        // Fields an image without the wiring does not use are not compared.
+        let off_with_anchors = AntiRollbackSetting {
+            enabled: false,
+            ..anti_rollback_on(false, &[0xc0])
+        };
+        assert_eq!(off.check_successor(&off_with_anchors), Ok(()));
+        assert_eq!(genesis.check_successor(&target), Ok(()));
+        assert_eq!(target.check_successor(&target), Ok(()));
+        assert_eq!(genesis.check_successor(&off), Err(TurnedOff));
+        assert_eq!(off.check_successor(&target), Err(TurnedOn));
+        assert_eq!(
+            genesis.check_successor(&anti_rollback_on(false, &[0xa0])),
+            Err(NotUpgradeTarget)
+        );
+        let debug = AntiRollbackSetting {
+            debug_attestation: true,
+            ..target.clone()
+        };
+        assert_eq!(genesis.check_successor(&debug), Err(DebugAttestationChanged));
+        // Another trust list is a synchronizer rotation, which the owner's
+        // signature authorizes: not a chain-validation error.
+        assert_eq!(
+            genesis.check_successor(&anti_rollback_on(true, &[0xa0, 0xc0])),
+            Ok(())
+        );
+        assert_eq!(genesis.check_successor(&anti_rollback_on(true, &[0xc0])), Ok(()));
+        assert_eq!(
+            genesis.check_successor(&anti_rollback_on(true, &[])),
+            Err(NoTrustedSynchronizer)
+        );
+    }
+
+    /// A promotion boot must keep the previous boot's anti-rollback setting;
+    /// ingest refuses one that does not.
+    #[test]
+    fn promotion_boot_must_keep_anti_rollback() {
+        let (_, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let mut genesis =
+            boot_link_with(id, "sha256:v1", 0x15, now, anti_rollback_on(false, &[0xa0]));
+        genesis.id = Some(Uuid::new_v4());
+        genesis.sequence = Some(0);
+        let prior = std::slice::from_ref(&genesis);
+        let promo_pcrs = pcrs_hex_from_seed(0x16);
+        let promote = |setting: AntiRollbackSetting| {
+            let link = boot_link_with(id, "sha256:v2", 0x16, now, setting);
+            validate_chain_link(
+                &link,
+                &ctx(&id, &promo_pcrs, "sha256:v2", Some(&pk), true, prior),
+                now,
+                true,
+            )
+        };
+        assert_eq!(
+            promote(anti_rollback_on(true, &[0xa0])).unwrap(),
+            Outcome::Append { sequence: 1 }
+        );
+        // A rotation to another synchronizer is accepted.
+        assert_eq!(
+            promote(anti_rollback_on(true, &[0xc0])).unwrap(),
+            Outcome::Append { sequence: 1 }
+        );
+        let debug = AntiRollbackSetting {
+            debug_attestation: true,
+            ..anti_rollback_on(true, &[0xa0])
+        };
+        for (setting, change) in [
+            (AntiRollbackSetting::disabled(), AntiRollbackChange::TurnedOff),
+            (anti_rollback_on(false, &[0xa0]), AntiRollbackChange::NotUpgradeTarget),
+            (debug, AntiRollbackChange::DebugAttestationChanged),
+            (anti_rollback_on(true, &[]), AntiRollbackChange::NoTrustedSynchronizer),
+        ] {
+            let err = promote(setting).unwrap_err();
+            assert!(
+                matches!(err, ChainValidationError::AntiRollbackChanged(c) if c == change),
+                "got {err}"
+            );
+        }
+    }
+
+    /// The setting is a required part of the attested payload: a boot payload
+    /// without it does not decode.
+    #[test]
+    fn boot_payload_without_anti_rollback_does_not_decode() {
+        #[derive(Serialize)]
+        struct WithoutSetting {
+            enclave_id: Uuid,
+            image_digest: String,
+            pcrs: PcrsHex,
+            booted_at: DateTime<Utc>,
+            #[serde(with = "serde_bytes")]
+            nonce: Vec<u8>,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &WithoutSetting {
+                enclave_id: Uuid::nil(),
+                image_digest: "sha256:v1".into(),
+                pcrs: pcrs_hex_from_seed(0x01),
+                booted_at: chrono::Utc::now(),
+                nonce: vec![0; 32],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(decode_canonical::<BootPayload>(&bytes).is_err());
     }
 
     #[test]
