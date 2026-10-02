@@ -23,3 +23,10 @@ hex = { workspace = true }
 # io-util for split() + AsyncReadExt/AsyncWriteExt on UpgradedStream, sync
 # for the per-half async Mutexes. Both are wasm-supported tokio features.
 tokio = { version = "1", default-features = false, features = ["sync", "io-util"] }
+
+[features]
+# `debugMode` (validate a QEMU enclave's attestation without the AWS Nitro
+# certificate chain). Off in the published package; the flake's
+# `enclavia-wasm-dev` / `enclavia-wasm-npm-dev` build it for development
+# against debug enclaves.
+dangerous-skip-chain = ["enclavia/dangerous-skip-chain"]

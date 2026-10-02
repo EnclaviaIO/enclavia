@@ -419,7 +419,12 @@
         # or vendor. wasm-bindgen-cli's version must equal the crate's pinned
         # `wasm-bindgen` (the ABI schema must match) — both currently 0.2.121,
         # via nixpkgs and enclavia-wasm/Cargo.toml respectively.
-        enclaviaWasm = craneLib.buildPackage (wasmCommonArgs // {
+        mkEnclaviaWasm = { pname, features ? [ ] }: craneLib.buildPackage (wasmCommonArgs // {
+          inherit pname;
+          cargoExtraArgs = pkgs.lib.concatStringsSep " " (
+            [ "-p enclavia-wasm" ]
+            ++ pkgs.lib.optional (features != [ ]) "--features ${pkgs.lib.concatStringsSep "," features}"
+          );
           cargoArtifacts = cargoArtifactsWasm;
           nativeBuildInputs = rustCommonArgs.nativeBuildInputs ++ [
             pkgs.wasm-bindgen-cli
@@ -433,6 +438,17 @@
           '';
         });
 
+        # The production build: no skip-chain path, so `debugMode` is refused.
+        enclaviaWasm = mkEnclaviaWasm { pname = "enclavia-wasm"; };
+
+        # Development build for debug (QEMU) enclaves: `debugMode` validates
+        # their self-signed attestation without the AWS Nitro certificate
+        # chain. Never the published @enclavia/client-wasm.
+        enclaviaWasmDev = mkEnclaviaWasm {
+          pname = "enclavia-wasm-dev";
+          features = [ "dangerous-skip-chain" ];
+        };
+
         # The publish-ready npm package: the reproducible wasm build plus
         # package.json and README. `npm publish result/` (or `npm pack`) from
         # the output. Kept as a separate derivation so the artifact build
@@ -441,6 +457,19 @@
           mkdir -p $out
           cp ${enclaviaWasm}/* $out/
           cp ${./enclavia-wasm/npm/package.json} $out/package.json
+          cp ${./enclavia-wasm/README.md} $out/README.md
+        '';
+
+        # The development build as its own npm package, renamed so it can
+        # never be published as @enclavia/client-wasm.
+        enclaviaWasmNpmDev = pkgs.runCommand "enclavia-client-wasm-npm-dev" {
+          nativeBuildInputs = [ pkgs.jq ];
+        } ''
+          mkdir -p $out
+          cp ${enclaviaWasmDev}/* $out/
+          jq '.name = "@enclavia/client-wasm-dev"
+              | .description = "DEVELOPMENT build of @enclavia/client-wasm for debug (QEMU) enclaves: debugMode accepts attestation documents without the AWS Nitro certificate chain. Never use it against production enclaves."' \
+            ${./enclavia-wasm/npm/package.json} > $out/package.json
           cp ${./enclavia-wasm/README.md} $out/README.md
         '';
 
@@ -581,6 +610,10 @@
           # The same, assembled as the @enclavia/client-wasm npm package:
           # `nix build .#enclavia-wasm-npm && npm publish result/`.
           enclavia-wasm-npm = enclaviaWasmNpm;
+          # Development flavours with `debugMode` (skip-chain) for debug
+          # enclaves; the npm one is named @enclavia/client-wasm-dev.
+          enclavia-wasm-dev = enclaviaWasmDev;
+          enclavia-wasm-npm-dev = enclaviaWasmNpmDev;
 
           # Synchronizer node binaries + their runtime identity fetcher,
           # plus the dedicated EIFs that wrap them. `synchronizer` /

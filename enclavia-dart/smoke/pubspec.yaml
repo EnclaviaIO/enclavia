@@ -1,0 +1,20 @@
+# Development-only package for the reconnect smoke test. It is the root
+# package when the smoke test runs, so its `user_defines` select the
+# development build of enclavia_dart's native library, with the skip-chain
+# path `ConnectOptions(debugMode: true)` needs against the mock enclave's
+# self-signed attestation. Apps never get this build: only the ROOT
+# package's pubspec is read for user-defines.
+name: enclavia_dart_smoke
+publish_to: none
+
+environment:
+  sdk: "^3.10.0"
+
+dependencies:
+  enclavia_dart:
+    path: ..
+
+hooks:
+  user_defines:
+    enclavia_dart:
+      dangerous_skip_chain: true

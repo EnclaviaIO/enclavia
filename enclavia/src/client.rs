@@ -498,8 +498,9 @@ impl ClientBuilder {
     /// emulated NSM self-signs. The document's structure, clock-skew bound,
     /// session nonce and PCRs are still checked, but any well-formed document
     /// passes the rest, so never enable it against production Nitro enclaves.
-    /// Needs the `dangerous-skip-chain` feature (on by default); without it a
-    /// debug-mode connection is refused.
+    /// Needs the `dangerous-skip-chain` feature (off by default, for
+    /// development builds only); without it a debug-mode connection is
+    /// refused.
     pub fn debug_mode(mut self, debug: bool) -> Self {
         self.debug_mode = debug;
         self

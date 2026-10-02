@@ -25,7 +25,7 @@ await init();   // bundlers resolve the .wasm asset; for plain Node see below
 const client = await connect(
   "wss://<id>.enclaves.beta.enclavia.io",
   { pcr0: "...", pcr1: "...", pcr2: "..." },   // hex, from `enclavia enclave status`
-  { debugMode: true },                          // beta/QEMU only; omit on production Nitro
+  { debugMode: true },                          // debug (QEMU) enclaves, dev build only (below)
 );
 
 // HTTP through the encrypted channel:
@@ -40,6 +40,16 @@ const chunk = await stream.recv();   // Uint8Array | null on EOF
 
 `connect` also accepts `trustUpgrades: { backendUrl, enclaveId }`, mirroring
 the native `ClientBuilder::trust_upgrades`.
+
+`debugMode` validates a debug (QEMU) enclave's self-signed attestation without
+the AWS Nitro certificate chain, so any well-formed document passes. The
+published `@enclavia/client-wasm` does not contain that path and refuses
+`debugMode: true`. For development against debug enclaves, build the
+development flavour, packaged as `@enclavia/client-wasm-dev`:
+
+```bash
+nix build .#enclavia-wasm-npm-dev
+```
 
 In plain Node (no bundler), pass the wasm bytes to `init` yourself:
 

@@ -20,3 +20,9 @@ thiserror.workspace = true
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 once_cell = "1"
+
+[features]
+# `ConnectOptions.debug_mode` (validate a QEMU enclave's attestation without
+# the AWS Nitro certificate chain). Off by default; a development build
+# enables it (enclavia-dart: the `dangerous_skip_chain` user-define).
+dangerous-skip-chain = ["enclavia/dangerous-skip-chain"]

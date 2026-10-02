@@ -1209,6 +1209,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ciborium",
+ "enclavia",
  "enclavia-protocol",
  "futures-util",
  "getrandom 0.2.17",
