@@ -306,8 +306,10 @@ const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
 /// delay floor (`now + min_delay_secs - CLOCK_SKEW_TOLERANCE_SECS`)?
 ///
 /// `min_delay_secs == 0` means no floor was configured (pre-existing
-/// behavior) and never rejects. Pure so the comparison is unit-testable
-/// without the chain-host machinery.
+/// behavior) and never rejects. A delay too large to add to `now` puts the
+/// floor beyond any representable time, so every `valid_from` violates it.
+/// Pure so the comparison is unit-testable without the chain-host
+/// machinery.
 fn violates_min_upgrade_delay(
     valid_from: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
@@ -316,9 +318,15 @@ fn violates_min_upgrade_delay(
     if min_delay_secs == 0 {
         return false;
     }
-    let floor = now + chrono::Duration::seconds(min_delay_secs as i64)
-        - chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS);
-    valid_from < floor
+    let floor = i64::try_from(min_delay_secs)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .and_then(|delay| now.checked_add_signed(delay))
+        .and_then(|t| t.checked_sub_signed(chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS)));
+    match floor {
+        Some(floor) => valid_from < floor,
+        None => true,
+    }
 }
 
 /// Execute the `PrepareUpgrade` flow:
@@ -1810,6 +1818,15 @@ mod tests {
 
         // "Immediate" activation (valid_from = now) is rejected.
         assert!(violates_min_upgrade_delay(now, now, day));
+
+        // A delay too large for the clock arithmetic (or for i64) refuses
+        // instead of wrapping or panicking.
+        assert!(violates_min_upgrade_delay(now + Duration::days(365), now, u64::MAX));
+        assert!(violates_min_upgrade_delay(
+            now + Duration::days(365),
+            now,
+            i64::MAX as u64
+        ));
     }
 
     #[tokio::test]
