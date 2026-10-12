@@ -145,11 +145,13 @@ pub enum RpcOutcome {
     TransitionRevoked,
     /// [`RpcError::RevocationRejected`].
     RevocationRejected,
+    /// [`RpcError::TransitionCommitmentMismatch`].
+    TransitionCommitmentMismatch,
 }
 
 impl RpcOutcome {
     /// Every outcome, in label order.
-    pub const ALL: [RpcOutcome; 11] = [
+    pub const ALL: [RpcOutcome; 12] = [
         RpcOutcome::Ok,
         RpcOutcome::Unauthorized,
         RpcOutcome::NotFound,
@@ -161,6 +163,7 @@ impl RpcOutcome {
         RpcOutcome::Timeout,
         RpcOutcome::TransitionRevoked,
         RpcOutcome::RevocationRejected,
+        RpcOutcome::TransitionCommitmentMismatch,
     ];
 
     /// Metric label.
@@ -177,6 +180,7 @@ impl RpcOutcome {
             RpcOutcome::Timeout => "timeout",
             RpcOutcome::TransitionRevoked => "transition_revoked",
             RpcOutcome::RevocationRejected => "revocation_rejected",
+            RpcOutcome::TransitionCommitmentMismatch => "commitment_mismatch",
         }
     }
 
@@ -203,6 +207,9 @@ impl RpcOutcome {
                 RpcError::Unavailable => RpcOutcome::Unavailable,
                 RpcError::TransitionRevoked => RpcOutcome::TransitionRevoked,
                 RpcError::RevocationRejected => RpcOutcome::RevocationRejected,
+                RpcError::TransitionCommitmentMismatch => {
+                    RpcOutcome::TransitionCommitmentMismatch
+                }
             },
             _ => RpcOutcome::Ok,
         }

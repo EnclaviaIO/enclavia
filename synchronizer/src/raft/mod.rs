@@ -33,8 +33,8 @@
 //!   carries `new_control_pubkey`. A follower replays
 //!   `observe_attestation(new_key, new_control_pubkey)` then
 //!   `observe_transition(old_key, new_key)` then
-//!   `apply(Op::Transition { old_key, new_key, link_hash })`. (The old
-//!   key was attested by an earlier `Register`/`Pin` entry, already
+//!   `apply(Op::Transition { old_key, new_key, link_hash, commitment })`. (The
+//!   old key was attested by an earlier `Register`/`Pin` entry, already
 //!   replicated, so its observation is already present on every replica.)
 //! * [`ReplicatedOp::Revoke`]: `apply(Op::Revoke { key, link_hash })`. The
 //!   leader verified the revocation link's control signature against `key`'s
@@ -245,6 +245,10 @@ pub enum ReplicatedOp {
         /// with its trusted time and flags a commit past the deadline (see
         /// `StateMachineStore`).
         valid_until_ms: i64,
+        /// The commitment the submitting session read from its volume. Apply
+        /// moves the pin only if it equals `old_key`'s latest commitment
+        /// (`Op::Transition`'s precondition).
+        commitment: Commitment,
     },
     /// Revocation of one upgrade link out of `key`. The leader verified the
     /// revocation link's control signature against `key`'s frozen pubkey, and
@@ -1048,6 +1052,7 @@ mod tests {
                 new_control_pubkey: pk(4),
                 link_hash: [0x4c; 32],
                 valid_until_ms: 1_800_000_000_000,
+                commitment: c(0xcc),
             },
             ReplicatedOp::Revoke {
                 key: k(3),

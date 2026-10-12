@@ -344,9 +344,20 @@ pub enum Request {
     /// retires `old_key`, registers `new_key` (which must itself have
     /// produced an attestation in this session, the submitting session
     /// does), and carries the existing commitment + version forward.
+    ///
+    /// Precondition: `commitment` must equal `old_key`'s latest commitment,
+    /// checked when the op is applied. Otherwise the answer is
+    /// [`RpcError::TransitionCommitmentMismatch`] and nothing changes:
+    /// `old_key` stays current and keeps its pin. The new enclave computes
+    /// `commitment` from the volume it booted on, exactly as it would for a
+    /// `Pin`, so booting the target on the wrong volume (blank, older, or
+    /// another enclave's) can never retire the predecessor.
     Transition {
         /// The #47 upgrade chain link authorizing the transition.
         link: ChainLink,
+        /// The commitment of the volume the new enclave booted on (same
+        /// derivation as [`Request::Pin`]'s `commitment`).
+        commitment: Commitment,
     },
 
     /// Revoke one upgrade link out of the session's own key
@@ -480,6 +491,18 @@ pub enum RpcError {
     /// activated). The revocation did NOT take effect ([`CAPABILITY_REVOCATION`]).
     #[error("revocation rejected")]
     RevocationRejected,
+
+    /// `Transition` was refused because its `commitment` is not the old
+    /// key's latest commitment: the new enclave did not boot on a volume
+    /// holding the predecessor's latest state. Nothing changed; the old key
+    /// keeps the pin, so the upgrade can still run on the right volume.
+    ///
+    /// Not capability-gated, unlike the wire rules above ask for a new
+    /// variant: `Transition` itself changed shape in the same release (its
+    /// `commitment` is required), so no peer that could receive this variant
+    /// predates it.
+    #[error("transition commitment does not match the pinned state")]
+    TransitionCommitmentMismatch,
 }
 
 impl From<ValidationError> for RpcError {
@@ -498,6 +521,7 @@ impl From<ValidationError> for RpcError {
             ValidationError::NewKeyAlreadyExists => RpcError::TransitionRejected,
             ValidationError::OldKeyEqualsNew => RpcError::TransitionRejected,
             ValidationError::TransitionRevoked => RpcError::TransitionRevoked,
+            ValidationError::CommitmentMismatch => RpcError::TransitionCommitmentMismatch,
 
             // KeyNotCurrent surfaces from Pin/Get on an unregistered key
             // (NotFound for the caller) AND from Transition on an
@@ -1284,7 +1308,10 @@ mod tests {
     fn request_transition_roundtrip() {
         let (sk, _) = keypair(0x10);
         let link = upgrade_link(0x10, 0x20, &sk);
-        roundtrip(&Request::Transition { link });
+        roundtrip(&Request::Transition {
+            link,
+            commitment: c(0x3c),
+        });
     }
 
     #[test]
@@ -1324,6 +1351,7 @@ mod tests {
             RpcError::Unavailable,
             RpcError::TransitionRevoked,
             RpcError::RevocationRejected,
+            RpcError::TransitionCommitmentMismatch,
         ] {
             roundtrip(&Response::Err { error: code });
         }
@@ -1368,6 +1396,10 @@ mod tests {
             (
                 ValidationError::TransitionRevoked,
                 RpcError::TransitionRevoked,
+            ),
+            (
+                ValidationError::CommitmentMismatch,
+                RpcError::TransitionCommitmentMismatch,
             ),
         ];
         for (input, expected) in cases {

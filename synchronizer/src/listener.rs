@@ -1060,7 +1060,10 @@ mod tests {
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Transition { link },
+                request: Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                },
             },
         )
         .await;
@@ -1100,7 +1103,10 @@ mod tests {
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Transition { link },
+                request: Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                },
             },
         )
         .await;
@@ -1136,7 +1142,10 @@ mod tests {
             &mut client,
             &mut ct,
             &Frame::Rpc {
-                request: Request::Transition { link },
+                request: Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                },
             },
         )
         .await;

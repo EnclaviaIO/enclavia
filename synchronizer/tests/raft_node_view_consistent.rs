@@ -390,14 +390,32 @@ async fn run_scenario(seed: u64) {
                 .unwrap();
             let new_idx = model.fresh_idx();
             let link = rng.gen_range(0..4u8);
+            // Present the commitment the old key holds in the leader's
+            // applied view, or, one time in four, one it never held: the
+            // commitment precondition must refuse that one.
+            let wrong = rng.gen_range(0u8..4) == 0;
+            let never_held = commitment(u64::MAX);
+            let held = match current_leader(&nodes).await {
+                Some(l) => l.raft.state_machine().get(&key(old_idx)).await,
+                None => None,
+            };
+            let presented = match held {
+                Some(state) if !wrong => state.commitment,
+                _ => never_held,
+            };
             let op = ReplicatedOp::Transition {
                 old_key: key(old_idx),
                 new_key: key(new_idx),
                 new_control_pubkey: pubkey(pubkey_seed(new_idx)),
                 link_hash: link_hash(old_idx, link),
                 valid_until_ms: i64::MAX,
+                commitment: presented,
             };
             if let SubmitOutcome::Applied(v) = submit(&nodes, op).await {
+                assert_ne!(
+                    presented, never_held,
+                    "a commitment key {old_idx} never held moved its pin (seed {seed})"
+                );
                 // A committed revocation of this link would have refused it.
                 // The model only knows ACKed revocations, a subset of the
                 // committed ones, so this cannot flake.

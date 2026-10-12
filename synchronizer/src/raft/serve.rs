@@ -67,7 +67,7 @@ use crate::wire::{
     Request, Response, RpcError, decode_transition_link, verify_revocation_link,
     verify_transition_link,
 };
-use crate::{CONTROL_PUBKEY_LEN, PcrKey, ValidationError};
+use crate::{CONTROL_PUBKEY_LEN, Commitment, PcrKey, ValidationError};
 
 /// Run one client [`Request`] from a session authenticated as `session_key`
 /// (with `control_pubkey` its announced 65-byte SEC1 P-256 control key) against
@@ -103,8 +103,9 @@ pub async fn handle_on_leader(
             expected_version,
             commitment,
         } => handle_pin(raft, session_key, key, expected_version, commitment).await,
-        Request::Transition { link } => {
-            handle_transition(raft, session_key, control_pubkey, link, debug_mode).await
+        Request::Transition { link, commitment } => {
+            handle_transition(raft, session_key, control_pubkey, link, commitment, debug_mode)
+                .await
         }
         Request::Revoke { link } => handle_revoke(raft, session_key, link).await,
     }
@@ -273,11 +274,14 @@ async fn handle_pin(
 ///    leader's own NSM time as `now` for the payload's `valid_from` and
 ///    `valid_until` gates.
 /// 4. Submit `ReplicatedOp::Transition { old_key, new_key, new_control_pubkey:
-///    control_pubkey, link_hash, valid_until_ms }`, where `control_pubkey` is
-///    the submitting (new-enclave) session's announced key. The verifier
+///    control_pubkey, link_hash, valid_until_ms, commitment }`, where
+///    `control_pubkey` is the submitting (new-enclave) session's announced key
+///    and `commitment` the one the session read from its volume. The verifier
 ///    requires `new_key == session_key`, so the session's `control_pubkey` IS
 ///    the new key's attested pubkey; followers record it before applying so the
-///    pure core's `NewKeyNotAttested` check passes.
+///    pure core's `NewKeyNotAttested` check passes. The commitment precondition
+///    (it must equal `old_key`'s latest commitment) is checked only at apply,
+///    against the committed log.
 ///
 /// The time gates hold at submission only. The entry commits whenever a quorum
 /// holds it, possibly after `valid_until` (for example after this call answered
@@ -298,6 +302,7 @@ async fn handle_transition(
     session_key: PcrKey,
     control_pubkey: [u8; CONTROL_PUBKEY_LEN],
     link: crate::wire::ChainLink,
+    commitment: Commitment,
     debug_mode: bool,
 ) -> Answered {
     // Phase one: structurally decode the (still-untrusted) link.
@@ -365,6 +370,7 @@ async fn handle_transition(
             new_control_pubkey: control_pubkey,
             link_hash: verified.link_hash,
             valid_until_ms: verified.valid_until_ms,
+            commitment,
         })
         .await
     {

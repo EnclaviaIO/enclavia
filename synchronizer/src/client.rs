@@ -346,8 +346,19 @@ where
     /// link over needs no trust of its own. A failed verification
     /// surfaces as [`RpcError::TransitionRejected`]. Returns the
     /// carried-over version on success.
-    pub async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
-        match self.rpc(Request::Transition { link }).await? {
+    ///
+    /// `commitment` is the commitment of the volume this enclave booted on,
+    /// computed exactly as for a `Pin`. The oracle moves the pin only if it
+    /// equals the old key's latest commitment; otherwise it answers
+    /// [`RpcError::TransitionCommitmentMismatch`] and changes nothing, so the
+    /// old key keeps its pin and the upgrade can still run on the right
+    /// volume.
+    pub async fn transition(
+        &mut self,
+        link: ChainLink,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError> {
+        match self.rpc(Request::Transition { link, commitment }).await? {
             Response::TransitionOk { version } => Ok(version),
             Response::Err { error } => Err(ClientError::Rpc(error)),
             _ => Err(ClientError::UnexpectedResponse("expected TransitionOk")),

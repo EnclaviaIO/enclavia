@@ -1508,8 +1508,12 @@ pub trait BootOracle {
         expected_version: Version,
         commitment: Commitment,
     ) -> Result<Version, ClientError>;
-    /// `Client::transition`.
-    async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError>;
+    /// `Client::transition`: `commitment` is this volume's, as for a pin.
+    async fn transition(
+        &mut self,
+        link: ChainLink,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError>;
 }
 
 impl<S> BootOracle for Client<S>
@@ -1530,8 +1534,12 @@ where
     ) -> Result<Version, ClientError> {
         Client::pin(self, key, expected_version, commitment).await
     }
-    async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
-        Client::transition(self, link).await
+    async fn transition(
+        &mut self,
+        link: ChainLink,
+        commitment: Commitment,
+    ) -> Result<Version, ClientError> {
+        Client::transition(self, link, commitment).await
     }
 }
 
@@ -1684,13 +1692,21 @@ where
 /// (new) key, which is either a genuine rollback or the first boot
 /// after a staged upgrade whose pin still lives under the OLD image's
 /// PCR key. Disambiguate with the #47 upgrade link: if chain-host
-/// serves one, submit `Transition { link }` on the already-established,
-/// MUTUALLY-authenticated session (the only place this is ever called
-/// from) and re-run the NORMAL verify against the migrated pin, whose
-/// carried-forward commitment must match the disk. Anything short of
-/// that full success (no link, non-upgrade link, oracle rejection,
+/// serves one, submit `Transition { link, commitment }` on the
+/// already-established, MUTUALLY-authenticated session (the only place this
+/// is ever called from) and re-run the NORMAL verify against the migrated
+/// pin, whose carried-forward commitment must match the disk. Anything short
+/// of that full success (no link, non-upgrade link, oracle rejection,
 /// post-transition mismatch) fail-stops exactly as before #46, with
 /// the extra context appended to `fail_reason`.
+///
+/// `commitment` is this device's commitment, computed exactly as for a pin.
+/// The oracle moves the pin only if it equals the predecessor's latest
+/// commitment, so the disk check happens BEFORE the one-shot Transition: an
+/// upgrade target booted on the wrong volume (blank, older, another
+/// enclave's) is refused with `TransitionCommitmentMismatch`, the
+/// predecessor keeps its pin, and the upgrade can still run on the right
+/// volume. The post-transition `Get` + compare stays as defence in depth.
 ///
 /// SECURITY: the link is a bearer credential the ORACLE verifies end to
 /// end (control signature against the pubkey frozen for the old key,
@@ -1750,18 +1766,31 @@ where
     }
 
     info!("submitting PCR transition: adopting the pre-upgrade pinned state under this image");
-    let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.transition(link))
+    let commitment = Commitment(commitment_of_region(region));
+    let version = tokio::time::timeout(SYNC_RPC_TIMEOUT, oracle.transition(link, commitment))
         .await
         .map_err(|_| {
             format!(
                 "boot verify: Transition timed out after {SYNC_RPC_TIMEOUT:?} \
-                 (synchronizer unreachable)"
+                 (synchronizer unreachable; the outcome is unknown and the transition may \
+                 have committed: reboot to re-verify)"
             )
         })?
-        .map_err(|e| {
-            format!(
+        .map_err(|e| match e {
+            ClientError::Rpc(RpcError::TransitionCommitmentMismatch) => format!(
+                "boot verify: {fail_reason} (this volume does not hold the predecessor's \
+                 latest pinned state: wrong, blank or rolled-back volume. The synchronizer \
+                 refused the transition and the predecessor keeps its pin, so the upgrade can \
+                 still run on the right volume)"
+            ),
+            ClientError::Rpc(RpcError::Unavailable) => format!(
+                "boot verify: {fail_reason} (the synchronizer could not confirm the PCR \
+                 transition: the outcome is unknown and it may have committed; reboot to \
+                 re-verify)"
+            ),
+            e => format!(
                 "boot verify: {fail_reason} (the synchronizer rejected the PCR transition: {e})"
-            )
+            ),
         })?;
     info!(
         version = version.0,
@@ -2594,6 +2623,8 @@ mod tests {
         registers: std::collections::VecDeque<Result<(), ClientError>>,
         transitions: std::collections::VecDeque<Result<Version, ClientError>>,
         pub(super) seen_transitions: Vec<ChainLink>,
+        /// The commitment each Transition presented, in order.
+        pub(super) seen_commitments: Vec<Commitment>,
     }
 
     impl ScriptedOracle {
@@ -2607,6 +2638,7 @@ mod tests {
                 registers: registers.into_iter().collect(),
                 transitions: transitions.into_iter().collect(),
                 seen_transitions: Vec::new(),
+                seen_commitments: Vec::new(),
             }
         }
     }
@@ -2630,8 +2662,13 @@ mod tests {
         ) -> Result<Version, ClientError> {
             panic!("boot verification never pins")
         }
-        async fn transition(&mut self, link: ChainLink) -> Result<Version, ClientError> {
+        async fn transition(
+            &mut self,
+            link: ChainLink,
+            commitment: Commitment,
+        ) -> Result<Version, ClientError> {
             self.seen_transitions.push(link);
+            self.seen_commitments.push(commitment);
             self.transitions.pop_front().expect("unexpected Transition")
         }
     }
@@ -2711,6 +2748,51 @@ mod tests {
 
         assert_eq!(oracle.seen_transitions.len(), 1);
         assert_eq!(oracle.seen_transitions[0].sequence, Some(3));
+        // The Transition carries this device's commitment, the precondition
+        // the oracle checks against the predecessor's latest pin.
+        assert_eq!(oracle.seen_commitments, vec![migrated]);
+    }
+
+    /// The oracle refusing the Transition because this volume is not the
+    /// predecessor's latest state is fail-stop, and the message says the
+    /// predecessor keeps its pin.
+    #[tokio::test]
+    async fn transition_commitment_mismatch_fail_stops_and_keeps_the_predecessor() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found()],
+            vec![],
+            vec![Err(ClientError::Rpc(RpcError::TransitionCommitmentMismatch))],
+        );
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
+            Some(test_upgrade_link(3))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("predecessor keeps its pin"), "{err}");
+        assert_eq!(
+            oracle.seen_commitments,
+            vec![Commitment(commitment_of_region(&region))]
+        );
+    }
+
+    /// `Unavailable` on the Transition is an unknown outcome, not a refusal:
+    /// the message says it may have committed.
+    #[tokio::test]
+    async fn transition_unavailable_reports_an_unknown_outcome() {
+        let region = region_with_data();
+        let mut oracle = ScriptedOracle::new(
+            vec![not_found()],
+            vec![],
+            vec![Err(ClientError::Rpc(RpcError::Unavailable))],
+        );
+        let err = verify_or_register(&mut oracle, test_key(), ImageRole::Genesis, &region, async {
+            Some(test_upgrade_link(3))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("may have committed"), "{err}");
+        assert!(!err.to_string().contains("rejected"), "{err}");
     }
 
     /// No upgrade link available: the written-but-unpinned device
@@ -2826,15 +2908,13 @@ mod tests {
         assert!(err.to_string().contains("upgrade target"), "{err}");
         assert!(oracle.seen_transitions.is_empty());
 
-        // The predecessor holds written data: the migrated pin does not
-        // match the blank disk, fail-stop.
+        // The predecessor holds written data: the Transition presents the
+        // blank disk's commitment, the oracle refuses it (the predecessor
+        // keeps its pin), fail-stop.
         let mut oracle = ScriptedOracle::new(
-            vec![
-                not_found(),
-                Ok((Commitment(commitment_of_region(&region_with_data())), Version(5))),
-            ],
+            vec![not_found()],
             vec![],
-            vec![Ok(Version(5))],
+            vec![Err(ClientError::Rpc(RpcError::TransitionCommitmentMismatch))],
         );
         let err = verify_or_register(
             &mut oracle,
@@ -2845,7 +2925,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("mismatch"), "{err}");
+        assert!(err.to_string().contains("predecessor keeps its pin"), "{err}");
+        assert_eq!(
+            oracle.seen_commitments,
+            vec![Commitment(commitment_of_region(&blank))]
+        );
 
         // The predecessor never wrote: its blank pin moves over and serves.
         let mut oracle = ScriptedOracle::new(
@@ -4343,7 +4427,11 @@ mod retry_budget_tests {
             }
             Ok(self.version)
         }
-        async fn transition(&mut self, _link: ChainLink) -> Result<Version, ClientError> {
+        async fn transition(
+            &mut self,
+            _link: ChainLink,
+            _commitment: Commitment,
+        ) -> Result<Version, ClientError> {
             unreachable!("no transition on the pin path")
         }
     }
@@ -4421,7 +4509,11 @@ mod retry_budget_tests {
         ) -> Result<Version, ClientError> {
             self.0.take().expect("one pin only")
         }
-        async fn transition(&mut self, _link: ChainLink) -> Result<Version, ClientError> {
+        async fn transition(
+            &mut self,
+            _link: ChainLink,
+            _commitment: Commitment,
+        ) -> Result<Version, ClientError> {
             unreachable!("no transition on the pin path")
         }
     }

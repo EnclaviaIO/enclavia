@@ -154,6 +154,14 @@ pub enum Op {
         /// The op is refused when a committed [`Op::Revoke`] for `old_key`
         /// names this hash.
         link_hash: [u8; 32],
+        /// The commitment the successor read from the volume it booted on,
+        /// the same value it would `Pin` (precondition). The op applies only
+        /// if it equals `old_key`'s latest commitment, so the pin moves only
+        /// onto a volume that holds the predecessor's latest state; on any
+        /// other volume (blank, older, another enclave's) it is refused with
+        /// [`ValidationError::CommitmentMismatch`] and `old_key` keeps the
+        /// pin.
+        commitment: Commitment,
     },
     /// Revoke ONE upgrade link out of `key`, named by its payload hash: from
     /// now on a `Transition` out of `key` presenting that exact link is
@@ -284,6 +292,11 @@ pub enum ValidationError {
     /// `old_key` names (same payload hash).
     #[error("the upgrade link authorizing this transition has been revoked")]
     TransitionRevoked,
+    /// `Transition` named a commitment other than `old_key`'s latest one:
+    /// the successor did not boot on a volume holding the predecessor's
+    /// latest state. Nothing changes; `old_key` keeps the pin.
+    #[error("transition commitment does not match the old key's latest commitment")]
+    CommitmentMismatch,
 }
 
 /// Synchronizer state machine.
@@ -379,7 +392,8 @@ impl StateMachine {
                 old_key,
                 new_key,
                 link_hash,
-            } => self.apply_transition(old_key, new_key, link_hash),
+                commitment,
+            } => self.apply_transition(old_key, new_key, link_hash, commitment),
             Op::Revoke { key, link_hash } => self.apply_revoke(key, link_hash),
         }
     }
@@ -434,6 +448,7 @@ impl StateMachine {
         old_key: PcrKey,
         new_key: PcrKey,
         link_hash: [u8; 32],
+        commitment: Commitment,
     ) -> Result<KeyState, ValidationError> {
         if old_key == new_key {
             return Err(ValidationError::OldKeyEqualsNew);
@@ -456,6 +471,12 @@ impl StateMachine {
         };
         if !self.transition_authorizations.contains(&(old_key, new_key)) {
             return Err(ValidationError::NoTransitionAuthorization);
+        }
+        // Precondition: the successor booted on the predecessor's latest
+        // state. Checked here, at the entry's position in the log, so a Pin
+        // committed before the Transition is what it is compared against.
+        if self.state.get(&old_key).map(|s| s.commitment) != Some(commitment) {
+            return Err(ValidationError::CommitmentMismatch);
         }
         let mut carried = self.state.remove(&old_key).expect("checked above");
         // Rotate the registered pubkey to `new_key`'s, future
@@ -628,6 +649,13 @@ mod tests {
         Commitment([b; 32])
     }
 
+    /// The commitment `key` holds now (zeros for an unknown key): what an
+    /// upgrade target booted on the predecessor's disk presents in its
+    /// Transition.
+    fn held(sm: &StateMachine, key: PcrKey) -> Commitment {
+        sm.get(&key).map_or(Commitment([0; 32]), |s| s.commitment)
+    }
+
     /// Synthetic 65-byte SEC1-shaped pubkey for tests that just need
     /// *some* control pubkey in `observe_attestation`. The pure state
     /// machine doesn't verify the bytes, it only stores them, so any
@@ -705,6 +733,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(2),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::NoTransitionAuthorization);
@@ -725,6 +754,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(2),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::NewKeyNotAttested);
@@ -752,6 +782,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(2),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap();
         assert_eq!(state.commitment, c(0xbb));
@@ -775,6 +806,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(1),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::OldKeyEqualsNew);
@@ -790,6 +822,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(2),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::KeyNotCurrent);
@@ -816,6 +849,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(2),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::NewKeyAlreadyExists);
@@ -844,6 +878,7 @@ mod tests {
             old_key: k(2),
             new_key: k(3),
             link_hash: [0; 32],
+            commitment: held(&sm, k(2)),
         })
         .unwrap();
         for key in sm.head_keys() {
@@ -965,6 +1000,7 @@ mod tests {
             old_key: k(1),
             new_key: k(2),
             link_hash: [0; 32],
+            commitment: held(&sm, k(1)),
         })
         .unwrap();
         let err = sm
@@ -991,6 +1027,7 @@ mod tests {
             old_key: k(1),
             new_key: k(2),
             link_hash: [0; 32],
+            commitment: held(&sm, k(1)),
         })
         .unwrap();
         let err = sm
@@ -1019,6 +1056,7 @@ mod tests {
             old_key: k(1),
             new_key: k(2),
             link_hash: [0; 32],
+            commitment: held(&sm, k(1)),
         })
         .unwrap();
         sm.observe_transition(k(1), k(3));
@@ -1027,6 +1065,7 @@ mod tests {
                 old_key: k(1),
                 new_key: k(3),
                 link_hash: [0; 32],
+                commitment: held(&sm, k(1)),
             })
             .unwrap_err();
         assert_eq!(err, ValidationError::KeyNotCurrent);
@@ -1085,6 +1124,7 @@ mod tests {
             old_key: k(1),
             new_key: k(2),
             link_hash: [0; 32],
+            commitment: held(&sm, k(1)),
         })
         .unwrap();
         let post = *sm.get(&k(2)).unwrap();
@@ -1163,6 +1203,7 @@ mod tests {
                 old_key: k(2),
                 new_key: k(3),
                 link_hash: [0; 32],
+                commitment: c(0xbc),
             },
             Op::Pin {
                 key: k(3),
@@ -1242,6 +1283,7 @@ mod tests {
             old_key: k(2),
             new_key: k(3),
             link_hash: [0; 32],
+            commitment: held(&sm, k(2)),
         })
         .unwrap();
 
@@ -1276,11 +1318,13 @@ mod tests {
                 old_key: k(1),
                 new_key: k(4),
                 link_hash: [0; 32],
+                commitment: held(&a, k(1)),
             }),
             b.apply(Op::Transition {
                 old_key: k(1),
                 new_key: k(4),
                 link_hash: [0; 32],
+                commitment: held(&b, k(1)),
             }),
             "post-restore Transition diverged from the original"
         );
@@ -1317,6 +1361,7 @@ mod tests {
             old_key: k(1),
             new_key: k(2),
             link_hash,
+            commitment: held(sm, k(1)),
         })
     }
 
@@ -1326,6 +1371,42 @@ mod tests {
         link_hash: [u8; 32],
     ) -> Result<KeyState, ValidationError> {
         sm.apply(Op::Revoke { key, link_hash })
+    }
+
+    /// The commitment precondition: a Transition naming anything but the old
+    /// key's latest commitment (a blank volume's, an older pin's) is refused
+    /// and changes nothing; the right commitment then moves the pin, and a
+    /// replay of it is refused without touching the moved state.
+    #[test]
+    fn transition_requires_the_old_keys_latest_commitment() {
+        let mut sm = upgrade_ready();
+        sm.apply(Op::Pin {
+            key: k(1),
+            expected_version: Version(0),
+            commitment: c(0xab),
+        })
+        .unwrap();
+        let op = |commitment| Op::Transition {
+            old_key: k(1),
+            new_key: k(2),
+            link_hash: h(0xa1),
+            commitment,
+        };
+        for wrong in [Commitment([0; 32]), c(0xaa)] {
+            assert_eq!(
+                sm.apply(op(wrong)),
+                Err(ValidationError::CommitmentMismatch)
+            );
+            let old = sm.get(&k(1)).unwrap();
+            assert_eq!((old.commitment, old.version), (c(0xab), Version(1)));
+            assert!(sm.get(&k(2)).is_none());
+            assert_eq!(sm.retired_len(), 0);
+        }
+        let moved = sm.apply(op(c(0xab))).unwrap();
+        assert_eq!((moved.commitment, moved.version), (c(0xab), Version(1)));
+        assert!(sm.get(&k(1)).is_none());
+        assert_eq!(sm.apply(op(c(0xab))), Err(ValidationError::KeyNotCurrent));
+        assert_eq!(sm.get(&k(2)), Some(&moved));
     }
 
     /// The revoked link is refused, and the pin stays where it was.

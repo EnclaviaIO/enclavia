@@ -383,6 +383,7 @@ impl StateMachineStore {
                 new_control_pubkey,
                 link_hash,
                 valid_until_ms: _,
+                commitment,
             } => {
                 // The new key's attestation was observed by the leader from the
                 // submitting session; record it so the pure core's
@@ -397,6 +398,7 @@ impl StateMachineStore {
                     old_key: *old_key,
                     new_key: *new_key,
                     link_hash: *link_hash,
+                    commitment: *commitment,
                 })
             }
             ReplicatedOp::Revoke { key, link_hash } => sm.apply(Op::Revoke {

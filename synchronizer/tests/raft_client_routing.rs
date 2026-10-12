@@ -809,7 +809,31 @@ async fn transition_flow_carries_version_and_retires_old() {
     // different node, exercising forwarding of a Transition too).
     let link = upgrade_link(old_seed, new_seed, &sk_old);
     let mut new_enclave = Client::connect(find(&nodes, "node-b"), new_seed, pk_new).await;
-    let r = new_enclave.rpc(Request::Transition { link }).await;
+    // Booted on a volume holding an older state (the registration's, not the
+    // latest pin's): refused at apply on every replica, and nothing moves.
+    let r = new_enclave
+        .rpc(Request::Transition {
+            link: link.clone(),
+            commitment: c(0xaa),
+        })
+        .await;
+    assert_eq!(
+        r,
+        Response::Err {
+            error: RpcError::TransitionCommitmentMismatch
+        }
+    );
+    assert_all_nodes_have(&nodes, old_key, Version(1)).await;
+    for n in &nodes {
+        assert!(n.raft.state_machine().get(&new_key).await.is_none());
+    }
+    // From the volume holding the latest state, the same link moves the pin.
+    let r = new_enclave
+        .rpc(Request::Transition {
+            link,
+            commitment: c(0xbb),
+        })
+        .await;
     assert_eq!(
         r,
         Response::TransitionOk {
@@ -1959,6 +1983,7 @@ async fn transition_committed_after_its_deadline_is_counted_by_the_leader() {
             new_control_pubkey: keypair(mid_seed).1,
             link_hash: [0x51; 32],
             valid_until_ms: now_ms - tolerance - 1_000,
+            commitment: c(0x01),
         })
         .await
         .expect("a late commit still applies");
@@ -1981,6 +2006,7 @@ async fn transition_committed_after_its_deadline_is_counted_by_the_leader() {
             new_control_pubkey: keypair(new_seed).1,
             link_hash: [0x52; 32],
             valid_until_ms: now_ms + 60 * 60 * 1000,
+            commitment: c(0x01),
         })
         .await
         .expect("an in-time commit applies");
@@ -2161,7 +2187,8 @@ async fn revoked_link_is_refused_everywhere_and_survives_a_leader_change() {
     assert_eq!(
         via_leader
             .rpc(Request::Transition {
-                link: revoked.clone()
+                link: revoked.clone(),
+                commitment: c(0x81),
             })
             .await,
         revoked_err
@@ -2170,7 +2197,8 @@ async fn revoked_link_is_refused_everywhere_and_survives_a_leader_change() {
     assert_eq!(
         via_follower
             .rpc(Request::Transition {
-                link: revoked.clone()
+                link: revoked.clone(),
+                commitment: c(0x81),
             })
             .await,
         revoked_err
@@ -2189,7 +2217,8 @@ async fn revoked_link_is_refused_everywhere_and_survives_a_leader_change() {
             new_seed,
             pk_new,
             Request::Transition {
-                link: revoked.clone()
+                link: revoked.clone(),
+                commitment: c(0x81),
             }
         )
         .await,
@@ -2217,7 +2246,10 @@ async fn revoked_link_is_refused_everywhere_and_survives_a_leader_change() {
             followers[1],
             new_seed,
             pk_new,
-            Request::Transition { link: reapproved }
+            Request::Transition {
+                link: reapproved,
+                commitment: c(0x81),
+            }
         )
         .await,
         Response::TransitionOk {
@@ -2326,7 +2358,10 @@ async fn unauthorized_or_mistargeted_revocations_do_not_block_the_link() {
     let mut new_session = Client::connect(leader, new_seed, pk_new).await;
     assert_eq!(
         new_session
-            .rpc(Request::Transition { link: target })
+            .rpc(Request::Transition {
+                link: target,
+                commitment: c(0x83),
+            })
             .await,
         Response::TransitionOk {
             version: Version(0)
@@ -2443,7 +2478,10 @@ async fn revocation_survives_snapshot_install() {
             victim,
             new_seed,
             pk_new,
-            Request::Transition { link: revoked }
+            Request::Transition {
+                link: revoked,
+                commitment: c(0x87),
+            }
         )
         .await,
         Response::Err {

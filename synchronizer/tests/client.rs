@@ -280,7 +280,7 @@ async fn transition_migrates_pin_to_new_key() {
 
     let (mut client, new_key, _task) = connect_as(Arc::clone(&node), 0x60).await;
     let link = upgrade_link(0x50, 0x60, &sk_old);
-    let version = client.transition(link).await.expect("transition");
+    let version = client.transition(link, c(0xee)).await.expect("transition");
     assert_eq!(version, Version(0), "carried-over version");
 
     let (commitment, version) = client.get(new_key).await.expect("get after transition");
@@ -300,11 +300,37 @@ async fn rejected_transition_surfaces_as_rpc_error() {
 
     let (mut client, _new_key, _task) = connect_as(Arc::clone(&node), 0x61).await;
     let link = upgrade_link(0x51, 0x61, &sk_attacker);
-    let err = client.transition(link).await.unwrap_err();
+    let err = client.transition(link, c(0xee)).await.unwrap_err();
     assert!(
         matches!(err, ClientError::Rpc(RpcError::TransitionRejected)),
         "{err:?}"
     );
+}
+
+/// A Transition from a volume that does not hold the predecessor's latest
+/// commitment surfaces as the structured `TransitionCommitmentMismatch`, and
+/// the same link still works from the right volume afterwards.
+#[tokio::test]
+async fn transition_from_another_volume_surfaces_as_commitment_mismatch() {
+    let node = Arc::new(Node::with_debug_mode(true));
+    let (sk_old, pk_old) = keypair(0x53);
+    register_old(&node, 0x53, pk_old).await;
+
+    let (mut client, new_key, _task) = connect_as(Arc::clone(&node), 0x63).await;
+    let link = upgrade_link(0x53, 0x63, &sk_old);
+    let err = client
+        .transition(link.clone(), c(0x00))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::Rpc(RpcError::TransitionCommitmentMismatch)),
+        "{err:?}"
+    );
+    assert_eq!(
+        client.transition(link, c(0xee)).await.expect("right volume"),
+        Version(0)
+    );
+    assert_eq!(client.get(new_key).await.unwrap(), (c(0xee), Version(0)));
 }
 
 /// An attestation document the server rejects (garbage bytes) tears the
@@ -640,7 +666,7 @@ async fn revoke_then_the_revoked_link_cannot_transition() {
 
     let (mut new_session, _, _task) = connect_as(Arc::clone(&node), 0x71).await;
     let err = new_session
-        .transition(revoked)
+        .transition(revoked, c(0xee))
         .await
         .unwrap_err();
     assert!(

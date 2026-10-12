@@ -45,7 +45,7 @@ use crate::wire::{
     ChainLink, Request, Response, RpcError, decode_transition_link, verify_revocation_link,
     verify_transition_link,
 };
-use crate::{CONTROL_PUBKEY_LEN, Op, PcrKey, StateMachine, ValidationError};
+use crate::{CONTROL_PUBKEY_LEN, Commitment, Op, PcrKey, StateMachine, ValidationError};
 
 /// Single-node synchronizer.
 ///
@@ -143,7 +143,9 @@ impl Node {
                 self.handle_pin(session_key, key, expected_version, commitment)
                     .await
             }
-            Request::Transition { link } => self.handle_transition(session_key, link).await,
+            Request::Transition { link, commitment } => {
+                self.handle_transition(session_key, link, commitment).await
+            }
             Request::Revoke { link } => self.handle_revoke(session_key, link).await,
         }
     }
@@ -206,7 +208,12 @@ impl Node {
         }
     }
 
-    async fn handle_transition(&self, session_key: PcrKey, link: ChainLink) -> Response {
+    async fn handle_transition(
+        &self,
+        session_key: PcrKey,
+        link: ChainLink,
+        commitment: Commitment,
+    ) -> Response {
         // Trusted time for the link's `valid_from` gate, read before taking
         // the state-machine lock. No trusted time means the gate cannot be
         // evaluated, so the transition is refused (retryable).
@@ -282,12 +289,13 @@ impl Node {
         // Link verified, record the observation and apply the op through
         // the pure state machine, which still enforces the remaining
         // structural checks (new_key attested, not retired, not already
-        // registered, etc.).
+        // registered, etc.) and the commitment precondition.
         inner.observe_transition(verified.old_key, verified.new_key);
         match inner.apply(Op::Transition {
             old_key: verified.old_key,
             new_key: verified.new_key,
             link_hash: verified.link_hash,
+            commitment,
         }) {
             Ok(state) => Response::TransitionOk {
                 version: state.version,
@@ -678,7 +686,10 @@ mod tests {
         // neither the old key A nor the new key C).
         let link = upgrade_link(0x10, 0x30, &sk_a);
         let resp = node
-            .handle_request(key_b, Request::Transition { link })
+            .handle_request(key_b, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -696,7 +707,10 @@ mod tests {
         let mut link = upgrade_link(0x11, 0x21, &sk);
         link.signature = Some(vec![0xde, 0xad]); // not 64 bytes
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -714,7 +728,10 @@ mod tests {
         // Link signed by the attacker, not old_key's registered key.
         let link = upgrade_link(0x12, 0x22, &sk_attacker);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -733,7 +750,10 @@ mod tests {
         node.observe_attestation(key_new, dummy_pubkey(0x23)).await;
         let link = upgrade_link(0x13, 0x23, &sk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -752,7 +772,10 @@ mod tests {
         // as that session.
         let link = upgrade_link(0x14, 0x24, &sk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -789,7 +812,10 @@ mod tests {
         node.observe_attestation(key_new, dummy_pubkey(0x25)).await;
         let link = upgrade_link(0x15, 0x25, &sk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xbb),
+                })
             .await;
         assert_eq!(
             resp,
@@ -815,6 +841,84 @@ mod tests {
         assert_eq!(resp, err(RpcError::NotFound));
     }
 
+    /// The commitment precondition: a target that booted on a volume that
+    /// does not hold the predecessor's latest state (blank, or an older
+    /// state) is refused with `TransitionCommitmentMismatch`, and nothing
+    /// changes: the old key keeps its pin and the new key has none. The same
+    /// link then still moves the pin from the right volume, and a replay of
+    /// the completed Transition is refused without touching the new state.
+    #[tokio::test]
+    async fn transition_moves_the_pin_only_from_the_latest_state() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x19);
+        let key_old = register_old(&node, 0x19, pk).await;
+        node.handle_request(
+            key_old,
+            Request::Pin {
+                key: key_old,
+                expected_version: Version(0),
+                commitment: c(0xbb),
+            },
+        )
+        .await;
+        let key_new = key_from_seed(0x29);
+        node.observe_attestation(key_new, dummy_pubkey(0x29)).await;
+        let link = upgrade_link(0x19, 0x29, &sk);
+
+        let blank = Commitment([0; 32]);
+        for wrong in [blank, c(0xaa)] {
+            let resp = node
+                .handle_request(
+                    key_new,
+                    Request::Transition {
+                        link: link.clone(),
+                        commitment: wrong,
+                    },
+                )
+                .await;
+            assert_eq!(resp, err(RpcError::TransitionCommitmentMismatch));
+            assert_eq!(
+                node.handle_request(key_old, Request::Get { key: key_old })
+                    .await,
+                Response::GetOk {
+                    commitment: c(0xbb),
+                    version: Version(1),
+                },
+                "the predecessor keeps its pin"
+            );
+            assert_eq!(
+                node.handle_request(key_new, Request::Get { key: key_new })
+                    .await,
+                err(RpcError::NotFound)
+            );
+        }
+
+        let moved = Request::Transition {
+            link,
+            commitment: c(0xbb),
+        };
+        assert_eq!(
+            node.handle_request(key_new, moved.clone()).await,
+            Response::TransitionOk {
+                version: Version(1)
+            }
+        );
+        // Replay: the old key is retired, so the same request is refused and
+        // the new key's state is untouched.
+        assert_eq!(
+            node.handle_request(key_new, moved).await,
+            err(RpcError::TransitionRejected)
+        );
+        assert_eq!(
+            node.handle_request(key_new, Request::Get { key: key_new })
+                .await,
+            Response::GetOk {
+                commitment: c(0xbb),
+                version: Version(1),
+            }
+        );
+    }
+
     /// "Control pubkey substitution": after old_key registers with pk_real,
     /// the attacker re-attests old_key with their own pubkey and signs a
     /// link with the matching key, submitting from the new enclave's
@@ -833,7 +937,10 @@ mod tests {
         node.observe_attestation(key_old, pk_attacker).await;
         let link = upgrade_link(0x16, 0x26, &sk_attacker);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -854,7 +961,10 @@ mod tests {
             chrono::Utc::now() + chrono::Duration::hours(1),
         );
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
         let resp = node
@@ -878,7 +988,10 @@ mod tests {
         let key_new = key_from_seed(0x27);
         node.observe_attestation(key_new, dummy_pubkey(0x27)).await;
         let link = upgrade_link(0x17, 0x27, &sk);
-        node.handle_request(key_new, Request::Transition { link })
+        node.handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         // After retirement old_key is unknown to Pin, and the state machine
         // refuses to register it again.
@@ -1046,7 +1159,10 @@ mod tests {
         assert_eq!(resp, Response::RevokeOk);
 
         let resp = node
-            .handle_request(key_new, Request::Transition { link: revoked })
+            .handle_request(key_new, Request::Transition {
+                    link: revoked,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRevoked));
         let resp = node
@@ -1056,7 +1172,10 @@ mod tests {
 
         let reapproved = upgrade_link_issued_at(0x51, 0x52, &sk, hours_ago(1));
         let resp = node
-            .handle_request(key_new, Request::Transition { link: reapproved })
+            .handle_request(key_new, Request::Transition {
+                    link: reapproved,
+                    commitment: c(0xaa),
+                })
             .await;
         assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
     }
@@ -1083,7 +1202,10 @@ mod tests {
             .await;
         assert_eq!(resp, Response::RevokeOk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link: target })
+            .handle_request(key_new, Request::Transition {
+                    link: target,
+                    commitment: c(0xaa),
+                })
             .await;
         assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
     }
@@ -1110,7 +1232,10 @@ mod tests {
         let key_new = key_from_seed(0x55);
         node.observe_attestation(key_new, dummy_pubkey(0x55)).await;
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
     }
