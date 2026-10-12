@@ -1447,6 +1447,13 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let summary = upgrade::chain(&client, &enclave_id, debug_enclave).await?;
             emit(json, &summary, || print_chain(&summary));
+            // A chain that does not verify is a failure for scripts too,
+            // not only in the printed verdict.
+            if !summary.is_verified() {
+                return Err(CliError::Other(
+                    "the enclave's upgrade chain does not verify".into(),
+                ));
+            }
             Ok(())
         }
         UpgradeCmd::List { enclave_id } => {

@@ -19,7 +19,7 @@
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use enclavia_protocol::chain::{
-    AntiRollbackSetting, BootPayload, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
+    AntiRollbackSetting, BootPayload, ChainLinkJson, ChainLinkKind, EnclaveChainRow, PcrsHex, RecordedLink, RevocationPayload,
     UpgradePayload, UPGRADE_DELAY_DEFAULT, UPGRADE_WINDOW_MAX, UPGRADE_WINDOW_MIN,
     upgrade_window_is_valid, validate_chain,
 };
@@ -106,6 +106,35 @@ pub struct ChainSummary {
     pub links: Vec<VerifiedLink>,
 }
 
+impl ChainSummary {
+    /// Every link verified locally and the tip matches the enclave row: the
+    /// chain accounts for what the enclave runs.
+    pub fn is_verified(&self) -> bool {
+        self.tip_matches_row && self.links.iter().all(|l| l.validation.is_ok())
+    }
+}
+
+/// The backend's chain in `sequence` order. The walker validates each
+/// link against the ones before it, so the order is the backend's numbering,
+/// not the order of the response; that numbering must be exactly 0..n (the
+/// validator assigns the next number to every appended link), so a missing,
+/// repeated or absent number is refused rather than walked around.
+fn in_sequence_order(mut links: Vec<ChainLinkJson>) -> Result<Vec<ChainLinkJson>, CliError> {
+    links.sort_by_key(|l| l.sequence);
+    for (i, l) in links.iter().enumerate() {
+        if l.sequence != i64::try_from(i).ok() {
+            return Err(CliError::Other(format!(
+                "the backend's upgrade chain is not numbered 0 to {}: link {} has sequence \
+                 {:?}; refusing to walk it",
+                links.len().saturating_sub(1),
+                l.id.map(|u| u.to_string()).unwrap_or_else(|| "without an id".into()),
+                l.sequence
+            )));
+        }
+    }
+    Ok(links)
+}
+
 /// Fetch the enclave + its chain and re-validate end-to-end.
 ///
 /// Two backend round-trips: `GET /enclaves/{id}` for the validator
@@ -132,7 +161,7 @@ pub async fn chain(
     debug_enclave: bool,
 ) -> Result<ChainSummary, CliError> {
     let enclave = client.get_enclave(id).await?;
-    let wire_links = client.get_enclave_chain(id).await?;
+    let wire_links = in_sequence_order(client.get_enclave_chain(id).await?)?;
 
     // The expected enclave id for the walk is the (already resolved)
     // id the user asked about — the same id both GETs above were
@@ -879,6 +908,17 @@ fn print_upgrade_to_sign(p: &UpgradePayload, source: &TargetPcrs) {
     eprintln!("{ABANDON_BY_REVOKING}");
 }
 
+/// Whether a 409 from a submit is the stale control nonce, the one conflict
+/// a fresh prepare can fix: the backend's own nonce check (`the control
+/// nonce in the submitted command is stale`) or the enclave's (`stale
+/// nonce`, relayed as `enclave rejected ...`). Any other conflict is
+/// returned as is, so it does not cost the owner another round of
+/// signatures.
+fn is_stale_nonce(body: &str) -> bool {
+    body.contains("control nonce in the submitted command is stale")
+        || body.contains("stale nonce")
+}
+
 /// Two-phase confirm: prepare, check the payload the backend built
 /// ([`check_upgrade_payload`]), sign locally (inner + envelope), submit.
 /// On a stale-nonce 409 from submit, re-runs prepare (and the check) and
@@ -903,7 +943,7 @@ async fn confirm_self_hosted(
     let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
     submitting("Confirming");
     match client.confirm_submit(enclave_id, upgrade_id, &submission).await {
-        Err(CliError::Conflict(msg)) => {
+        Err(CliError::Conflict(msg)) if is_stale_nonce(&msg) => {
             eprintln!(
                 "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
             );
@@ -990,7 +1030,7 @@ async fn revoke_self_hosted(
     let submission = crate::signer::sign_revoke_submission(signer.as_ref(), &prep)?;
     submitting("Revoking");
     match client.revoke_submit(enclave_id, upgrade_id, &submission).await {
-        Err(CliError::Conflict(msg)) => {
+        Err(CliError::Conflict(msg)) if is_stale_nonce(&msg) => {
             eprintln!(
                 "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
             );
@@ -1205,6 +1245,53 @@ pub fn check_revocation_target(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// Only the two stale-nonce rejections re-run prepare; any other 409
+    /// (for example the enclave refusing the payload) is surfaced.
+    #[test]
+    fn only_a_stale_nonce_conflict_is_retried() {
+        assert!(is_stale_nonce(
+            "{\"error\":\"conflict\",\"message\":\"the control nonce in the submitted command \
+             is stale (the enclave processed another control command since prepare); re-run \
+             prepare and sign again\"}"
+        ));
+        assert!(is_stale_nonce(
+            "enclave rejected PrepareUpgrade: stale nonce, fetch a fresh attestation"
+        ));
+        assert!(!is_stale_nonce(
+            "enclave rejected PrepareUpgrade: valid_from is earlier than the minimum delay"
+        ));
+        assert!(!is_stale_nonce("upgrade is not staged"));
+    }
+
+    /// The walk follows the backend's `sequence` numbering, not the response
+    /// order, and refuses a numbering that is not exactly 0..n.
+    #[test]
+    fn chain_is_walked_in_sequence_order() {
+        let link = |seq: Option<i64>| ChainLinkJson {
+            id: Some(Uuid::nil()),
+            kind: ChainLinkKind::Boot,
+            sequence: seq,
+            payload: String::new(),
+            attestation: String::new(),
+            signature: None,
+            created_at: None,
+        };
+        let ordered = in_sequence_order(vec![link(Some(2)), link(Some(0)), link(Some(1))]).unwrap();
+        let seqs: Vec<_> = ordered.iter().map(|l| l.sequence).collect();
+        assert_eq!(seqs, vec![Some(0), Some(1), Some(2)]);
+        assert!(in_sequence_order(Vec::new()).unwrap().is_empty());
+
+        for bad in [
+            vec![link(Some(0)), link(Some(2))],
+            vec![link(Some(0)), link(Some(0))],
+            vec![link(Some(1))],
+            vec![link(None), link(Some(0))],
+        ] {
+            let err = in_sequence_order(bad).unwrap_err().to_string();
+            assert!(err.contains("not numbered"), "{err}");
+        }
+    }
 
     fn pcrs_fixture() -> PcrsHex {
         PcrsHex {
