@@ -21,8 +21,8 @@
 //!    performing its own WebSocket, Noise, and attestation handshakes.
 //!
 //! The harness stands up a small in-process Noise responder that mimics
-//! enclavia-server (attestation reply + a single `Data` response per
-//! request). Unlike `upgrade.rs` it accepts MULTIPLE TCP connections in
+//! enclavia-server (attestation reply + the response to each request
+//! streamed back as `StreamData` followed by `StreamClose`). Unlike `upgrade.rs` it accepts MULTIPLE TCP connections in
 //! sequence, so the SDK can be observed reconnecting.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,28 +88,37 @@ async fn do_attestation(conn: &mut Conn, seed: u8) {
     .unwrap();
 }
 
-/// Receive exactly one `Data` request WITHOUT answering it, to simulate
-/// the enclave dropping while a request is in flight.
-async fn receive_one_request(conn: &mut Conn) {
-    match conn.receive::<ClientMessage>().await.unwrap() {
-        ClientMessage::Data { .. } => {}
-        other => panic!("expected Data, got {other:?}"),
+/// Wait for the next request (an `OpenStream`), skipping the
+/// `StreamClose { Both }` the client sends after each finished request.
+async fn next_request_id(conn: &mut Conn) -> u64 {
+    loop {
+        match conn.receive::<ClientMessage>().await.unwrap() {
+            ClientMessage::OpenStream { id, .. } => return id,
+            ClientMessage::StreamClose { .. } => continue,
+            other => panic!("expected OpenStream, got {other:?}"),
+        }
     }
 }
 
-/// Answer exactly one `Data` request, echoing back `body` in the response.
+/// Receive exactly one request WITHOUT answering it, to simulate the
+/// enclave dropping while a request is in flight.
+async fn receive_one_request(conn: &mut Conn) {
+    next_request_id(conn).await;
+}
+
+/// Answer exactly one request, echoing back `body` in the response, the way
+/// enclavia-server does: the workload's bytes as `StreamData`, then
+/// `StreamClose` at workload EOF.
 async fn answer_one_request(conn: &mut Conn, body: &[u8]) {
-    let id = match conn.receive::<ClientMessage>().await.unwrap() {
-        ClientMessage::Data { id, .. } => id,
-        other => panic!("expected Data, got {other:?}"),
-    };
+    let id = next_request_id(conn).await;
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut payload = resp.into_bytes();
     payload.extend_from_slice(body);
-    conn.send(&ServerMessage::Data { id, payload }).await.unwrap();
+    conn.send(&ServerMessage::StreamData { id, payload }).await.unwrap();
+    conn.send(&ServerMessage::StreamClose { id }).await.unwrap();
 }
 
 /// Accept one stream-opening request and complete its HTTP upgrade.

@@ -86,6 +86,38 @@ pub(crate) fn try_parse_response_head(buf: &[u8]) -> Result<Option<(u16, usize)>
     }
 }
 
+/// Whether `buf` provably holds a whole final HTTP/1.1 response: a complete
+/// head, and either a status that carries no body (204, 304) or a
+/// `Content-Length` whose bytes have all arrived. A response delimited only
+/// by connection close cannot be proven complete and returns `false`, as
+/// does an interim 1xx response, which a final response follows.
+pub(crate) fn is_complete_response(buf: &[u8]) -> bool {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut resp = httparse::Response::new(&mut headers);
+    let Ok(httparse::Status::Complete(head_len)) = resp.parse(buf) else {
+        return false;
+    };
+    let Some(code) = resp.code else {
+        return false;
+    };
+    if code < 200 {
+        return false;
+    }
+    if code == 204 || code == 304 {
+        return true;
+    }
+    let content_length = resp
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    match content_length {
+        Some(len) => buf.len() - head_len >= len,
+        None => false,
+    }
+}
+
 /// Parse a raw HTTP/1.1 response into a `Response`.
 pub(crate) fn parse_response(raw: &[u8]) -> Result<Response, Error> {
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
@@ -120,4 +152,24 @@ pub(crate) fn parse_response(raw: &[u8]) -> Result<Response, Error> {
     let body = raw[header_len..].to_vec();
 
     Ok(Response::new(status_code, headers, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_response_detection() {
+        assert!(is_complete_response(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 3\r\n\r\nbig"));
+        assert!(is_complete_response(b"HTTP/1.1 204 No Content\r\n\r\n"));
+        // Interim response: the final one is still to come.
+        assert!(!is_complete_response(b"HTTP/1.1 100 Continue\r\n\r\n"));
+        // Body still short of its Content-Length.
+        assert!(!is_complete_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"));
+        // Head not terminated yet.
+        assert!(!is_complete_response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"));
+        // Close-delimited body: completeness unknowable.
+        assert!(!is_complete_response(b"HTTP/1.1 200 OK\r\n\r\nwhatever"));
+        assert!(!is_complete_response(b""));
+    }
 }

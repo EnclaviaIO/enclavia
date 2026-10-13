@@ -8,14 +8,55 @@ use crate::error::Error;
 use crate::noise::recv_binary;
 use crate::ws::{Ws, WsEvent};
 
-type PendingMap = HashMap<u64, oneshot::Sender<Result<Vec<u8>, Error>>>;
 type StreamMap = HashMap<u64, mpsc::Sender<Result<Vec<u8>, Error>>>;
+type PendingMap = HashMap<u64, PendingRequest>;
+
+/// Largest Noise transport message plaintext: 65535 bytes of ciphertext
+/// minus the 16-byte authentication tag.
+const MAX_NOISE_PLAINTEXT: usize = 65535 - 16;
+
+/// Upper bound on the CBOR bytes around a stream payload: the message map,
+/// its `type` tag and `id`, and the payload's array header.
+const STREAM_FRAME_OVERHEAD: usize = 64;
+
+/// Largest slice of request bytes carried by one `OpenStream` / `StreamData`
+/// frame. Every message must fit in a single Noise transport message, and a
+/// payload byte costs up to two CBOR bytes (bytes are sent as an array of
+/// integers), so a request of any size is split into frames of at most this
+/// many bytes. A request small enough for a single frame goes out as one
+/// `OpenStream`, which the server writes to the workload in one call.
+pub(crate) const REQUEST_CHUNK: usize = (MAX_NOISE_PLAINTEXT - STREAM_FRAME_OVERHEAD) / 2;
+
+/// A one-shot request carried over a workload stream: the response bytes
+/// accumulate here until the response is complete.
+struct PendingRequest {
+    response: Vec<u8>,
+    response_tx: oneshot::Sender<Result<Vec<u8>, Error>>,
+}
+
+/// What the transport loop must do after routing one inbound message.
+enum Followup {
+    None,
+    /// A one-shot request's response is complete. The server keeps the
+    /// stream (and one of its in-flight slots) alive until the client
+    /// closes both halves, so the loop sends `StreamClose { Both }` for
+    /// this id.
+    CloseStream(u64),
+}
 
 /// Outbound command from a `Client` handle to the background transport task.
 #[derive(Debug)]
 pub(crate) enum OutboundCommand {
-    /// One-shot HTTP request. Response arrives as a single `Data` frame and is
-    /// delivered via `response_tx`.
+    /// One-shot HTTP request. Carried over a workload stream so neither the
+    /// request nor the response is bounded by the size of one Noise message:
+    /// the raw request goes out as `OpenStream` plus `StreamData` frames of
+    /// at most [`REQUEST_CHUNK`] bytes, and the `StreamData` the server
+    /// returns for that id is accumulated until the response is complete:
+    /// as soon as it is provably whole (see
+    /// [`crate::http::is_complete_response`]), otherwise at the stream's
+    /// `StreamClose` (workload EOF). It is then delivered via `response_tx`.
+    /// Not waiting for EOF when the length is known keeps a request from
+    /// stalling on a close the workload or a network hop delays.
     Request {
         payload: Vec<u8>,
         response_tx: oneshot::Sender<Result<Vec<u8>, Error>>,
@@ -116,8 +157,8 @@ pub(crate) async fn send_and_receive<S: serde::Serialize, R: serde::de::Deserial
 /// incoming WS frames, decrypts each `ServerMessage`, and routes it to the
 /// appropriate consumer:
 ///
-/// - `pending`: one-shot `Request` consumers, keyed by id, removed on first
-///   response.
+/// - `pending`: one-shot `Request` consumers, keyed by stream id; their
+///   response bytes accumulate until the response is complete.
 /// - `streams`: long-lived `OpenStream` consumers, keyed by id, removed on
 ///   `StreamClose` or an error.
 pub(crate) async fn run_transport(
@@ -145,15 +186,10 @@ pub(crate) async fn run_transport(
                     OutboundCommand::Request { payload, response_tx } => {
                         let id = next_id;
                         next_id += 1;
-                        let msg = ClientMessage::Data { id, payload };
-                        match encrypt_cbor(&mut transport, &msg, &mut write_buf) {
-                            Ok(data) => {
-                                if let Err(e) = ws.send(data).await {
-                                    let _ = response_tx.send(Err(e));
-                                    continue;
-                                }
-                                pending.insert(id, response_tx);
-                                trace!(id, "Sent request");
+                        match send_request_frames(&mut ws, &mut transport, &mut write_buf, id, &payload).await {
+                            Ok(()) => {
+                                pending.insert(id, PendingRequest { response: Vec::new(), response_tx });
+                                trace!(id, size = payload.len(), "Sent request");
                             }
                             Err(e) => {
                                 let _ = response_tx.send(Err(e));
@@ -226,7 +262,11 @@ pub(crate) async fn run_transport(
                                     // polls the receiving side, so any task
                                     // that is polling the stream keeps
                                     // draining slots and eventually resumes us.
-                                    dispatch_response(&mut pending, &mut streams, msg).await;
+                                    let followup =
+                                        dispatch_response(&mut pending, &mut streams, msg).await;
+                                    if let Followup::CloseStream(id) = followup {
+                                        close_request_stream(&mut ws, &mut transport, &mut write_buf, id).await;
+                                    }
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
@@ -264,6 +304,48 @@ pub(crate) async fn run_transport(
     }
 }
 
+/// Send a one-shot request as `OpenStream` (the first [`REQUEST_CHUNK`]
+/// bytes) followed by `StreamData` frames for the rest. The server writes
+/// them to the workload socket in order and does not half-close it, so the
+/// workload receives the same bytes as from a single write.
+async fn send_request_frames(
+    ws: &mut Ws,
+    transport: &mut snow::TransportState,
+    write_buf: &mut [u8],
+    id: u64,
+    payload: &[u8],
+) -> Result<(), Error> {
+    let mut chunks = payload.chunks(REQUEST_CHUNK);
+    let first = chunks.next().unwrap_or_default().to_vec();
+    let data = encrypt_cbor(transport, &ClientMessage::OpenStream { id, payload: first }, write_buf)?;
+    ws.send(data).await?;
+    for chunk in chunks {
+        let msg = ClientMessage::StreamData { id, payload: chunk.to_vec() };
+        let data = encrypt_cbor(transport, &msg, write_buf)?;
+        ws.send(data).await?;
+    }
+    Ok(())
+}
+
+/// Release the server side of a finished one-shot request stream. A failure
+/// here means the channel itself is going down, which the read side reports.
+async fn close_request_stream(
+    ws: &mut Ws,
+    transport: &mut snow::TransportState,
+    write_buf: &mut [u8],
+    id: u64,
+) {
+    let msg = ClientMessage::StreamClose { id, half: StreamHalf::Both };
+    match encrypt_cbor(transport, &msg, write_buf) {
+        Ok(data) => {
+            if let Err(e) = ws.send(data).await {
+                warn!(id, error = %e, "Failed to close finished request stream");
+            }
+        }
+        Err(e) => warn!(id, error = %e, "Failed to encode StreamClose"),
+    }
+}
+
 fn fail_stream(streams: &mut StreamMap, id: u64, err: Error) {
     if let Some(tx) = streams.remove(&id) {
         // Best-effort: receiver may already have been dropped.
@@ -272,8 +354,8 @@ fn fail_stream(streams: &mut StreamMap, id: u64, err: Error) {
 }
 
 fn notify_all_closed(pending: &mut PendingMap, streams: &mut StreamMap) {
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(Error::ConnectionClosed));
+    for (_, req) in pending.drain() {
+        let _ = req.response_tx.send(Err(Error::ConnectionClosed));
     }
     for (_, tx) in streams.drain() {
         let _ = tx.try_send(Err(Error::ConnectionClosed));
@@ -284,18 +366,19 @@ async fn dispatch_response(
     pending: &mut PendingMap,
     streams: &mut StreamMap,
     msg: ServerMessage,
-) {
+) -> Followup {
     match msg {
-        ServerMessage::Data { id, payload } => {
-            if let Some(tx) = pending.remove(&id) {
-                let _ = tx.send(Ok(payload));
-                trace!(id, "Dispatched response");
-            } else {
-                warn!(id, "Received Data for unknown request id");
-            }
-        }
         ServerMessage::StreamData { id, payload } => {
-            if let Some(tx) = streams.get(&id) {
+            if let Some(req) = pending.get_mut(&id) {
+                req.response.extend_from_slice(&payload);
+                if crate::http::is_complete_response(&req.response) {
+                    if let Some(req) = pending.remove(&id) {
+                        let _ = req.response_tx.send(Ok(req.response));
+                        trace!(id, "Dispatched response");
+                    }
+                    return Followup::CloseStream(id);
+                }
+            } else if let Some(tx) = streams.get(&id) {
                 // Backpressured on purpose: awaiting here suspends the whole
                 // transport task, so we stop reading further WebSocket frames
                 // until the stream's consumer drains a slot, and the pressure
@@ -319,13 +402,32 @@ async fn dispatch_response(
             }
         }
         ServerMessage::StreamClose { id } => {
+            if let Some(req) = pending.remove(&id) {
+                // Workload EOF ends a response whose length was not known up
+                // front. The caller may have stopped waiting; the stream is
+                // closed either way.
+                let _ = req.response_tx.send(Ok(req.response));
+                trace!(id, "Dispatched response");
+                return Followup::CloseStream(id);
+            }
             // Removing the Sender closes the mpsc on the receiver side; that
             // is how UpgradedStream observes server-side EOF.
             streams.remove(&id);
         }
         ServerMessage::Error { id, message } => {
-            if let Some(tx) = pending.remove(&id) {
-                let _ = tx.send(Err(Error::ServerError { id, message }));
+            if let Some(req) = pending.remove(&id) {
+                // A workload may answer and close before reading the whole
+                // request (an early 404 or 413), and the server then fails
+                // writing the rest of the request. A response that already
+                // arrived in full is still the workload's answer; anything
+                // short of that is an error.
+                let result = if crate::http::is_complete_response(&req.response) {
+                    debug!(id, error = %message, "Workload answered before reading the whole request");
+                    Ok(req.response)
+                } else {
+                    Err(Error::ServerError { id, message })
+                };
+                let _ = req.response_tx.send(result);
             } else if let Some(tx) = streams.remove(&id) {
                 // Same backpressured send as StreamData: the error is the
                 // stream's terminal event and must not be lost to a full
@@ -342,4 +444,5 @@ async fn dispatch_response(
             warn!("Received unexpected control result during transport");
         }
     }
+    Followup::None
 }
