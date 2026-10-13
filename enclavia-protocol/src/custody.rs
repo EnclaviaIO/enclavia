@@ -9,6 +9,11 @@
 //! managed flow and the CLI's self-hosted flow both call them, so the
 //! bytes can never drift between the two.
 //!
+//! Every signature covers the domain-separated message
+//! ([`crate::signing::signed_message`]): the inner signature is made in
+//! the payload's domain, the envelope signature in the control-command
+//! domain.
+//!
 //! The module also carries the signing-request DTOs exchanged over the
 //! two-phase confirm/revoke HTTP endpoints (`.../confirm/prepare` and
 //! `.../confirm/submit`, plus the revoke pair), shared verbatim by the
@@ -29,7 +34,7 @@ use crate::{ControlCommand, RekeyParams};
 ///
 /// `payload` is the CBOR-encoded [`crate::chain::UpgradePayload`] and
 /// `payload_signature` the 64-byte raw `r || s` inner signature over
-/// it (see [`der_signature_to_raw`] for hardware signers that emit
+/// it in the upgrade-payload domain (see [`der_signature_to_raw`] for hardware signers that emit
 /// DER).
 pub fn encode_prepare_upgrade(
     payload: &[u8],
@@ -64,15 +69,10 @@ pub fn encode_revoke_upgrade(
     encode_command(&cmd)
 }
 
-/// Single serialization path for signed control commands. Writing into
-/// a `Vec` cannot fail for these plain-data enums, so the panic is
-/// unreachable in practice; panicking (vs. returning `Result`) keeps
-/// the two encode helpers infallible for callers on both sides.
+/// Single serialization path for signed control commands: the canonical
+/// encoding [`crate::signing::decode_canonical`] accepts on the enclave.
 fn encode_command(cmd: &ControlCommand) -> Vec<u8> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(cmd, &mut buf)
-        .expect("CBOR encoding a ControlCommand into a Vec cannot fail");
-    buf
+    crate::signing::encode(cmd)
 }
 
 /// Failure re-encoding a DER ECDSA signature to raw `r || s`.
@@ -140,7 +140,8 @@ pub struct ConfirmSubmitRequest {
     /// [`encode_prepare_upgrade`] / [`encode_revoke_upgrade`], base64.
     #[serde(with = "base64_vec")]
     pub command: Vec<u8>,
-    /// 64-byte raw `r || s` P-256 signature over `command`, base64.
+    /// 64-byte raw `r || s` P-256 signature over `command` in the
+    /// control-command domain, base64.
     #[serde(with = "base64_vec")]
     pub envelope_signature: Vec<u8>,
 }

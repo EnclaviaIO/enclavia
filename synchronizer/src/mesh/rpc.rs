@@ -264,7 +264,23 @@ impl ClientChannel {
 /// leak a task.
 pub fn spawn_client<S>(
     stream: S,
+    transport: enclavia_protocol::NoiseTransport,
+) -> (
+    ClientChannel,
+    impl std::future::Future<Output = Result<(), HandshakeError>>,
+)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_client_with_stats(stream, transport, None)
+}
+
+/// [`spawn_client`], additionally recording pings, pong timeouts and ping
+/// round-trip times into `stats`.
+pub fn spawn_client_with_stats<S>(
+    stream: S,
     mut transport: enclavia_protocol::NoiseTransport,
+    stats: Option<Arc<crate::metrics::PeerLinkStats>>,
 ) -> (
     ClientChannel,
     impl std::future::Future<Output = Result<(), HandshakeError>>,
@@ -312,6 +328,7 @@ where
         // frame clears both, because any frame proves the peer is reading and
         // writing this channel.
         let mut awaiting_pong = false;
+        let mut ping_sent_at = tokio::time::Instant::now();
         let mut deadline = tokio::time::Instant::now() + IDLE_BEFORE_PING;
         loop {
             let idle = tokio::time::sleep_until(deadline);
@@ -322,6 +339,9 @@ where
                 // extend the deadline.
                 _ = &mut idle => {
                     if awaiting_pong {
+                        if let Some(s) = &stats {
+                            s.pong_timed_out();
+                        }
                         // We pinged, nothing came back: the channel is open but
                         // dead. Returning drops the ClientChannel and lets the
                         // dial loop rebuild a working connection.
@@ -332,6 +352,10 @@ where
                     }
                     write_frame(&mut write_half, &mut transport, &MeshFrame::Ping).await?;
                     awaiting_pong = true;
+                    ping_sent_at = tokio::time::Instant::now();
+                    if let Some(s) = &stats {
+                        s.ping_sent();
+                    }
                     deadline = tokio::time::Instant::now() + PONG_TIMEOUT;
                 }
                 maybe_req = outbound_rx.recv() => {
@@ -351,6 +375,7 @@ where
                         Some(ciphertext) => {
                             // Any inbound frame is proof of life: clear the
                             // outstanding ping and restart the idle window.
+                            let answering_ping = awaiting_pong;
                             awaiting_pong = false;
                             deadline = tokio::time::Instant::now() + IDLE_BEFORE_PING;
                             match decrypt_frame(&mut transport, &ciphertext)? {
@@ -359,7 +384,11 @@ where
                                 // is not expected (the serve side never probes)
                                 // but is answered anyway, so the liveness
                                 // protocol stays symmetric if that changes.
-                                MeshFrame::Pong => {}
+                                MeshFrame::Pong => {
+                                    if let (true, Some(s)) = (answering_ping, &stats) {
+                                        s.ping_answered(ping_sent_at.elapsed());
+                                    }
+                                }
                                 MeshFrame::Ping => {
                                     write_frame(&mut write_half, &mut transport, &MeshFrame::Pong).await?;
                                 }

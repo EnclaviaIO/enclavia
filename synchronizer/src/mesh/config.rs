@@ -4,19 +4,21 @@
 //! ## Self-PCR allowlist (the trust model)
 //!
 //! The synchronizer cluster is a closed set of *identical* EIFs: every node
-//! runs the same image, so every node measures the same PCR0/1/2. A node
-//! therefore admits a peer only when the peer's attested PCR digest equals
-//! its OWN image measurements. There is no separate "trusted peer PCR list":
-//! the allowlist is a singleton, `{ self_pcr_digest }`. It is deliberately
-//! un-upgradable in v1 (the #16 design pass froze the mesh allowlist to
+//! runs the same image, so every node has the same pin identity (PCR0-2 plus
+//! user PCRs 16-31, which the synchronizer never extends). A node therefore
+//! admits a peer only when the key of the peer's attested identity
+//! ([`PcrKey`], see [`enclavia_protocol::pin_identity`]) equals its OWN.
+//! There is no separate "trusted peer PCR list": the allowlist is a
+//! singleton, `{ self_pcr_digest }`. It is deliberately un-upgradable in v1 (the #16 design pass froze the mesh allowlist to
 //! exactly the node's own PCR digest, no successor-PCR admission, no
 //! config-driven list).
 //!
 //! The own-PCR digest is HARDWARE-derived at startup, not host-supplied. The
 //! node requests a fresh attestation document from its OWN `/dev/nsm` and reads
-//! back its PCR0/1/2 via
-//! [`enclavia_protocol::attestation::extract_own_pcrs`] (see `read_mesh_env` in
-//! the binary). This works identically in production and under QEMU: QEMU's
+//! back its pin identity (PCR0-2 plus user PCRs 16-31, keyed exactly like a
+//! customer's) from
+//! [`enclavia_protocol::attestation::ValidatedAttestation::request_local`] (see
+//! `read_mesh_env` in the binary). This works identically in production and under QEMU: QEMU's
 //! nitro-enclave machine emulates `/dev/nsm` and measures the real PCR0/1/2 of
 //! the running VM (self-signed chain), and because the node is reading its OWN
 //! local device, inside its trusted computing base, no cert-chain trust is
@@ -63,8 +65,8 @@ impl PcrAllowlist {
         Self { allowed }
     }
 
-    /// Whether a peer presenting `digest` (the SHA-256 of its attested
-    /// PCR0/1/2) is admitted.
+    /// Whether a peer presenting `digest` (the [`PcrKey`] of its attested pin
+    /// identity) is admitted.
     pub fn admits(&self, digest: &PcrKey) -> bool {
         self.allowed.contains(digest)
     }

@@ -67,5 +67,16 @@ rpassword = { version = "7", optional = true }
 tempfile = "3"
 
 [features]
-default = ["yubikey"]
+# `dangerous-skip-chain` is a default feature (what it enables is described
+# below). Cargo unifies features per build, so a crate that depends on
+# enclavia-cli as a library WITH default features also gets
+# `enclavia-protocol/dangerous-skip-chain` in its own build, and every
+# validator in that build gains the skip-chain methods. Library consumers
+# depend on it with `default-features = false` (the backend does).
+default = ["yubikey", "dangerous-skip-chain"]
 yubikey = ["dep:yubikey", "dep:rpassword"]
+# `enclavia upgrade chain|confirm --debug-enclave` re-validates a debug
+# (QEMU) enclave's chain links without the AWS Nitro certificate chain. Only
+# the user's flag selects it, never the backend; on by default so the CLI can
+# inspect debug enclaves. A build without it refuses `--debug-enclave`.
+dangerous-skip-chain = ["enclavia-protocol/dangerous-skip-chain"]

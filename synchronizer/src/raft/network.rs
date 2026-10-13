@@ -385,13 +385,15 @@ impl RaftRequestHandler {
         peer: &PeerContext,
         fwd: ForwardedClientRequest,
     ) -> ForwardedClientResponse {
+        use crate::metrics::Answered;
         use crate::wire::{Response, RpcError};
         let Some((handle, debug_mode)) = self.serve.get() else {
             // Serve path not yet installed (bootstrap window): tell the
             // forwarder to retry.
-            return ForwardedClientResponse(Response::Err {
+            return Answered::new(Response::Err {
                 error: RpcError::Unavailable,
-            });
+            })
+            .into();
         };
         // SECURITY: only a committed cluster VOTER may forward a client
         // request. The forwarding contract (see the doc comment above) is that
@@ -424,19 +426,26 @@ impl RaftRequestHandler {
                 "rejecting forwarded client request from a non-voter peer (retryable: \
                  a restarted node is a learner until its admission commits)"
             );
-            return ForwardedClientResponse(Response::Err {
+            return Answered::new(Response::Err {
                 error: RpcError::Unavailable,
-            });
+            })
+            .into();
         }
-        let resp = crate::raft::serve::handle_on_leader(
+        crate::metrics::global()
+            .routes
+            .forwarded_served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Bounded by the handle's commit timeout, so this peer's mesh channel
+        // (served sequentially) is never parked on a write with no quorum.
+        crate::raft::serve::handle_on_leader(
             handle,
             fwd.session_key,
             fwd.control_pubkey,
             fwd.request,
             *debug_mode,
         )
-        .await;
-        ForwardedClientResponse(resp)
+        .await
+        .into()
     }
 
     /// Handle a membership [`JoinRequest`] on this node (#209). The candidate's
@@ -631,9 +640,12 @@ mod tests {
         let resp = handler.serve_forwarded(&peer, fwd).await;
         assert_eq!(
             resp,
-            ForwardedClientResponse(Response::Err {
-                error: RpcError::Unavailable,
-            }),
+            ForwardedClientResponse {
+                response: Response::Err {
+                    error: RpcError::Unavailable,
+                },
+                timed_out: false,
+            },
             "a non-voter's forward must be rejected with retryable Unavailable, \
              never fatal Unauthorized"
         );

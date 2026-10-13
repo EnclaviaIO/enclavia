@@ -72,6 +72,7 @@ use std::collections::BTreeMap;
 use tracing::{error, info, warn};
 
 use crate::mesh::Mesh;
+use crate::metrics::{JoinPhase, JoinStats};
 use crate::raft::network::{JoinReply, JoinRequest, MeshMessage};
 use crate::raft::{MemberRecord, RaftHandle, RaftNodeId, instance_node_id};
 
@@ -124,11 +125,13 @@ pub async fn discover_and_join(raft: &RaftHandle, mesh: &Mesh) {
     let self_name = raft.self_record().name.clone();
 
     loop {
+        join_metrics().set_phase(JoinPhase::Discovering);
         // Already a voter? (We initialized, were admitted, or an initialize that
         // included our id replicated to us, or we hydrated a membership naming
         // us.) Done.
         if raft.self_is_committed_voter().await {
             info!(node = %self_name, "this node is a committed voter; discovery complete");
+            join_metrics().set_phase(JoinPhase::Voter);
             return;
         }
 
@@ -221,6 +224,7 @@ async fn try_initialize_fresh(raft: &RaftHandle, mesh: &Mesh, self_name: &str) -
     if raft.cluster_is_initialized().await {
         return true; // someone (or we) initialized; stop trying to init
     }
+    join_metrics().set_phase(JoinPhase::Initializing);
     let peers = peer_names(raft, self_name);
     let mut records = vec![own_record(raft)];
     for peer in &peers {
@@ -318,6 +322,9 @@ async fn send_join(mesh: &Mesh, peer: &str, self_name: &str) -> Option<JoinReply
     if ciborium::into_writer(&msg, &mut buf).is_err() {
         return None;
     }
+    join_metrics()
+        .probes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let reply = match tokio::time::timeout(JOIN_CALL_TIMEOUT, mesh.call(peer, buf)).await {
         Ok(result) => result.ok()?,
         Err(_) => {
@@ -329,6 +336,11 @@ async fn send_join(mesh: &Mesh, peer: &str, self_name: &str) -> Option<JoinReply
         }
     };
     ciborium::from_reader(reply.as_slice()).ok()
+}
+
+/// The process-wide join counters.
+fn join_metrics() -> &'static JoinStats {
+    &crate::metrics::global().join
 }
 
 /// This node's own [`MemberRecord`].
@@ -377,6 +389,7 @@ pub async fn watch_for_eviction(raft: RaftHandle) {
                      (a same-slot instance replaced it). Shutting down the local Raft; this \
                      node will serve no further writes or reads."
                 );
+                join_metrics().set_phase(JoinPhase::Evicted);
                 raft.shutdown().await;
                 return;
             }

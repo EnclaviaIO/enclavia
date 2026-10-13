@@ -7,7 +7,9 @@ use tracing::info;
 use url::Url;
 
 use crate::error::Error;
-use enclavia_protocol::attestation::{self, Pcrs};
+use enclavia_protocol::attestation::{
+    AttestationError, Pcrs, UnvalidatedAttestation, ValidatedAttestation,
+};
 use enclavia_protocol::chain::{ChainLinkJson, EnclaveChainRow, RecordedLink};
 use uuid::Uuid;
 use crate::http::{self, Method};
@@ -491,10 +493,14 @@ impl ClientBuilder {
         self
     }
 
-    /// Enable debug mode: skip attestation signature verification.
-    ///
-    /// In debug mode, the server echoes the handshake nonce instead of returning
-    /// a real COSE_Sign1 attestation document. Only the nonce match is verified.
+    /// Enable debug mode: validate the enclave's attestation WITHOUT the AWS
+    /// Nitro certificate chain or its signature, for enclaves on QEMU, whose
+    /// emulated NSM self-signs. The document's structure, clock-skew bound,
+    /// session nonce and PCRs are still checked, but any well-formed document
+    /// passes the rest, so never enable it against production Nitro enclaves.
+    /// Needs the `dangerous-skip-chain` feature (off by default, for
+    /// development builds only); without it [`ClientBuilder::build`] refuses
+    /// debug mode before connecting.
     pub fn debug_mode(mut self, debug: bool) -> Self {
         self.debug_mode = debug;
         self
@@ -565,6 +571,15 @@ impl ClientBuilder {
     /// this identical sequence, re-verifying attestation against the SAME
     /// expectations. See [`ClientBuilder::auto_reconnect`].
     pub async fn build(self) -> Result<Client, Error> {
+        // A build without the skip-chain path refuses debug mode before any
+        // I/O; `validate_live` refuses it again on every connect.
+        #[cfg(not(feature = "dangerous-skip-chain"))]
+        if self.debug_mode {
+            return Err(Error::Attestation(
+                AttestationError::SkipChainNotCompiled.to_string(),
+            ));
+        }
+
         let pcrs = self.pcrs.unwrap_or(Pcrs {
             pcr0: Vec::new(),
             pcr1: Vec::new(),
@@ -665,12 +680,10 @@ impl ConnectConfig {
         // step, and it is identical on the first connect and on every
         // reconnect: same pinned PCRs, same debug/cert-chain policy, same
         // handshake-hash binding, same trust_upgrades descent check.
-        match attestation::verify_against(
-            &attestation_data,
-            &handshake_hash,
-            &self.pcrs,
-            attestation::VerificationMode::from_debug_flag(self.debug_mode),
-        ) {
+        let attestation_data = UnvalidatedAttestation::from_bytes(attestation_data);
+        match validate_live(&attestation_data, &handshake_hash, self.debug_mode)
+            .and_then(|doc| doc.require_pcrs(&self.pcrs))
+        {
             Ok(()) => info!("Attestation verified (pinned PCRs match)"),
             Err(pinned_err) => match &self.trust_upgrades {
                 // Pinned PCRs did not match, but the caller opted into
@@ -727,12 +740,12 @@ impl ConnectConfig {
 /// 3. Re-verify the LIVE attestation against exactly that tip. This is
 ///    the step that binds the verified descendant version to THIS Noise
 ///    session: without it the chain could belong to a different live
-///    enclave. It reuses the same pinned-identity verifier
-///    ([`attestation::verify_against`]) used for the original pin, so
-///    the session-nonce and (in production) the Nitro CA chain are
-///    checked on the live document too.
+///    enclave. It reuses the same session validation and PCR check
+///    ([`validate_live`] plus [`ValidatedAttestation::require_pcrs`]) used
+///    for the original pin, so the session nonce and (in production) the
+///    Nitro CA chain are checked on the live document too.
 async fn verify_via_upgrade_chain(
-    attestation_data: &[u8],
+    attestation_data: &UnvalidatedAttestation,
     handshake_hash: &[u8],
     pinned: &Pcrs,
     debug_mode: bool,
@@ -798,17 +811,32 @@ async fn verify_via_upgrade_chain(
     .map_err(|e| Error::TrustUpgrades(e.to_string()))?;
 
     // Bind the verified descendant version to this live session.
-    attestation::verify_against(
-        attestation_data,
-        handshake_hash,
-        &tip,
-        attestation::VerificationMode::from_debug_flag(debug_mode),
-    )
-    .map_err(|e| {
-        Error::TrustUpgrades(format!(
-            "running enclave does not match the verified chain tip: {e}"
-        ))
-    })?;
+    validate_live(attestation_data, handshake_hash, debug_mode)
+        .and_then(|doc| doc.require_pcrs(&tip))
+        .map_err(|e| {
+            Error::TrustUpgrades(format!(
+                "running enclave does not match the verified chain tip: {e}"
+            ))
+        })?;
 
     Ok(())
+}
+
+/// Validate the live enclave's document as a session document for this
+/// Noise session. `debug_mode` (the caller's
+/// [`ClientBuilder::debug_mode`]) skips the AWS Nitro certificate chain; it
+/// needs the `dangerous-skip-chain` feature, and a build without it refuses
+/// the document instead.
+fn validate_live(
+    doc: &UnvalidatedAttestation,
+    handshake_hash: &[u8],
+    debug_mode: bool,
+) -> Result<ValidatedAttestation, AttestationError> {
+    if debug_mode {
+        #[cfg(feature = "dangerous-skip-chain")]
+        return doc.validate_session_skip_chain(handshake_hash);
+        #[cfg(not(feature = "dangerous-skip-chain"))]
+        return Err(AttestationError::SkipChainNotCompiled);
+    }
+    doc.validate_session(handshake_hash)
 }

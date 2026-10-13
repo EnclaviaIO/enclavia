@@ -14,7 +14,7 @@
 //! 1. Performed the Noise handshake with the caller.
 //! 2. Verified the caller's Nitro attestation document, derived a
 //!    [`PcrKey`] from its PCRs, and extracted the 65-byte SEC1 P-256
-//!    control pubkey from `user_data` (`AttestedIdentity::control_pubkey`).
+//!    control pubkey from `user_data` (`ValidatedAttestation::control_pubkey`).
 //! 3. Called [`Node::observe_attestation`] for the caller's key + pubkey.
 //!
 //! For a `Transition` the SUBMITTING session is the NEW enclave: it
@@ -42,9 +42,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::wire::{
-    ChainLink, Request, Response, RpcError, decode_transition_link, verify_transition_link,
+    ChainLink, Request, Response, RpcError, decode_transition_link, verify_revocation_link,
+    verify_transition_link,
 };
-use crate::{CONTROL_PUBKEY_LEN, Op, PcrKey, StateMachine, ValidationError};
+use crate::{CONTROL_PUBKEY_LEN, Commitment, Op, PcrKey, StateMachine, ValidationError};
 
 /// Single-node synchronizer.
 ///
@@ -85,13 +86,13 @@ impl Node {
 
     /// Record that `key` has produced a valid Nitro attestation and
     /// announced `control_pubkey` as its 65-byte SEC1 P-256 verifying key
-    /// (`AttestedIdentity::control_pubkey`). The listener calls this once
+    /// (`ValidatedAttestation::control_pubkey`). The listener calls this once
     /// per session, immediately after the attestation document is
     /// verified.
     ///
     /// When `key` later registers (`Pin` of an unseen key), this pubkey is
     /// frozen into its `KeyState.control_pubkey`. A `Transition` link that
-    /// names this `key` as its `old_key` (via `from_pcrs`) is checked
+    /// names this `key` as its `old_key` (via `from`) is checked
     /// against that frozen pubkey, even though the submitting session is a
     /// different (new) enclave. If `key` is already committed in the state
     /// machine, its frozen `KeyState.control_pubkey` wins, this method only
@@ -131,6 +132,9 @@ impl Node {
     pub async fn handle_request(&self, session_key: PcrKey, req: Request) -> Response {
         match req {
             Request::Get { key } => self.handle_get(session_key, key).await,
+            Request::Register { key, commitment } => {
+                self.handle_register(session_key, key, commitment).await
+            }
             Request::Pin {
                 key,
                 expected_version,
@@ -139,7 +143,10 @@ impl Node {
                 self.handle_pin(session_key, key, expected_version, commitment)
                     .await
             }
-            Request::Transition { link } => self.handle_transition(session_key, link).await,
+            Request::Transition { link, commitment } => {
+                self.handle_transition(session_key, link, commitment).await
+            }
+            Request::Revoke { link } => self.handle_revoke(session_key, link).await,
         }
     }
 
@@ -157,6 +164,27 @@ impl Node {
         }
     }
 
+    /// Register the session's own key (its control pubkey was recorded by
+    /// `observe_attestation`). An already registered key is
+    /// `AlreadyRegistered`, a retired one `OperationRejected`.
+    async fn handle_register(
+        &self,
+        session_key: PcrKey,
+        key: PcrKey,
+        commitment: crate::Commitment,
+    ) -> Response {
+        if key != session_key {
+            return err(RpcError::Unauthorized);
+        }
+        let mut inner = self.inner.lock().await;
+        match inner.apply(Op::Register { key, commitment }) {
+            Ok(_) => Response::RegisterOk,
+            Err(e) => err(RpcError::from(e)),
+        }
+    }
+
+    /// Compare-and-swap pin of a registered key. An unknown key is
+    /// `NotFound`: a Pin never registers.
     async fn handle_pin(
         &self,
         session_key: PcrKey,
@@ -168,23 +196,11 @@ impl Node {
             return err(RpcError::Unauthorized);
         }
         let mut inner = self.inner.lock().await;
-        // Pin is a single wire RPC; map to Register (first pin) or Pin
-        // (subsequent) based on what's already committed. The caller
-        // distinguishes the two by inspecting the returned version:
-        // Version(0) means this was the registration. The CAS guard is
-        // checked only for the Pin arm: a Register is inherently a
-        // compare-and-swap on non-existence, so `expected_version` is
-        // ignored there.
-        let op = if inner.get(&key).is_some() {
-            Op::Pin {
-                key,
-                expected_version,
-                commitment,
-            }
-        } else {
-            Op::Register { key, commitment }
-        };
-        match inner.apply(op) {
+        match inner.apply(Op::Pin {
+            key,
+            expected_version,
+            commitment,
+        }) {
             Ok(state) => Response::PinOk {
                 version: state.version,
             },
@@ -192,16 +208,32 @@ impl Node {
         }
     }
 
-    async fn handle_transition(&self, session_key: PcrKey, link: ChainLink) -> Response {
+    async fn handle_transition(
+        &self,
+        session_key: PcrKey,
+        link: ChainLink,
+        commitment: Commitment,
+    ) -> Response {
+        // Trusted time for the link's `valid_from` gate, read before taking
+        // the state-machine lock. No trusted time means the gate cannot be
+        // evaluated, so the transition is refused (retryable).
+        let now_ms = match crate::trusted_time::now_ms().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "transition refused: trusted time unavailable");
+                return err(RpcError::Unavailable);
+            }
+        };
+
         let mut inner = self.inner.lock().await;
 
         // Phase one: structurally decode the (still-untrusted) link to
         // learn the derived old_key / new_key. The NEW enclave submits a
         // Transition, so the session is bound to new_key; the OLD key is
-        // whatever the payload's from_pcrs hashes to, and is the key whose
+        // the key of the payload's `from` identity, and is the key whose
         // FROZEN control pubkey must have authorized the link. Any
         // structural failure (wrong kind, missing signature, undecodable
-        // payload, malformed PCRs) folds to TransitionRejected.
+        // payload, malformed identity) folds to TransitionRejected.
         let decoded = match decode_transition_link(&link) {
             Ok(d) => d,
             Err(_) => return err(RpcError::TransitionRejected),
@@ -219,32 +251,51 @@ impl Node {
         };
 
         // Phase two: cryptographically verify the link. This enforces the
-        // full contract: new_key (derived from to_pcrs) equals the
+        // full contract: new_key (the key of `to`) equals the
         // submitting session, it is not a self-transition, the link's
         // control signature verifies under old_key's frozen pubkey, and
         // the chain attestation binds `user_data == sha256(payload)` and
-        // the OLD enclave's PCRs (from_pcrs). Both keys are re-derived
-        // from the signed payload, never from an untrusted wire field.
-        // Any failure folds to a single TransitionRejected.
+        // the OLD enclave's full identity (`from`). Both keys are re-derived
+        // from the signed payload, never from an untrusted wire field. The
+        // payload's window is at least `UPGRADE_WINDOW_MIN` long and the
+        // trusted `now_ms` lies inside it, each edge widened by
+        // `TRANSITION_CLOCK_TOLERANCE_MS`. Any failure folds to a single
+        // TransitionRejected.
         let verified = match verify_transition_link(
             &link,
             decoded,
             session_key,
             &old_control_pubkey,
             self.debug_mode,
+            now_ms,
         ) {
             Ok(v) => v,
-            Err(_) => return err(RpcError::TransitionRejected),
+            Err(e) => {
+                if let Some(reason) = e.attestation_reason() {
+                    crate::metrics::record_rejection(
+                        crate::metrics::RejectionSource::TransitionLink,
+                        reason,
+                    );
+                }
+                tracing::warn!(
+                    reason = e.attestation_reason().map(|r| r.as_str()),
+                    error = %e,
+                    "transition link rejected"
+                );
+                return err(RpcError::TransitionRejected);
+            }
         };
 
         // Link verified, record the observation and apply the op through
         // the pure state machine, which still enforces the remaining
         // structural checks (new_key attested, not retired, not already
-        // registered, etc.).
+        // registered, etc.) and the commitment precondition.
         inner.observe_transition(verified.old_key, verified.new_key);
         match inner.apply(Op::Transition {
             old_key: verified.old_key,
             new_key: verified.new_key,
+            link_hash: verified.link_hash,
+            commitment,
         }) {
             Ok(state) => Response::TransitionOk {
                 version: state.version,
@@ -257,6 +308,33 @@ impl Node {
             Err(e) => err(RpcError::from(e)),
         }
     }
+
+    /// Revoke the upgrade links out of the session's own key. The session
+    /// must hold the pin (its key registered); the link must carry the
+    /// control signature of that key's FROZEN pubkey
+    /// ([`verify_revocation_link`]). Any failure is `RevocationRejected`,
+    /// meaning the revocation did NOT take effect.
+    async fn handle_revoke(&self, session_key: PcrKey, link: ChainLink) -> Response {
+        let mut inner = self.inner.lock().await;
+        let control_pubkey = match inner.get(&session_key) {
+            Some(state) => state.control_pubkey,
+            None => return err(RpcError::RevocationRejected),
+        };
+        let verified = match verify_revocation_link(&link, &control_pubkey) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "revocation link rejected");
+                return err(RpcError::RevocationRejected);
+            }
+        };
+        match inner.apply(Op::Revoke {
+            key: session_key,
+            link_hash: verified.link_hash,
+        }) {
+            Ok(_) => Response::RevokeOk,
+            Err(_) => err(RpcError::RevocationRejected),
+        }
+    }
 }
 
 fn err(error: RpcError) -> Response {
@@ -267,10 +345,10 @@ fn err(error: RpcError) -> Response {
 mod tests {
     use super::*;
     use crate::{Commitment, Version};
-    use enclavia_protocol::attestation::Pcrs;
-    use enclavia_protocol::attestation::test_utils::FakeChainAttestation;
-    use enclavia_protocol::chain::{ChainLinkKind, PcrsHex, UpgradePayload};
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use enclavia_protocol::attestation::test_utils::{FakeChainAttestation, identity_from_seed};
+    use enclavia_protocol::chain::{ChainLinkKind, UpgradePayload};
+    use enclavia_protocol::signing::{SignedDomain, sign_control};
+    use p256::ecdsa::SigningKey;
 
     /// Arbitrary PcrKey for the Pin/Get/session-binding tests that never
     /// go through transition-link verification. These never have to match
@@ -283,23 +361,10 @@ mod tests {
         Commitment([b; 32])
     }
 
-    fn pcrs_hex_from_seed(seed: u8) -> PcrsHex {
-        PcrsHex {
-            pcr0: hex::encode(vec![seed; 48]),
-            pcr1: hex::encode(vec![seed.wrapping_add(1); 48]),
-            pcr2: hex::encode(vec![seed.wrapping_add(2); 48]),
-        }
-    }
-
-    /// The PcrKey a seed's PcrsHex hashes to, matching `Pcrs::digest()`
-    /// and `verify_transition_link`'s key derivation.
+    /// The PcrKey of a seed's identity (no user PCRs), matching
+    /// `verify_transition_link`'s key derivation.
     fn key_from_seed(seed: u8) -> PcrKey {
-        let raw = Pcrs {
-            pcr0: vec![seed; 48],
-            pcr1: vec![seed.wrapping_add(1); 48],
-            pcr2: vec![seed.wrapping_add(2); 48],
-        };
-        PcrKey(raw.digest())
+        PcrKey(identity_from_seed(seed).key())
     }
 
     /// Deterministic P-256 keypair; returns the signing key and the
@@ -335,30 +400,41 @@ mod tests {
     /// its PrepareUpgrade flow, so it attests its own PCRs. Mirrors what
     /// `enclavia-server::run_prepare_upgrade` / `chain-host` produce.
     fn upgrade_link(from_seed: u8, to_seed: u8, signing: &SigningKey) -> ChainLink {
+        upgrade_link_valid_from(from_seed, to_seed, signing, chrono::Utc::now())
+    }
+
+    /// [`upgrade_link`] with an explicit `valid_from`.
+    fn upgrade_link_valid_from(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        valid_from: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
         let payload = UpgradePayload {
             enclave_id: uuid::Uuid::new_v4(),
-            from_pcrs: pcrs_hex_from_seed(from_seed),
-            to_pcrs: pcrs_hex_from_seed(to_seed),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
             image_digest: "sha256:to".into(),
-            valid_from: chrono::Utc::now(),
+            valid_from,
+            valid_until: valid_from + chrono::Duration::days(7),
             issued_at: chrono::Utc::now(),
             nonce: vec![0x5a; 32],
         };
         let mut payload_bytes = Vec::new();
         ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
         let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
-        let sig: Signature = signing.sign(&payload_bytes);
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
         ChainLink {
             id: None,
             sequence: None,
             kind: ChainLinkKind::Upgrade,
             payload: payload_bytes,
             attestation,
-            signature: Some(sig.to_bytes().to_vec()),
+            signature: Some(sig.to_vec()),
         }
     }
 
-    /// Register an OLD key (attest + Pin) so it is live with a frozen
+    /// Register an OLD key (attest + Register) so it is live with a frozen
     /// control pubkey, ready to be a transition's `from`. The submitting
     /// session in the corrected flow is the NEW enclave, so the old key is
     /// set up by a separate (earlier) session, modelled here by driving
@@ -372,9 +448,8 @@ mod tests {
         node.observe_attestation(key_old, signing_pubkey).await;
         node.handle_request(
             key_old,
-            Request::Pin {
+            Request::Register {
                 key: key_old,
-                expected_version: Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -382,7 +457,7 @@ mod tests {
         key_old
     }
 
-    /// Debug-mode node so `verify_chain_attestation` accepts the synthetic
+    /// Debug-mode node so the chain-link validation accepts the synthetic
     /// `FakeChainAttestation` docs (no real Nitro CA chain).
     fn debug_node() -> Node {
         Node::with_debug_mode(true)
@@ -397,7 +472,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_registers_unseen_key_at_version_zero() {
+    async fn register_creates_unseen_key_at_version_zero() {
+        let node = Node::new();
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        let resp = node
+            .handle_request(
+                k(1),
+                Request::Register {
+                    key: k(1),
+                    commitment: c(0xaa),
+                },
+            )
+            .await;
+        assert_eq!(resp, Response::RegisterOk);
+        let resp = node.handle_request(k(1), Request::Get { key: k(1) }).await;
+        assert_eq!(
+            resp,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
+            }
+        );
+    }
+
+    /// A Pin never registers: an unknown key is `NotFound`, and stays
+    /// unknown.
+    #[tokio::test]
+    async fn pin_on_unknown_key_is_not_found() {
         let node = Node::new();
         node.observe_attestation(k(1), dummy_pubkey(1)).await;
         let resp = node
@@ -410,10 +511,39 @@ mod tests {
                 },
             )
             .await;
+        assert_eq!(resp, err(RpcError::NotFound));
+        let resp = node.handle_request(k(1), Request::Get { key: k(1) }).await;
+        assert_eq!(resp, err(RpcError::NotFound));
+    }
+
+    /// A second Register of a live key is `AlreadyRegistered` and leaves the
+    /// pinned state alone; a Register for another session's key is refused.
+    #[tokio::test]
+    async fn register_is_once_and_own_key_only() {
+        let node = Node::new();
+        node.observe_attestation(k(1), dummy_pubkey(1)).await;
+        node.observe_attestation(k(2), dummy_pubkey(2)).await;
+        let register = |key, byte| Request::Register {
+            key,
+            commitment: c(byte),
+        };
         assert_eq!(
-            resp,
-            Response::PinOk {
-                version: Version(0)
+            node.handle_request(k(1), register(k(1), 0xaa)).await,
+            Response::RegisterOk
+        );
+        assert_eq!(
+            node.handle_request(k(1), register(k(1), 0xbb)).await,
+            err(RpcError::AlreadyRegistered)
+        );
+        assert_eq!(
+            node.handle_request(k(1), register(k(2), 0xcc)).await,
+            err(RpcError::Unauthorized)
+        );
+        assert_eq!(
+            node.handle_request(k(1), Request::Get { key: k(1) }).await,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
             }
         );
     }
@@ -425,9 +555,8 @@ mod tests {
         let _ = node
             .handle_request(
                 k(1),
-                Request::Pin {
+                Request::Register {
                     key: k(1),
-                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -472,9 +601,8 @@ mod tests {
         node.observe_attestation(k(1), dummy_pubkey(1)).await;
         node.handle_request(
             k(1),
-            Request::Pin {
+            Request::Register {
                 key: k(1),
-                expected_version: Version(0),
                 commitment: c(0xab),
             },
         )
@@ -531,7 +659,7 @@ mod tests {
 
     /// Session-binding fires inside the link verifier: even with a valid
     /// link for (from=A -> to=C), a session authenticated as B (not the
-    /// link's to=C) can't drive it. The link's to_pcrs hashes to C, not B,
+    /// link's to=C) can't drive it. The link's `to` has key C, not B,
     /// so the SessionKeyMismatch path rejects it as TransitionRejected.
     #[tokio::test]
     async fn session_binding_rejects_transition_for_someone_else() {
@@ -545,9 +673,8 @@ mod tests {
         node.observe_attestation(key_b, pk_b).await;
         node.handle_request(
             key_b,
-            Request::Pin {
+            Request::Register {
                 key: key_b,
-                expected_version: Version(0),
                 commitment: c(0xbb),
             },
         )
@@ -559,7 +686,10 @@ mod tests {
         // neither the old key A nor the new key C).
         let link = upgrade_link(0x10, 0x30, &sk_a);
         let resp = node
-            .handle_request(key_b, Request::Transition { link })
+            .handle_request(key_b, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -577,7 +707,10 @@ mod tests {
         let mut link = upgrade_link(0x11, 0x21, &sk);
         link.signature = Some(vec![0xde, 0xad]); // not 64 bytes
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -595,7 +728,10 @@ mod tests {
         // Link signed by the attacker, not old_key's registered key.
         let link = upgrade_link(0x12, 0x22, &sk_attacker);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -614,7 +750,10 @@ mod tests {
         node.observe_attestation(key_new, dummy_pubkey(0x23)).await;
         let link = upgrade_link(0x13, 0x23, &sk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -633,7 +772,10 @@ mod tests {
         // as that session.
         let link = upgrade_link(0x14, 0x24, &sk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
     }
@@ -651,9 +793,8 @@ mod tests {
         node.observe_attestation(key_old, pk).await;
         node.handle_request(
             key_old,
-            Request::Pin {
+            Request::Register {
                 key: key_old,
-                expected_version: Version(0),
                 commitment: c(0xaa),
             },
         )
@@ -671,7 +812,10 @@ mod tests {
         node.observe_attestation(key_new, dummy_pubkey(0x25)).await;
         let link = upgrade_link(0x15, 0x25, &sk);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xbb),
+                })
             .await;
         assert_eq!(
             resp,
@@ -697,6 +841,84 @@ mod tests {
         assert_eq!(resp, err(RpcError::NotFound));
     }
 
+    /// The commitment precondition: a target that booted on a volume that
+    /// does not hold the predecessor's latest state (blank, or an older
+    /// state) is refused with `TransitionCommitmentMismatch`, and nothing
+    /// changes: the old key keeps its pin and the new key has none. The same
+    /// link then still moves the pin from the right volume, and a replay of
+    /// the completed Transition is refused without touching the new state.
+    #[tokio::test]
+    async fn transition_moves_the_pin_only_from_the_latest_state() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x19);
+        let key_old = register_old(&node, 0x19, pk).await;
+        node.handle_request(
+            key_old,
+            Request::Pin {
+                key: key_old,
+                expected_version: Version(0),
+                commitment: c(0xbb),
+            },
+        )
+        .await;
+        let key_new = key_from_seed(0x29);
+        node.observe_attestation(key_new, dummy_pubkey(0x29)).await;
+        let link = upgrade_link(0x19, 0x29, &sk);
+
+        let blank = Commitment([0; 32]);
+        for wrong in [blank, c(0xaa)] {
+            let resp = node
+                .handle_request(
+                    key_new,
+                    Request::Transition {
+                        link: link.clone(),
+                        commitment: wrong,
+                    },
+                )
+                .await;
+            assert_eq!(resp, err(RpcError::TransitionCommitmentMismatch));
+            assert_eq!(
+                node.handle_request(key_old, Request::Get { key: key_old })
+                    .await,
+                Response::GetOk {
+                    commitment: c(0xbb),
+                    version: Version(1),
+                },
+                "the predecessor keeps its pin"
+            );
+            assert_eq!(
+                node.handle_request(key_new, Request::Get { key: key_new })
+                    .await,
+                err(RpcError::NotFound)
+            );
+        }
+
+        let moved = Request::Transition {
+            link,
+            commitment: c(0xbb),
+        };
+        assert_eq!(
+            node.handle_request(key_new, moved.clone()).await,
+            Response::TransitionOk {
+                version: Version(1)
+            }
+        );
+        // Replay: the old key is retired, so the same request is refused and
+        // the new key's state is untouched.
+        assert_eq!(
+            node.handle_request(key_new, moved).await,
+            err(RpcError::TransitionRejected)
+        );
+        assert_eq!(
+            node.handle_request(key_new, Request::Get { key: key_new })
+                .await,
+            Response::GetOk {
+                commitment: c(0xbb),
+                version: Version(1),
+            }
+        );
+    }
+
     /// "Control pubkey substitution": after old_key registers with pk_real,
     /// the attacker re-attests old_key with their own pubkey and signs a
     /// link with the matching key, submitting from the new enclave's
@@ -715,9 +937,46 @@ mod tests {
         node.observe_attestation(key_old, pk_attacker).await;
         let link = upgrade_link(0x16, 0x26, &sk_attacker);
         let resp = node
-            .handle_request(key_new, Request::Transition { link })
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
         assert_eq!(resp, err(RpcError::TransitionRejected));
+    }
+
+    /// A link scheduled an hour from now is refused (the `valid_from` gate),
+    /// and the old key keeps its state: the early attempt changes nothing.
+    #[tokio::test]
+    async fn transition_before_valid_from_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x18);
+        let key_old = register_old(&node, 0x18, pk).await;
+        let key_new = key_from_seed(0x28);
+        node.observe_attestation(key_new, dummy_pubkey(0x28)).await;
+        let link = upgrade_link_valid_from(
+            0x18,
+            0x28,
+            &sk,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        let resp = node
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRejected));
+        let resp = node
+            .handle_request(key_old, Request::Get { key: key_old })
+            .await;
+        assert_eq!(
+            resp,
+            Response::GetOk {
+                commitment: c(0xaa),
+                version: Version(0),
+            }
+        );
     }
 
     /// Once a key transitions, any further session bound to it is dead.
@@ -729,11 +988,13 @@ mod tests {
         let key_new = key_from_seed(0x27);
         node.observe_attestation(key_new, dummy_pubkey(0x27)).await;
         let link = upgrade_link(0x17, 0x27, &sk);
-        node.handle_request(key_new, Request::Transition { link })
+        node.handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
             .await;
-        // After retirement, old_key tries to Pin. Mapped to Register
-        // (since old_key is not registered), which the state machine
-        // refuses because the key is retired.
+        // After retirement old_key is unknown to Pin, and the state machine
+        // refuses to register it again.
         let resp = node
             .handle_request(
                 key_old,
@@ -744,10 +1005,20 @@ mod tests {
                 },
             )
             .await;
+        assert_eq!(resp, err(RpcError::NotFound));
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Register {
+                    key: key_old,
+                    commitment: c(0xee),
+                },
+            )
+            .await;
         assert_eq!(resp, err(RpcError::OperationRejected));
     }
 
-    /// Two sessions pinning their own keys concurrently both succeed ,
+    /// Two sessions registering their own keys concurrently both succeed:
     /// the Mutex serializes them in some order without losing writes.
     #[tokio::test]
     async fn concurrent_pins_on_disjoint_keys_serialize() {
@@ -760,9 +1031,8 @@ mod tests {
         let t1 = tokio::spawn(async move {
             n1.handle_request(
                 k(1),
-                Request::Pin {
+                Request::Register {
                     key: k(1),
-                    expected_version: Version(0),
                     commitment: c(0xaa),
                 },
             )
@@ -771,27 +1041,16 @@ mod tests {
         let t2 = tokio::spawn(async move {
             n2.handle_request(
                 k(2),
-                Request::Pin {
+                Request::Register {
                     key: k(2),
-                    expected_version: Version(0),
                     commitment: c(0xbb),
                 },
             )
             .await
         });
         let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
-        assert_eq!(
-            r1,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
-        assert_eq!(
-            r2,
-            Response::PinOk {
-                version: Version(0)
-            }
-        );
+        assert_eq!(r1, Response::RegisterOk);
+        assert_eq!(r2, Response::RegisterOk);
 
         let g1 = node.handle_request(k(1), Request::Get { key: k(1) }).await;
         let g2 = node.handle_request(k(2), Request::Get { key: k(2) }).await;
@@ -809,5 +1068,197 @@ mod tests {
                 version: Version(0),
             }
         );
+    }
+
+    // --- revocation --------------------------------------------------------
+
+    /// An upgrade link with an explicit `issued_at` (and `valid_from` in the
+    /// past, so only a revocation can stop it).
+    fn upgrade_link_issued_at(
+        from_seed: u8,
+        to_seed: u8,
+        signing: &SigningKey,
+        issued_at: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
+            image_digest: "sha256:to".into(),
+            valid_from: chrono::Utc::now() - chrono::Duration::hours(1),
+            valid_until: (chrono::Utc::now() - chrono::Duration::hours(1)) + chrono::Duration::days(7),
+            issued_at,
+            nonce: vec![0x5a; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation,
+            signature: Some(sig.to_vec()),
+        }
+    }
+
+    /// A revocation of `target` signed by `signing`, stamped `issued_at`.
+    fn revocation_of(
+        signing: &SigningKey,
+        target: &ChainLink,
+        issued_at: chrono::DateTime<chrono::Utc>,
+    ) -> ChainLink {
+        let payload = enclavia_protocol::chain::RevocationPayload {
+            enclave_id: uuid::Uuid::new_v4(),
+            revokes: uuid::Uuid::new_v4(),
+            issued_at,
+            nonce: vec![0x6b; 32],
+            revokes_link: crate::wire::upgrade_link_hash(&target.payload),
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let sig = sign_control(signing, SignedDomain::RevocationPayload, &payload_bytes);
+        ChainLink {
+            id: None,
+            sequence: None,
+            kind: ChainLinkKind::Revocation,
+            payload: payload_bytes,
+            attestation: vec![],
+            signature: Some(sig.to_vec()),
+        }
+    }
+
+    fn hours_ago(h: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::hours(h)
+    }
+
+    /// The old enclave revokes a link; that exact link can never move the
+    /// pin, even when a hostile backend stamped it with a far-future
+    /// `issued_at` and the revocation with an old one. A different
+    /// (re-approved) link to the same target still works.
+    #[tokio::test]
+    async fn revoked_link_is_refused_whatever_its_timestamps() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x51);
+        let key_old = register_old(&node, 0x51, pk).await;
+        let key_new = key_from_seed(0x52);
+        node.observe_attestation(key_new, dummy_pubkey(0x52)).await;
+
+        let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let revoked = upgrade_link_issued_at(0x51, 0x52, &sk, far_future);
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Revoke {
+                    link: revocation_of(&sk, &revoked, hours_ago(1000)),
+                },
+            )
+            .await;
+        assert_eq!(resp, Response::RevokeOk);
+
+        let resp = node
+            .handle_request(key_new, Request::Transition {
+                    link: revoked,
+                    commitment: c(0xaa),
+                })
+            .await;
+        assert_eq!(resp, err(RpcError::TransitionRevoked));
+        let resp = node
+            .handle_request(key_old, Request::Get { key: key_old })
+            .await;
+        assert!(matches!(resp, Response::GetOk { .. }), "{resp:?}");
+
+        let reapproved = upgrade_link_issued_at(0x51, 0x52, &sk, hours_ago(1));
+        let resp = node
+            .handle_request(key_new, Request::Transition {
+                    link: reapproved,
+                    commitment: c(0xaa),
+                })
+            .await;
+        assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
+    }
+
+    /// A revocation naming ANOTHER link (what a hostile backend would hand
+    /// the signer) does not block the real one: only the named link is
+    /// revoked, which is why the signer must check the name.
+    #[tokio::test]
+    async fn revocation_of_another_link_does_not_block_the_target() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x58);
+        let key_old = register_old(&node, 0x58, pk).await;
+        let key_new = key_from_seed(0x59);
+        node.observe_attestation(key_new, dummy_pubkey(0x59)).await;
+        let target = upgrade_link_issued_at(0x58, 0x59, &sk, hours_ago(2));
+        let decoy = upgrade_link_issued_at(0x58, 0x59, &sk, hours_ago(3));
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Revoke {
+                    link: revocation_of(&sk, &decoy, hours_ago(1)),
+                },
+            )
+            .await;
+        assert_eq!(resp, Response::RevokeOk);
+        let resp = node
+            .handle_request(key_new, Request::Transition {
+                    link: target,
+                    commitment: c(0xaa),
+                })
+            .await;
+        assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
+    }
+
+    /// A revocation signed by anything but the key's frozen control key is
+    /// refused and records nothing: the link still works afterwards.
+    #[tokio::test]
+    async fn revocation_signed_by_another_key_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x53);
+        let (host_sk, _) = keypair(0x54);
+        let key_old = register_old(&node, 0x53, pk).await;
+        let link = upgrade_link_issued_at(0x53, 0x55, &sk, hours_ago(2));
+        let resp = node
+            .handle_request(
+                key_old,
+                Request::Revoke {
+                    link: revocation_of(&host_sk, &link, hours_ago(1)),
+                },
+            )
+            .await;
+        assert_eq!(resp, err(RpcError::RevocationRejected));
+
+        let key_new = key_from_seed(0x55);
+        node.observe_attestation(key_new, dummy_pubkey(0x55)).await;
+        let resp = node
+            .handle_request(key_new, Request::Transition {
+                    link,
+                    commitment: c(0xaa),
+                })
+            .await;
+        assert!(matches!(resp, Response::TransitionOk { .. }), "{resp:?}");
+    }
+
+    /// Only the enclave holding the pin can revoke: a session whose key is
+    /// not registered (any other image the host can boot) is refused, even
+    /// with a validly signed revocation.
+    #[tokio::test]
+    async fn revocation_from_a_session_without_a_pin_is_rejected() {
+        let node = debug_node();
+        let (sk, pk) = keypair(0x56);
+        register_old(&node, 0x56, pk).await;
+        let stranger = key_from_seed(0x57);
+        node.observe_attestation(stranger, pk).await;
+        let link = upgrade_link_issued_at(0x56, 0x57, &sk, hours_ago(2));
+        let resp = node
+            .handle_request(
+                stranger,
+                Request::Revoke {
+                    link: revocation_of(&sk, &link, hours_ago(1)),
+                },
+            )
+            .await;
+        assert_eq!(resp, err(RpcError::RevocationRejected));
     }
 }

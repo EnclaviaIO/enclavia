@@ -6,7 +6,7 @@
 # QEMU nitro-enclave guests with distinct CIDs and names (node-a/b/c),
 # bridges their mesh over `mesh-host` instances wired into a triangle of
 # inter-host TCP links, lets them mutually attest + form a Raft cluster,
-# then drives a customer Pin on one node and a Get on ANOTHER through the
+# then drives a customer Register on one node and a Get on ANOTHER through the
 # cluster (forwarding + linearizable read).
 #
 # Identity injection: each guest fetches its MESH_SELF_NAME / MESH_PEERS
@@ -29,7 +29,9 @@
 #   ENCLAVIA_DIR    path to the enclavia checkout (this branch). Default:
 #                   resolved from this script's location.
 #   CRATES_DIR      path to the enclavia-crates checkout (mesh-host). Default ../enclavia-crates
-#   BUILDER_DIR     path to the builder checkout (init-patched + blobs). Default ../builder
+#   BUILDER_DIR     path to the builder checkout (heartbeat.py only; the EIF
+#                   builds its kernel and init from the pinned
+#                   `builder-src` input). Default ../builder
 #   MEMORY          guest RAM (default 768M)
 #   CLUSTER_TIMEOUT seconds to wait for leader election (default 180)
 #   KEEP            if set, do not tear down at the end (debugging)
@@ -106,7 +108,6 @@ echo "=== build (one EIF, identical PCRs) ==="
 
 echo "  building synchronizer EIF..."
 nice nix build "path:$ENCLAVIA_DIR#synchronizer-eif" \
-    --override-input builder-src "path:$BUILDER_DIR" \
     --out-link "$WORK/eif" --print-build-logs
 EIF="$WORK/eif/image.eif"
 [ -f "$EIF" ] || { echo "FATAL: EIF not produced at $EIF" >&2; ls -la "$WORK/eif" >&2; exit 1; }
@@ -224,9 +225,9 @@ start_node node-c
 # ---------------------------------------------------------------------------
 # 3. Wait for the cluster to form: ALL THREE nodes must log "committed
 #    voter" (the discover_and_join exit line, hit by joiners and the
-#    initializer alike). Anything weaker races the Pin against formation:
+#    initializer alike). Anything weaker races the Register against formation:
 #    "initialized a fresh cluster" appears on the bootstrap node before
-#    the others join, and a 1-voter cluster accepts a durable Pin
+#    the others join, and a 1-voter cluster accepts a durable Register
 #    trivially while the Get target may not have joined yet.
 # ---------------------------------------------------------------------------
 echo ""
@@ -260,15 +261,15 @@ fi
 echo "Cluster formed: all three nodes are committed voters"
 
 # ---------------------------------------------------------------------------
-# 4. Client round-trip: Pin on node-a, Get on node-b (cross-node).
+# 4. Client round-trip: Register on node-a, Get on node-b (cross-node).
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== client Pin (node-a) then Get (node-b), same key ==="
+echo "=== client Register (node-a) then Get (node-b), same key ==="
 SEED=0x42
 COMMIT=0xab
 
-echo "--- Pin on node-a ---"
-"$CLIENT" "${DIR[node-a]}/proxy.sock" pin "$COMMIT" --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED"
+echo "--- Register on node-a ---"
+"$CLIENT" "${DIR[node-a]}/proxy.sock" register "$COMMIT" --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED"
 
 echo "--- Get on node-b (forwarded to leader, linearizable) ---"
 GET_OUT="$("$CLIENT" "${DIR[node-b]}/proxy.sock" get --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED")"
@@ -276,10 +277,22 @@ echo "$GET_OUT"
 
 if echo "$GET_OUT" | grep -q "get ok commitment_byte=$COMMIT"; then
     echo ""
-    echo "PASS: cross-node Pin/Get round-trip (wrote on node-a, read identical commitment on node-b)"
+    echo "PASS: cross-node Register/Get round-trip (wrote on node-a, read identical commitment on node-b)"
 else
     echo ""
-    echo "BLOCKER: cross-node Get did not return the pinned commitment ($COMMIT). Output: $GET_OUT" >&2
+    echo "BLOCKER: cross-node Get did not return the registered commitment ($COMMIT). Output: $GET_OUT" >&2
+    exit 3
+fi
+
+# Same image (same PCR0-2), but a locked PCR16: a different enclave, so a
+# different pin slot. Its Get must not see the pin above.
+echo "--- Get on node-b as another enclave of the same image (PCR16 locked) ---"
+OTHER_OUT="$("$CLIENT" "${DIR[node-b]}/proxy.sock" get --server-pcrs "$PCRS_JSON" --port 5010 --seed "$SEED" --user-pcr16 0x16 || true)"
+echo "$OTHER_OUT"
+if echo "$OTHER_OUT" | grep -q "RESULT error NotFound"; then
+    echo "PASS: same image, different user PCR16 has its own (empty) pin slot"
+else
+    echo "BLOCKER: an enclave with a different PCR16 did not get its own pin slot. Output: $OTHER_OUT" >&2
     exit 3
 fi
 

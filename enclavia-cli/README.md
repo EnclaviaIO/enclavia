@@ -138,8 +138,11 @@ of deploying; nothing activates without a signed confirm.
 
 ```sh
 enclavia upgrade list <enclave-id>
-enclavia upgrade chain <enclave-id>       # the enclave's attested boot/upgrade history
+enclavia upgrade chain <enclave-id> [--debug-enclave]  # the enclave's attested boot/upgrade history
 enclavia upgrade confirm <enclave-id> <upgrade-id> [--at RFC3339 | --immediate]
+    [--reproduce | --expect-pcrs FILE|JSON] [--expect-digest sha256:...]   # self-hosted custody
+    [--accept-synchronizer-change]       # sign a synchronizer rotation (see below)
+    [--debug-enclave]                    # only for a debug (QEMU) enclave you created as one
 enclavia upgrade revoke <enclave-id> <upgrade-id>
 ```
 
@@ -147,6 +150,37 @@ With managed custody the backend signs the confirmation for you. With
 `--control-key` (self-hosted custody) confirm and revoke run a two-phase
 prepare/sign/submit flow against your local key, so the signature happens on
 your machine (or your YubiKey) and the backend never holds the private key.
+
+The backend still builds the upgrade payload your key signs, so before
+signing, `confirm` checks it against what you intend: the target PCRs from a
+local rebuild of the staged image (`--reproduce`) or from PCRs you obtained
+yourself (`--expect-pcrs`), the enclave's verified current state as the
+starting point, a `valid_from` no earlier than you asked for (now + 7 days by
+default) and a `valid_until` at least an hour and at most 30 days later. It
+shows all of it and refuses on any mismatch.
+Anti-rollback is fixed when the enclave is created: an upgrade can neither
+turn it on nor off. `confirm` reads the running version's setting from its own
+attested boot link (never from the backend), and shows it. With `--reproduce`
+it refuses a target whose setting differs from it: anti-rollback turned on or
+off, or, when it is on, a target not built as an upgrade target (such an image
+could register a fresh volume instead of taking over the enclave's pin), one
+that checks the synchronizer's attestation differently, or one that trusts no
+synchronizer. With `--expect-pcrs`, build the target with the running
+version's setting, and with the builder's `--upgrade-target` if that setting
+is on.
+
+A target that trusts another set of synchronizer builds than the running
+version is a synchronizer rotation. On both paths `confirm` shows the sets
+removed and added (with `--expect-pcrs`, from the backend's record of the
+staged build) and refuses unless you pass `--accept-synchronizer-change`.
+Until a migration protocol exists, such an upgrade works only if the new
+cluster holds this enclave's pin: the upgraded image never registers, so
+otherwise it fail-stops at boot and the enclave stays down.
+
+A debug (QEMU) enclave self-signs its attestations. `upgrade chain` and
+`confirm` check its chain without the AWS Nitro certificate chain only when
+you pass `--debug-enclave`; the CLI never takes that from the backend, and
+refuses when the backend reports another mode.
 
 ### Control keys (self-hosted custody)
 
