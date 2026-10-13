@@ -17,6 +17,12 @@ pub use noise::*;
 use serde::{Deserialize, Serialize};
 
 /// Messages sent from the client to the enclave server.
+///
+/// Byte fields are written as CBOR arrays of integers and read as either an
+/// array or a CBOR byte string. Writers keep the array form because a reader
+/// that declares a plain `Vec<u8>` inside an internally tagged enum (serde
+/// buffers the content to find the tag) rejects a byte string; every reader
+/// built from this crate accepts both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -27,8 +33,15 @@ pub enum ClientMessage {
     /// Raw bytes to forward to the inner container (typically an HTTP request).
     /// The `id` is echoed back in the response so the client can match them.
     /// One-shot: the server writes the payload, drains the response to EOF,
-    /// and replies with exactly one [`ServerMessage::Data`].
-    Data { id: u64, payload: Vec<u8> },
+    /// and replies with exactly one [`ServerMessage::Data`], so the response
+    /// must fit in one Noise message; a larger one fails that request with
+    /// [`ServerMessage::Error`]. [`ClientMessage::OpenStream`] carries
+    /// exchanges of any size.
+    Data {
+        id: u64,
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
+        payload: Vec<u8>,
+    },
 
     /// Authenticated management command. `payload` is a CBOR-encoded
     /// `ControlCommand`; `signature` is a P-256 ECDSA raw r||s 64-byte
@@ -37,7 +50,9 @@ pub enum ClientMessage {
     /// baked into the EIF and the embedded nonce against its current
     /// single-use nonce.
     Control {
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
         payload: Vec<u8>,
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
         signature: Vec<u8>,
     },
 
@@ -58,11 +73,19 @@ pub enum ClientMessage {
     /// in the returned bytes. This keeps the in-enclave protocol small enough
     /// that a non-Rust frontend (a future nginx C module, a WASM SDK) can
     /// implement it without an HTTP parser.
-    OpenStream { id: u64, payload: Vec<u8> },
+    OpenStream {
+        id: u64,
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
+        payload: Vec<u8>,
+    },
 
     /// Additional bytes sent into an open stream (e.g. WebSocket payload
     /// frames). The `id` matches the original `OpenStream` request.
-    StreamData { id: u64, payload: Vec<u8> },
+    StreamData {
+        id: u64,
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
+        payload: Vec<u8>,
+    },
 
     /// Close one or both halves of an open stream. `half = Write` signals
     /// that the client is done sending (the server should `shutdown(WRITE)` on
@@ -80,7 +103,8 @@ pub enum StreamHalf {
     Both,
 }
 
-/// Messages sent from the enclave server to the client.
+/// Messages sent from the enclave server to the client. Byte fields follow
+/// the same encoding rule as [`ClientMessage`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -88,6 +112,7 @@ pub enum ServerMessage {
     /// mode). `control_nonce` is the current per-boot single-use nonce that
     /// must be embedded in the next signed `ControlCommand`.
     Attestation {
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
         data: Vec<u8>,
         control_nonce: [u8; 32],
     },
@@ -103,9 +128,14 @@ pub enum ServerMessage {
 
     /// Raw bytes received from the inner container (typically an HTTP response).
     /// The `id` matches the corresponding `ClientMessage::Data` request.
-    Data { id: u64, payload: Vec<u8> },
+    Data {
+        id: u64,
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
+        payload: Vec<u8>,
+    },
 
-    /// Error forwarding to the inner container.
+    /// Error forwarding to the inner container, or a reply for this `id`
+    /// that could not be sent. Fails only that request or stream.
     Error { id: u64, message: String },
 
     /// Result of a `Control` command. The control nonce was rotated whether
@@ -118,7 +148,11 @@ pub enum ServerMessage {
     /// [`ClientMessage::OpenStream`] this carries everything the workload
     /// writes back, including the initial HTTP response head: the client is
     /// responsible for any parsing.
-    StreamData { id: u64, payload: Vec<u8> },
+    StreamData {
+        id: u64,
+        #[serde(deserialize_with = "serde_bytes::deserialize")]
+        payload: Vec<u8>,
+    },
 
     /// The open stream has been closed by the server side (workload EOF or
     /// error). After this, no further `StreamData` for this `id` will arrive.
@@ -362,6 +396,82 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// Byte payloads are read whether they arrive as a CBOR array of
+    /// integers or as a CBOR byte string.
+    #[test]
+    fn byte_fields_read_both_encodings() {
+        #[derive(Serialize)]
+        #[serde(tag = "type")]
+        enum BstrWriter {
+            StreamData {
+                id: u64,
+                #[serde(with = "serde_bytes")]
+                payload: Vec<u8>,
+            },
+        }
+        let payload: Vec<u8> = (0..=255).collect();
+        let mut as_bstr = Vec::new();
+        ciborium::into_writer(
+            &BstrWriter::StreamData {
+                id: 5,
+                payload: payload.clone(),
+            },
+            &mut as_bstr,
+        )
+        .unwrap();
+        let mut as_array = Vec::new();
+        ciborium::into_writer(
+            &ServerMessage::StreamData {
+                id: 5,
+                payload: payload.clone(),
+            },
+            &mut as_array,
+        )
+        .unwrap();
+        assert!(as_bstr.len() < as_array.len());
+
+        for bytes in [&as_array, &as_bstr] {
+            match ciborium::from_reader(bytes.as_slice()).unwrap() {
+                ServerMessage::StreamData { id, payload: got } => {
+                    assert_eq!(id, 5);
+                    assert_eq!(got, payload);
+                }
+                other => panic!("wrong variant {other:?}"),
+            }
+            match ciborium::from_reader(bytes.as_slice()).unwrap() {
+                ClientMessage::StreamData { id, payload: got } => {
+                    assert_eq!(id, 5);
+                    assert_eq!(got, payload);
+                }
+                other => panic!("wrong variant {other:?}"),
+            }
+        }
+    }
+
+    /// Byte payloads are still written as arrays: a reader declaring a plain
+    /// `Vec<u8>` in an internally tagged enum (every SDK and backend build
+    /// before the readers above) accepts only that form.
+    #[test]
+    fn byte_fields_are_written_as_arrays() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type")]
+        enum PlainReader {
+            StreamData { id: u64, payload: Vec<u8> },
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &ServerMessage::StreamData {
+                id: 8,
+                payload: vec![0xff; 64],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let PlainReader::StreamData { id, payload } =
+            ciborium::from_reader(bytes.as_slice()).expect("plain reader decodes the array form");
+        assert_eq!((id, payload), (8, vec![0xff; 64]));
     }
 
     #[test]
