@@ -32,6 +32,7 @@ dangerous-skip-chain = ["enclavia-protocol/dangerous-skip-chain"]
 enclavia-protocol = { path = "../enclavia-protocol", version = "0.2.0", default-features = false }
 snow.workspace = true
 serde.workspace = true
+serde_bytes = "0.11"
 ciborium.workspace = true
 thiserror.workspace = true
 httparse.workspace = true

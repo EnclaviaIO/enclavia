@@ -309,6 +309,12 @@ impl Client {
 
     /// Send a one-shot request over the attested channel.
     ///
+    /// The exchange runs over a workload stream (see
+    /// [`transport::OutboundCommand::Request`]), so the request and the
+    /// response may be of any size: both are split into frames that each
+    /// fit in one Noise message. The response ends at its `Content-Length`
+    /// when it has one, otherwise when the workload closes its connection.
+    ///
     /// If auto-reconnect is enabled (the default) and the channel is down
     /// (from a prior drop), this transparently re-establishes it first,
     /// re-running the FULL attestation handshake against the SAME pinned

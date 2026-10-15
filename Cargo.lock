@@ -1218,6 +1218,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_bytes",
  "serde_json",
  "snow",
  "thiserror 2.0.18",
