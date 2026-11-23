@@ -5,7 +5,7 @@
 //! tests/reconnect.rs, but as a long-running process: accept a WS
 //! connection, run the responder-side Noise handshake, answer the
 //! attestation exchange with a FakeAttestation (seed 0x11 -> PCR0 =
-//! "11"*48 etc.), answer exactly ONE Data request (body = "conn-<n>"),
+//! "11"*48 etc.), answer exactly ONE request (body = "conn-<n>"),
 //! then DROP the connection. Every further request therefore requires the
 //! client to transparently reconnect + re-attest — which is exactly what
 //! the smoke test asserts on.
@@ -70,11 +70,13 @@ async fn main() {
             .unwrap();
         println!("conn {n}: attested");
 
-        // Answer exactly one request, then drop the connection.
+        // Answer exactly one request, then drop the connection. Requests
+        // arrive as OpenStream; the response goes back as StreamData plus
+        // StreamClose (workload EOF), as enclavia-server sends it.
         let id = match transport.receive::<ClientMessage>().await {
-            Ok(ClientMessage::Data { id, .. }) => id,
+            Ok(ClientMessage::OpenStream { id, .. }) => id,
             other => {
-                println!("conn {n}: expected Data, got {other:?}");
+                println!("conn {n}: expected OpenStream, got {other:?}");
                 continue;
             }
         };
@@ -85,9 +87,10 @@ async fn main() {
             body
         );
         transport
-            .send(&ServerMessage::Data { id, payload: resp.into_bytes() })
+            .send(&ServerMessage::StreamData { id, payload: resp.into_bytes() })
             .await
             .unwrap();
+        transport.send(&ServerMessage::StreamClose { id }).await.unwrap();
         println!("conn {n}: answered one request, dropping");
         // transport dropped here -> socket closes -> client must reconnect.
     }

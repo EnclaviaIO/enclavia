@@ -54,8 +54,10 @@ impl RequestBuilder {
                 .insert(0, ("Host".into(), self.client.host().to_string()));
         }
 
-        // Add Connection: close for HTTP/1.1 (the server-side closes the TCP
-        // connection after reading the response, matching HTTP/1.0 behaviour)
+        // Add Connection: close for HTTP/1.1. A response without a
+        // Content-Length ends when the workload closes its end of the
+        // connection (stream EOF), so the workload must not keep it alive
+        // after responding.
         if !self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")) {
             self.headers.push(("Connection".into(), "close".into()));
         }

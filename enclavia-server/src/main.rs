@@ -6,8 +6,8 @@ use std::time::Duration;
 use enclavia_protocol::attestation::ValidatedAttestation;
 use enclavia_protocol::chain::{ChainLink, ChainLinkKind};
 use enclavia_protocol::{
-    CHAIN_LINK_ACK, ClientMessage, ControlCommand, RekeyParams, ServerMessage, StreamHalf,
-    perform_cbor_handshake_as_responder,
+    CHAIN_LINK_ACK, ClientMessage, ControlCommand, FrameTooLarge, RekeyParams, ServerMessage,
+    StreamHalf, perform_cbor_handshake_as_responder,
 };
 use enclavia_protocol::signing::{
     ControlSignatureError, SignedDomain, decode_canonical, verify_control_signature,
@@ -97,6 +97,19 @@ fn fresh_nonce() -> [u8; 32] {
     let mut buf = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut buf);
     buf
+}
+
+/// The request or stream id a reply belongs to, if any.
+fn reply_id(msg: &ServerMessage) -> Option<u64> {
+    match msg {
+        ServerMessage::Data { id, .. }
+        | ServerMessage::Error { id, .. }
+        | ServerMessage::StreamData { id, .. }
+        | ServerMessage::StreamClose { id } => Some(*id),
+        ServerMessage::Attestation { .. }
+        | ServerMessage::ControlNonce { .. }
+        | ServerMessage::ControlResult { .. } => None,
+    }
 }
 
 /// A payload-free one-line summary of a [`ClientMessage`], safe to log at any
@@ -1278,9 +1291,33 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 }
             }
 
-            // Send completed responses back to the client
+            // Send completed responses back to the client. A reply too large
+            // for one Noise message is refused before anything is encrypted
+            // or written, so the session is intact: fail only that request.
+            // Any other send error means the session itself is gone.
             Some(response) = response_rx.recv() => {
-                if let Err(e) = transport.send(&response).await {
+                let too_large = match transport.send(&response).await {
+                    Ok(()) => continue,
+                    Err(e) => match e.downcast_ref::<FrameTooLarge>() {
+                        Some(too_large) => *too_large,
+                        None => {
+                            warn!(error = %e, "Failed to send response");
+                            break;
+                        }
+                    },
+                };
+                let Some(id) = reply_id(&response) else {
+                    warn!(error = %too_large, "Dropped an unsendable reply");
+                    continue;
+                };
+                warn!(id, error = %too_large, "Reply too large for one message, failing the request");
+                let error = ServerMessage::Error {
+                    id,
+                    message: format!(
+                        "reply too large for one message ({too_large}); use a stream (OpenStream) for large exchanges"
+                    ),
+                };
+                if let Err(e) = transport.send(&error).await {
                     warn!(error = %e, "Failed to send response");
                     break;
                 }
@@ -2209,6 +2246,150 @@ mod channel_gating_tests {
             other => panic!("expected ControlResult, got {other:?}"),
         }
         assert!(cbor.receive::<ServerMessage>().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod oversize_reply_tests {
+    //! A reply that cannot fit in one Noise message fails only its own
+    //! request: the session and its other requests keep working.
+    use super::tests::fixed_pair;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const BIG: usize = 200 * 1024;
+
+    /// HTTP workload: `/big` answers with a body far larger than one Noise
+    /// message, anything else with `ok`. Closes after each response.
+    async fn spawn_workload() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    let body = if req.starts_with(b"GET /big ") {
+                        vec![b'x'; BIG]
+                    } else {
+                        b"ok".to_vec()
+                    };
+                    let mut resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    resp.extend_from_slice(&body);
+                    let _ = socket.write_all(&resp).await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn connect(
+        workload: String,
+    ) -> enclavia_protocol::CborTransport<tokio::io::DuplexStream> {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (_sk, pk) = fixed_pair();
+        let nonce: ControlNonce = Arc::new(Mutex::new([1u8; 32]));
+        tokio::spawn(async move {
+            let _ = handle_client(
+                server,
+                ChannelKind::Public,
+                workload,
+                Some(Arc::new(pk)),
+                nonce,
+                Arc::new("true".to_string()),
+                0,
+            )
+            .await;
+        });
+        let (cbor, _hh) = enclavia_protocol::perform_cbor_handshake_as_initiator(client)
+            .await
+            .expect("initiator handshake");
+        cbor
+    }
+
+    fn get(path: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").into_bytes()
+    }
+
+    async fn recv(
+        cbor: &mut enclavia_protocol::CborTransport<tokio::io::DuplexStream>,
+    ) -> ServerMessage {
+        tokio::time::timeout(Duration::from_secs(10), cbor.receive::<ServerMessage>())
+            .await
+            .expect("reply within timeout")
+            .expect("session still up")
+    }
+
+    #[tokio::test]
+    async fn oversized_data_reply_fails_only_that_request() {
+        let mut cbor = connect(spawn_workload().await).await;
+
+        cbor.send(&ClientMessage::Data {
+            id: 1,
+            payload: get("/big"),
+        })
+        .await
+        .unwrap();
+        match recv(&mut cbor).await {
+            ServerMessage::Error { id, message } => {
+                assert_eq!(id, 1);
+                assert!(message.contains("too large"), "message = {message}");
+            }
+            other => panic!("expected Error for the oversized reply, got {other:?}"),
+        }
+
+        // Same session: a small one-shot request still works.
+        cbor.send(&ClientMessage::Data {
+            id: 2,
+            payload: get("/small"),
+        })
+        .await
+        .unwrap();
+        match recv(&mut cbor).await {
+            ServerMessage::Data { id, payload } => {
+                assert_eq!(id, 2);
+                assert!(payload.ends_with(b"\r\n\r\nok"));
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // And the same large response arrives whole over a stream.
+        cbor.send(&ClientMessage::OpenStream {
+            id: 3,
+            payload: get("/big"),
+        })
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        loop {
+            match recv(&mut cbor).await {
+                ServerMessage::StreamData { id: 3, payload } => {
+                    response.extend_from_slice(&payload)
+                }
+                ServerMessage::StreamClose { id: 3 } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(response.ends_with(&vec![b'x'; BIG]));
+        cbor.send(&ClientMessage::StreamClose {
+            id: 3,
+            half: StreamHalf::Both,
+        })
+        .await
+        .unwrap();
     }
 }
 

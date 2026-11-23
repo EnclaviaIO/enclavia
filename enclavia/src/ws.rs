@@ -69,7 +69,12 @@ mod imp {
                 })?;
                 request.headers_mut().insert(header_name, header_value);
             }
-            let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+            // Nagle off: a request is several back-to-back small frames
+            // (OpenStream, StreamData, the previous request's StreamClose),
+            // and with Nagle each one after the first waits for the peer's
+            // delayed ACK. Browsers already disable it on WebSockets.
+            let (ws, _) =
+                tokio_tungstenite::connect_async_with_config(request, None, true).await?;
             Ok(Self { inner: ws })
         }
 

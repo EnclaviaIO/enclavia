@@ -11,6 +11,32 @@ use tracing::{debug, info, instrument, trace};
 
 pub const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
 
+/// Largest plaintext one Noise transport message can carry: the 65535-byte
+/// message limit minus the 16-byte authentication tag. Every CBOR message
+/// on a [`CborTransport`] must fit in this.
+pub const MAX_NOISE_PLAINTEXT: usize = 65535 - 16;
+
+/// A message whose CBOR encoding does not fit in one Noise transport
+/// message. [`CborTransport::send`] returns it before encrypting or writing
+/// anything, so the transport stays in sync and usable for later messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTooLarge {
+    /// Size of the CBOR encoding that did not fit.
+    pub len: usize,
+}
+
+impl std::fmt::Display for FrameTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "message encodes to {} bytes, more than the {MAX_NOISE_PLAINTEXT} one Noise message carries",
+            self.len
+        )
+    }
+}
+
+impl std::error::Error for FrameTooLarge {}
+
 pub struct NoiseHandshake {
     state: HandshakeState,
 }
@@ -286,6 +312,11 @@ where
         let mut cbor_bytes = Vec::new();
         into_writer(message, &mut cbor_bytes)?;
         trace!(cbor_len = cbor_bytes.len(), "Serialized CBOR message");
+        if cbor_bytes.len() > MAX_NOISE_PLAINTEXT {
+            return Err(Box::new(FrameTooLarge {
+                len: cbor_bytes.len(),
+            }));
+        }
 
         let encrypted_len = self
             .transport
@@ -441,6 +472,61 @@ mod write_chunk_tests {
             "single write exceeded the vsock limit: {:?}",
             sink.writes
         );
+    }
+
+    /// A message too large for one Noise message is refused with a typed
+    /// error before anything is encrypted or written, and the transport
+    /// keeps working: the next message still decrypts on the peer.
+    #[tokio::test]
+    async fn oversized_message_is_refused_without_desyncing() {
+        let mut hs_i = NoiseHandshake::initiator().unwrap();
+        let mut hs_r = NoiseHandshake::responder().unwrap();
+        let mut buf_a = vec![0u8; 65535];
+        let mut buf_b = vec![0u8; 65535];
+        let len = hs_i.write_message(&[], &mut buf_a).unwrap();
+        hs_r.read_message(&buf_a[..len], &mut buf_b).unwrap();
+        let len = hs_r.write_message(&[], &mut buf_a).unwrap();
+        hs_i.read_message(&buf_a[..len], &mut buf_b).unwrap();
+        let mut peer = hs_r.into_transport_mode().unwrap();
+
+        let sink = RecordingSink {
+            writes: Vec::new(),
+            data: Vec::new(),
+        };
+        let mut cbor = CborTransport::new(hs_i.into_transport_mode().unwrap(), sink);
+
+        #[derive(Serialize)]
+        struct Big {
+            payload: Vec<u8>,
+        }
+        let err = cbor
+            .send(&Big {
+                payload: vec![0xABu8; 40 * 1024],
+            })
+            .await
+            .expect_err("80 KiB of CBOR cannot be one Noise message");
+        let too_large = err
+            .downcast_ref::<FrameTooLarge>()
+            .expect("typed FrameTooLarge error");
+        assert!(too_large.len > MAX_NOISE_PLAINTEXT);
+        assert!(cbor.stream.writes.is_empty(), "nothing written");
+
+        cbor.send(&Big {
+            payload: vec![1, 2, 3],
+        })
+        .await
+        .expect("transport still usable");
+        let data = &cbor.stream.data;
+        let frame_len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+        let n = peer
+            .read_message(&data[4..4 + frame_len], &mut buf_b)
+            .expect("peer decrypts the next message");
+        #[derive(Deserialize)]
+        struct Small {
+            payload: Vec<u8>,
+        }
+        let got: Small = from_reader(&buf_b[..n]).unwrap();
+        assert_eq!(got.payload, vec![1, 2, 3]);
     }
 }
 
