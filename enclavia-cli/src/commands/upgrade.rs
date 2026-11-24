@@ -161,20 +161,20 @@ pub async fn chain(
     debug_enclave: bool,
 ) -> Result<ChainSummary, CliError> {
     let enclave = client.get_enclave(id).await?;
+    chain_with_enclave(client, id, &enclave, debug_enclave).await
+}
+
+/// Re-validate an enclave's upgrade chain against an already-fetched enclave
+/// row snapshot (eliminating TOCTOU between callers that already fetched the
+/// row and the chain walk).
+pub(crate) async fn chain_with_enclave(
+    client: &ApiClient,
+    id: &str,
+    enclave: &serde_json::Value,
+    debug_enclave: bool,
+) -> Result<ChainSummary, CliError> {
     let wire_links = in_sequence_order(client.get_enclave_chain(id).await?)?;
 
-    // The expected enclave id for the walk is the (already resolved)
-    // id the user asked about — the same id both GETs above were
-    // addressed to — NOT anything read off the untrusted row, so a
-    // transplanted chain cannot satisfy the validator's enclave_id
-    // binding. `run_upgrade` resolves prefixes to full UUIDs before
-    // calling here; the parse is a hard failure rather than a silent
-    // skip in case a future caller forgets. Note the CLI's transplant
-    // protection is inherently weaker than the SDK's: the resolved id
-    // itself comes from the backend's list endpoint, so a malicious
-    // backend controls both sides of this check. That's fine for an
-    // inspection tool — the load-bearing enclave_id binding is the
-    // SDK's caller-pinned id.
     let enclave_uuid = Uuid::parse_str(id)
         .map_err(|e| CliError::Other(format!("enclave id `{id}` is not a UUID: {e}")))?;
 
@@ -182,8 +182,8 @@ pub async fn chain(
     // row's `mode` must only agree with it. The rest of the validator
     // context is the shared, tolerant `EnclaveChainRow` parse used by every
     // chain consumer.
-    let debug_mode = attestation_debug_mode(&enclave, debug_enclave)?;
-    let row: EnclaveChainRow = serde_json::from_value(enclave)
+    let debug_mode = attestation_debug_mode(enclave, debug_enclave)?;
+    let row: EnclaveChainRow = serde_json::from_value(enclave.clone())
         .map_err(|e| CliError::Other(format!("enclave row: {e}")))?;
     let control_public_key_b64 = row
         .control_public_key
@@ -331,7 +331,7 @@ pub async fn confirm_upgrade(
     target: Option<UpgradeTarget>,
 ) -> Result<StagedUpgradeJson, CliError> {
     let enclave = client.get_enclave(enclave_id).await?;
-    match control_key_mode(&enclave) {
+    match control_key_mode(&enclave)? {
         ControlKeyMode::SelfHosted => {
             let target = target.ok_or_else(|| {
                 CliError::Other(
@@ -367,7 +367,7 @@ pub async fn revoke_upgrade(
     upgrade_id: &str,
 ) -> Result<StagedUpgradeJson, CliError> {
     let enclave = client.get_enclave(enclave_id).await?;
-    match control_key_mode(&enclave) {
+    match control_key_mode(&enclave)? {
         ControlKeyMode::SelfHosted => {
             revoke_self_hosted(client, &enclave, enclave_id, upgrade_id).await
         }
@@ -382,20 +382,23 @@ pub async fn revoke_upgrade(
 /// Control-key custody mode read off the enclave row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlKeyMode {
-    /// Backend holds the control key (or the row predates custody
-    /// modes): single-shot confirm/revoke.
+    /// Backend holds the control key: single-shot confirm/revoke.
     Managed,
     /// The user holds the control key: two-phase prepare/submit.
     SelfHosted,
 }
 
-/// Detect the custody mode from the enclave row. Anything other than an
-/// explicit `"self_hosted"` (including a missing field on pre-custody
-/// backends) is managed, preserving the existing single-shot behaviour.
-pub fn control_key_mode(enclave: &serde_json::Value) -> ControlKeyMode {
+/// Detect the custody mode from the enclave row. Fail-closed: only an explicit
+/// `"self_hosted"` or `"managed"` is accepted; missing, null, or unrecognized
+/// values error rather than silently falling back to managed custody.
+pub fn control_key_mode(enclave: &serde_json::Value) -> Result<ControlKeyMode, CliError> {
     match enclave.get("control_key_mode").and_then(|v| v.as_str()) {
-        Some("self_hosted") => ControlKeyMode::SelfHosted,
-        _ => ControlKeyMode::Managed,
+        Some("self_hosted") => Ok(ControlKeyMode::SelfHosted),
+        Some("managed") => Ok(ControlKeyMode::Managed),
+        other => Err(CliError::Other(format!(
+            "the backend reports control_key_mode as {other:?}, not \"self_hosted\" or \
+             \"managed\"; refusing to guess custody mode"
+        ))),
     }
 }
 
@@ -719,10 +722,11 @@ pub struct RunningVersion {
 /// image's setting is read from its own boot link.
 async fn verified_running(
     client: &ApiClient,
+    enclave: &serde_json::Value,
     enclave_id: &str,
     debug_enclave: bool,
 ) -> Result<RunningVersion, CliError> {
-    let summary = chain(client, enclave_id, debug_enclave).await?;
+    let summary = chain_with_enclave(client, enclave_id, enclave, debug_enclave).await?;
     if let Some(bad) = summary.links.iter().find(|l| l.validation.is_err()) {
         return Err(CliError::Other(format!(
             "the enclave's upgrade chain does not verify (link {:?}: {}); refusing to sign an \
@@ -806,7 +810,7 @@ async fn upgrade_expectation(
             )));
         }
     };
-    let running = verified_running(client, enclave_id, target.debug_enclave).await?;
+    let running = verified_running(client, enclave, enclave_id, target.debug_enclave).await?;
     eprintln!("The running version's anti-rollback setting, from its attested boot link:");
     for line in anti_rollback_lines(&running.anti_rollback) {
         eprintln!("  {line}");
@@ -830,8 +834,21 @@ async fn upgrade_expectation(
         }
         TargetPcrs::Reproduce => {
             eprintln!("Rebuilding upgrade {upgrade_id} locally to learn its PCRs...");
-            let r = crate::commands::reproduce::reproduce_upgrade(client, enclave_id, upgrade_id)
-                .await?;
+            // Pass the single fetched `(enclave, staged)` snapshot directly so
+            // a hostile backend cannot serve different data to `reproduce` vs
+            // `confirm_upgrade`.
+            let r = crate::commands::reproduce::reproduce_upgrade_with(
+                enclave_id,
+                enclave,
+                &staged,
+            )
+            .await?;
+            if r.image_digest != image_digest {
+                return Err(CliError::Other(format!(
+                    "reproduced image digest {} does not match expected {}; refusing to sign",
+                    r.image_digest, image_digest
+                )));
+            }
             if !r.is_reproducible() {
                 return Err(CliError::Other(format!(
                     "the local rebuild of upgrade {upgrade_id} does not reproduce the PCRs the \
@@ -884,7 +901,72 @@ fn min_upgrade_delay_secs(enclave: &serde_json::Value) -> Result<u64, CliError> 
     }
 }
 
-fn print_upgrade_to_sign(p: &UpgradePayload, source: &TargetPcrs) {
+/// Validate the backend-supplied storage rekey parameters before embedding
+/// them inside the signed `PrepareUpgrade` envelope:
+/// - Presence must match whether the enclave has persistent storage (`rekey.is_some() == has_storage`).
+/// - `new_key_id` must be non-empty and free of whitespace/control characters.
+/// - `new_public_key` must parse as a valid DER-encoded RSA SubjectPublicKeyInfo
+///   with modulus >= 2048 bits.
+///
+/// Returns `Ok(Some((new_key_id, pubkey_sha256_hex)))` for storage enclaves so
+/// the caller can display both before prompting for the control-key signature.
+pub fn check_rekey_params(
+    rekey: Option<&enclavia_protocol::RekeyParams>,
+    has_storage: bool,
+) -> Result<Option<(String, String)>, CliError> {
+    use rsa::pkcs8::DecodePublicKey as _;
+    use rsa::traits::PublicKeyParts as _;
+    use sha2::{Digest as _, Sha256};
+
+    match (rekey, has_storage) {
+        (None, false) => Ok(None),
+        (None, true) => Err(CliError::Other(
+            "refusing to sign: enclave has persistent storage but backend prepared no rekey \
+             parameters"
+                .into(),
+        )),
+        (Some(_), false) => Err(CliError::Other(
+            "refusing to sign: stateless enclave unexpectedly received storage rekey parameters \
+             from backend"
+                .into(),
+        )),
+        (Some(rk), true) => {
+            if rk.new_key_id.is_empty()
+                || rk
+                    .new_key_id
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+            {
+                return Err(CliError::Other(format!(
+                    "refusing to sign: invalid rekey new_key_id {:?}",
+                    rk.new_key_id
+                )));
+            }
+            let rsa_pk = rsa::RsaPublicKey::from_public_key_der(&rk.new_public_key).map_err(
+                |e| {
+                    CliError::Other(format!(
+                        "refusing to sign: rekey new_public_key is not a valid DER RSA SPKI: {e}"
+                    ))
+                },
+            )?;
+            if rsa_pk.size() * 8 < 2048 {
+                return Err(CliError::Other(format!(
+                    "refusing to sign: rekey RSA public key is {} bits (minimum 2048)",
+                    rsa_pk.size() * 8
+                )));
+            }
+            let digest = Sha256::digest(&rk.new_public_key);
+            let fp: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            Ok(Some((rk.new_key_id.clone(), fp)))
+        }
+    }
+}
+
+fn print_upgrade_to_sign(
+    p: &UpgradePayload,
+    source: &TargetPcrs,
+    rekey_display: Option<&(String, String)>,
+) {
     let source = match source {
         TargetPcrs::Expected(_) => "the PCRs you gave",
         TargetPcrs::Reproduce => "your local rebuild",
@@ -905,6 +987,10 @@ fn print_upgrade_to_sign(p: &UpgradePayload, source: &TargetPcrs) {
         "  valid_until: {}",
         p.valid_until.format("%Y-%m-%d %H:%M:%S UTC")
     );
+    if let Some((key_id, pubkey_sha256)) = rekey_display {
+        eprintln!("  rekey_key:   {key_id}");
+        eprintln!("  rekey_pk:    sha256:{pubkey_sha256}");
+    }
     eprintln!("{ABANDON_BY_REVOKING}");
 }
 
@@ -933,11 +1019,13 @@ async fn confirm_self_hosted(
     valid_from: Option<DateTime<Utc>>,
     target: UpgradeTarget,
 ) -> Result<StagedUpgradeJson, CliError> {
+    let has_storage = crate::commands::reproduce::row_has_storage(enclave);
     let expected =
         upgrade_expectation(client, enclave, enclave_id, upgrade_id, valid_from, &target).await?;
     let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
     let payload = check_upgrade_payload(&prep.payload, &expected)?;
-    print_upgrade_to_sign(&payload, &target.pcrs);
+    let rekey_display = check_rekey_params(prep.rekey.as_ref(), has_storage)?;
+    print_upgrade_to_sign(&payload, &target.pcrs, rekey_display.as_ref());
     let signer = signer_for_enclave(enclave)?;
     eprintln!("Two signatures are required.");
     let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
@@ -947,12 +1035,20 @@ async fn confirm_self_hosted(
             eprintln!(
                 "Submit rejected (stale nonce): {msg}. Re-running prepare and retrying once."
             );
-            let prep = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
-            check_upgrade_payload(&prep.payload, &UpgradeExpectation {
+            let prep2 = client.confirm_prepare(enclave_id, upgrade_id, valid_from).await?;
+            check_upgrade_payload(&prep2.payload, &UpgradeExpectation {
                 now: Utc::now(),
                 ..expected
             })?;
-            let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep)?;
+            check_rekey_params(prep2.rekey.as_ref(), has_storage)?;
+            if prep2.rekey != prep.rekey {
+                return Err(CliError::Other(
+                    "refusing to sign retry: backend changed rekey parameters between prepare \
+                     attempts"
+                        .into(),
+                ));
+            }
+            let submission = crate::signer::sign_confirm_submission(signer.as_ref(), &prep2)?;
             submitting("Confirming");
             client.confirm_submit(enclave_id, upgrade_id, &submission).await
         }
@@ -1472,22 +1568,71 @@ mod tests {
     // Custody detection
     // -----------------------------------------------------------------------
 
-    /// Only an explicit `"self_hosted"` selects the two-phase flow;
-    /// everything else (managed, unknown values, missing field on
-    /// pre-custody backends, wrong type) stays on the single-shot path.
+    /// Only explicit `"self_hosted"` and `"managed"` are accepted; missing,
+    /// null, wrong-type, or unknown values fail closed rather than silently
+    /// falling back to managed custody.
     #[test]
     fn control_key_mode_detection() {
         let self_hosted = serde_json::json!({ "control_key_mode": "self_hosted" });
-        assert_eq!(control_key_mode(&self_hosted), ControlKeyMode::SelfHosted);
+        assert_eq!(
+            control_key_mode(&self_hosted).unwrap(),
+            ControlKeyMode::SelfHosted
+        );
+        let managed = serde_json::json!({ "control_key_mode": "managed" });
+        assert_eq!(control_key_mode(&managed).unwrap(), ControlKeyMode::Managed);
 
         for row in [
-            serde_json::json!({ "control_key_mode": "managed" }),
             serde_json::json!({ "control_key_mode": null }),
             serde_json::json!({ "control_key_mode": 3 }),
+            serde_json::json!({ "control_key_mode": "SelfHosted" }),
             serde_json::json!({}),
         ] {
-            assert_eq!(control_key_mode(&row), ControlKeyMode::Managed, "row: {row}");
+            assert!(
+                control_key_mode(&row).is_err(),
+                "expected fail-closed error for row: {row}"
+            );
         }
+    }
+
+    #[test]
+    fn check_rekey_params_validates_presence_and_rsa_spki() {
+        use enclavia_protocol::RekeyParams;
+        use rsa::pkcs8::EncodePublicKey as _;
+
+        // Stateless enclave: None ok, Some rejected.
+        assert!(check_rekey_params(None, false).unwrap().is_none());
+
+        // Generate a real 2048-bit RSA SPKI for positive test.
+        let mut rng = rand::thread_rng();
+        let sk = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let spki = sk.to_public_key().to_public_key_der().unwrap();
+        let good = RekeyParams {
+            new_public_key: spki.as_bytes().to_vec(),
+            new_key_id: "arn:aws:kms:eu-central-1:123456789012:key/test".into(),
+        };
+
+        assert!(check_rekey_params(Some(&good), false).is_err());
+        assert!(check_rekey_params(None, true).is_err());
+
+        let (key_id, fp) = check_rekey_params(Some(&good), true)
+            .unwrap()
+            .expect("storage rekey display");
+        assert_eq!(key_id, good.new_key_id);
+        assert_eq!(fp.len(), 64);
+
+        // Corrupt DER rejected.
+        let bad_der = RekeyParams {
+            new_public_key: vec![0x30, 0x00],
+            new_key_id: good.new_key_id.clone(),
+        };
+        assert!(check_rekey_params(Some(&bad_der), true).is_err());
+
+        // Empty key id rejected.
+        let bad_id = RekeyParams {
+            new_public_key: good.new_public_key.clone(),
+            new_key_id: "".into(),
+        };
+        assert!(check_rekey_params(Some(&bad_id), true).is_err());
     }
 
     /// A self-hosted row without any matching local key must fail with

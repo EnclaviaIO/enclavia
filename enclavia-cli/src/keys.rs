@@ -190,30 +190,34 @@ pub fn save_index_to(path: &Path, index: &KeyIndex) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Write `data` to `path` with mode 0600 from the moment of creation
-/// (no chmod-after-write window). Truncates an existing file.
+/// Atomically write `data` to `path` with mode 0600 via a sibling temp file
+/// + `sync_all` + `rename` so a crash mid-write or concurrent reader never
+/// observes a truncated/corrupt index and permissions are always clamped to
+/// 0600 on Unix.
 fn write_private(path: &Path, data: &[u8]) -> Result<(), CliError> {
     use std::io::Write as _;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(path)
-        .map_err(|e| CliError::Other(format!("opening {}: {e}", path.display())))?;
-    // An existing file keeps its creation-time mode; enforce 0600 on
-    // rewrite too.
+    let dir = path
+        .parent()
+        .ok_or_else(|| CliError::Other(format!("{} has no parent directory", path.display())))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".index.json.")
+        .tempfile_in(dir)
+        .map_err(|e| CliError::Other(format!("creating temp file in {}: {e}", dir.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| CliError::Other(format!("chmod {}: {e}", path.display())))?;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| CliError::Other(format!("chmod temp file in {}: {e}", dir.display())))?;
     }
-    f.write_all(data)
+    tmp.as_file_mut()
+        .write_all(data)
         .map_err(|e| CliError::Other(format!("writing {}: {e}", path.display())))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| CliError::Other(format!("syncing {}: {e}", path.display())))?;
+    tmp.persist(path)
+        .map_err(|e| CliError::Other(format!("persisting {}: {}", path.display(), e.error)))?;
     Ok(())
 }
 

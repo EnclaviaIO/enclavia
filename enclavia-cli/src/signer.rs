@@ -161,6 +161,7 @@ mod yubikey_backend {
     use sha2::{Digest as _, Sha256};
     use yubikey::piv::{AlgorithmId, SlotId};
     use yubikey::{MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey};
+    use zeroize::Zeroizing;
 
     use super::ControlSigner;
     use crate::error::CliError;
@@ -195,14 +196,17 @@ mod yubikey_backend {
     }
 
     /// Prompt for the PIV PIN on stderr with hidden input. stderr keeps
-    /// `--json` stdout parseable.
-    fn prompt_pin(serial: u32) -> Result<String, CliError> {
+    /// `--json` stdout parseable. Returned inside [`Zeroizing`] so the PIN
+    /// buffer is scrubbed from memory on drop.
+    fn prompt_pin(serial: u32) -> Result<Zeroizing<String>, CliError> {
         eprint!("PIN for YubiKey {serial}: ");
         std::io::stderr()
             .flush()
             .map_err(|e| CliError::Other(format!("flushing stderr: {e}")))?;
-        let pin = rpassword::read_password()
-            .map_err(|e| CliError::Other(format!("reading PIN: {e}")))?;
+        let pin = Zeroizing::new(
+            rpassword::read_password()
+                .map_err(|e| CliError::Other(format!("reading PIN: {e}")))?,
+        );
         if pin.is_empty() {
             return Err(CliError::Other("empty PIN".into()));
         }
@@ -231,7 +235,7 @@ mod yubikey_backend {
         slot: SlotId,
         slot_name: String,
         serial: u32,
-        pin: String,
+        pin: Zeroizing<String>,
         public_key: [u8; 65],
     }
 

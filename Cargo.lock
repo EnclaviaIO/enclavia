@@ -1268,6 +1268,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "rpassword",
+ "rsa",
  "serde",
  "serde_json",
  "sha2",
@@ -1279,6 +1280,7 @@ dependencies = [
  "url",
  "uuid",
  "yubikey",
+ "zeroize",
 ]
 
 [[package]]

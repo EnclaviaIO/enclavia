@@ -167,7 +167,7 @@ pub enum ServerMessage {
 /// Storage re-key parameters for a `PrepareUpgrade` control command. Only
 /// provided for enclaves that have a persistent LUKS-backed storage volume;
 /// `None` for stateless enclaves.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RekeyParams {
     /// DER-encoded SubjectPublicKeyInfo of the new RSA-OAEP KMS key.
     /// The enclave wraps a freshly-generated passphrase under this key and

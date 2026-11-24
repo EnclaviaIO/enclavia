@@ -1446,7 +1446,17 @@ async fn run_upgrade(cmd: UpgradeCmd, json: bool) -> Result<(), CliError> {
             let client = ApiClient::new()?;
             let enclave_id = resolve_enclave_id(&client, &enclave_id).await?;
             let summary = upgrade::chain(&client, &enclave_id, debug_enclave).await?;
-            emit(json, &summary, || print_chain(&summary));
+            if json {
+                // Emit a single JSON object on stdout (never a second error
+                // object from `main`) and exit 2 on verification failure,
+                // matching `enclavia reproduce --json`.
+                print_json(&summary);
+                if !summary.is_verified() {
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
+            print_chain(&summary);
             // A chain that does not verify is a failure for scripts too,
             // not only in the printed verdict.
             if !summary.is_verified() {

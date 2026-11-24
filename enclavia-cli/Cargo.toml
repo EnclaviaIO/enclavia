@@ -55,6 +55,13 @@ ciborium = { workspace = true }
 # (public-key parsing, fingerprints, and verifying assembled commands in
 # tests exactly as enclavia-server does).
 p256 = { workspace = true }
+# Validate DER RSA SubjectPublicKeyInfo on self-hosted storage rekey params
+# before signing PrepareUpgrade.
+rsa = { workspace = true }
+# Atomic private file writes (credentials, key index) and 0700 reproduce output dirs.
+tempfile = "3"
+# Scrub YubiKey PIN from memory on drop.
+zeroize = "1"
 # YubiKey PIV backend for the control key. Optional: server-side
 # consumers of this crate's library face use
 # default-features = false to avoid linking pcsclite into server-side
@@ -64,7 +71,6 @@ yubikey = { version = "0.8", optional = true }
 rpassword = { version = "7", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 
 [features]
 # `dangerous-skip-chain` is a default feature (what it enables is described

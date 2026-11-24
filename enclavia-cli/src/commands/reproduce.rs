@@ -290,8 +290,19 @@ pub async fn reproduce_upgrade(
     let summary = resolve_enclave(client, id_or_prefix).await?;
     let enclave = client.get_enclave(&summary.id).await?;
     let upgrade = client.get_upgrade(&summary.id, upgrade_id).await?;
-    let inputs = ReproduceInputs::from_staged_upgrade(&upgrade)?;
-    run_reproduce(&summary.id, &enclave, inputs).await
+    reproduce_upgrade_with(&summary.id, &enclave, &upgrade).await
+}
+
+/// Reproduce a staged upgrade from an already-fetched `(enclave, upgrade)`
+/// snapshot, avoiding a second backend round-trip (eliminates TOCTOU between
+/// `confirm_upgrade` inspection and local reproduction).
+pub async fn reproduce_upgrade_with(
+    enclave_id: &str,
+    enclave: &serde_json::Value,
+    upgrade: &enclavia_protocol::staging::StagedUpgradeJson,
+) -> Result<ReproduceResult, CliError> {
+    let inputs = ReproduceInputs::from_staged_upgrade(upgrade)?;
+    run_reproduce(enclave_id, enclave, inputs).await
 }
 
 /// Shared tail of both reproduce paths: pin the image, run the local
@@ -302,7 +313,12 @@ async fn run_reproduce(
     enclave: &serde_json::Value,
     inputs: ReproduceInputs,
 ) -> Result<ReproduceResult, CliError> {
-    let pinned_image = pin_to_digest(&inputs.docker_image, &inputs.image_digest);
+    // Validate enclave_id is a canonical UUID before passing it to the builder
+    // or using it in any path/argument context.
+    let parsed_id = uuid::Uuid::parse_str(enclave_id)
+        .map_err(|e| CliError::Other(format!("invalid enclave id {enclave_id:?}: {e}")))?
+        .to_string();
+    let pinned_image = pin_to_digest(&inputs.docker_image, &inputs.image_digest)?;
 
     let recorded_egress_allowlist = enclave
         .get("egress_allowlist")
@@ -310,7 +326,7 @@ async fn run_reproduce(
         .unwrap_or(serde_json::Value::Null);
 
     let actual = run_builder(
-        enclave_id,
+        &parsed_id,
         &pinned_image,
         enclave,
         &inputs.image_digest,
@@ -326,7 +342,7 @@ async fn run_reproduce(
     let mismatches = diff_pcrs(&inputs.expected, &actual);
 
     Ok(ReproduceResult {
-        enclave_id: enclave_id.to_string(),
+        enclave_id: parsed_id,
         image_digest: inputs.image_digest,
         expected: inputs.expected,
         actual,
@@ -372,7 +388,7 @@ fn row_is_debug(enclave: &serde_json::Value) -> bool {
 }
 
 /// Whether the row records storage: the builder ran with `--storage`.
-fn row_has_storage(enclave: &serde_json::Value) -> bool {
+pub(crate) fn row_has_storage(enclave: &serde_json::Value) -> bool {
     enclave
         .get("storage_size_bytes")
         .and_then(|v| v.as_u64())
@@ -420,9 +436,14 @@ async fn run_builder(
     recorded_upgrade_target: bool,
 ) -> Result<PcrTriple, CliError> {
     let builder_path = std::env::var("BUILDER_PATH").unwrap_or_else(|_| "builder".to_string());
-    let output_dir = std::env::temp_dir().join(format!("enclavia-reproduce-{enclave_id}"));
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|e| CliError::Other(format!("creating {}: {e}", output_dir.display())))?;
+    // Use an unpredictable 0700 tempdir (auto-cleaned on drop) instead of a
+    // predictable `/tmp/enclavia-reproduce-<id>` directory vulnerable to
+    // local symlink / TOCTOU races.
+    let output_tempdir = tempfile::Builder::new()
+        .prefix("enclavia-reproduce-")
+        .tempdir()
+        .map_err(|e| CliError::Other(format!("creating reproduce tempdir: {e}")))?;
+    let output_dir = output_tempdir.path();
 
     // Materialise the recorded allowlist as a file the builder can copy
     // into the bundle. NULL on the row means the original build went
@@ -627,13 +648,29 @@ fn with_recorded_rev_hint(e: CliError) -> CliError {
 /// whatever auth `nix` is configured with — for `git+ssh://` URLs that
 /// means the user's GitHub SSH key; for `github:` URLs (post public
 /// flip) it's unauthenticated HTTPS.
+/// Validate a recorded git revision: must be a full 40-character hexadecimal
+/// SHA-1 commit hash (`[0-9a-f]{40}`). Rejects flake URL query/fragment
+/// injection (e.g. `?rev=abc&dir=...` or `#...`) from an untrusted backend.
+pub(crate) fn validate_git_rev(label: &str, rev: &str) -> Result<(), CliError> {
+    if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        Ok(())
+    } else {
+        Err(CliError::Other(format!(
+            "invalid {label} revision {rev:?}: expected a 40-character lowercase hex git commit SHA"
+        )))
+    }
+}
+
 pub(crate) async fn fetch_flake_source(
     label: &str,
     url: &str,
     rev: Option<&str>,
 ) -> Result<PathBuf, CliError> {
     let flake_ref = match rev {
-        Some(rev) => format!("{url}?rev={rev}"),
+        Some(rev) => {
+            validate_git_rev(label, rev)?;
+            format!("{url}?rev={rev}")
+        }
         None => url.to_string(),
     };
     match rev {
@@ -727,20 +764,123 @@ fn synchronizer_args(
     }
 }
 
-/// Replace a `<host>/<owner>/<repo>:<tag>` reference with its digest-pinned
-/// form `<host>/<owner>/<repo>@sha256:<digest>`. Mirrors the backend's
-/// `pin_image_to_digest` so the CLI pulls exactly the bytes the original
-/// build pulled, even if the tag has since been overwritten by a newer push.
-fn pin_to_digest(canonical: &str, digest: &str) -> String {
-    if canonical.contains('@') {
-        // Already digest-pinned. Trust the caller — re-pinning would just
-        // produce the same string.
-        return canonical.to_string();
+/// Validate an OCI `sha256:<64 lowercase hex>` digest.
+fn validate_image_digest(digest: &str) -> Result<(), CliError> {
+    let Some(hex_part) = digest.strip_prefix("sha256:") else {
+        return Err(CliError::Other(format!(
+            "invalid image digest {digest:?}: must start with \"sha256:\""
+        )));
+    };
+    if hex_part.len() != 64
+        || !hex_part
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(CliError::Other(format!(
+            "invalid image digest {digest:?}: expected 64 lowercase hex characters after \"sha256:\""
+        )));
     }
-    match canonical.rsplit_once(':') {
-        Some((stem, _tag)) => format!("{stem}@{digest}"),
-        None => format!("{canonical}@{digest}"),
+    Ok(())
+}
+
+/// Replace a `<host[:port]>/<owner>/<repo>[:<tag>]` reference with its
+/// digest-pinned form `<host[:port]>/<owner>/<repo>@sha256:<digest>`.
+///
+/// Rejects:
+/// - whitespace / control characters / leading `-` (CLI flag injection),
+/// - skopeo transport prefixes (`dir:`, `oci:`, `oci-archive:`,
+///   `docker-archive:`, `docker-daemon:`, `containers-storage:`, `docker://`,
+///   etc. — anything with `://` or a non-numeric-port `:` before the first `/`),
+/// - an existing `@<digest>` that disagrees with `digest` (fail-closed rather
+///   than silently pulling a different image than recorded),
+/// - malformed `digest` values.
+///
+/// Preserves registry ports (`registry.local:5000/alice/foo` without a tag).
+fn pin_to_digest(canonical: &str, digest: &str) -> Result<String, CliError> {
+    validate_image_digest(digest)?;
+    if canonical.is_empty()
+        || canonical.starts_with('-')
+        || canonical
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(CliError::Other(format!(
+            "invalid docker_image reference {canonical:?}"
+        )));
     }
+    if canonical.contains("://") {
+        return Err(CliError::Other(format!(
+            "refusing docker_image {canonical:?}: URL schemes / skopeo transports are not allowed"
+        )));
+    }
+
+    // Reject skopeo transport prefixes such as `dir:/tmp/x`, `oci:/...`,
+    // `oci-archive:...`, `docker-archive:...`, `docker-daemon:...`,
+    // `containers-storage:...`. In a valid registry reference, any `:` before
+    // the first `/` can ONLY be a numeric registry port (or a repo:tag when
+    // there is no `/` at all, e.g. `alpine:3.20` — wait: forbid known skopeo
+    // schemes unconditionally too!).
+    const FORBIDDEN_TRANSPORTS: &[&str] = &[
+        "dir:",
+        "oci:",
+        "oci-archive:",
+        "docker:",
+        "docker-archive:",
+        "docker-daemon:",
+        "containers-storage:",
+        "ostree:",
+        "sif:",
+        "tarball:",
+    ];
+    let lower = canonical.to_ascii_lowercase();
+    for prefix in FORBIDDEN_TRANSPORTS {
+        if lower.starts_with(prefix) {
+            return Err(CliError::Other(format!(
+                "refusing docker_image {canonical:?}: skopeo transport prefix {prefix:?} is not allowed"
+            )));
+        }
+    }
+    if let Some(first_slash) = canonical.find('/') {
+        let authority = &canonical[..first_slash];
+        if let Some((_, port_str)) = authority.split_once(':') {
+            if port_str.is_empty()
+                || !port_str.bytes().all(|b| b.is_ascii_digit())
+                || port_str.parse::<u16>().map_or(true, |p| p == 0)
+            {
+                return Err(CliError::Other(format!(
+                    "refusing docker_image {canonical:?}: invalid registry authority {authority:?}"
+                )));
+            }
+        }
+    }
+
+    // If the reference already carries `@<existing>`, require it to match
+    // `digest` rather than silently pulling a different image.
+    if let Some((repo_part, existing_digest)) = canonical.split_once('@') {
+        if existing_digest != digest {
+            return Err(CliError::Other(format!(
+                "docker_image {canonical:?} is pinned to {existing_digest}, which disagrees with \
+                 recorded image_digest {digest}"
+            )));
+        }
+        if repo_part.is_empty() {
+            return Err(CliError::Other(format!(
+                "invalid docker_image reference {canonical:?}"
+            )));
+        }
+        return Ok(canonical.to_string());
+    }
+
+    // Only strip `:tag` when the last `:` appears AFTER the last `/` (so a
+    // registry port in `host:5000/owner/repo` without a tag is preserved).
+    let last_slash = canonical.rfind('/');
+    let last_colon = canonical.rfind(':');
+    let stem = match (last_slash, last_colon) {
+        (Some(s), Some(c)) if c > s => &canonical[..c],
+        (None, Some(c)) => &canonical[..c],
+        _ => canonical,
+    };
+    Ok(format!("{stem}@{digest}"))
 }
 
 /// Slot-by-slot comparison. Three independent PCRs means up to three
@@ -812,14 +952,64 @@ mod tests {
 
     #[test]
     fn pin_replaces_tag_with_digest() {
-        let pinned = pin_to_digest("registry.local:5000/alice/foo:bar", "sha256:deadbeef");
-        assert_eq!(pinned, "registry.local:5000/alice/foo@sha256:deadbeef");
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let pinned = pin_to_digest("registry.local:5000/alice/foo:bar", &digest).unwrap();
+        assert_eq!(pinned, format!("registry.local:5000/alice/foo@{digest}"));
     }
 
     #[test]
-    fn pin_is_idempotent_when_already_digest_pinned() {
-        let already = "registry.local:5000/alice/foo@sha256:deadbeef";
-        assert_eq!(pin_to_digest(already, "sha256:other"), already);
+    fn pin_preserves_host_port_when_no_tag_present() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let pinned = pin_to_digest("registry.local:5000/alice/foo", &digest).unwrap();
+        assert_eq!(pinned, format!("registry.local:5000/alice/foo@{digest}"));
+    }
+
+    #[test]
+    fn pin_handles_existing_digest_and_rejects_mismatch() {
+        let d1 = format!("sha256:{}", "de".repeat(32));
+        let d2 = format!("sha256:{}", "ad".repeat(32));
+        let already = format!("registry.local:5000/alice/foo@{d1}");
+        assert_eq!(pin_to_digest(&already, &d1).unwrap(), already);
+        let err = pin_to_digest(&already, &d2).unwrap_err();
+        assert!(err.to_string().contains("disagrees"), "{err}");
+    }
+
+    #[test]
+    fn pin_rejects_skopeo_transports_and_flag_injection() {
+        let digest = format!("sha256:{}", "11".repeat(32));
+        for bad in [
+            "dir:/tmp/evil",
+            "oci:/tmp/evil",
+            "oci-archive:/tmp/evil.tar",
+            "docker-archive:/tmp/evil.tar",
+            "docker-daemon:foo:latest",
+            "containers-storage:foo",
+            "docker://evil.example/foo:bar",
+            "--output-dir=/tmp/x",
+            "registry.local/foo bar:v1",
+            "registry.local:notaport/alice/foo:v1",
+        ] {
+            assert!(
+                pin_to_digest(bad, &digest).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+        assert!(pin_to_digest("registry.local/alice/foo:v1", "sha256:short").is_err());
+    }
+
+    #[test]
+    fn validate_git_rev_accepts_only_40_lowercase_hex_chars() {
+        let ok_rev = "a".repeat(40);
+        assert!(validate_git_rev("builder", &ok_rev).is_ok());
+        for bad in [
+            "short",
+            &"A".repeat(40),
+            &format!("{}&dir=evil", "a".repeat(40)),
+            &format!("{}#frag", "a".repeat(35)),
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            assert!(validate_git_rev("builder", bad).is_err(), "rev={bad:?}");
+        }
     }
 
     #[test]
