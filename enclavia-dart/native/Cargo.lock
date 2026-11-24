@@ -823,7 +823,6 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
- "serde_bytes",
  "snow",
  "thiserror 2.0.19",
  "tokio",
