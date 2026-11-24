@@ -2291,31 +2291,11 @@ where
                     .into(),
             );
         }
-        // Probe standard secondary header offsets below `expected` to ensure no
-        // lurking secondary LUKS2 header exists on an ostensibly blank volume.
-        for &sec_off in LUKS2_SECONDARY_OFFSETS {
-            if sec_off.saturating_add(LUKS2_BINARY_HEADER_LEN) > expected {
-                break;
-            }
-            let probe = nbd_read_range(
-                stream,
-                BOOT_HDR_READ_HANDLE,
-                sec_off,
-                LUKS2_BINARY_HEADER_LEN as u32,
-            )
-            .await?;
-            if probe[0..6] == LUKS2_MAGIC || probe[0..6] == LUKS2_SECONDARY_MAGIC {
-                return Err(format!(
-                    "boot verify: unexpected LUKS2 header at secondary offset {sec_off} on an \
-                     unformatted device (fallback-header attack); refusing to serve"
-                )
-                .into());
-            }
-        }
         let pin_len = std::cmp::min(expected, LUKS2_DEFAULT_PIN_LEN as u64) as usize;
-        // Read the remainder of `[0, pin_len)` so the pin reflects the exact
-        // bytes present on the volume at boot (preventing false fail-stops if
-        // a blank volume carries non-zero non-LUKS bytes above offset 4096).
+        // Read the remainder of `[0, pin_len)` ONCE so both the secondary-header
+        // check and the pinned bytes come from the exact same read (no TOCTOU
+        // where a host serves zeroes to a 16 KiB probe and a `SKUL` header in a
+        // separate tail read).
         let mut pinned = binary;
         if pin_len > pinned.len() {
             let tail = nbd_read_range(
@@ -2328,6 +2308,36 @@ where
             pinned.extend_from_slice(&tail);
         } else {
             pinned.truncate(pin_len);
+        }
+        // Check standard secondary header offsets below `expected` to ensure no
+        // lurking secondary LUKS2 header exists on an ostensibly blank volume.
+        // Offsets inside `[0, pinned.len())` are checked directly in `pinned`;
+        // offsets beyond `pinned.len()` are probed over NBD.
+        for &sec_off in LUKS2_SECONDARY_OFFSETS {
+            if sec_off.saturating_add(LUKS2_BINARY_HEADER_LEN) > expected {
+                break;
+            }
+            let magic_matches = if sec_off.saturating_add(6) <= pinned.len() as u64 {
+                let off = sec_off as usize;
+                let magic = &pinned[off..off + 6];
+                magic == LUKS2_MAGIC || magic == LUKS2_SECONDARY_MAGIC
+            } else {
+                let probe = nbd_read_range(
+                    stream,
+                    BOOT_HDR_READ_HANDLE,
+                    sec_off,
+                    LUKS2_BINARY_HEADER_LEN as u32,
+                )
+                .await?;
+                probe[0..6] == LUKS2_MAGIC || probe[0..6] == LUKS2_SECONDARY_MAGIC
+            };
+            if magic_matches {
+                return Err(format!(
+                    "boot verify: unexpected LUKS2 header at secondary offset {sec_off} on an \
+                     unformatted device (fallback-header attack); refusing to serve"
+                )
+                .into());
+            }
         }
         info!(
             pin_len = pinned.len(),
@@ -5332,6 +5342,47 @@ mod luks_header_pin_tests {
         tampered[8192] ^= 0xff;
         watch.watch_luks_read(2, 0, LUKS2_DEFAULT_PIN_LEN as u32);
         assert!(watch.verify_luks_read(2, &tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_luks_data_offset_rejects_secondary_header_in_fresh_volume_tail() {
+        // Host serves all zeroes at offset 0 and sneaks a secondary LUKS2
+        // header (`SKUL\xba\xbe`) at offset 16384 in the `[4096, 32768)` read.
+        // Because `[0, pin_len)` is read once and scanned in-memory before
+        // pinning, this fallback-header attack must be rejected at boot.
+        let mut disk = vec![0u8; 64 * 1024];
+        let forged_sec = make_luks2_header(LUKS2_SECONDARY_MAGIC, 16384, 32 * 1024 * 1024);
+        disk[16384..32768].copy_from_slice(&forged_sec);
+
+        let (mut client, mut host) = duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            loop {
+                let mut req = [0u8; 28];
+                if host.read_exact(&mut req).await.is_err() {
+                    break;
+                }
+                let handle = u64::from_be_bytes(req[8..16].try_into().unwrap());
+                let offset = u64::from_be_bytes(req[16..24].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(req[24..28].try_into().unwrap()) as usize;
+                let mut reply = [0u8; 16];
+                reply[0..4].copy_from_slice(&nbd::NBD_SIMPLE_REPLY_MAGIC.to_be_bytes());
+                reply[8..16].copy_from_slice(&handle.to_be_bytes());
+                host.write_all(&reply).await.unwrap();
+                let mut slice = vec![0u8; len];
+                if offset < disk.len() {
+                    let avail = std::cmp::min(len, disk.len() - offset);
+                    slice[..avail].copy_from_slice(&disk[offset..offset + avail]);
+                }
+                host.write_all(&slice).await.unwrap();
+            }
+        });
+
+        let err = verify_luks_data_offset(&mut client, DATA_OFFSET)
+            .await
+            .expect_err("secondary LUKS2 header at 16 KiB in fresh tail must be rejected");
+        assert!(err.to_string().contains("fallback-header attack"), "{err}");
+        drop(client);
+        server.await.unwrap();
     }
 
     #[test]
