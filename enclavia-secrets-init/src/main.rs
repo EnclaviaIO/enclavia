@@ -260,8 +260,44 @@ where
     }
 }
 
+/// Env keys allowed from the untrusted host on port 5013 (`--mode aws-creds`).
+/// ANY other key is rejected outright: PID 1 `init.sh` (root) `source`s this
+/// file before running `enclavia-crypto init`, and `enclavia-crypto` honours
+/// security-critical env knobs (`LUKS_KEY_FILE`, `LUKS_CURRENT_KEY_FILE`,
+/// `NBD_DEVICE`, `CRYPTSETUP_BIN`, `KMS_VSOCK_PORT`, ...). Matches
+/// `enclavia-server`'s `ALLOWED_CREDS_ENV`.
+const ALLOWED_AWS_CREDS_ENV: [&str; 4] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+];
+
+/// Validate an AWS region identifier (`^[a-z]{2}(-[a-z]+)+-[0-9]+$`, e.g.
+/// `eu-central-1`, `us-gov-west-1`). Keeps host-supplied `AWS_REGION`
+/// strictly inside the `kms.<region>.amazonaws.com` hostname grammar.
+fn is_valid_aws_region(region: &str) -> bool {
+    if region.is_empty() || region.len() > 32 {
+        return false;
+    }
+    let parts: Vec<&str> = region.split('-').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
+    let middle = &parts[1..parts.len() - 1];
+    first.len() == 2
+        && first.bytes().all(|b| b.is_ascii_lowercase())
+        && !last.is_empty()
+        && last.bytes().all(|b| b.is_ascii_digit())
+        && middle
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
 /// Connect to the host-side daemon on `host_port` and pull the CBOR map.
-/// Any failure (connect refused, timeout, partial read, malformed CBOR)
+/// Any failure (connect, timeout, partial read, malformed CBOR)
 /// is fatal: the host's launcher always spawns the matching
 /// `secrets-host` instance, so an absence here means something is wrong
 /// on the host side and we'd rather fail the boot than proceed. A
@@ -276,57 +312,40 @@ async fn fetch_payload(
     // other in-enclave binary uses, so one EIF runs in both worlds with
     // no per-build CID baking. See `enclavia-vsock::host_cid`.
     let cid = enclavia_vsock::host_cid().await;
-    let mut stream = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, host_port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(Box::new(e)),
-        Err(_) => {
-            return Err(format!(
-                "vsock {cid}:{host_port} connect timed out after {CONNECT_TIMEOUT:?}"
-            )
-            .into());
+    // Bound the ENTIRE connect + frame-read + ACK exchange so a partial or
+    // stalled host frame cannot suspend boot indefinitely.
+    let bytes = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut stream =
+            tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, host_port)).await?;
+
+        // Length-prefixed framing on the host->init direction: 4-byte BE
+        // length, then exactly N bytes of CBOR.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_PAYLOAD_BYTES {
+            return Err::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(
+                format!("payload length {len} exceeds max {MAX_PAYLOAD_BYTES}").into(),
+            );
         }
-    };
+        let mut bytes = vec![0u8; len];
+        stream.read_exact(&mut bytes).await?;
 
-    // Length-prefixed framing on the host->init direction: 4-byte BE
-    // length, then exactly N bytes of CBOR. Replaces the older
-    // `read_to_end` + `shutdown(WRITE)` shape, which relied on EOF
-    // for end-of-payload and raced the host's FIN against our first
-    // read at the vhost-device-vsock bridge — for a 1-byte empty
-    // CBOR map (`0xa0`) the data and FIN coalesce into a single
-    // virtio frame and the read surfaces as ENOTCONN. With length
-    // framing the host doesn't shutdown(WRITE) at all; it stays in
-    // its `await_ack` blocked on our ack byte below, so by the time
-    // the kernel-level close happens we've already read the payload.
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_PAYLOAD_BYTES {
-        return Err(format!(
-            "payload length {len} exceeds max {MAX_PAYLOAD_BYTES}"
-        )
-        .into());
-    }
-    let mut bytes = vec![0u8; len];
-    stream.read_exact(&mut bytes).await?;
+        // ACK as soon as we have the bytes in our address space. The host
+        // is waiting on this byte; parsing + sink write are local to our
+        // process. Best-effort: if the ack write fails the host will time
+        // out and log, but we already have the data so boot can proceed.
+        if let Err(e) = stream.write_all(&[ACK_BYTE]).await {
+            warn!("sending ack to secrets-host: {e}");
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| {
+        format!("vsock {cid}:{host_port} payload fetch timed out after {CONNECT_TIMEOUT:?}")
+    })??;
 
-    // ACK as soon as we have the bytes in our address space. The host
-    // is waiting on this byte; parsing + sink write are local to our
-    // process. Best-effort: if the ack write fails the host will time
-    // out and log, but we already have the data so boot can proceed.
-    if let Err(e) = stream.write_all(&[ACK_BYTE]).await {
-        warn!("sending ack to secrets-host: {e}");
-    }
-    // No explicit shutdown: the host's `read_exact(1)` returns as soon
-    // as the ack byte arrives, regardless of whether we have sent a
-    // FIN. Dropping `stream` at the end of this function closes the
-    // socket; the kernel-level FIN cleans things up on the host side.
-
-    if len == 0 {
+    if bytes.is_empty() {
         // CBOR empty map is `0xa0`, not zero bytes. Zero-length is a
         // malformed host response, not a "no payload" case.
         return Err("host sent zero-length payload (expected at least an empty CBOR map)".into());
@@ -360,16 +379,12 @@ async fn inject_into_bundle(
     Ok(())
 }
 
-/// Render the aws-creds map to `KEY=value\n` lines and write them to the
-/// tmpfs env file (0600, truncating any prior contents). The file is
-/// consumed by init.sh via `set -a; . <file>; set +a` (or an explicit
-/// `export` loop), so we deliberately emit plain `KEY=value` lines with
-/// no quoting. AWS credential values are base64/hex tokens and an ARN
-/// region string; none contain shell metacharacters, whitespace, or
-/// newlines, so unquoted assignment is safe. We still reject the few
-/// shapes that WOULD break a `source` (newlines in a value, a key that
-/// isn't a valid shell identifier) rather than emit a file that init.sh
-/// would mis-parse.
+/// Render the aws-creds map to single-quoted `KEY='value'\n` lines and write
+/// them to the tmpfs env file (created with mode `0600`, truncating any prior
+/// contents). The file is consumed by PID 1 `init.sh` (root) via
+/// `set -a; . <file>; set +a`, so keys are strictly restricted to
+/// [`ALLOWED_AWS_CREDS_ENV`], values are single-quoted with NUL/CR/LF
+/// rejected, and `AWS_REGION` must match the AWS region grammar.
 async fn write_env_file(
     env_file: &Path,
     creds: &BTreeMap<String, Vec<u8>>,
@@ -387,13 +402,19 @@ async fn write_env_file(
         }
     }
 
-    tokio::fs::write(env_file, body.as_bytes())
+    // Create with mode 0600 atomically (no umask-derived permission window
+    // before chmod), and also enforce 0600 on pre-existing files.
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(env_file)
         .await
-        .map_err(|e| format!("writing {}: {e}", env_file.display()))?;
+        .map_err(|e| format!("opening {}: {e}", env_file.display()))?;
 
-    // 0600: the file holds kms:Decrypt-capable credentials for the few
-    // milliseconds between this write and init.sh's `rm -f`. init.sh
-    // runs as root and is the only reader; lock it down regardless.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -401,26 +422,40 @@ async fn write_env_file(
             .await
             .map_err(|e| format!("chmod 0600 {}: {e}", env_file.display()))?;
     }
+
+    file.write_all(body.as_bytes())
+        .await
+        .map_err(|e| format!("writing {}: {e}", env_file.display()))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("flushing {}: {e}", env_file.display()))?;
     Ok(())
 }
 
 /// Pure helper: render the creds map to the env-file body. Exercised by
-/// unit tests. Rejects keys that aren't valid POSIX shell identifiers
-/// and values that contain a newline (either would corrupt a `source`).
+/// unit tests. Enforces [`ALLOWED_AWS_CREDS_ENV`] fail-closed, rejects
+/// non-UTF-8 / NUL / CR / LF values, validates `AWS_REGION`, and single-quotes
+/// every value for POSIX shell `source` safety.
 fn render_env_file(creds: &BTreeMap<String, Vec<u8>>) -> Result<String, String> {
     let mut body = String::new();
     for (name, value_bytes) in creds {
-        if !is_valid_env_name(name) {
+        if !ALLOWED_AWS_CREDS_ENV.contains(&name.as_str()) {
             return Err(format!(
-                "credential name `{name}` is not a valid shell identifier; refusing to write"
+                "credential name `{name}` is not in the aws-creds allowlist \
+                 ({ALLOWED_AWS_CREDS_ENV:?}); refusing to write"
             ));
         }
         let value = std::str::from_utf8(value_bytes).map_err(|_| {
             format!("credential `{name}` value is not valid UTF-8; refusing to write")
         })?;
-        if value.contains('\n') || value.contains('\r') {
+        if value.contains('\n') || value.contains('\r') || value.contains('\0') {
             return Err(format!(
-                "credential `{name}` value contains a newline; refusing to write (would corrupt the sourced env file)"
+                "credential `{name}` value contains a newline or NUL; refusing to write (would corrupt the sourced env file)"
+            ));
+        }
+        if name == "AWS_REGION" && !is_valid_aws_region(value) {
+            return Err(format!(
+                "credential `AWS_REGION` value `{value}` is not a valid AWS region; refusing to write"
             ));
         }
         body.push_str(name);
@@ -648,13 +683,13 @@ mod tests {
         // A `'` would otherwise close the quoting and break out; it must
         // be close-escape-reopened as `'\''`.
         assert_eq!(
-            render_env_file(&secrets_from(&[("AWS_REGION", "a'b")])).unwrap(),
-            "AWS_REGION='a'\\''b'\n"
+            render_env_file(&secrets_from(&[("AWS_SESSION_TOKEN", "a'b")])).unwrap(),
+            "AWS_SESSION_TOKEN='a'\\''b'\n"
         );
         // A `'`-led breakout attempt stays inert.
         assert_eq!(
-            render_env_file(&secrets_from(&[("AWS_REGION", "'; reboot #")])).unwrap(),
-            "AWS_REGION=''\\''; reboot #'\n"
+            render_env_file(&secrets_from(&[("AWS_SESSION_TOKEN", "'; reboot #")])).unwrap(),
+            "AWS_SESSION_TOKEN=''\\''; reboot #'\n"
         );
     }
 
@@ -807,10 +842,59 @@ mod tests {
     }
 
     #[test]
-    fn accepts_underscore_leading_env_name() {
+    fn rejects_non_allowlisted_aws_creds_keys() {
+        // PID 1 init.sh sources /run/aws-creds.env as root before running
+        // enclavia-crypto init and exec'ing enclavia-server. Any key outside
+        // the 4-key AWS allowlist must be refused outright.
+        for bad in [
+            "LUKS_KEY_FILE",
+            "LUKS_CURRENT_KEY_FILE",
+            "LUKS_NEW_KEY_FILE",
+            "NBD_DEVICE",
+            "CRYPTSETUP_BIN",
+            "KMS_VSOCK_PORT",
+            "META_VSOCK_PORT",
+            "PATH",
+            "LD_PRELOAD",
+            "EGRESS_CONFIG_PATH",
+            "_PRIVATE",
+        ] {
+            let err = render_env_file(&secrets_from(&[
+                ("AWS_REGION", "eu-central-1"),
+                (bad, "/dev/console"),
+            ]))
+            .expect_err("non-allowlisted key must be rejected");
+            assert!(err.contains(bad), "error should name key {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_nul_and_invalid_aws_region() {
         let mut creds = BTreeMap::new();
-        creds.insert("_PRIVATE".to_string(), b"x".to_vec());
-        assert_eq!(render_env_file(&creds).unwrap(), "_PRIVATE='x'\n");
+        creds.insert("AWS_SESSION_TOKEN".to_string(), b"abc\0def".to_vec());
+        assert!(render_env_file(&creds).unwrap_err().contains("NUL"));
+
+        for bad_region in [
+            "",
+            "localhost",
+            "eu-central-1.evil.com",
+            "EU-CENTRAL-1",
+            "eu-central",
+            "eu-central-1/foo",
+            "a'b",
+        ] {
+            let err = render_env_file(&secrets_from(&[("AWS_REGION", bad_region)]))
+                .expect_err("invalid AWS_REGION must be rejected");
+            assert!(
+                err.contains("AWS_REGION"),
+                "error should mention AWS_REGION for {bad_region:?}: {err}"
+            );
+        }
+
+        // Valid multi-part AWS regions pass.
+        for good_region in ["us-east-1", "eu-central-1", "us-gov-west-1", "ap-southeast-2"] {
+            assert!(render_env_file(&secrets_from(&[("AWS_REGION", good_region)])).is_ok());
+        }
     }
 
     #[tokio::test]

@@ -603,41 +603,71 @@ async fn run_revoke_upgrade(
 /// framing as the boot-time `enclavia-secrets-init` pull. In-memory only: the
 /// `kms:Decrypt`-capable creds never touch the enclave's disk.
 async fn pull_upgrade_kms_creds() -> Result<BTreeMap<String, Vec<u8>>, String> {
-    // Matches `enclavia-secrets-init`'s `AWS_CREDS_HOST_PORT` and the
-    // launcher's AWS-creds `secrets-host` port.
+    // Matches `enclavia-secrets-init`'s `AWS_CREDS_HOST_PORT` and `ACK_BYTE`
+    // (`0x06`, matching `secrets-host/src/main.rs`).
     const AWS_CREDS_VSOCK_PORT: u32 = 5013;
-    const ACK_BYTE: u8 = 0x00;
+    const ACK_BYTE: u8 = 0x06;
     const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+    const CREDS_PULL_TIMEOUT: Duration = Duration::from_secs(10);
 
     let cid = enclavia_vsock::host_cid().await;
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        VsockStream::connect(tokio_vsock::VsockAddr::new(cid, AWS_CREDS_VSOCK_PORT)),
-    )
-    .await
-    .map_err(|_| format!("vsock {cid}:{AWS_CREDS_VSOCK_PORT} connect timed out"))?
-    .map_err(|e| format!("vsock {cid}:{AWS_CREDS_VSOCK_PORT} connect: {e}"))?;
+    // Bound the entire connect + read + ACK sequence so a partial host frame
+    // cannot wedge the upgrade control task indefinitely.
+    let bytes = tokio::time::timeout(CREDS_PULL_TIMEOUT, async {
+        let mut stream =
+            VsockStream::connect(tokio_vsock::VsockAddr::new(cid, AWS_CREDS_VSOCK_PORT))
+                .await
+                .map_err(|e| format!("vsock {cid}:{AWS_CREDS_VSOCK_PORT} connect: {e}"))?;
 
-    // 4-byte BE length prefix, then exactly N bytes of CBOR (the host stays
-    // blocked on our ack below rather than shutting down the write half).
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| format!("reading creds length prefix: {e}"))?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_PAYLOAD_BYTES {
-        return Err(format!("creds payload length {len} out of range"));
-    }
-    let mut bytes = vec![0u8; len];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|e| format!("reading creds payload: {e}"))?;
-    // Ack so the single-shot relay can serve-once and exit.
-    let _ = stream.write_all(&[ACK_BYTE]).await;
+        // 4-byte BE length prefix, then exactly N bytes of CBOR (the host stays
+        // blocked on our ack below rather than shutting down the write half).
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("reading creds length prefix: {e}"))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_PAYLOAD_BYTES {
+            return Err(format!("creds payload length {len} out of range"));
+        }
+        let mut bytes = vec![0u8; len];
+        stream
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|e| format!("reading creds payload: {e}"))?;
+        // Ack so the single-shot relay can serve-once and exit.
+        let _ = stream.write_all(&[ACK_BYTE]).await;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "vsock {cid}:{AWS_CREDS_VSOCK_PORT} creds pull timed out after {CREDS_PULL_TIMEOUT:?}"
+        )
+    })??;
 
     ciborium::de::from_reader(&bytes[..]).map_err(|e| format!("decoding creds CBOR: {e}"))
+}
+
+/// Validate an AWS region identifier (`^[a-z]{2}(-[a-z]+)+-[0-9]+$`).
+fn is_valid_aws_region(region: &str) -> bool {
+    if region.is_empty() || region.len() > 32 {
+        return false;
+    }
+    let parts: Vec<&str> = region.split('-').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
+    let middle = &parts[1..parts.len() - 1];
+    first.len() == 2
+        && first.bytes().all(|b| b.is_ascii_lowercase())
+        && !last.is_empty()
+        && last.bytes().all(|b| b.is_ascii_digit())
+        && middle
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_lowercase()))
 }
 
 /// Env keys we forward from the host-pulled creds map into the
@@ -654,10 +684,29 @@ const ALLOWED_CREDS_ENV: [&str; 4] = [
     "AWS_REGION",
 ];
 
+/// Baseline env keys forwarded from `enclavia-server`'s own environment into
+/// the `enclavia-crypto` subprocess after `Command::env_clear()`. Everything
+/// else is scrubbed so inherited variables can never bypass `filter_creds_env`
+/// or inject `LUKS_CURRENT_KEY_FILE` / `NBD_DEVICE` / `CRYPTSETUP_BIN`.
+const ALLOWED_INHERITED_CRYPTO_ENV: [&str; 2] = ["PATH", "RUST_LOG"];
+
+/// Build a scrubbed `tokio::process::Command` for `enclavia-crypto`: starts
+/// from `env_clear()` and copies only [`ALLOWED_INHERITED_CRYPTO_ENV`].
+fn build_enclavia_crypto_command(bin: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(bin);
+    command.env_clear();
+    for key in ALLOWED_INHERITED_CRYPTO_ENV {
+        if let Ok(val) = std::env::var(key) {
+            command.env(key, val);
+        }
+    }
+    command
+}
+
 /// Filter the host-supplied creds map down to [`ALLOWED_CREDS_ENV`],
 /// fail-closed: any unexpected key (or a value that is not clean UTF-8 /
-/// contains NUL, which would make `Command::env` panic) rejects the whole
-/// pull. Pure so the policy is unit-testable.
+/// contains NUL, which would make `Command::env` panic, or an invalid
+/// `AWS_REGION`) rejects the whole pull. Pure so the policy is unit-testable.
 fn filter_creds_env(creds: &BTreeMap<String, Vec<u8>>) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::with_capacity(creds.len());
     for (k, v) in creds {
@@ -671,6 +720,9 @@ fn filter_creds_env(creds: &BTreeMap<String, Vec<u8>>) -> Result<Vec<(String, St
             .map_err(|_| format!("creds value for {k} is not valid UTF-8"))?;
         if value.contains('\0') {
             return Err(format!("creds value for {k} contains a NUL byte"));
+        }
+        if k == "AWS_REGION" && !is_valid_aws_region(&value) {
+            return Err(format!("creds value for AWS_REGION ({value:?}) is not a valid AWS region"));
         }
         out.push((k.clone(), value));
     }
@@ -772,7 +824,7 @@ async fn run_enclavia_crypto_prepare_upgrade(
     use base64::Engine as _;
     let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(new_public_key);
 
-    let mut command = tokio::process::Command::new(bin);
+    let mut command = build_enclavia_crypto_command(bin);
     command.args([
         "prepare-upgrade",
         "--new-public-key",
@@ -811,7 +863,7 @@ async fn run_enclavia_crypto_prepare_upgrade(
 
 /// Spawn `enclavia-crypto revoke-upgrade` and translate its exit status.
 async fn run_enclavia_crypto_revoke_upgrade(bin: &str) -> (bool, String) {
-    let mut command = tokio::process::Command::new(bin);
+    let mut command = build_enclavia_crypto_command(bin);
     command.arg("revoke-upgrade");
 
     // revoke-upgrade re-derives the current LUKS passphrase via `kms:Decrypt`
@@ -2536,6 +2588,25 @@ mod host_input_hardening_tests {
         let err = filter_creds_env(&creds(&[("AWS_REGION", &[0xff, 0xfe])]))
             .expect_err("non-UTF-8 value rejected");
         assert!(err.contains("UTF-8"), "{err}");
+        let err = filter_creds_env(&creds(&[("AWS_REGION", b"eu-central-1.evil.com")]))
+            .expect_err("invalid AWS_REGION rejected");
+        assert!(err.contains("AWS_REGION"), "{err}");
+    }
+
+    #[test]
+    fn build_enclavia_crypto_command_scrubs_inherited_env() {
+        // Verify env_clear() is applied so dangerous inherited variables
+        // (e.g. LUKS_CURRENT_KEY_FILE) are never visible to the subprocess.
+        let cmd = build_enclavia_crypto_command("/bin/true");
+        let std_cmd = cmd.as_std();
+        let envs: Vec<_> = std_cmd.get_envs().collect();
+        for (k, _) in &envs {
+            let key = k.to_string_lossy();
+            assert!(
+                ALLOWED_INHERITED_CRYPTO_ENV.contains(&key.as_ref()),
+                "unexpected env key passed to enclavia-crypto: {key}"
+            );
+        }
     }
 
     #[test]
