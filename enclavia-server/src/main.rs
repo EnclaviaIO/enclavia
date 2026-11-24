@@ -92,10 +92,21 @@ fn max_concurrent_clients() -> usize {
 /// Maximum time to wait for a client message when no stream is open.
 const CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Maximum time to wait for a client frame while one or more streams are open.
-/// Bounds zombie connections so an attacker cannot hold admission permits
-/// indefinitely by opening a single idle stream.
+/// Maximum time to wait for a client frame while one or more streams (or
+/// in-flight requests) are active and BOTH directions are silent. Reset on
+/// both inbound client messages and outbound server writes so long-lived
+/// server-push streams (SSE/WebSocket) stay open while zombie idle
+/// connections still expire.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Maximum time a single outbound write or bounded channel enqueue may stall
+/// before the connection is torn down. Prevents a client that stops reading
+/// from wedging the writer task and holding an admission permit indefinitely.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum time teardown waits for `writer_task` to drain after closing
+/// `response_tx` before aborting it.
+const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Backoff after a transient `accept()` error so a persistent error (e.g.
 /// EMFILE) does not spin a CPU core at 100%.
@@ -1136,6 +1147,25 @@ async fn pump_bidirectional(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SessionTimeouts {
+    client_idle: Duration,
+    stream_idle: Duration,
+    write: Duration,
+    writer_drain: Duration,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            client_idle: CLIENT_IDLE_TIMEOUT,
+            stream_idle: STREAM_IDLE_TIMEOUT,
+            write: WRITE_TIMEOUT,
+            writer_drain: WRITER_DRAIN_TIMEOUT,
+        }
+    }
+}
+
 #[instrument(skip(stream, container_addr, control_pubkey, nonce))]
 async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
     stream: S,
@@ -1145,6 +1175,32 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
     nonce: ControlNonce,
     crypto_bin: Arc<String>,
     min_upgrade_delay_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    handle_client_with_timeouts(
+        stream,
+        kind,
+        container_addr,
+        control_pubkey,
+        nonce,
+        crypto_bin,
+        min_upgrade_delay_secs,
+        SessionTimeouts::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_with_timeouts<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+>(
+    stream: S,
+    kind: ChannelKind,
+    container_addr: String,
+    control_pubkey: Option<Arc<VerifyingKey>>,
+    nonce: ControlNonce,
+    crypto_bin: Arc<String>,
+    min_upgrade_delay_secs: u64,
+    timeouts: SessionTimeouts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(?kind, "Client connected, performing handshake");
 
@@ -1160,17 +1216,40 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
     let (response_tx, mut response_rx) = mpsc::channel::<ServerMessage>(MAX_IN_FLIGHT);
     let (writer_done_tx, mut writer_done_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // Bidirectional activity clock (milliseconds since `session_start`). Both
+    // inbound messages and completed outbound writes advance it so active
+    // server-push streams (SSE / receive-only WebSockets) are not killed by
+    // client silence, while truly idle sessions still time out.
+    let session_start = tokio::time::Instant::now();
+    let last_activity_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer_activity = Arc::clone(&last_activity_ms);
+
+    let write_timeout = timeouts.write;
     let writer_task = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
-            let too_large = match writer.send(&response).await {
-                Ok(()) => continue,
-                Err(e) => match e.downcast_ref::<FrameTooLarge>() {
+            let too_large = match tokio::time::timeout(write_timeout, writer.send(&response)).await
+            {
+                Ok(Ok(())) => {
+                    writer_activity.store(
+                        session_start.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    continue;
+                }
+                Ok(Err(e)) => match e.downcast_ref::<FrameTooLarge>() {
                     Some(too_large) => *too_large,
                     None => {
                         warn!(error = %e, "Failed to send response, tearing down session");
                         break;
                     }
                 },
+                Err(_elapsed) => {
+                    warn!(
+                        timeout_secs = write_timeout.as_secs(),
+                        "Client write timed out (stalled reader), tearing down session"
+                    );
+                    break;
+                }
             };
             let Some(id) = reply_id(&response) else {
                 warn!(error = %too_large, "Dropped an unsendable reply");
@@ -1183,9 +1262,24 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                     "reply too large for one message ({too_large}); use a stream (OpenStream) for large exchanges"
                 ),
             };
-            if let Err(e) = writer.send(&error).await {
-                warn!(error = %e, "Failed to send FrameTooLarge error reply, tearing down session");
-                break;
+            match tokio::time::timeout(write_timeout, writer.send(&error)).await {
+                Ok(Ok(())) => {
+                    writer_activity.store(
+                        session_start.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "Failed to send FrameTooLarge error reply, tearing down session");
+                    break;
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        timeout_secs = write_timeout.as_secs(),
+                        "Timed out sending FrameTooLarge error reply, tearing down session"
+                    );
+                    break;
+                }
             }
         }
         let _ = writer_done_tx.send(());
@@ -1194,36 +1288,68 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     let streams: Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<StreamCommand>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mut session_err: Option<String> = None;
 
-    loop {
-        let idle_timeout = if streams.lock().unwrap().is_empty() {
-            CLIENT_IDLE_TIMEOUT
+    // Helper: compute the current idle deadline from `last_activity_ms` and
+    // whether any stream or in-flight request is currently active.
+    let current_deadline = |streams: &std::sync::Mutex<HashMap<u64, mpsc::Sender<StreamCommand>>>,
+                            in_flight: &Semaphore| {
+        let active = !streams.lock().unwrap().is_empty()
+            || in_flight.available_permits() < MAX_IN_FLIGHT;
+        let idle = if active {
+            timeouts.stream_idle
         } else {
-            STREAM_IDLE_TIMEOUT
+            timeouts.client_idle
         };
+        let last_ms = last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+        (session_start + Duration::from_millis(last_ms) + idle, idle)
+    };
 
-        // Note: if either `writer_done_rx` fires OR `idle_timeout` elapses, we
-        // immediately `break` and drop `reader` — `reader.receive()` is NEVER
-        // resumed after cancellation, so length-prefix desync is impossible.
-        let msg = tokio::select! {
-            _ = &mut writer_done_rx => {
-                warn!("Writer task ended, closing client connection");
-                break;
-            }
-            res = tokio::time::timeout(idle_timeout, reader.receive::<ClientMessage>()) => {
-                match res {
-                    Ok(Ok(msg)) => msg,
-                    Ok(Err(e)) => {
-                        warn!("Error receiving message, closing connection: {}", e);
-                        break;
+    'session: loop {
+        // Pin `reader.receive()` once per message so checking/extending the
+        // bidirectional idle deadline NEVER cancels `reader.receive()`
+        // mid-frame (preventing length-prefix desync).
+        let read_fut = reader.receive::<ClientMessage>();
+        tokio::pin!(read_fut);
+
+        let msg = loop {
+            let (deadline, idle_timeout) = current_deadline(&streams, &in_flight);
+            tokio::select! {
+                _ = &mut writer_done_rx => {
+                    warn!("Writer task ended, closing client connection");
+                    break 'session;
+                }
+                res = &mut read_fut => {
+                    match res {
+                        Ok(msg) => break msg,
+                        Err(e) => {
+                            warn!("Error receiving message, closing connection: {}", e);
+                            break 'session;
+                        }
                     }
-                    Err(_elapsed) => {
-                        warn!(timeout_secs = idle_timeout.as_secs(), "Client idle timeout, closing connection");
-                        break;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    // Re-check against the latest activity timestamp: outbound
+                    // stream traffic (or a newly opened stream/request) may
+                    // have pushed the deadline forward since `sleep_until` was
+                    // armed.
+                    let (refreshed, _) = current_deadline(&streams, &in_flight);
+                    if tokio::time::Instant::now() < refreshed {
+                        continue;
                     }
+                    warn!(
+                        timeout_secs = idle_timeout.as_secs(),
+                        "Client idle timeout, closing connection"
+                    );
+                    break 'session;
                 }
             }
         };
+
+        last_activity_ms.store(
+            session_start.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // NEVER log the message body: Data/OpenStream/StreamData
         // carry the decrypted customer traffic (HTTP requests with
@@ -1249,8 +1375,9 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
         );
         if !allowed {
             warn!(?kind, "message variant not allowed on this channel, closing");
-            let _ = response_tx
-                .send(ServerMessage::ControlResult {
+            let _ = tokio::time::timeout(
+                timeouts.write,
+                response_tx.send(ServerMessage::ControlResult {
                     success: false,
                     message: format!(
                         "message not accepted on the {} channel",
@@ -1259,27 +1386,40 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                             ChannelKind::Control => "control",
                         }
                     ),
-                })
-                .await;
-            break;
+                }),
+            )
+            .await;
+            break 'session;
         }
 
         match msg {
             ClientMessage::RequestAttestation => {
                 let control_nonce = *nonce.lock().await;
                 let hs_hash = handshake_hash.clone();
-                let attestation_data = tokio::task::spawn_blocking(move || {
+                let attestation_res = tokio::task::spawn_blocking(move || {
                     attestation::session_attestation(&hs_hash, &control_nonce)
                 })
-                .await
-                .map_err(|e| format!("session attestation task panicked: {e}"))??;
+                .await;
+                let attestation_data = match attestation_res {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(e)) => {
+                        error!(error = %e, "Session attestation failed, closing connection");
+                        session_err = Some(e.to_string());
+                        break 'session;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Session attestation task panicked, closing connection");
+                        session_err = Some(format!("session attestation task panicked: {e}"));
+                        break 'session;
+                    }
+                };
                 let response = ServerMessage::Attestation {
                     data: attestation_data,
                     control_nonce,
                 };
-                if response_tx.send(response).await.is_err() {
-                    warn!("Writer task closed while sending attestation response");
-                    break;
+                if !send_bounded(&response_tx, response, timeouts.write).await {
+                    warn!("Writer task closed or timed out while sending attestation response");
+                    break 'session;
                 }
             }
             ClientMessage::GetControlNonce => {
@@ -1287,9 +1427,9 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 let response = ServerMessage::ControlNonce {
                     nonce: control_nonce,
                 };
-                if response_tx.send(response).await.is_err() {
-                    warn!("Writer task closed while sending ControlNonce response");
-                    break;
+                if !send_bounded(&response_tx, response, timeouts.write).await {
+                    warn!("Writer task closed or timed out while sending ControlNonce response");
+                    break 'session;
                 }
             }
             ClientMessage::Control { payload, signature } => {
@@ -1306,30 +1446,44 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                     warn!(message = %message, "Control command rejected");
                 }
                 let response = ServerMessage::ControlResult { success, message };
-                if response_tx.send(response).await.is_err() {
-                    warn!("Writer task closed while sending control result");
-                    break;
+                if !send_bounded(&response_tx, response, timeouts.write).await {
+                    warn!("Writer task closed or timed out while sending control result");
+                    break 'session;
                 }
             }
             ClientMessage::Data { id, payload } => {
                 if payload.len() > MAX_PAYLOAD_SIZE {
                     warn!(id, size = payload.len(), max = MAX_PAYLOAD_SIZE, "Payload exceeds size limit");
-                    if response_tx
-                        .send(ServerMessage::Error {
+                    if !send_bounded(
+                        &response_tx,
+                        ServerMessage::Error {
                             id,
                             message: "payload too large".into(),
-                        })
-                        .await
-                        .is_err()
+                        },
+                        timeouts.write,
+                    )
+                    .await
                     {
-                        break;
+                        break 'session;
                     }
                     continue;
                 }
 
-                let permit = match in_flight.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
+                let permit = tokio::select! {
+                    _ = &mut writer_done_rx => {
+                        warn!("Writer task ended while awaiting in-flight permit");
+                        break 'session;
+                    }
+                    res = tokio::time::timeout(timeouts.write, in_flight.clone().acquire_owned()) => {
+                        match res {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(_)) => break 'session,
+                            Err(_) => {
+                                warn!("Timed out waiting for in-flight slot, closing connection");
+                                break 'session;
+                            }
+                        }
+                    }
                 };
                 let tx = response_tx.clone();
                 let addr = container_addr.clone();
@@ -1352,15 +1506,17 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
             ClientMessage::OpenStream { id, payload } => {
                 if payload.len() > MAX_PAYLOAD_SIZE {
                     warn!(id, size = payload.len(), max = MAX_PAYLOAD_SIZE, "OpenStream payload exceeds size limit");
-                    if response_tx
-                        .send(ServerMessage::Error {
+                    if !send_bounded(
+                        &response_tx,
+                        ServerMessage::Error {
                             id,
                             message: "payload too large".into(),
-                        })
-                        .await
-                        .is_err()
+                        },
+                        timeouts.write,
+                    )
+                    .await
                     {
-                        break;
+                        break 'session;
                     }
                     continue;
                 }
@@ -1369,22 +1525,36 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 // the map entry and orphaning the earlier pump task.
                 if streams.lock().unwrap().contains_key(&id) {
                     warn!(id, "Duplicate OpenStream id rejected");
-                    if response_tx
-                        .send(ServerMessage::Error {
+                    if !send_bounded(
+                        &response_tx,
+                        ServerMessage::Error {
                             id,
                             message: "duplicate stream id".into(),
-                        })
-                        .await
-                        .is_err()
+                        },
+                        timeouts.write,
+                    )
+                    .await
                     {
-                        break;
+                        break 'session;
                     }
                     continue;
                 }
 
-                let permit = match in_flight.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
+                let permit = tokio::select! {
+                    _ = &mut writer_done_rx => {
+                        warn!("Writer task ended while awaiting stream permit");
+                        break 'session;
+                    }
+                    res = tokio::time::timeout(timeouts.write, in_flight.clone().acquire_owned()) => {
+                        match res {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(_)) => break 'session,
+                            Err(_) => {
+                                warn!("Timed out waiting for stream slot, closing connection");
+                                break 'session;
+                            }
+                        }
+                    }
                 };
                 let tx = response_tx.clone();
                 let addr = container_addr.clone();
@@ -1392,24 +1562,26 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                 let (cmd_tx, cmd_rx) = mpsc::channel::<StreamCommand>(MAX_IN_FLIGHT);
                 let inserted = {
                     let mut map = streams.lock().unwrap();
-                    if map.contains_key(&id) {
-                        false
-                    } else {
-                        map.insert(id, cmd_tx);
+                    if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(id) {
+                        entry.insert(cmd_tx);
                         true
+                    } else {
+                        false
                     }
                 };
                 if !inserted {
                     drop(permit);
-                    if response_tx
-                        .send(ServerMessage::Error {
+                    if !send_bounded(
+                        &response_tx,
+                        ServerMessage::Error {
                             id,
                             message: "duplicate stream id".into(),
-                        })
-                        .await
-                        .is_err()
+                        },
+                        timeouts.write,
+                    )
+                    .await
                     {
-                        break;
+                        break 'session;
                     }
                     continue;
                 }
@@ -1427,33 +1599,61 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                     Some(tx) => {
                         if payload.len() > MAX_PAYLOAD_SIZE {
                             warn!(id, size = payload.len(), max = MAX_PAYLOAD_SIZE, "StreamData payload exceeds size limit");
-                            if response_tx
-                                .send(ServerMessage::Error {
+                            if !send_bounded(
+                                &response_tx,
+                                ServerMessage::Error {
                                     id,
                                     message: "payload too large".into(),
-                                })
-                                .await
-                                .is_err()
+                                },
+                                timeouts.write,
+                            )
+                            .await
                             {
-                                break;
+                                break 'session;
                             }
                             continue;
                         }
-                        if tx.send(StreamCommand::Data(payload)).await.is_err() {
-                            streams.lock().unwrap().remove(&id);
+                        match tokio::time::timeout(
+                            timeouts.write,
+                            tx.send(StreamCommand::Data(payload)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                streams.lock().unwrap().remove(&id);
+                            }
+                            Err(_) => {
+                                warn!(id, "Timed out forwarding StreamData to stalled workload, closing stream");
+                                streams.lock().unwrap().remove(&id);
+                                if !send_bounded(
+                                    &response_tx,
+                                    ServerMessage::Error {
+                                        id,
+                                        message: "stream write timed out".into(),
+                                    },
+                                    timeouts.write,
+                                )
+                                .await
+                                {
+                                    break 'session;
+                                }
+                            }
                         }
                     }
                     None => {
                         warn!(id, "Received StreamData for unknown stream id");
-                        if response_tx
-                            .send(ServerMessage::Error {
+                        if !send_bounded(
+                            &response_tx,
+                            ServerMessage::Error {
                                 id,
                                 message: "unknown stream id".into(),
-                            })
-                            .await
-                            .is_err()
+                            },
+                            timeouts.write,
+                        )
+                        .await
                         {
-                            break;
+                            break 'session;
                         }
                     }
                 }
@@ -1465,8 +1665,16 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                     streams.lock().unwrap().get(&id).cloned()
                 };
                 if let Some(tx) = maybe_tx {
-                    if tx.send(StreamCommand::Close(half)).await.is_err() {
-                        streams.lock().unwrap().remove(&id);
+                    match tokio::time::timeout(
+                        timeouts.write,
+                        tx.send(StreamCommand::Close(half)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => {
+                            streams.lock().unwrap().remove(&id);
+                        }
                     }
                 }
             }
@@ -1474,13 +1682,35 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
     }
 
     // Close all active stream command channels so pumps exit promptly, then
-    // drop `response_tx` and allow the writer task to drain any final message
-    // (such as a channel-gating rejection) before returning.
+    // drop `response_tx` and allow the writer task a bounded window to drain
+    // any final message (such as a channel-gating rejection) before aborting
+    // it so a stalled reader can never hold an admission permit indefinitely.
     streams.lock().unwrap().clear();
     drop(response_tx);
-    let _ = writer_task.await;
+    let mut writer_task = writer_task;
+    if tokio::time::timeout(timeouts.writer_drain, &mut writer_task)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = timeouts.writer_drain.as_secs(),
+            "Writer task did not drain in time, aborting"
+        );
+        writer_task.abort();
+    }
 
-    Ok(())
+    match session_err {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+async fn send_bounded(
+    tx: &mpsc::Sender<ServerMessage>,
+    msg: ServerMessage,
+    timeout: Duration,
+) -> bool {
+    matches!(tokio::time::timeout(timeout, tx.send(msg)).await, Ok(Ok(())))
 }
 
 #[tokio::main]
@@ -2832,5 +3062,151 @@ mod host_input_hardening_tests {
 
         drop(transport);
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn outbound_stream_activity_keeps_session_alive_past_idle_timeout() {
+        use enclavia_protocol::perform_cbor_handshake_as_initiator;
+        use tokio::net::TcpListener;
+
+        let workload = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let workload_addr = workload.local_addr().unwrap().to_string();
+        let _workload_task = tokio::spawn(async move {
+            let (mut s, _) = workload.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf).await;
+            // Push 4 chunks spaced 90ms apart (360ms total > stream_idle=200ms)
+            // while the client remains completely silent.
+            for i in 0u8..4 {
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                if s.write_all(&[b'x', i]).await.is_err() {
+                    return;
+                }
+            }
+            // Keep the socket open so the session only closes once BOTH
+            // directions have been silent for stream_idle.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let timeouts = SessionTimeouts {
+            client_idle: Duration::from_millis(100),
+            stream_idle: Duration::from_millis(200),
+            write: Duration::from_secs(2),
+            writer_drain: Duration::from_millis(200),
+        };
+
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let nonce = Arc::new(Mutex::new([0u8; 32]));
+        let server_task = tokio::spawn(async move {
+            handle_client_with_timeouts(
+                server_stream,
+                ChannelKind::Public,
+                workload_addr,
+                None,
+                nonce,
+                Arc::new("/bin/true".into()),
+                0,
+                timeouts,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+
+        let (mut transport, _) = perform_cbor_handshake_as_initiator(client_stream)
+            .await
+            .unwrap();
+        transport
+            .send(&ClientMessage::OpenStream {
+                id: 1,
+                payload: b"subscribe".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        for i in 0u8..4 {
+            let msg: ServerMessage = transport.receive().await.expect("stream must stay alive");
+            match msg {
+                ServerMessage::StreamData { id, payload } => {
+                    assert_eq!(id, 1);
+                    assert_eq!(payload, vec![b'x', i]);
+                }
+                other => panic!("expected StreamData chunk {i}, got {other:?}"),
+            }
+        }
+
+        // Now both directions go completely silent: server must close after
+        // stream_idle instead of leaking the session forever.
+        let eof = tokio::time::timeout(Duration::from_secs(2), transport.receive::<ServerMessage>())
+            .await
+            .expect("silent bidirectional stream must time out");
+        assert!(eof.is_err(), "silent bidirectional stream should close");
+        server_task.await.unwrap().expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn stalled_reader_client_is_torn_down_by_write_timeout() {
+        use enclavia_protocol::perform_cbor_handshake_as_initiator;
+        use tokio::net::TcpListener;
+
+        let workload = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let workload_addr = workload.local_addr().unwrap().to_string();
+        let _workload_task = tokio::spawn(async move {
+            let (mut s, _) = workload.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf).await;
+            // Flood outbound bytes so the tiny client duplex buffer fills up.
+            let chunk = vec![b'Z'; 16 * 1024];
+            for _ in 0..8 {
+                if s.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let timeouts = SessionTimeouts {
+            client_idle: Duration::from_secs(10),
+            stream_idle: Duration::from_secs(10),
+            write: Duration::from_millis(150),
+            writer_drain: Duration::from_millis(150),
+        };
+
+        // Tiny duplex buffer: once handshake completes and client stops
+        // reading, `writer.send` blocks on the full buffer and write timeout fires.
+        let (client_stream, server_stream) = tokio::io::duplex(512);
+        let nonce = Arc::new(Mutex::new([0u8; 32]));
+        let server_task = tokio::spawn(async move {
+            handle_client_with_timeouts(
+                server_stream,
+                ChannelKind::Public,
+                workload_addr,
+                None,
+                nonce,
+                Arc::new("/bin/true".into()),
+                0,
+                timeouts,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+
+        let (mut transport, _) = perform_cbor_handshake_as_initiator(client_stream)
+            .await
+            .unwrap();
+        transport
+            .send(&ClientMessage::OpenStream {
+                id: 1,
+                payload: b"flood".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        // Client deliberately holds `transport` open and NEVER reads.
+        // Server must tear down cleanly well before stream_idle (10s).
+        let res = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("handle_client must not hang on stalled reader");
+        res.unwrap().expect("clean teardown on write timeout");
+        drop(transport);
     }
 }

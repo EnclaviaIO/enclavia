@@ -325,7 +325,7 @@ async fn run_reproduce(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let actual = run_builder(
+    let (actual, output_tempdir) = run_builder(
         &parsed_id,
         &pinned_image,
         enclave,
@@ -340,6 +340,13 @@ async fn run_reproduce(
     .await?;
 
     let mismatches = diff_pcrs(&inputs.expected, &actual);
+    if !mismatches.is_empty() {
+        let kept = output_tempdir.keep();
+        eprintln!(
+            "PCR mismatch — kept rebuilt artifacts at: {}",
+            kept.display()
+        );
+    }
 
     Ok(ReproduceResult {
         enclave_id: parsed_id,
@@ -434,11 +441,12 @@ async fn run_builder(
     recorded_synchronizer_pcrs: Option<&serde_json::Value>,
     recorded_synchronizer_enabled: bool,
     recorded_upgrade_target: bool,
-) -> Result<PcrTriple, CliError> {
+) -> Result<(PcrTriple, tempfile::TempDir), CliError> {
     let builder_path = std::env::var("BUILDER_PATH").unwrap_or_else(|_| "builder".to_string());
-    // Use an unpredictable 0700 tempdir (auto-cleaned on drop) instead of a
-    // predictable `/tmp/enclavia-reproduce-<id>` directory vulnerable to
-    // local symlink / TOCTOU races.
+    // Use an unpredictable 0700 tempdir (auto-cleaned on drop unless the
+    // caller keeps it on PCR mismatch) instead of a predictable
+    // `/tmp/enclavia-reproduce-<id>` directory vulnerable to local symlink /
+    // TOCTOU races.
     let output_tempdir = tempfile::Builder::new()
         .prefix("enclavia-reproduce-")
         .tempdir()
@@ -465,7 +473,7 @@ async fn run_builder(
         .arg("--image")
         .arg(pinned_image)
         .arg("--output-dir")
-        .arg(&output_dir)
+        .arg(output_dir)
         .arg("--enclave-id")
         .arg(enclave_id)
         .arg("--egress-allowlist")
@@ -564,7 +572,6 @@ async fn run_builder(
     }
 
     eprintln!("Running local builder: {builder_path:?}");
-    eprintln!("  output: {}", output_dir.display());
 
     let output = cmd
         .stdout(Stdio::piped())
@@ -583,11 +590,12 @@ async fn run_builder(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_builder_output(stdout.trim()).map_err(|e| {
+    let pcrs = parse_builder_output(stdout.trim()).map_err(|e| {
         CliError::Other(format!(
             "couldn't parse builder output: {e}\n--- builder stdout ---\n{stdout}\n--- end ---"
         ))
-    })
+    })?;
+    Ok((pcrs, output_tempdir))
 }
 
 /// The builder writes a JSON line on stdout with `eif_path` and `pcrs`.
@@ -814,30 +822,42 @@ fn pin_to_digest(canonical: &str, digest: &str) -> Result<String, CliError> {
         )));
     }
 
-    // Reject skopeo transport prefixes such as `dir:/tmp/x`, `oci:/...`,
-    // `oci-archive:...`, `docker-archive:...`, `docker-daemon:...`,
-    // `containers-storage:...`. In a valid registry reference, any `:` before
-    // the first `/` can ONLY be a numeric registry port (or a repo:tag when
-    // there is no `/` at all, e.g. `alpine:3.20` — wait: forbid known skopeo
-    // schemes unconditionally too!).
-    const FORBIDDEN_TRANSPORTS: &[&str] = &[
-        "dir:",
-        "oci:",
+    // Reject skopeo transport prefixes.
+    //
+    // Hyphenated transports (`oci-archive:`, `docker-archive:`,
+    // `docker-daemon:`, `containers-storage:`) are rejected unconditionally.
+    // Short single-word transports (`dir:`, `oci:`, `ostree:`, `sif:`,
+    // `tarball:`) are rejected whenever what follows is not a plain tag
+    // (contains `/`, `:`, `@`, or starts with `.`) so legitimate Docker Hub
+    // references like `docker:27-dind` (where `docker://` is already blocked
+    // above) are not falsely refused.
+    const UNCONDITIONAL_TRANSPORTS: &[&str] = &[
         "oci-archive:",
-        "docker:",
         "docker-archive:",
         "docker-daemon:",
         "containers-storage:",
-        "ostree:",
-        "sif:",
-        "tarball:",
     ];
+    const PATH_TRANSPORTS: &[&str] = &["dir:", "oci:", "ostree:", "sif:", "tarball:"];
     let lower = canonical.to_ascii_lowercase();
-    for prefix in FORBIDDEN_TRANSPORTS {
+    for prefix in UNCONDITIONAL_TRANSPORTS {
         if lower.starts_with(prefix) {
             return Err(CliError::Other(format!(
                 "refusing docker_image {canonical:?}: skopeo transport prefix {prefix:?} is not allowed"
             )));
+        }
+    }
+    for prefix in PATH_TRANSPORTS {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if rest.is_empty()
+                || rest.starts_with('.')
+                || rest.contains('/')
+                || rest.contains(':')
+                || rest.contains('@')
+            {
+                return Err(CliError::Other(format!(
+                    "refusing docker_image {canonical:?}: skopeo transport prefix {prefix:?} is not allowed"
+                )));
+            }
         }
     }
     if let Some(first_slash) = canonical.find('/') {
@@ -855,7 +875,8 @@ fn pin_to_digest(canonical: &str, digest: &str) -> Result<String, CliError> {
     }
 
     // If the reference already carries `@<existing>`, require it to match
-    // `digest` rather than silently pulling a different image.
+    // `digest` rather than silently pulling a different image, and ensure the
+    // repo portion has no stray `:` outside a valid registry port.
     if let Some((repo_part, existing_digest)) = canonical.split_once('@') {
         if existing_digest != digest {
             return Err(CliError::Other(format!(
@@ -863,7 +884,11 @@ fn pin_to_digest(canonical: &str, digest: &str) -> Result<String, CliError> {
                  recorded image_digest {digest}"
             )));
         }
-        if repo_part.is_empty() {
+        let repo_after_authority = repo_part
+            .find('/')
+            .map(|i| &repo_part[i + 1..])
+            .unwrap_or(repo_part);
+        if repo_part.is_empty() || repo_after_authority.contains(':') {
             return Err(CliError::Other(format!(
                 "invalid docker_image reference {canonical:?}"
             )));
@@ -880,6 +905,12 @@ fn pin_to_digest(canonical: &str, digest: &str) -> Result<String, CliError> {
         (None, Some(c)) => &canonical[..c],
         _ => canonical,
     };
+    let stem_after_authority = stem.find('/').map(|i| &stem[i + 1..]).unwrap_or(stem);
+    if stem.is_empty() || stem_after_authority.contains(':') {
+        return Err(CliError::Other(format!(
+            "invalid docker_image reference {canonical:?}"
+        )));
+    }
     Ok(format!("{stem}@{digest}"))
 }
 
@@ -979,8 +1010,13 @@ mod tests {
         let digest = format!("sha256:{}", "11".repeat(32));
         for bad in [
             "dir:/tmp/evil",
+            "dir:./evil",
             "oci:/tmp/evil",
+            "oci:layout:tag",
+            &format!("oci:layout@{digest}"),
+            "oci-archive:evil.tar",
             "oci-archive:/tmp/evil.tar",
+            "docker-archive:evil.tar",
             "docker-archive:/tmp/evil.tar",
             "docker-daemon:foo:latest",
             "containers-storage:foo",
@@ -995,6 +1031,13 @@ mod tests {
             );
         }
         assert!(pin_to_digest("registry.local/alice/foo:v1", "sha256:short").is_err());
+
+        // Plain Docker Hub image names whose repo matches a transport word
+        // (such as `docker:27-dind`) are valid registry references and must pass.
+        assert_eq!(
+            pin_to_digest("docker:27-dind", &digest).unwrap(),
+            format!("docker@{digest}")
+        );
     }
 
     #[test]

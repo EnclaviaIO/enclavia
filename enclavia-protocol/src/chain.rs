@@ -1201,6 +1201,11 @@ pub fn validate_chain(
                             // PCRs 16-31 must also match the in-force
                             // identity (an unverified attestation document
                             // is left to `validate_chain_link` to report).
+                            // Upgrades only target normal-mode identities; if
+                            // a future recovery boot (#315) ever appends a
+                            // boot link with altered user PCRs, rejecting it
+                            // here is intentional so clients must re-pin
+                            // rather than silently following a recovery boot.
                             if let Some(ref expected_id) = in_force_identity {
                                 if link_attestation(link, debug_mode)
                                     .is_ok_and(|doc| doc.identity() != expected_id)

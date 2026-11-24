@@ -453,13 +453,22 @@ struct RegionWatchInner {
     /// Region-covering reads in flight, keyed by the NBD read handle.
     reads: HashMap<u64, ReadWatch>,
     /// Reads overlapping the LUKS2 header area `[0, luks_data_offset)`, keyed
-    /// by NBD read handle -> `(device_offset, length)`.
-    luks_reads: HashMap<u64, (u64, u32)>,
+    /// by NBD read handle -> `(device_offset, length, accept_from_seq)`.
+    luks_reads: HashMap<u64, (u64, u32, u64)>,
     /// Configured LUKS data offset (0 disables LUKS header pinning).
     luks_data_offset: u64,
-    /// Expected raw bytes of `[0, luks_pinned.len())` (primary + secondary
-    /// LUKS2 headers; all zeroes on an unformatted volume until `luksFormat`).
+    /// Latest expected raw bytes of `[0, luks_pinned.len())` (primary +
+    /// secondary LUKS2 headers; boot-verified prefix on an unformatted volume
+    /// until `luksFormat`).
     luks_pinned: Vec<u8>,
+    /// Monotonic sequence number for `luks_pinned`, incremented on every
+    /// enclave-originated write mirrored via `apply_luks_write`.
+    luks_seq: u64,
+    /// `(luks_seq, pinned_bytes)` history retained while overlapping reads are
+    /// in flight so an in-flight read issued before `apply_luks_write` accepts
+    /// either pre-write or post-write bytes without false fail-stops, while
+    /// still rejecting anything older than the read's issue-time `luks_seq`.
+    luks_history: VecDeque<(u64, Vec<u8>)>,
     next_seq: u64,
 }
 
@@ -496,9 +505,14 @@ pub struct RegionWatch {
     inner: Mutex<RegionWatchInner>,
 }
 
+/// Maximum retained LUKS2 header snapshots in `luks_history` (bounds memory
+/// even if a pathological burst of header writes races a slow read).
+const MAX_LUKS_HISTORY: usize = 64;
+
 impl RegionWatch {
     /// Seed the watch with the boot-verified region commitment (seq 0) and no
-    /// LUKS header pin (for callers/tests that only exercise superblock pinning).
+    /// LUKS header pin (for unit tests that only exercise superblock pinning).
+    #[cfg(test)]
     pub fn new(boot_commitment: [u8; 32]) -> Self {
         Self::new_with_luks(boot_commitment, LuksHeaderPin::disabled())
     }
@@ -509,20 +523,42 @@ impl RegionWatch {
         let mut inner = RegionWatchInner::default();
         inner.history.push_back((0, boot_commitment));
         inner.luks_data_offset = luks.data_offset;
+        inner.luks_history.push_back((0, luks.pinned.clone()));
         inner.luks_pinned = luks.pinned;
+        inner.luks_seq = 0;
         inner.next_seq = 1;
         Self {
             inner: Mutex::new(inner),
         }
     }
 
+    fn prune_luks_history(i: &mut RegionWatchInner) {
+        let keep_from = i
+            .luks_reads
+            .values()
+            .map(|&(_, _, seq)| seq)
+            .min()
+            .unwrap_or(i.luks_seq);
+        while i.luks_history.len() > 1 {
+            let Some(&(seq, _)) = i.luks_history.front() else {
+                break;
+            };
+            if seq < keep_from || i.luks_history.len() > MAX_LUKS_HISTORY {
+                i.luks_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Issue-side (request proxy): register a read overlapping `[0, data_offset)`
-    /// so its reply is verified against the pinned LUKS2 header before reaching
-    /// the kernel.
+    /// so its reply is verified against the pinned LUKS2 header (at or after
+    /// the issue-time `luks_seq`) before reaching the kernel.
     pub fn watch_luks_read(&self, handle: u64, offset: u64, length: u32) {
         let mut i = self.inner.lock().unwrap();
         if i.luks_data_offset > 0 && length > 0 && offset < i.luks_data_offset {
-            i.luks_reads.insert(handle, (offset, length));
+            let seq = i.luks_seq;
+            i.luks_reads.insert(handle, (offset, length, seq));
         }
     }
 
@@ -554,23 +590,24 @@ impl RegionWatch {
                 needed_len = std::cmp::max(needed_len, std::cmp::min(both, max_pin));
             }
         }
-        if needed_len > i.luks_pinned.len() {
-            i.luks_pinned.resize(needed_len, 0);
+        let mut updated = i.luks_pinned.clone();
+        if needed_len > updated.len() {
+            updated.resize(needed_len, 0);
         }
 
         // Only mirror bytes that fall within the currently tracked header span
         // (leaving keyslot material outside `[0, 2 * hdr_size)` untouched).
-        if write_start < i.luks_pinned.len() {
-            let apply_end = std::cmp::min(write_end, i.luks_pinned.len());
+        if write_start < updated.len() {
+            let apply_end = std::cmp::min(write_end, updated.len());
             let apply_len = apply_end - write_start;
-            i.luks_pinned[write_start..apply_end].copy_from_slice(&data[..apply_len]);
+            updated[write_start..apply_end].copy_from_slice(&data[..apply_len]);
         }
 
         // If the pinned primary (or secondary) header now parses as a complete
         // LUKS2 header, verify its crypt segment offset matches `data_offset`.
         // Partial mid-format writes that don't yet parse as JSON are allowed;
         // once the full JSON lands, the offset check enforces consistency.
-        if let Ok(Some(actual)) = parse_luks2_data_offset(&i.luks_pinned) {
+        if let Ok(Some(actual)) = parse_luks2_data_offset(&updated) {
             if actual != i.luks_data_offset {
                 return Err(format!(
                     "enclave write produced LUKS2 primary header with data offset {actual}, \
@@ -578,10 +615,10 @@ impl RegionWatch {
                     i.luks_data_offset
                 ));
             }
-            let hdr_size = u64::from_be_bytes(i.luks_pinned[8..16].try_into().unwrap()) as usize;
-            if i.luks_pinned.len() >= hdr_size.saturating_mul(2) {
+            let hdr_size = u64::from_be_bytes(updated[8..16].try_into().unwrap()) as usize;
+            if updated.len() >= hdr_size.saturating_mul(2) {
                 if let Ok(Some(sec_actual)) = parse_luks2_data_offset_with_magic(
-                    &i.luks_pinned[hdr_size..],
+                    &updated[hdr_size..],
                     LUKS2_SECONDARY_MAGIC,
                 ) {
                     if sec_actual != i.luks_data_offset {
@@ -594,6 +631,13 @@ impl RegionWatch {
                 }
             }
         }
+
+        i.luks_pinned = updated;
+        i.luks_seq = i.luks_seq.saturating_add(1);
+        let seq = i.luks_seq;
+        let snapshot = i.luks_pinned.clone();
+        i.luks_history.push_back((seq, snapshot));
+        Self::prune_luks_history(&mut i);
         Ok(())
     }
 
@@ -602,58 +646,87 @@ impl RegionWatch {
         self.inner.lock().unwrap().luks_reads.contains_key(&handle)
     }
 
-    /// Reply-side: verify a read reply overlapping `[0, data_offset)` against
-    /// the pinned LUKS2 header bytes and confirm no unpinned secondary LUKS2
-    /// header appeared at a standard probe offset.
-    pub fn verify_luks_read(&self, handle: u64, payload: &[u8]) -> Result<(), String> {
-        let mut i = self.inner.lock().unwrap();
-        let Some((offset, length)) = i.luks_reads.remove(&handle) else {
-            return Ok(());
-        };
-        if payload.len() != length as usize {
-            return Err(format!(
-                "LUKS header read (handle {handle}) payload length {} != expected {length}",
-                payload.len()
-            ));
-        }
-        let read_end = offset.saturating_add(length as u64);
-        let pin_len = i.luks_pinned.len() as u64;
+    fn matches_luks_snapshot(
+        pinned: &[u8],
+        luks_data_offset: u64,
+        offset: u64,
+        read_end: u64,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let pin_len = pinned.len() as u64;
 
         // 1. Byte-for-byte verification of any overlap with `[0, pin_len)`.
         if offset < pin_len {
             let hi = std::cmp::min(read_end, pin_len);
-            let p_start = 0usize;
             let p_end = (hi - offset) as usize;
             let pin_start = offset as usize;
             let pin_end = hi as usize;
-            if payload[p_start..p_end] != i.luks_pinned[pin_start..pin_end] {
-                return Err(format!(
-                    "LUKS2 header read (handle {handle}, offset {offset}, len {length}) does not \
-                     match the boot-verified header: the storage host swapped or tampered with \
-                     the LUKS2 header (TOCTOU rollback attack); refusing to serve"
-                ));
+            if payload[..p_end] != pinned[pin_start..pin_end] {
+                return Err("swapped or tampered".into());
             }
         }
 
         // 2. Reject any unexpected LUKS2 primary/secondary header magic at
         //    standard secondary probe offsets outside `[0, pin_len)`.
         for &sec_off in LUKS2_SECONDARY_OFFSETS {
-            if sec_off < pin_len || sec_off.saturating_add(6) > i.luks_data_offset {
+            if sec_off < pin_len || sec_off.saturating_add(6) > luks_data_offset {
                 continue;
             }
             if offset <= sec_off && read_end >= sec_off + 6 {
                 let rel = (sec_off - offset) as usize;
                 let magic = &payload[rel..rel + 6];
                 if magic == LUKS2_MAGIC || magic == LUKS2_SECONDARY_MAGIC {
-                    return Err(format!(
-                        "LUKS2 header read (handle {handle}) observed an unexpected unpinned \
-                         LUKS2 header at secondary offset {sec_off}; refusing to serve"
-                    ));
+                    return Err(format!("unexpected unpinned LUKS2 header at secondary offset {sec_off}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reply-side: verify a read reply overlapping `[0, data_offset)` against
+    /// the pinned LUKS2 header snapshots at or after the read's issue-time
+    /// `luks_seq`, and confirm no unpinned secondary LUKS2 header appeared at
+    /// a standard probe offset.
+    pub fn verify_luks_read(&self, handle: u64, payload: &[u8]) -> Result<(), String> {
+        let mut i = self.inner.lock().unwrap();
+        let Some((offset, length, accept_from_seq)) = i.luks_reads.remove(&handle) else {
+            return Ok(());
+        };
+        if payload.len() != length as usize {
+            Self::prune_luks_history(&mut i);
+            return Err(format!(
+                "LUKS header read (handle {handle}) payload length {} != expected {length}",
+                payload.len()
+            ));
+        }
+        let read_end = offset.saturating_add(length as u64);
+        let luks_data_offset = i.luks_data_offset;
+
+        let mut last_err = None;
+        for (seq, pinned) in i.luks_history.iter().rev() {
+            if *seq < accept_from_seq {
+                break;
+            }
+            match Self::matches_luks_snapshot(pinned, luks_data_offset, offset, read_end, payload) {
+                Ok(()) => {
+                    Self::prune_luks_history(&mut i);
+                    return Ok(());
+                }
+                Err(e) => {
+                    if last_err.is_none() {
+                        last_err = Some(e);
+                    }
                 }
             }
         }
 
-        Ok(())
+        Self::prune_luks_history(&mut i);
+        let detail = last_err.unwrap_or_else(|| "swapped or tampered".into());
+        Err(format!(
+            "LUKS2 header read (handle {handle}, offset {offset}, len {length}) does not \
+             match the boot-verified header ({detail}): the storage host swapped or tampered with \
+             the LUKS2 header (TOCTOU rollback attack); refusing to serve"
+        ))
     }
 
     /// Issue-side (request proxy): register a read that fully covers the
@@ -2240,11 +2313,27 @@ where
             }
         }
         let pin_len = std::cmp::min(expected, LUKS2_DEFAULT_PIN_LEN as u64) as usize;
+        // Read the remainder of `[0, pin_len)` so the pin reflects the exact
+        // bytes present on the volume at boot (preventing false fail-stops if
+        // a blank volume carries non-zero non-LUKS bytes above offset 4096).
+        let mut pinned = binary;
+        if pin_len > pinned.len() {
+            let tail = nbd_read_range(
+                stream,
+                BOOT_HDR_READ_HANDLE,
+                pinned.len() as u64,
+                (pin_len - pinned.len()) as u32,
+            )
+            .await?;
+            pinned.extend_from_slice(&tail);
+        } else {
+            pinned.truncate(pin_len);
+        }
         info!(
-            pin_len,
-            "boot verify: fresh unformatted volume; pinning blank LUKS2 header window until luksFormat"
+            pin_len = pinned.len(),
+            "boot verify: fresh unformatted volume; pinning boot-read LUKS2 header window until luksFormat"
         );
-        return Ok(LuksHeaderPin::new(expected, vec![0u8; pin_len]));
+        return Ok(LuksHeaderPin::new(expected, pinned));
     }
     let hdr_size = u64::from_be_bytes(binary[8..16].try_into().unwrap());
     if !(LUKS2_BINARY_HEADER_LEN..=LUKS2_MAX_HDR_SIZE).contains(&hdr_size) {
@@ -5191,5 +5280,93 @@ mod luks_header_pin_tests {
             .unwrap_err();
         assert!(err.to_string().contains("non-zero non-LUKS2"), "{err}");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_luks_data_offset_pins_actual_bytes_on_fresh_volume_with_nonzero_tail() {
+        // Fresh volume: 0..4096 is all zero, secondary offsets have no LUKS2
+        // magic, but offset 8192 holds non-zero non-LUKS bytes (e.g. a device
+        // wiped with `dd bs=4k count=1`). Boot verify must read and pin the
+        // actual 32 KiB window so `cryptsetup isLuks` / `luksFormat` succeeds.
+        let mut disk = vec![0u8; 64 * 1024];
+        disk[8192..8200].copy_from_slice(b"OLDGARBG");
+        let disk_server = disk.clone();
+
+        let (mut client, mut host) = duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            loop {
+                let mut req = [0u8; 28];
+                if host.read_exact(&mut req).await.is_err() {
+                    break;
+                }
+                let handle = u64::from_be_bytes(req[8..16].try_into().unwrap());
+                let offset = u64::from_be_bytes(req[16..24].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(req[24..28].try_into().unwrap()) as usize;
+                let mut reply = [0u8; 16];
+                reply[0..4].copy_from_slice(&nbd::NBD_SIMPLE_REPLY_MAGIC.to_be_bytes());
+                reply[8..16].copy_from_slice(&handle.to_be_bytes());
+                host.write_all(&reply).await.unwrap();
+                let mut slice = vec![0u8; len];
+                if offset < disk_server.len() {
+                    let avail = std::cmp::min(len, disk_server.len() - offset);
+                    slice[..avail].copy_from_slice(&disk_server[offset..offset + avail]);
+                }
+                host.write_all(&slice).await.unwrap();
+            }
+        });
+
+        let pin = verify_luks_data_offset(&mut client, DATA_OFFSET)
+            .await
+            .expect("blank volume with non-zero non-LUKS tail must boot");
+        drop(client);
+        server.await.unwrap();
+
+        let watch = RegionWatch::new_with_luks([0x44; 32], pin);
+        watch.watch_luks_read(1, 0, LUKS2_DEFAULT_PIN_LEN as u32);
+        watch
+            .verify_luks_read(1, &disk[..LUKS2_DEFAULT_PIN_LEN])
+            .expect("boot-read bytes accepted");
+
+        // Subsequent tampering at offset 8192 is still caught.
+        let mut tampered = disk[..LUKS2_DEFAULT_PIN_LEN].to_vec();
+        tampered[8192] ^= 0xff;
+        watch.watch_luks_read(2, 0, LUKS2_DEFAULT_PIN_LEN as u32);
+        assert!(watch.verify_luks_read(2, &tampered).is_err());
+    }
+
+    #[test]
+    fn luks_read_in_flight_across_header_write_accepts_pre_or_post_but_rejects_rollback() {
+        let v0_primary = make_luks2_header(LUKS2_MAGIC, 16384, DATA_OFFSET);
+        let mut v1_primary = v0_primary.clone();
+        v1_primary[500] ^= 0x55; // e.g. keyslot metadata update in luksAddKey
+
+        let watch = RegionWatch::new_with_luks(
+            [0x55; 32],
+            LuksHeaderPin::new(DATA_OFFSET, v0_primary.clone()),
+        );
+
+        // Read #1 is issued BEFORE the enclave writes v1.
+        watch.watch_luks_read(1, 0, 16384);
+        // Enclave issues header write v1 while read #1 is still in flight.
+        watch.apply_luks_write(0, &v1_primary).unwrap();
+        // Read #2 is issued AFTER v1.
+        watch.watch_luks_read(2, 0, 16384);
+
+        // Read #1 legitimately returns pre-write v0 bytes -> accepted.
+        watch
+            .verify_luks_read(1, &v0_primary)
+            .expect("in-flight read spanning write must accept pre-write bytes");
+
+        // Read #2 returning stale v0 bytes is a rollback -> rejected!
+        let err = watch
+            .verify_luks_read(2, &v0_primary)
+            .expect_err("read issued after v1 must reject stale v0 bytes");
+        assert!(err.contains("swapped or tampered"), "{err}");
+
+        // Read #3 issued after v1 returning v1 bytes -> accepted.
+        watch.watch_luks_read(3, 0, 16384);
+        watch
+            .verify_luks_read(3, &v1_primary)
+            .expect("post-write bytes accepted");
     }
 }

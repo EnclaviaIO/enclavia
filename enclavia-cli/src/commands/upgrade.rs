@@ -391,7 +391,14 @@ pub enum ControlKeyMode {
 /// Detect the custody mode from the enclave row. Fail-closed: only an explicit
 /// `"self_hosted"` or `"managed"` is accepted; missing, null, or unrecognized
 /// values error rather than silently falling back to managed custody.
+/// Non-upgradable enclaves (`"upgradable": false`) report a clear error before
+/// inspecting `control_key_mode` (which the backend sends as `null` for them).
 pub fn control_key_mode(enclave: &serde_json::Value) -> Result<ControlKeyMode, CliError> {
+    if enclave.get("upgradable").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(CliError::Other(
+            "this enclave is not upgradable (created without a control key)".into(),
+        ));
+    }
     match enclave.get("control_key_mode").and_then(|v| v.as_str()) {
         Some("self_hosted") => Ok(ControlKeyMode::SelfHosted),
         Some("managed") => Ok(ControlKeyMode::Managed),
@@ -1583,15 +1590,23 @@ mod tests {
 
         for row in [
             serde_json::json!({ "control_key_mode": null }),
+            serde_json::json!({ "upgradable": true, "control_key_mode": null }),
             serde_json::json!({ "control_key_mode": 3 }),
             serde_json::json!({ "control_key_mode": "SelfHosted" }),
             serde_json::json!({}),
         ] {
+            let err = control_key_mode(&row).unwrap_err().to_string();
             assert!(
-                control_key_mode(&row).is_err(),
-                "expected fail-closed error for row: {row}"
+                err.contains("refusing to guess custody mode"),
+                "expected fail-closed custody error for row {row}, got: {err}"
             );
         }
+
+        // Non-upgradable enclaves report a clear "not upgradable" error even
+        // though the backend sends `control_key_mode: null` for them.
+        let non_upgradable = serde_json::json!({ "upgradable": false, "control_key_mode": null });
+        let err = control_key_mode(&non_upgradable).unwrap_err().to_string();
+        assert!(err.contains("not upgradable"), "{err}");
     }
 
     #[test]

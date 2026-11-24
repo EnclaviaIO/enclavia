@@ -190,8 +190,8 @@ pub fn save_index_to(path: &Path, index: &KeyIndex) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Atomically write `data` to `path` with mode 0600 via a sibling temp file
-/// + `sync_all` + `rename` so a crash mid-write or concurrent reader never
+/// Atomically write `data` to `path` with mode 0600 via a sibling temp file,
+/// `sync_all`, and `rename` so a crash mid-write or concurrent reader never
 /// observes a truncated/corrupt index and permissions are always clamped to
 /// 0600 on Unix.
 fn write_private(path: &Path, data: &[u8]) -> Result<(), CliError> {
