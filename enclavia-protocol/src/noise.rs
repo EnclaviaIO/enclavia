@@ -345,9 +345,9 @@ where
         tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut length_bytes).await?;
         let encrypted_len = u32::from_be_bytes(length_bytes) as usize;
 
-        if encrypted_len > self.read_buffer.len() {
+        if encrypted_len == 0 || encrypted_len > self.read_buffer.len() {
             return Err(format!(
-                "Message too large: {} bytes (max: {})",
+                "Invalid Noise frame length: {} bytes (must be 1..={})",
                 encrypted_len,
                 self.read_buffer.len()
             )
@@ -380,6 +380,131 @@ where
 
     pub fn transport_mut(&mut self) -> &mut NoiseTransport {
         &mut self.transport
+    }
+
+    /// Split this transport into independent [`CborReader`] and [`CborWriter`]
+    /// halves backed by `tokio::io::split`.
+    ///
+    /// Splitting eliminates single-task `select!` self-deadlocks (where a read
+    /// handler awaits a full response channel that only the same task drains)
+    /// and guarantees `receive` is never cancelled mid-frame after consuming a
+    /// 4-byte length prefix.
+    pub fn into_split(self) -> (CborReader<tokio::io::ReadHalf<S>>, CborWriter<tokio::io::WriteHalf<S>>) {
+        let (r, w) = tokio::io::split(self.stream);
+        let transport = std::sync::Arc::new(std::sync::Mutex::new(self.transport));
+        (
+            CborReader {
+                transport: std::sync::Arc::clone(&transport),
+                reader: r,
+                read_buffer: self.read_buffer,
+            },
+            CborWriter {
+                transport,
+                writer: w,
+                write_buffer: self.write_buffer,
+            },
+        )
+    }
+}
+
+/// Read half of a split [`CborTransport`].
+#[cfg(feature = "async-transport")]
+pub struct CborReader<R> {
+    transport: std::sync::Arc<std::sync::Mutex<NoiseTransport>>,
+    reader: R,
+    read_buffer: Vec<u8>,
+}
+
+#[cfg(feature = "async-transport")]
+impl<R> CborReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    #[instrument(skip(self))]
+    pub async fn receive<T: for<'de> Deserialize<'de>>(
+        &mut self,
+    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+        let mut length_bytes = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut length_bytes).await?;
+        let encrypted_len = u32::from_be_bytes(length_bytes) as usize;
+
+        if encrypted_len == 0 || encrypted_len > self.read_buffer.len() {
+            return Err(format!(
+                "Invalid Noise frame length: {} bytes (must be 1..={})",
+                encrypted_len,
+                self.read_buffer.len()
+            )
+            .into());
+        }
+
+        trace!(encrypted_len = encrypted_len, "Reading encrypted message");
+
+        tokio::io::AsyncReadExt::read_exact(
+            &mut self.reader,
+            &mut self.read_buffer[..encrypted_len],
+        )
+        .await?;
+
+        let mut payload = vec![0u8; 65535];
+        let payload_len = {
+            let mut guard = self
+                .transport
+                .lock()
+                .map_err(|_| "Noise transport lock poisoned")?;
+            guard.read_message(&self.read_buffer[..encrypted_len], &mut payload)?
+        };
+        trace!(payload_len = payload_len, "Decrypted message");
+
+        let mut cursor = Cursor::new(&payload[..payload_len]);
+        let message: T = from_reader(&mut cursor)?;
+        trace!("CBOR message received and deserialized successfully");
+        Ok(message)
+    }
+}
+
+/// Write half of a split [`CborTransport`].
+#[cfg(feature = "async-transport")]
+pub struct CborWriter<W> {
+    transport: std::sync::Arc<std::sync::Mutex<NoiseTransport>>,
+    writer: W,
+    write_buffer: Vec<u8>,
+}
+
+#[cfg(feature = "async-transport")]
+impl<W> CborWriter<W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    #[instrument(skip(self, message))]
+    pub async fn send<T: Serialize>(
+        &mut self,
+        message: &T,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut cbor_bytes = Vec::new();
+        into_writer(message, &mut cbor_bytes)?;
+        trace!(cbor_len = cbor_bytes.len(), "Serialized CBOR message");
+        if cbor_bytes.len() > MAX_NOISE_PLAINTEXT {
+            return Err(Box::new(FrameTooLarge {
+                len: cbor_bytes.len(),
+            }));
+        }
+
+        let encrypted_len = {
+            let mut guard = self
+                .transport
+                .lock()
+                .map_err(|_| "Noise transport lock poisoned")?;
+            guard.write_message(&cbor_bytes, &mut self.write_buffer)?
+        };
+        trace!(encrypted_len = encrypted_len, "Encrypted message");
+
+        let length_bytes = (encrypted_len as u32).to_be_bytes();
+        tokio::io::AsyncWriteExt::write_all(&mut self.writer, &length_bytes).await?;
+        write_all_vsock(&mut self.writer, &self.write_buffer[..encrypted_len]).await?;
+        tokio::io::AsyncWriteExt::flush(&mut self.writer).await?;
+
+        trace!("CBOR message sent successfully");
+        Ok(())
     }
 }
 

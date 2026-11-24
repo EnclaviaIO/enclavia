@@ -29,13 +29,75 @@ impl fmt::Display for Method {
     }
 }
 
-/// Serialize an HTTP/1.1 request into raw bytes.
+/// Validate an HTTP request target (`path`) against CRLF/whitespace/control
+/// injection before serializing an HTTP/1.1 request line.
+fn validate_request_path(path: &str) -> Result<(), Error> {
+    if path.is_empty()
+        || path
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(Error::HttpParse(format!(
+            "invalid HTTP request path {path:?}: must be non-empty without whitespace or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// RFC 9110 `tchar`: token characters allowed in an HTTP header name.
+fn is_http_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Validate an HTTP header `(name, value)` pair against CRLF / NUL / header
+/// injection.
+fn validate_header(name: &str, value: &str) -> Result<(), Error> {
+    if name.is_empty() || !name.bytes().all(is_http_tchar) {
+        return Err(Error::HttpParse(format!(
+            "invalid HTTP header name {name:?}"
+        )));
+    }
+    if value
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || (b < 0x20 && b != b'\t') || b == 0x7f)
+    {
+        return Err(Error::HttpParse(format!(
+            "invalid HTTP header value for {name:?}: contains forbidden control character"
+        )));
+    }
+    Ok(())
+}
+
+/// Serialize an HTTP/1.1 request into raw bytes after validating the request
+/// path and every header name/value against CRLF / request-smuggling injection.
 pub(crate) fn serialize_request(
     method: Method,
     path: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Error> {
+    validate_request_path(path)?;
+    for (key, value) in headers {
+        validate_header(key, value)?;
+    }
+
     let mut out = Vec::new();
 
     // Request line
@@ -63,7 +125,7 @@ pub(crate) fn serialize_request(
         out.extend_from_slice(body);
     }
 
-    out
+    Ok(out)
 }
 
 /// Try to parse an HTTP/1.1 response head out of `buf` while it's still being
@@ -171,5 +233,30 @@ mod tests {
         // Close-delimited body: completeness unknowable.
         assert!(!is_complete_response(b"HTTP/1.1 200 OK\r\n\r\nwhatever"));
         assert!(!is_complete_response(b""));
+    }
+
+    #[test]
+    fn serialize_request_rejects_crlf_and_whitespace_injection() {
+        assert!(serialize_request(Method::Get, "/ok?a=1", &[("X-Test".into(), "ok".into())], None).is_ok());
+
+        for bad_path in ["", "/a b", "/a\r\nX-Injected: 1", "/a\n", "/a\0b"] {
+            assert!(
+                serialize_request(Method::Get, bad_path, &[], None).is_err(),
+                "path {bad_path:?} should be rejected"
+            );
+        }
+        for bad_name in ["", "Bad Name", "Bad:Name", "Bad\r\nName"] {
+            assert!(
+                serialize_request(Method::Get, "/", &[(bad_name.into(), "v".into())], None).is_err(),
+                "header name {bad_name:?} should be rejected"
+            );
+        }
+        for bad_val in ["a\r\nX-Evil: 1", "a\nb", "a\0b", "a\x7fb"] {
+            assert!(
+                serialize_request(Method::Get, "/", &[("X-Test".into(), bad_val.into())], None)
+                    .is_err(),
+                "header value {bad_val:?} should be rejected"
+            );
+        }
     }
 }

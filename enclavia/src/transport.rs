@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use crate::message::{ClientMessage, ServerMessage, StreamHalf};
+use enclavia_protocol::{
+    ClientMessage, MAX_NOISE_PLAINTEXT, NoiseTransport, ServerMessage, StreamHalf,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, trace, warn};
 
@@ -8,12 +11,19 @@ use crate::error::Error;
 use crate::noise::recv_binary;
 use crate::ws::{Ws, WsEvent};
 
-type StreamMap = HashMap<u64, mpsc::Sender<Result<Vec<u8>, Error>>>;
-type PendingMap = HashMap<u64, PendingRequest>;
+/// Shared slot carrying a terminal stream error from the transport task to
+/// [`crate::UpgradedStream`]. Stored out-of-band from the bounded data channel
+/// so a transport teardown or stream failure can NEVER be silently dropped
+/// into clean EOF when the 64-slot receive buffer is full.
+pub(crate) type TerminalErr = Arc<StdMutex<Option<String>>>;
 
-/// Largest Noise transport message plaintext: 65535 bytes of ciphertext
-/// minus the 16-byte authentication tag.
-const MAX_NOISE_PLAINTEXT: usize = 65535 - 16;
+struct StreamEntry {
+    tx: mpsc::Sender<Result<Vec<u8>, Error>>,
+    terminal_err: TerminalErr,
+}
+
+type StreamMap = HashMap<u64, StreamEntry>;
+type PendingMap = HashMap<u64, PendingRequest>;
 
 /// Upper bound on the CBOR bytes around a stream payload: the message map,
 /// its `type` tag and `id`, and the payload's array header.
@@ -72,6 +82,7 @@ pub(crate) enum OutboundCommand {
         payload: Vec<u8>,
         id_tx: oneshot::Sender<Result<u64, Error>>,
         stream_tx: mpsc::Sender<Result<Vec<u8>, Error>>,
+        terminal_err: TerminalErr,
     },
 
     /// Bytes to write into an already-open stream.
@@ -81,16 +92,40 @@ pub(crate) enum OutboundCommand {
     StreamClose { id: u64, half: StreamHalf },
 }
 
+/// Outcome of encrypting and sending one outbound CBOR frame.
+enum SendOutcome {
+    /// CBOR serialization or plaintext-size validation failed BEFORE the Noise
+    /// outbound nonce advanced: the transport session is still intact.
+    PreEncrypt(Error),
+    /// The Noise cipher state advanced or the WebSocket write failed: the
+    /// transport session is now dead/desynced and MUST be torn down.
+    TransportFatal(Error),
+}
+
 /// Encrypt a CBOR message with the Noise transport, returning length-prefixed ciphertext.
+///
+/// Validates `cbor.len() <= MAX_NOISE_PLAINTEXT` BEFORE touching `transport`
+/// so an oversized message never advances the Noise nonce.
 fn encrypt_cbor<T: serde::Serialize>(
-    transport: &mut snow::TransportState,
+    transport: &mut NoiseTransport,
     msg: &T,
     write_buf: &mut [u8],
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, SendOutcome> {
     let mut cbor = Vec::new();
-    ciborium::ser::into_writer(msg, &mut cbor)?;
+    ciborium::ser::into_writer(msg, &mut cbor)
+        .map_err(|e| SendOutcome::PreEncrypt(Error::from(e)))?;
 
-    let encrypted_len = transport.write_message(&cbor, write_buf)?;
+    if cbor.len() > MAX_NOISE_PLAINTEXT {
+        return Err(SendOutcome::PreEncrypt(Error::Cbor(format!(
+            "outbound CBOR frame is {} bytes, exceeding Noise limit {}",
+            cbor.len(),
+            MAX_NOISE_PLAINTEXT
+        ))));
+    }
+
+    let encrypted_len = transport
+        .write_message(&cbor, write_buf)
+        .map_err(|e| SendOutcome::TransportFatal(Error::from(e)))?;
 
     let mut out = Vec::with_capacity(4 + encrypted_len);
     out.extend_from_slice(&(encrypted_len as u32).to_be_bytes());
@@ -98,12 +133,25 @@ fn encrypt_cbor<T: serde::Serialize>(
     Ok(out)
 }
 
+/// Encrypt and send one CBOR message over the WebSocket.
+async fn send_cbor<T: serde::Serialize>(
+    ws: &mut Ws,
+    transport: &mut NoiseTransport,
+    write_buf: &mut [u8],
+    msg: &T,
+) -> Result<(), SendOutcome> {
+    let data = encrypt_cbor(transport, msg, write_buf)?;
+    ws.send(data).await.map_err(SendOutcome::TransportFatal)
+}
+
 /// Decrypt a length-prefixed encrypted message from accumulated bytes.
 ///
 /// Returns `Some((message, consumed))` if a complete message was decoded,
-/// or `None` if more data is needed.
+/// or `None` if more data is needed. Rejects zero-length or oversized frames
+/// (> `read_buf.len()`) before waiting for more bytes so a hostile proxy
+/// cannot trigger unbounded buffering or 32-bit `4 + encrypted_len` overflow.
 fn try_decrypt<T: serde::de::DeserializeOwned>(
-    transport: &mut snow::TransportState,
+    transport: &mut NoiseTransport,
     accum: &[u8],
     read_buf: &mut [u8],
 ) -> Result<Option<(T, usize)>, Error> {
@@ -112,18 +160,25 @@ fn try_decrypt<T: serde::de::DeserializeOwned>(
     }
 
     let encrypted_len = u32::from_be_bytes(accum[..4].try_into().unwrap()) as usize;
-    if accum.len() < 4 + encrypted_len {
+    if encrypted_len == 0 || encrypted_len > read_buf.len() {
+        return Err(Error::Cbor(format!(
+            "invalid Noise frame length {encrypted_len} (must be 1..={})",
+            read_buf.len()
+        )));
+    }
+    let total_len = 4usize
+        .checked_add(encrypted_len)
+        .ok_or_else(|| Error::Cbor("Noise frame length overflow".into()))?;
+    if accum.len() < total_len {
         return Ok(None);
     }
 
-    let payload_len =
-        transport.read_message(&accum[4..4 + encrypted_len], read_buf)?;
+    let payload_len = transport.read_message(&accum[4..total_len], read_buf)?;
 
-    let msg: T =
-        ciborium::de::from_reader(&read_buf[..payload_len])
-            .map_err(|e| Error::Cbor(e.to_string()))?;
+    let msg: T = ciborium::de::from_reader(&read_buf[..payload_len])
+        .map_err(|e| Error::Cbor(e.to_string()))?;
 
-    Ok(Some((msg, 4 + encrypted_len)))
+    Ok(Some((msg, total_len)))
 }
 
 /// Send an encrypted CBOR message and receive a response before the background task starts.
@@ -131,12 +186,15 @@ fn try_decrypt<T: serde::de::DeserializeOwned>(
 /// Used during the connection phase for the attestation exchange.
 pub(crate) async fn send_and_receive<S: serde::Serialize, R: serde::de::DeserializeOwned>(
     ws: &mut Ws,
-    transport: &mut snow::TransportState,
+    transport: &mut NoiseTransport,
     msg: &S,
 ) -> Result<R, Error> {
     let mut write_buf = vec![0u8; 65535];
-    let data = encrypt_cbor(transport, msg, &mut write_buf)?;
-    ws.send(data).await?;
+    send_cbor(ws, transport, &mut write_buf, msg)
+        .await
+        .map_err(|e| match e {
+            SendOutcome::PreEncrypt(err) | SendOutcome::TransportFatal(err) => err,
+        })?;
 
     let mut accum = Vec::new();
     let mut read_buf = vec![0u8; 65535];
@@ -163,7 +221,7 @@ pub(crate) async fn send_and_receive<S: serde::Serialize, R: serde::de::Deserial
 ///   `StreamClose` or an error.
 pub(crate) async fn run_transport(
     mut ws: Ws,
-    mut transport: snow::TransportState,
+    mut transport: NoiseTransport,
     mut cmd_rx: mpsc::Receiver<OutboundCommand>,
 ) {
     let mut write_buf = vec![0u8; 65535];
@@ -191,52 +249,72 @@ pub(crate) async fn run_transport(
                                 pending.insert(id, PendingRequest { response: Vec::new(), response_tx });
                                 trace!(id, size = payload.len(), "Sent request");
                             }
-                            Err(e) => {
+                            Err(SendOutcome::PreEncrypt(e)) => {
                                 let _ = response_tx.send(Err(e));
+                            }
+                            Err(SendOutcome::TransportFatal(e)) => {
+                                warn!(id, error = %e, "Transport send failed on Request, tearing down channel");
+                                let _ = response_tx.send(Err(e));
+                                notify_all_closed(&mut pending, &mut streams);
+                                ws.close().await;
+                                break 'transport;
                             }
                         }
                     }
-                    OutboundCommand::OpenStream { payload, id_tx, stream_tx } => {
+                    OutboundCommand::OpenStream { payload, id_tx, stream_tx, terminal_err } => {
                         let id = next_id;
                         next_id += 1;
-                        let msg = ClientMessage::OpenStream { id, payload };
-                        match encrypt_cbor(&mut transport, &msg, &mut write_buf) {
-                            Ok(data) => {
-                                if let Err(e) = ws.send(data).await {
-                                    let _ = id_tx.send(Err(e));
-                                    continue;
-                                }
-                                streams.insert(id, stream_tx);
+                        match send_request_frames(&mut ws, &mut transport, &mut write_buf, id, &payload).await {
+                            Ok(()) => {
+                                streams.insert(id, StreamEntry { tx: stream_tx, terminal_err });
                                 let _ = id_tx.send(Ok(id));
                                 trace!(id, "Sent OpenStream");
                             }
-                            Err(e) => {
+                            Err(SendOutcome::PreEncrypt(e)) => {
                                 let _ = id_tx.send(Err(e));
+                            }
+                            Err(SendOutcome::TransportFatal(e)) => {
+                                warn!(id, error = %e, "Transport send failed on OpenStream, tearing down channel");
+                                let _ = id_tx.send(Err(e));
+                                notify_all_closed(&mut pending, &mut streams);
+                                ws.close().await;
+                                break 'transport;
                             }
                         }
                     }
                     OutboundCommand::StreamData { id, payload } => {
                         let msg = ClientMessage::StreamData { id, payload };
-                        match encrypt_cbor(&mut transport, &msg, &mut write_buf) {
-                            Ok(data) => {
-                                if let Err(e) = ws.send(data).await {
-                                    warn!(id, error = %e, "Failed to send StreamData");
-                                    fail_stream(&mut streams, id, e);
-                                }
-                            }
-                            Err(e) => {
+                        match send_cbor(&mut ws, &mut transport, &mut write_buf, &msg).await {
+                            Ok(()) => {}
+                            Err(SendOutcome::PreEncrypt(e)) => {
                                 warn!(id, error = %e, "Failed to encode StreamData");
                                 fail_stream(&mut streams, id, e);
+                            }
+                            Err(SendOutcome::TransportFatal(e)) => {
+                                warn!(id, error = %e, "Transport send failed on StreamData, tearing down channel");
+                                fail_stream(&mut streams, id, e);
+                                notify_all_closed(&mut pending, &mut streams);
+                                ws.close().await;
+                                break 'transport;
                             }
                         }
                     }
                     OutboundCommand::StreamClose { id, half } => {
-                        let msg = ClientMessage::StreamClose { id, half };
-                        if let Ok(data) = encrypt_cbor(&mut transport, &msg, &mut write_buf) {
-                            let _ = ws.send(data).await;
-                        }
                         if matches!(half, StreamHalf::Both) {
                             streams.remove(&id);
+                        }
+                        let msg = ClientMessage::StreamClose { id, half };
+                        match send_cbor(&mut ws, &mut transport, &mut write_buf, &msg).await {
+                            Ok(()) => {}
+                            Err(SendOutcome::PreEncrypt(e)) => {
+                                warn!(id, error = %e, "Failed to encode StreamClose");
+                            }
+                            Err(SendOutcome::TransportFatal(e)) => {
+                                warn!(id, error = %e, "Transport send failed on StreamClose, tearing down channel");
+                                notify_all_closed(&mut pending, &mut streams);
+                                ws.close().await;
+                                break 'transport;
+                            }
                         }
                     }
                 }
@@ -250,22 +328,21 @@ pub(crate) async fn run_transport(
                             match try_decrypt::<ServerMessage>(&mut transport, &accum, &mut read_buf) {
                                 Ok(Some((msg, consumed))) => {
                                     accum.drain(..consumed);
-                                    // May suspend on a full per-stream buffer
-                                    // (see dispatch_response). While suspended
-                                    // the cmd_rx arm is not polled either, but
-                                    // that cannot deadlock: stream consumers
-                                    // never block on issuing a command before
-                                    // draining. UpgradedStream's poll_write /
-                                    // poll_shutdown use try_send (WouldBlock
-                                    // semantics, never a suspended await), its
-                                    // Drop uses try_send, and poll_read only
-                                    // polls the receiving side, so any task
-                                    // that is polling the stream keeps
-                                    // draining slots and eventually resumes us.
                                     let followup =
                                         dispatch_response(&mut pending, &mut streams, msg).await;
                                     if let Followup::CloseStream(id) = followup {
-                                        close_request_stream(&mut ws, &mut transport, &mut write_buf, id).await;
+                                        let close = ClientMessage::StreamClose {
+                                            id,
+                                            half: StreamHalf::Both,
+                                        };
+                                        if let Err(SendOutcome::TransportFatal(e)) =
+                                            send_cbor(&mut ws, &mut transport, &mut write_buf, &close).await
+                                        {
+                                            warn!(id, error = %e, "Transport send failed closing finished request stream, tearing down channel");
+                                            notify_all_closed(&mut pending, &mut streams);
+                                            ws.close().await;
+                                            break 'transport;
+                                        }
                                     }
                                 }
                                 Ok(None) => break,
@@ -273,13 +350,9 @@ pub(crate) async fn run_transport(
                                     // A frame that fails to decrypt means the Noise
                                     // transport is desynced (or the peer is corrupt);
                                     // no later frame on this session can ever decrypt
-                                    // again. Leaving the connection up wedged the
-                                    // client silently: in-flight requests never
-                                    // resolved, and because the command channel stayed
-                                    // open, auto-reconnect never engaged. Fail the
-                                    // whole channel instead — pending requests get a
-                                    // retryable ConnectionClosed, and the next request
-                                    // reconnects and re-attests.
+                                    // again. Fail the whole channel so pending requests
+                                    // get retryable ConnectionClosed and auto-reconnect
+                                    // re-establishes and re-attests.
                                     error!("Failed to decrypt incoming message, closing channel: {e}");
                                     notify_all_closed(&mut pending, &mut streams);
                                     ws.close().await;
@@ -304,52 +377,47 @@ pub(crate) async fn run_transport(
     }
 }
 
-/// Send a one-shot request as `OpenStream` (the first [`REQUEST_CHUNK`]
+/// Send an initial stream payload as `OpenStream` (the first [`REQUEST_CHUNK`]
 /// bytes) followed by `StreamData` frames for the rest. The server writes
 /// them to the workload socket in order and does not half-close it, so the
 /// workload receives the same bytes as from a single write.
 async fn send_request_frames(
     ws: &mut Ws,
-    transport: &mut snow::TransportState,
+    transport: &mut NoiseTransport,
     write_buf: &mut [u8],
     id: u64,
     payload: &[u8],
-) -> Result<(), Error> {
+) -> Result<(), SendOutcome> {
     let mut chunks = payload.chunks(REQUEST_CHUNK);
     let first = chunks.next().unwrap_or_default().to_vec();
-    let data = encrypt_cbor(transport, &ClientMessage::OpenStream { id, payload: first }, write_buf)?;
-    ws.send(data).await?;
+    send_cbor(
+        ws,
+        transport,
+        write_buf,
+        &ClientMessage::OpenStream { id, payload: first },
+    )
+    .await?;
     for chunk in chunks {
-        let msg = ClientMessage::StreamData { id, payload: chunk.to_vec() };
-        let data = encrypt_cbor(transport, &msg, write_buf)?;
-        ws.send(data).await?;
+        let msg = ClientMessage::StreamData {
+            id,
+            payload: chunk.to_vec(),
+        };
+        send_cbor(ws, transport, write_buf, &msg).await?;
     }
     Ok(())
 }
 
-/// Release the server side of a finished one-shot request stream. A failure
-/// here means the channel itself is going down, which the read side reports.
-async fn close_request_stream(
-    ws: &mut Ws,
-    transport: &mut snow::TransportState,
-    write_buf: &mut [u8],
-    id: u64,
-) {
-    let msg = ClientMessage::StreamClose { id, half: StreamHalf::Both };
-    match encrypt_cbor(transport, &msg, write_buf) {
-        Ok(data) => {
-            if let Err(e) = ws.send(data).await {
-                warn!(id, error = %e, "Failed to close finished request stream");
-            }
-        }
-        Err(e) => warn!(id, error = %e, "Failed to encode StreamClose"),
+fn record_terminal_error(entry: &StreamEntry, msg: String) {
+    let mut slot = entry.terminal_err.lock().unwrap();
+    if slot.is_none() {
+        *slot = Some(msg);
     }
 }
 
 fn fail_stream(streams: &mut StreamMap, id: u64, err: Error) {
-    if let Some(tx) = streams.remove(&id) {
-        // Best-effort: receiver may already have been dropped.
-        let _ = tx.try_send(Err(err));
+    if let Some(entry) = streams.remove(&id) {
+        record_terminal_error(&entry, err.to_string());
+        let _ = entry.tx.try_send(Err(err));
     }
 }
 
@@ -357,8 +425,9 @@ fn notify_all_closed(pending: &mut PendingMap, streams: &mut StreamMap) {
     for (_, req) in pending.drain() {
         let _ = req.response_tx.send(Err(Error::ConnectionClosed));
     }
-    for (_, tx) in streams.drain() {
-        let _ = tx.try_send(Err(Error::ConnectionClosed));
+    for (_, entry) in streams.drain() {
+        record_terminal_error(&entry, Error::ConnectionClosed.to_string());
+        let _ = entry.tx.try_send(Err(Error::ConnectionClosed));
     }
 }
 
@@ -378,23 +447,8 @@ async fn dispatch_response(
                     }
                     return Followup::CloseStream(id);
                 }
-            } else if let Some(tx) = streams.get(&id) {
-                // Backpressured on purpose: awaiting here suspends the whole
-                // transport task, so we stop reading further WebSocket frames
-                // until the stream's consumer drains a slot, and the pressure
-                // propagates over TCP back to the in-enclave server (whose
-                // own per-stream channels already block the same way). The
-                // previous try_send silently DISCARDED the frame and tore the
-                // stream down when the 64-slot buffer filled, which truncated
-                // responses under load ("ConnectionClosed while reading
-                // response headers, bytes already read: 0" on the proxy).
-                // Accepted tradeoff, mirroring the server side: one slow
-                // consumer head-of-line-blocks the other multiplexed streams
-                // of this client for the duration of the stall.
-                if tx.send(Ok(payload)).await.is_err() {
-                    // Receiver dropped: the UpgradedStream was abandoned
-                    // locally. Drop the stream entry; a follow-up StreamClose
-                    // will land on `streams.get(None)`.
+            } else if let Some(entry) = streams.get(&id) {
+                if entry.tx.send(Ok(payload)).await.is_err() {
                     streams.remove(&id);
                 }
             } else {
@@ -403,24 +457,15 @@ async fn dispatch_response(
         }
         ServerMessage::StreamClose { id } => {
             if let Some(req) = pending.remove(&id) {
-                // Workload EOF ends a response whose length was not known up
-                // front. The caller may have stopped waiting; the stream is
-                // closed either way.
                 let _ = req.response_tx.send(Ok(req.response));
                 trace!(id, "Dispatched response");
                 return Followup::CloseStream(id);
             }
-            // Removing the Sender closes the mpsc on the receiver side; that
-            // is how UpgradedStream observes server-side EOF.
+            // Clean EOF: drop sender without setting `terminal_err`.
             streams.remove(&id);
         }
         ServerMessage::Error { id, message } => {
             if let Some(req) = pending.remove(&id) {
-                // A workload may answer and close before reading the whole
-                // request (an early 404 or 413), and the server then fails
-                // writing the rest of the request. A response that already
-                // arrived in full is still the workload's answer; anything
-                // short of that is an error.
                 let result = if crate::http::is_complete_response(&req.response) {
                     debug!(id, error = %message, "Workload answered before reading the whole request");
                     Ok(req.response)
@@ -428,21 +473,100 @@ async fn dispatch_response(
                     Err(Error::ServerError { id, message })
                 };
                 let _ = req.response_tx.send(result);
-            } else if let Some(tx) = streams.remove(&id) {
-                // Same backpressured send as StreamData: the error is the
-                // stream's terminal event and must not be lost to a full
-                // buffer (dropping the Sender right after delivers EOF).
-                let _ = tx.send(Err(Error::ServerError { id, message })).await;
+            } else if let Some(entry) = streams.remove(&id) {
+                let err = Error::ServerError { id, message };
+                record_terminal_error(&entry, err.to_string());
+                let _ = entry.tx.send(Err(err)).await;
             } else {
                 warn!(id, "Received error for unknown request id");
             }
         }
+        ServerMessage::Data { id, .. } => {
+            warn!(id, "Received unexpected one-shot Data message during transport");
+        }
         ServerMessage::Attestation { .. } => {
             warn!("Received unexpected attestation message during transport");
+        }
+        ServerMessage::ControlNonce { .. } => {
+            warn!("Received unexpected control nonce during transport");
         }
         ServerMessage::ControlResult { .. } => {
             warn!("Received unexpected control result during transport");
         }
     }
     Followup::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclavia_protocol::NoiseHandshake;
+
+    fn paired_transports() -> (NoiseTransport, NoiseTransport) {
+        let mut init = NoiseHandshake::initiator().unwrap();
+        let mut resp = NoiseHandshake::responder().unwrap();
+        let mut buf1 = [0u8; 128];
+        let mut buf2 = [0u8; 128];
+        let mut scratch = [0u8; 128];
+        let n1 = init.write_message(&[], &mut buf1).unwrap();
+        resp.read_message(&buf1[..n1], &mut scratch).unwrap();
+        let n2 = resp.write_message(&[], &mut buf2).unwrap();
+        init.read_message(&buf2[..n2], &mut scratch).unwrap();
+        (
+            init.into_transport_mode().unwrap(),
+            resp.into_transport_mode().unwrap(),
+        )
+    }
+
+    #[test]
+    fn try_decrypt_rejects_zero_oversized_and_u32_max_frame_lengths() {
+        let (mut init, _resp) = paired_transports();
+        let mut read_buf = vec![0u8; 65535];
+
+        for bad_len in [0u32, 65536u32, u32::MAX - 3, u32::MAX] {
+            let accum = bad_len.to_be_bytes();
+            let err = try_decrypt::<ServerMessage>(&mut init, &accum, &mut read_buf)
+                .expect_err("invalid frame length must fail immediately");
+            assert!(
+                matches!(err, Error::Cbor(_)),
+                "expected Cbor error for len={bad_len}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_encrypt_does_not_desync_noise_nonce() {
+        let (mut init, mut resp) = paired_transports();
+        let mut write_buf = vec![0u8; 65535];
+        let mut read_buf = vec![0u8; 65535];
+
+        // Oversized message fails BEFORE touching Noise transport state.
+        let huge = ClientMessage::StreamData {
+            id: 1,
+            payload: vec![0xff; MAX_NOISE_PLAINTEXT],
+        };
+        let err = encrypt_cbor(&mut init, &huge, &mut write_buf).unwrap_err();
+        assert!(matches!(err, SendOutcome::PreEncrypt(_)));
+
+        // Subsequent small message still decrypts cleanly on responder (nonce intact).
+        let ok_msg = ClientMessage::StreamClose {
+            id: 1,
+            half: StreamHalf::Both,
+        };
+        let wire = encrypt_cbor(&mut init, &ok_msg, &mut write_buf)
+            .ok()
+            .expect("small message encrypts");
+        let (decoded, consumed) =
+            try_decrypt::<ClientMessage>(&mut resp, &wire, &mut read_buf)
+                .unwrap()
+                .expect("complete frame");
+        assert_eq!(consumed, wire.len());
+        assert!(matches!(
+            decoded,
+            ClientMessage::StreamClose {
+                id: 1,
+                half: StreamHalf::Both
+            }
+        ));
+    }
 }
