@@ -221,10 +221,14 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let (sync_hooks, rep_task, pin_task) = match sync_boot {
         Some(boot) => {
             let gate = Arc::new(rollback::PinGate::new());
-            // The runtime region watch: the boot-verified commitment seeds
-            // it, and every superblock-covering read reply is checked
-            // against the pinned history from here on (the boot-TOCTOU fix).
-            let watch = Arc::new(rollback::RegionWatch::new(boot.commitment));
+            // The runtime region watch: the boot-verified superblock commitment
+            // AND LUKS2 header pin seed it, so every superblock-covering read
+            // AND every LUKS2 header read is verified before reaching the
+            // kernel (closing both boot-TOCTOU windows).
+            let watch = Arc::new(rollback::RegionWatch::new_with_luks(
+                boot.commitment,
+                boot.luks_pin.clone(),
+            ));
             let (pin_tx, pin_rx) = tokio::sync::mpsc::channel::<rollback::PinJob>(64);
             let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel();
             let hooks = rollback::SyncHooks {
@@ -399,6 +403,7 @@ where
         // that fully cover the region get a watch entry for reply-time
         // verification (the host cannot tell them from btrfs's own reads).
         let mut sb_capture: Option<usize> = None;
+        let mut luks_mirror_len: usize = 0;
         match cmd_type {
             nbd::NBD_CMD_READ => {
                 inflight.lock().unwrap().insert(handle, length);
@@ -407,6 +412,9 @@ where
                         rollback::primary_sb_overlap(offset, length, data_offset)
                     {
                         hooks.watch.watch_read(handle, payload_offset);
+                    }
+                    if offset < data_offset && length > 0 {
+                        hooks.watch.watch_luks_read(handle, offset, length);
                     }
                 }
             }
@@ -419,6 +427,11 @@ where
                     );
                 }
                 if let Some(hooks) = &sync_hooks {
+                    let max_pin = rollback::LuksHeaderPin::max_pin_len(data_offset) as u64;
+                    if offset < max_pin && length > 0 {
+                        luks_mirror_len =
+                            std::cmp::min(length as u64, max_pin - offset) as usize;
+                    }
                     match rollback::primary_sb_overlap(offset, length, data_offset) {
                         rollback::SbOverlap::None => {}
                         rollback::SbOverlap::Full { payload_offset } => {
@@ -439,9 +452,9 @@ where
             // Payload-less storage mutations (TRIM, WRITE_ZEROES) bypass the
             // write-payload hashing entirely. The kernel never issues them
             // (we mask the capability flags at NBD_SET_FLAGS), but defence
-            // in depth: one that covers the superblock region would erase or
-            // rewrite it without any pin, so it is fail-stop. Others forward
-            // normally.
+            // in depth: one that covers the superblock region or the LUKS2
+            // header area would erase or rewrite it without updating the pin,
+            // so it is fail-stop. Others forward normally.
             nbd::NBD_CMD_TRIM | nbd::NBD_CMD_WRITE_ZEROES if sync_hooks.is_some() => {
                 if rollback::primary_sb_overlap(offset, length, data_offset)
                     != rollback::SbOverlap::None
@@ -452,6 +465,13 @@ where
                     )
                     .into());
                 }
+                if offset < data_offset && length > 0 {
+                    return Err(format!(
+                        "command {cmd_type} at offset {offset} (len {length}) touches the \
+                         LUKS2 header area without a payload to verify (fail-stop)"
+                    )
+                    .into());
+                }
             }
             _ => {}
         }
@@ -459,8 +479,8 @@ where
         to_host.write_all(&header).await?;
 
         if cmd_type == nbd::NBD_CMD_WRITE && length > 0 {
-            match (sb_capture, &sync_hooks) {
-                (Some(payload_offset), Some(hooks)) => {
+            match (sb_capture, luks_mirror_len, &sync_hooks) {
+                (Some(payload_offset), 0, Some(hooks)) => {
                     // Forward the payload while extracting the superblock
                     // region's new ciphertext, then queue the durable pin.
                     // The NBD reply for `handle` stays parked in the reply
@@ -494,6 +514,48 @@ where
                             "pin actor is gone; cannot guarantee rollback protection \
                              (fail-stop)"
                         })?;
+                }
+                (Some(payload_offset), mirror_len, Some(hooks)) => {
+                    // Rare case where a single write starts inside the LUKS
+                    // header window AND covers the primary superblock (only
+                    // possible with tiny non-default LUKS_DATA_OFFSET). Buffer
+                    // the payload (bounded by kernel max request size), update
+                    // both watches before forwarding, then gate the pin.
+                    let mut payload = vec![0u8; length as usize];
+                    from_kernel.read_exact(&mut payload).await?;
+                    hooks
+                        .watch
+                        .apply_luks_write(offset, &payload[..mirror_len])
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                    let region = &payload[payload_offset..payload_offset + rollback::SB_REGION_LEN];
+                    let commitment = rollback::commitment_of_region(region);
+                    hooks.watch.begin_pending(handle, commitment);
+                    for chunk in payload.chunks(32 * 1024) {
+                        to_host.write_all(chunk).await?;
+                    }
+                    hooks
+                        .pin_tx
+                        .send(rollback::PinJob { handle, commitment })
+                        .await
+                        .map_err(|_| {
+                            "pin actor is gone; cannot guarantee rollback protection \
+                             (fail-stop)"
+                        })?;
+                }
+                (None, mirror_len, Some(hooks)) if mirror_len > 0 => {
+                    // Enclave-originated write into the LUKS2 header window
+                    // (`luksFormat`, `luksAddKey`, `luksKillSlot`): mirror the
+                    // overlapping prefix into the LUKS pin before forwarding to
+                    // the host so subsequent runtime reads stay verified.
+                    let watch = hooks.watch.clone();
+                    rollback::forward_bytes_mirror_prefix(
+                        &mut from_kernel,
+                        &mut to_host,
+                        length as u64,
+                        mirror_len,
+                        move |mirrored| watch.apply_luks_write(offset, mirrored),
+                    )
+                    .await?;
                 }
                 _ => {
                     // Forward the write payload. Use a bounded buffer to avoid

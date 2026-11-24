@@ -40,13 +40,29 @@ use crate::raft::{MemberRecord, Raft, RaftHandle, RaftHandleError, RaftNodeId, T
 /// [`JoinReply`].
 #[derive(Serialize, Deserialize)]
 pub enum MeshMessage {
-    /// A Raft consensus RPC (AppendEntries / Vote / InstallSnapshot).
-    Raft(MeshRaftRpc),
+    /// A Raft consensus RPC (AppendEntries / Vote / InstallSnapshot) bound to
+    /// the intended recipient's `RaftNodeId`.
+    Raft(MeshRaftEnvelope),
     /// A customer request a non-leader forwarded to the leader.
     ForwardClient(ForwardedClientRequest),
     /// A membership-join request from a (re)started node for its configured
     /// slot. See [`JoinRequest`].
     Join(JoinRequest),
+}
+
+/// Wire envelope for a Raft RPC carrying the intended recipient's
+/// `RaftNodeId`. Combined with [`Mesh::call_verified`] on the sender and the
+/// channel-attested `peer.mesh_pubkey` check on the receiver, this prevents a
+/// host-booted same-image clone from impersonating an evicted or partitioned
+/// voter (#209).
+#[derive(Serialize, Deserialize)]
+pub struct MeshRaftEnvelope {
+    /// The `RaftNodeId` (derived from `MemberRecord::pubkey`) that the sender
+    /// believes it is addressing. The receiver rejects any RPC whose
+    /// `target_id` does not equal its own local `RaftNodeId`.
+    pub target_id: RaftNodeId,
+    /// The inner openraft RPC payload.
+    pub rpc: MeshRaftRpc,
 }
 
 /// A node's request to be admitted into the cluster for its configured slot
@@ -140,13 +156,14 @@ impl RaftNetworkFactory<TypeConfig> for MeshRaftNetworkFactory {
     type Network = MeshRaftNetwork;
 
     async fn new_client(&mut self, target: RaftNodeId, node: &MemberRecord) -> Self::Network {
-        // The target's routing name comes from its committed membership record:
-        // `Mesh::call` routes by name, and the record is what the cluster
-        // committed for this instance id.
+        // The target's routing name and attested pubkey come from its committed
+        // membership record: `Mesh::call_verified` routes by name and enforces
+        // that the connected channel belongs to this exact instance pubkey.
         MeshRaftNetwork {
             mesh: Arc::clone(&self.mesh),
             target,
             target_name: node.name.clone(),
+            target_pubkey: node.pubkey,
         }
     }
 }
@@ -156,30 +173,45 @@ pub struct MeshRaftNetwork {
     mesh: Arc<Mesh>,
     target: RaftNodeId,
     target_name: String,
+    target_pubkey: [u8; crate::CONTROL_PUBKEY_LEN],
 }
 
 impl MeshRaftNetwork {
-    /// CBOR-encode `rpc`, send it to the target over the mesh, decode the
-    /// reply. Maps mesh `CallError`s onto openraft `RPCError`s: a
-    /// not-connected / dropped channel becomes [`Unreachable`] (so openraft
-    /// backs off rather than hammering), anything else a [`NetworkError`].
+    /// CBOR-encode `rpc`, send it to the target over the mesh (verified
+    /// against the committed `MemberRecord::pubkey`), and decode the reply.
+    /// Maps mesh `CallError`s onto openraft `RPCError`s: a not-connected /
+    /// dropped / identity-mismatched channel becomes [`Unreachable`] (so
+    /// openraft backs off rather than hammering), anything else a
+    /// [`NetworkError`].
     async fn call(
         &self,
         rpc: MeshRaftRpc,
     ) -> Result<MeshRaftReply, RPCError<RaftNodeId, MemberRecord, RaftError<RaftNodeId>>> {
         let mut buf = Vec::new();
-        ciborium::into_writer(&MeshMessage::Raft(rpc), &mut buf)
-            .map_err(|e| RPCError::Network(NetworkError::new(&CborErr(e.to_string()))))?;
+        ciborium::into_writer(
+            &MeshMessage::Raft(MeshRaftEnvelope {
+                target_id: self.target,
+                rpc,
+            }),
+            &mut buf,
+        )
+        .map_err(|e| RPCError::Network(NetworkError::new(&CborErr(e.to_string()))))?;
 
-        let resp: MeshPayload = self.mesh.call(&self.target_name, buf).await.map_err(|e| {
-            use crate::mesh::CallError;
-            match e {
-                CallError::NotConnected(_) | CallError::Rpc { .. } => {
-                    RPCError::Unreachable(Unreachable::new(&MeshErr(e.to_string())))
+        let resp: MeshPayload = self
+            .mesh
+            .call_verified(&self.target_name, &self.target_pubkey, buf)
+            .await
+            .map_err(|e| {
+                use crate::mesh::CallError;
+                match e {
+                    CallError::NotConnected(_)
+                    | CallError::Rpc { .. }
+                    | CallError::IdentityMismatch { .. } => {
+                        RPCError::Unreachable(Unreachable::new(&MeshErr(e.to_string())))
+                    }
+                    other => RPCError::Network(NetworkError::new(&MeshErr(other.to_string()))),
                 }
-                other => RPCError::Network(NetworkError::new(&MeshErr(other.to_string()))),
-            }
-        })?;
+            })?;
 
         let reply: MeshRaftReply = ciborium::from_reader(resp.as_slice())
             .map_err(|e| RPCError::Network(NetworkError::new(&CborErr(e.to_string()))))?;
@@ -349,11 +381,57 @@ impl RaftRequestHandler {
         self.serve.set((handle, debug_mode)).is_ok()
     }
 
-    async fn dispatch_raft(&self, rpc: MeshRaftRpc) -> MeshRaftReply {
+    async fn dispatch_raft(&self, peer: &PeerContext, env: MeshRaftEnvelope) -> MeshRaftReply {
         let Some(raft) = self.raft.get() else {
             return MeshRaftReply::Error("raft not yet installed (bootstrap window)".to_string());
         };
-        match rpc {
+        // SECURITY (#209): verify BOTH ends of the Raft RPC against the
+        // mutually-attested channel identities.
+        //
+        // 1. Target binding: openraft accepts Vote/AppendEntries on an
+        //    uninitialized node without checking whether it is in the sender's
+        //    membership, so a host-booted same-image clone occupying a
+        //    partitioned voter's slot name could otherwise grant votes or
+        //    absorb logs meant for the original voter. Requiring
+        //    `env.target_id == self_id` ensures a fresh clone rejects every
+        //    Raft RPC addressed to the original instance id.
+        let self_id = raft.metrics().borrow().id;
+        if env.target_id != self_id {
+            tracing::warn!(
+                peer = %peer.name,
+                target_id = env.target_id,
+                self_id,
+                "rejecting Raft RPC addressed to a different instance id"
+            );
+            return MeshRaftReply::Error(format!(
+                "target_id mismatch: addressed to {}, local instance is {}",
+                env.target_id, self_id
+            ));
+        }
+        // 2. Sender binding: the `vote.leader_id` in any Raft RPC must match
+        //    the `RaftNodeId` derived from the mutually-attested channel
+        //    pubkey (`peer.mesh_pubkey`), preventing any peer from claiming
+        //    another voter's node id inside an RPC body.
+        let peer_id = crate::raft::membership::instance_node_id(&peer.mesh_pubkey);
+        let claimed_sender = match &env.rpc {
+            MeshRaftRpc::AppendEntries(req) => req.vote.leader_id().voted_for(),
+            MeshRaftRpc::Vote(req) => req.vote.leader_id().voted_for(),
+            MeshRaftRpc::InstallSnapshot(req) => req.vote.leader_id().voted_for(),
+        };
+        if claimed_sender != Some(peer_id) {
+            tracing::warn!(
+                peer = %peer.name,
+                peer_id,
+                claimed_sender = ?claimed_sender,
+                "rejecting Raft RPC whose sender node_id does not match the attested channel pubkey"
+            );
+            return MeshRaftReply::Error(format!(
+                "sender identity mismatch: vote claims {:?}, channel attests {}",
+                claimed_sender, peer_id
+            ));
+        }
+
+        match env.rpc {
             MeshRaftRpc::AppendEntries(req) => match raft.append_entries(req).await {
                 Ok(r) => MeshRaftReply::AppendEntries(r),
                 Err(e) => MeshRaftReply::Error(format!("append_entries: {e}")),
@@ -494,8 +572,8 @@ impl RequestHandler for RaftRequestHandler {
             }
         };
         match msg {
-            MeshMessage::Raft(rpc) => {
-                let reply = self.dispatch_raft(rpc).await;
+            MeshMessage::Raft(env) => {
+                let reply = self.dispatch_raft(peer, env).await;
                 encode_or_empty(&reply)
             }
             MeshMessage::ForwardClient(fwd) => {
@@ -649,6 +727,80 @@ mod tests {
             "a non-voter's forward must be rejected with retryable Unavailable, \
              never fatal Unauthorized"
         );
+        raft.shutdown().await;
+    }
+
+    /// Regression test (P0-5): `dispatch_raft` rejects both (a) a Raft RPC
+    /// addressed to a different `target_id` (clone occupying a partitioned
+    /// voter's slot name) and (b) a Raft RPC whose `vote.leader_id` does not
+    /// match the mutually-attested channel pubkey.
+    #[tokio::test]
+    async fn dispatch_raft_rejects_target_and_sender_identity_mismatch() {
+        const IMAGE_SEED: u8 = 0x42;
+        let dir = tempfile::tempdir().unwrap();
+        let host = MeshHostStub::new();
+        let sock = dir.path().join("node-clone.sock");
+        let acceptor = UdsMeshAcceptor::bind(&sock).unwrap();
+        host.register("node-b", &sock);
+        let identity = MeshIdentity::generate();
+        let self_pubkey = identity.pubkey();
+        let attestor = FakeAttestor::new(IMAGE_SEED, &identity);
+        let peers = vec!["node-a".to_string(), "node-c".to_string()];
+        let config = MeshConfig::new(
+            "node-b".to_string(),
+            peers.clone(),
+            FakeAttestor::pcr_digest(IMAGE_SEED),
+        );
+        let handler = RaftRequestHandler::deferred();
+        let mesh = Arc::new(Mesh::start(
+            config,
+            host.dialer_for("node-b"),
+            acceptor,
+            attestor,
+            identity,
+            handler.clone(),
+            true,
+        ));
+        // Uninitialized node (just like a freshly-booted clone).
+        let raft = RaftHandle::new(mesh, "node-b", self_pubkey, &peers, handler.clone())
+            .await
+            .unwrap();
+        let self_id = raft.self_id();
+        let peer_c_pk = pk(3);
+        let peer_c_id = instance_node_id(&peer_c_pk);
+        let peer_c = PeerContext {
+            name: "node-c".to_string(),
+            mesh_pubkey: peer_c_pk,
+            pcr_digest: PcrKey([0x42; 32]),
+        };
+
+        // (a) Wrong target_id: VoteRequest addressed to original node-b id
+        // rather than this clone's id must be rejected.
+        let wrong_target = MeshRaftEnvelope {
+            target_id: self_id.wrapping_add(1),
+            rpc: MeshRaftRpc::Vote(VoteRequest::new(openraft::Vote::new(1, peer_c_id), None)),
+        };
+        match handler.dispatch_raft(&peer_c, wrong_target).await {
+            MeshRaftReply::Error(msg) => assert!(msg.contains("target_id mismatch"), "{msg}"),
+            _ => panic!("expected target_id mismatch error"),
+        }
+
+        // (b) Right target_id, wrong sender inside VoteRequest: peer claims to
+        // be another node_id than its attested channel pubkey.
+        let wrong_sender = MeshRaftEnvelope {
+            target_id: self_id,
+            rpc: MeshRaftRpc::Vote(VoteRequest::new(
+                openraft::Vote::new(1, peer_c_id.wrapping_add(1)),
+                None,
+            )),
+        };
+        match handler.dispatch_raft(&peer_c, wrong_sender).await {
+            MeshRaftReply::Error(msg) => {
+                assert!(msg.contains("sender identity mismatch"), "{msg}")
+            }
+            _ => panic!("expected sender identity mismatch error"),
+        }
+
         raft.shutdown().await;
     }
 }

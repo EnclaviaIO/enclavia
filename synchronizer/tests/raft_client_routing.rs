@@ -2494,3 +2494,142 @@ async fn revocation_survives_snapshot_install() {
         n.raft.shutdown().await;
     }
 }
+
+/// Adversarial regression test (P0-5): a partitioned minority follower MUST NOT
+/// be able to elect itself leader or serve stale state by talking to a
+/// host-booted same-image clone occupying a killed/partitioned voter's slot
+/// name.
+///
+/// Setup:
+/// 1. 3-node cluster `{A1, B1, C1}` registers key `K` at commitment `V0`.
+/// 2. Host partitions `C1` (`block(C1)`).
+/// 3. Majority `{A1, B1}` advances `K` to `V1` (version 1).
+/// 4. Host kills/blocks `A1` and `B1`, unblocks `C1`, and boots a fresh
+///    same-image clone `B2` registered under `B1`'s slot name.
+/// 5. Before P0-5, `C1` routed Raft `Vote`/`AppendEntries` for `B1` by slot
+///    name straight to uninitialized `B2`, which granted the vote and gave
+///    `C1` a fake 2-of-3 quorum to elect itself and serve rolled-back `V0`.
+/// 6. With P0-5 (`Mesh::call_verified` + `MeshRaftEnvelope::target_id` +
+///    sender pubkey binding), `C1` refuses to deliver `B1`'s RPCs to `B2`
+///    and `B2` rejects any RPC addressed to `B1`. `C1` never becomes leader,
+///    never serves `V0`, and `B2` never becomes a voter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partitioned_follower_cannot_elect_via_same_image_clone_in_slot() {
+    let host = MeshHostStub::new();
+    let mut nodes = cluster(&host).await;
+
+    // 1. Register key K at V0 on the 3-node cluster and wait for all 3 nodes
+    //    to apply V0 so the soon-to-be-partitioned follower definitely holds V0.
+    let seed = 0x79;
+    let (_, pk) = keypair(seed);
+    let key = key_from_seed(seed);
+    let ld = current_leader(&nodes).await.unwrap();
+    register_until_acked(ld, seed, pk, key, c(0x10)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut all_have_v0 = true;
+        for n in &nodes {
+            if n.raft
+                .state_machine()
+                .head_view()
+                .await
+                .get(&key)
+                .map(|s| (s.commitment, s.version))
+                != Some((c(0x10), Version(0)))
+            {
+                all_have_v0 = false;
+            }
+        }
+        if all_have_v0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "cluster never replicated V0");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Pick a non-leader follower `C1` to partition, and another slot `B1` to
+    // replace with a host-booted clone `B2` later.
+    let leader_name = current_leader(&nodes).await.unwrap().name.clone();
+    let follower_names: Vec<String> = nodes
+        .iter()
+        .filter(|n| n.name != leader_name)
+        .map(|n| n.name.clone())
+        .collect();
+    let c_name = follower_names[0].clone();
+    let b_name = follower_names[1].clone();
+
+    // 2. Partition C1 from the cluster.
+    host.block(c_name.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 3. Majority {leader, B1} advances key K from V0 -> V1 (version 1).
+    let ld = current_leader(&nodes).await.unwrap();
+    let mut client = Client::connect(ld, seed, pk).await;
+    assert_eq!(
+        client
+            .rpc(Request::Pin {
+                key,
+                expected_version: Version(0),
+                commitment: c(0x20),
+            })
+            .await,
+        Response::PinOk {
+            version: Version(1)
+        }
+    );
+
+    // 4. Host isolates the committed majority {leader, B1}, brings C1 back,
+    //    and spawns a fresh same-image clone B2 occupying B1's slot name.
+    host.block(leader_name.clone());
+    host.block(b_name.clone());
+    let b_idx = nodes.iter().position(|n| n.name == b_name).unwrap();
+    let b1 = nodes.remove(b_idx);
+    b1.raft.shutdown().await;
+    drop(b1);
+    let ld_idx = nodes.iter().position(|n| n.name == leader_name).unwrap();
+    let a1 = nodes.remove(ld_idx);
+    a1.raft.shutdown().await;
+    drop(a1);
+
+    let b2 = spawn_node(&b_name, &host).await;
+    let b2_id = b2.raft.self_id();
+    host.unblock(&c_name);
+    host.unblock(&b_name);
+
+    let c1 = &nodes[0];
+    assert_eq!(c1.name, c_name);
+
+    // Give C1 plenty of election timeouts to try to elect itself with B2.
+    let observe_until = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < observe_until {
+        assert!(
+            !c1.raft.is_leader().await,
+            "partitioned follower C1 elected itself leader using uninitialized clone B2!"
+        );
+        assert!(
+            !b2.raft.is_leader().await,
+            "uninitialized clone B2 became leader!"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // C1 must NOT be able to serve stale V0 (linearizable read requires a real
+    // quorum), and B2 must NOT have become a committed voter or hydrated V0.
+    let mut attacker_client = Client::connect(c1, seed, pk).await;
+    let resp = attacker_client.rpc(Request::Get { key }).await;
+    assert!(
+        !matches!(resp, Response::GetOk { .. }),
+        "partitioned C1 served state ({resp:?}) after talking to clone B2!"
+    );
+    assert!(
+        !b2.raft.self_is_committed_voter().await,
+        "clone B2 ({b2_id}) must never become a committed voter"
+    );
+    assert!(
+        b2.raft.state_machine().head_view().await.is_empty(),
+        "clone B2 must never receive Raft logs from partitioned C1"
+    );
+
+    b2.raft.shutdown().await;
+    c1.raft.shutdown().await;
+}

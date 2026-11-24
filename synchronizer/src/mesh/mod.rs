@@ -118,11 +118,28 @@ pub enum CallError {
         #[source]
         source: RpcError,
     },
+    /// The peer slot is currently connected to an instance whose attested
+    /// ephemeral pubkey does not match the instance the caller expects (e.g.,
+    /// a host-booted clone or restarted instance occupying the same routing
+    /// name before Raft membership has moved).
+    #[error("peer {peer} is connected with a different attested instance identity")]
+    IdentityMismatch {
+        /// The peer slot the call targeted.
+        peer: PeerName,
+    },
+}
+
+/// The live client channel for one peer together with the instance pubkey
+/// cryptographically attested by its Noise+NSM handshake.
+#[derive(Clone)]
+struct LivePeer {
+    channel: ClientChannel,
+    pubkey: [u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN],
 }
 
 /// The currently-live client channel for one peer, swapped by its dial loop on
 /// each (re)connect. `None` while the peer is down or mid-handshake.
-type PeerSlot = Arc<Mutex<Option<ClientChannel>>>;
+type PeerSlot = Arc<Mutex<Option<LivePeer>>>;
 
 /// The instance pubkeys of peers this node has attested over INBOUND
 /// connections, keyed by the peer's `Hello` name. Populated by the accept loop
@@ -263,12 +280,47 @@ impl Mesh {
         // Clone the current channel out from under the lock so the call does
         // not hold it across the await (and so a reconnect can swap the slot
         // while a call is in flight on the old channel).
-        let channel = {
+        let live = {
             let guard = slot.lock().await;
             guard.clone()
         };
-        let channel = channel.ok_or_else(|| CallError::NotConnected(peer.to_string()))?;
-        channel
+        let live = live.ok_or_else(|| CallError::NotConnected(peer.to_string()))?;
+        live.channel
+            .call(payload)
+            .await
+            .map_err(|source| CallError::Rpc {
+                peer: peer.to_string(),
+                source,
+            })
+    }
+
+    /// Issue an id-correlated request to `peer` ONLY if the currently connected
+    /// channel's mutually-attested instance pubkey equals `expected_pubkey`.
+    ///
+    /// Used by the Raft transport (#209) so a Raft RPC targeted at a specific
+    /// committed `MemberRecord` can never be delivered to a different instance
+    /// (such as a host-booted clone) occupying the same routing name.
+    pub async fn call_verified(
+        &self,
+        peer: &str,
+        expected_pubkey: &[u8; enclavia_protocol::attestation::CONTROL_PUBKEY_LEN],
+        payload: MeshPayload,
+    ) -> Result<MeshPayload, CallError> {
+        let slot = self
+            .peers
+            .get(peer)
+            .ok_or_else(|| CallError::UnknownPeer(peer.to_string()))?;
+        let live = {
+            let guard = slot.lock().await;
+            guard.clone()
+        };
+        let live = live.ok_or_else(|| CallError::NotConnected(peer.to_string()))?;
+        if live.pubkey != *expected_pubkey {
+            return Err(CallError::IdentityMismatch {
+                peer: peer.to_string(),
+            });
+        }
+        live.channel
             .call(payload)
             .await
             .map_err(|source| CallError::Rpc {
@@ -517,7 +569,10 @@ where
     // channel so `Mesh::call` can use it, then drive the connection until it
     // ends.
     let (channel, driver) = spawn_client_with_stats(stream, transport, Some(Arc::clone(stats)));
-    *slot.lock().await = Some(channel);
+    *slot.lock().await = Some(LivePeer {
+        channel,
+        pubkey: peer_id.mesh_pubkey,
+    });
     stats.channel_up();
     driver.await?;
     Ok(())
