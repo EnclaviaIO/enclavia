@@ -1150,6 +1150,13 @@ pub fn validate_chain(
     let mut in_force: Option<(PcrsHex, String)> = None;
     // Full pin identity attested by the boot that set `in_force`.
     let mut in_force_identity: Option<PinIdentity> = None;
+    // Index in `prior` of the boot link that established the current
+    // `in_force` state (genesis or latest promotion). Only upgrade links
+    // strictly AFTER this index (and matching `from == in_force_identity`)
+    // can authorize the next promotion, so consumed/superseded upgrades and
+    // sibling branches from earlier versions can never be replayed to roll
+    // back the chain.
+    let mut last_promotion_idx: Option<usize> = None;
 
     for recorded in links {
         let link = &recorded.link;
@@ -1190,11 +1197,34 @@ pub fn validate_chain(
                 ) {
                     (Ok(p), Some((pcrs, digest))) => {
                         if p.pcrs == *pcrs {
-                            // Same-version reboot.
+                            // Same-version reboot: PCR0-2 match, so user
+                            // PCRs 16-31 must also match the in-force
+                            // identity (an unverified attestation document
+                            // is left to `validate_chain_link` to report).
+                            // Upgrades only target normal-mode identities; if
+                            // a future recovery boot (#315) ever appends a
+                            // boot link with altered user PCRs, rejecting it
+                            // here is intentional so clients must re-pin
+                            // rather than silently following a recovery boot.
+                            if let Some(ref expected_id) = in_force_identity {
+                                if link_attestation(link, debug_mode)
+                                    .is_ok_and(|doc| doc.identity() != expected_id)
+                                {
+                                    outcomes.push(Err(
+                                        ChainValidationError::PromotionIdentityMismatch,
+                                    ));
+                                    prior.push(link.clone());
+                                    continue;
+                                }
+                            }
                             (pcrs.clone(), digest.clone(), false)
-                        } else if let Some(target) =
-                            promotion_target(&prior, &p.pcrs, &p.image_digest)
-                        {
+                        } else if let Some(target) = promotion_target(
+                            &prior,
+                            in_force_identity.as_ref(),
+                            last_promotion_idx,
+                            &p.pcrs,
+                            &p.image_digest,
+                        ) {
                             // Promotion boot: ingest saw the row
                             // already promoted to the upgrade target.
                             // The boot must not PREDATE the upgrade's
@@ -1267,6 +1297,7 @@ pub fn validate_chain(
             in_force_identity = link_attestation(link, debug_mode)
                 .ok()
                 .map(|doc| doc.identity().clone());
+            last_promotion_idx = Some(prior.len());
         }
         outcomes.push(outcome);
         prior.push(link.clone());
@@ -1304,9 +1335,13 @@ pub fn validate_chain(
 /// the duplicate's error.
 fn promotion_target(
     prior: &[ChainLink],
+    in_force_identity: Option<&PinIdentity>,
+    last_promotion_idx: Option<usize>,
     boot_pcrs: &PcrsHex,
     boot_image_digest: &str,
 ) -> Option<UpgradePayload> {
+    let current_identity = in_force_identity?;
+    let min_upgrade_idx = last_promotion_idx?;
     let revoked: Vec<Uuid> = prior
         .iter()
         .filter(|l| l.kind == ChainLinkKind::Revocation)
@@ -1314,6 +1349,13 @@ fn promotion_target(
         .map(|p| p.revokes)
         .collect();
     for (i, l) in prior.iter().enumerate().rev() {
+        // Only upgrades appended AFTER the boot that established the current
+        // in-force state can authorize a promotion out of it. Earlier upgrades
+        // have already been consumed (by a prior promotion) or superseded (by
+        // promoting onto a sibling branch).
+        if i <= min_upgrade_idx {
+            break;
+        }
         if l.kind != ChainLinkKind::Upgrade {
             continue;
         }
@@ -1328,7 +1370,10 @@ fn promotion_target(
         let Ok(p) = decode_canonical::<UpgradePayload>(&l.payload) else {
             continue;
         };
-        if p.to.image_pcrs_hex() == *boot_pcrs && p.image_digest == boot_image_digest {
+        if p.from == *current_identity
+            && p.to.image_pcrs_hex() == *boot_pcrs
+            && p.image_digest == boot_image_digest
+        {
             return Some(p);
         }
     }
@@ -3587,6 +3632,250 @@ mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    // --- promotion lineage / anti-rollback (P0-3) -------------------------
+
+    fn upgrade_link_between(
+        enclave_id: Uuid,
+        from_seed: u8,
+        to_seed: u8,
+        to_digest: &str,
+        signing: &SigningKey,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> ChainLink {
+        let payload = UpgradePayload {
+            enclave_id,
+            from: identity_from_seed(from_seed),
+            to: identity_from_seed(to_seed),
+            image_digest: to_digest.into(),
+            valid_from,
+            valid_until,
+            issued_at: valid_from - Duration::days(7),
+            nonce: vec![to_seed; 32],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let attestation = FakeChainAttestation::for_payload(from_seed, &payload_bytes).encode();
+        let sig = sign_control(signing, SignedDomain::UpgradePayload, &payload_bytes).to_vec();
+        ChainLink {
+            id: Some(Uuid::new_v4()),
+            sequence: None,
+            kind: ChainLinkKind::Upgrade,
+            payload: payload_bytes,
+            attestation,
+            signature: Some(sig),
+        }
+    }
+
+    /// Replaying an older boot (`v2`) after `v1 -> v2 -> v3` must be rejected:
+    /// the consumed `v1 -> v2` upgrade cannot re-promote `v3` back to `v2`.
+    #[test]
+    fn consumed_upgrade_cannot_rollback_v3_to_v2() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let t0 = now - Duration::days(30);
+        let t1 = now - Duration::days(20);
+        let t2 = now - Duration::days(10);
+        let t3 = now - Duration::days(1);
+
+        let boot_v1 = boot_link_at(id, "sha256:v1", 0x10, t0);
+        let up_1_to_2 = upgrade_link_between(
+            id,
+            0x10,
+            0x20,
+            "sha256:v2",
+            &sk,
+            t0 + Duration::days(7),
+            now + Duration::days(30),
+        );
+        let boot_v2 = boot_link_at(id, "sha256:v2", 0x20, t1);
+        let up_2_to_3 = upgrade_link_between(
+            id,
+            0x20,
+            0x30,
+            "sha256:v3",
+            &sk,
+            t1 + Duration::days(7),
+            now + Duration::days(30),
+        );
+        let boot_v3 = boot_link_at(id, "sha256:v3", 0x30, t2);
+        // Host attempts to roll back by appending a fresh boot of v2 while
+        // `up_1_to_2` is still unrevoked and within its validity window.
+        let rollback_v2 = boot_link_at(id, "sha256:v2", 0x20, t3);
+
+        let links: Vec<RecordedLink> = [
+            (boot_v1, t0),
+            (up_1_to_2, t0),
+            (boot_v2, t1),
+            (up_2_to_3, t1),
+            (boot_v3, t2),
+            (rollback_v2, t3),
+        ]
+        .into_iter()
+        .map(|(link, at)| RecordedLink {
+            link,
+            recorded_at: Some(at),
+        })
+        .collect();
+
+        let v2_pcrs = pcrs_hex_from_seed(0x20);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &v2_pcrs,
+            "sha256:v2",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
+        assert!(walk.outcomes[0..5].iter().all(|o| o.is_ok()), "{:?}", walk.outcomes);
+        assert!(
+            walk.outcomes[5].is_err(),
+            "rollback boot(v2) after v3 must fail validation"
+        );
+        assert_eq!(walk.final_pcrs, Some(pcrs_hex_from_seed(0x30)));
+
+        let pinned_v1 = pcrs_hex_from_seed(0x10).to_pcrs().unwrap();
+        let err = verify_pcr_descent(
+            &pinned_v1,
+            &links,
+            &id,
+            Some(&pk),
+            &v2_pcrs,
+            "sha256:v2",
+            true,
+            now,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PcrDescentError::LinkInvalid { position: 5, .. }),
+            "expected LinkInvalid at position 5, got {err:?}"
+        );
+    }
+
+    /// If two sibling upgrades `v1 -> v2` and `v1 -> v3` were signed from `v1`
+    /// and the enclave promoted to `v3`, the unconsumed `v1 -> v2` branch
+    /// must NOT allow switching from `v3` to `v2`.
+    #[test]
+    fn sibling_upgrade_branch_cannot_switch_after_promotion() {
+        let (sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let t0 = now - Duration::days(20);
+        let t1 = now - Duration::days(5);
+        let t2 = now - Duration::days(1);
+
+        let boot_v1 = boot_link_at(id, "sha256:v1", 0x11, t0);
+        let up_1_to_2 = upgrade_link_between(
+            id,
+            0x11,
+            0x21,
+            "sha256:v2",
+            &sk,
+            t0 + Duration::days(7),
+            now + Duration::days(30),
+        );
+        let up_1_to_3 = upgrade_link_between(
+            id,
+            0x11,
+            0x31,
+            "sha256:v3",
+            &sk,
+            t0 + Duration::days(7),
+            now + Duration::days(30),
+        );
+        let boot_v3 = boot_link_at(id, "sha256:v3", 0x31, t1);
+        let switch_v2 = boot_link_at(id, "sha256:v2", 0x21, t2);
+
+        let links: Vec<RecordedLink> = [
+            (boot_v1, t0),
+            (up_1_to_2, t0),
+            (up_1_to_3, t0),
+            (boot_v3, t1),
+            (switch_v2, t2),
+        ]
+        .into_iter()
+        .map(|(link, at)| RecordedLink {
+            link,
+            recorded_at: Some(at),
+        })
+        .collect();
+
+        let v2_pcrs = pcrs_hex_from_seed(0x21);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &v2_pcrs,
+            "sha256:v2",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
+        assert!(walk.outcomes[0..4].iter().all(|o| o.is_ok()), "{:?}", walk.outcomes);
+        assert!(
+            walk.outcomes[4].is_err(),
+            "switching from v3 to sibling v2 must fail validation"
+        );
+    }
+
+    /// A same-version reboot (matching PCR0-2) that carries different user
+    /// PCRs 16-31 than the in-force boot must fail with
+    /// `PromotionIdentityMismatch`.
+    #[test]
+    fn same_version_reboot_with_different_user_pcrs_is_rejected() {
+        let (_sk, pk) = keypair();
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let t0 = now - Duration::days(2);
+        let t1 = now - Duration::days(1);
+
+        let boot_v1 = boot_link_at(id, "sha256:v1", 0x12, t0);
+        let mut tampered_reboot = boot_link_at(id, "sha256:v1", 0x12, t1);
+        // Same PCR0-2, different user PCR16 in the attestation document.
+        tampered_reboot.attestation =
+            FakeChainAttestation::for_payload(0x12, &tampered_reboot.payload)
+                .with_user_pcr(16, vec![0xee; 48])
+                .encode();
+
+        let links = vec![
+            RecordedLink {
+                link: boot_v1,
+                recorded_at: Some(t0),
+            },
+            RecordedLink {
+                link: tampered_reboot,
+                recorded_at: Some(t1),
+            },
+        ];
+
+        let v1_pcrs = pcrs_hex_from_seed(0x12);
+        let walk = validate_chain(
+            &links,
+            &id,
+            &v1_pcrs,
+            "sha256:v1",
+            Some(&pk),
+            true,
+            now,
+            true,
+        );
+        assert!(walk.outcomes[0].is_ok());
+        assert!(
+            matches!(
+                walk.outcomes[1],
+                Err(ChainValidationError::PromotionIdentityMismatch)
+            ),
+            "expected PromotionIdentityMismatch, got {:?}",
+            walk.outcomes[1]
         );
     }
 }

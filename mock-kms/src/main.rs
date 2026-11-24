@@ -228,6 +228,7 @@ async fn handle(
         "TrentService.GetPublicKey" => handle_get_public_key(&state, &body).await,
         "TrentService.GetKeyPolicy" => handle_get_key_policy(&state, &body).await,
         "TrentService.DescribeKey" => handle_describe_key(&state, &body).await,
+        "TrentService.ListGrants" => handle_list_grants(&state, &body).await,
         "TrentService.Decrypt" => handle_decrypt(&state, &body).await,
         "TrentService.ScheduleKeyDeletion" => handle_schedule_deletion(&state, &body).await,
         other => Err(KmsError::UnsupportedOperation(other.to_string())),
@@ -505,6 +506,12 @@ struct DescribeKeyMetadata {
     // in-enclave boot check requires to rule out BYOK/imported material.
     #[serde(rename = "Origin")]
     origin: &'static str,
+    #[serde(rename = "MultiRegion")]
+    multi_region: bool,
+    #[serde(rename = "KeyState")]
+    key_state: &'static str,
+    #[serde(rename = "KeyManager")]
+    key_manager: &'static str,
     #[serde(rename = "KeySpec")]
     key_spec: &'static str,
     #[serde(rename = "KeyUsage")]
@@ -513,9 +520,7 @@ struct DescribeKeyMetadata {
     enabled: bool,
 }
 
-/// `DescribeKey`: report key metadata. The only field the in-enclave check
-/// reads is `Origin`, which is always `AWS_KMS` for mock keys (they are
-/// generated in-process, never imported).
+/// `DescribeKey`: report key metadata.
 async fn handle_describe_key(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
     let req: DescribeKeyReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
     // Auto-create like GetPublicKey (see handle_get_key_policy): the boot
@@ -525,17 +530,50 @@ async fn handle_describe_key(state: &AppState, body: &[u8]) -> Result<serde_json
     } else {
         load_key(&state.key_dir, &req.key_id).await?
     };
+    let enabled = stored.deletion_date.is_none();
     let resp = DescribeKeyResp {
         key_metadata: DescribeKeyMetadata {
             arn: format!("arn:aws:kms:us-east-1:000000000000:key/{}", stored.key_id),
             key_id: stored.key_id,
             origin: "AWS_KMS",
+            multi_region: false,
+            key_state: if enabled { "Enabled" } else { "PendingDeletion" },
+            key_manager: "CUSTOMER",
             key_spec: "RSA_2048",
             key_usage: "ENCRYPT_DECRYPT",
-            enabled: stored.deletion_date.is_none(),
+            enabled,
         },
     };
     Ok(serde_json::to_value(resp).unwrap())
+}
+
+#[derive(Debug, Deserialize)]
+struct ListGrantsReq {
+    #[serde(rename = "KeyId")]
+    key_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListGrantsResp {
+    #[serde(rename = "Grants")]
+    grants: Vec<serde_json::Value>,
+    #[serde(rename = "Truncated")]
+    truncated: bool,
+}
+
+/// `ListGrants`: mock-kms has no grant API, so keys always have zero grants.
+async fn handle_list_grants(state: &AppState, body: &[u8]) -> Result<serde_json::Value, KmsError> {
+    let req: ListGrantsReq = serde_json::from_slice(body).map_err(KmsError::Invalid)?;
+    let _stored = if state.auto_create_keys {
+        load_or_create_key(&state.key_dir, &req.key_id).await?
+    } else {
+        load_key(&state.key_dir, &req.key_id).await?
+    };
+    Ok(serde_json::to_value(ListGrantsResp {
+        grants: Vec::new(),
+        truncated: false,
+    })
+    .unwrap())
 }
 
 #[derive(Debug, Deserialize)]
@@ -949,7 +987,21 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "DescribeKey body: {resp}");
         assert_eq!(resp["KeyMetadata"]["Origin"], "AWS_KMS");
+        assert_eq!(resp["KeyMetadata"]["MultiRegion"], false);
+        assert_eq!(resp["KeyMetadata"]["KeyState"], "Enabled");
+        assert_eq!(resp["KeyMetadata"]["KeyManager"], "CUSTOMER");
         assert_eq!(resp["KeyMetadata"]["KeyId"], key_id);
+
+        // ListGrants must return empty non-truncated list for in-enclave check.
+        let (status, resp) = rpc(
+            &socket,
+            "TrentService.ListGrants",
+            serde_json::json!({ "KeyId": key_id, "Limit": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "ListGrants body: {resp}");
+        assert_eq!(resp["Grants"], serde_json::json!([]));
+        assert_eq!(resp["Truncated"], false);
 
         // GetPublicKey on the freshly-created key must succeed *without*
         // auto-create (we disabled it in spawn_mock_kms).

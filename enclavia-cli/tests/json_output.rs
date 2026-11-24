@@ -192,3 +192,61 @@ async fn json_flag_is_global_before_subcommand() {
 
     cleanup(&cfg);
 }
+
+/// Regression test (P0-8): `enclavia upgrade chain --json` on an unverified
+/// chain MUST emit exactly ONE JSON object on stdout and exit non-zero (2),
+/// never two concatenated JSON objects.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_chain_json_unverified_emits_single_json_value() {
+    async fn get_enclave() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "mode": "production",
+            "upgradable": true,
+            "image_digest": "sha256:test",
+            "pcrs": {
+                "PCR0": "aa".repeat(48),
+                "PCR1": "bb".repeat(48),
+                "PCR2": "cc".repeat(48)
+            }
+        }))
+    }
+    async fn get_chain() -> Json<serde_json::Value> {
+        // Empty chain does not match the enclave row (`tip_matches_row == false`).
+        Json(serde_json::json!([]))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/enclaves/11111111-1111-1111-1111-111111111111", get(get_enclave))
+        .route(
+            "/enclaves/11111111-1111-1111-1111-111111111111/upgrade-chain",
+            get(get_chain),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+
+    let cfg = unique_config_dir();
+    write_credentials(&cfg, &format!("http://{addr}"));
+
+    let out = run(
+        &cfg,
+        &[
+            "upgrade",
+            "chain",
+            "11111111-1111-1111-1111-111111111111",
+            "--json",
+        ],
+    )
+    .await;
+
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stdout must be a single valid JSON object (not two concatenated objects)");
+    assert_eq!(v["tip_matches_row"], false);
+    assert_eq!(v["enclave_id"], "11111111-1111-1111-1111-111111111111");
+
+    cleanup(&cfg);
+}

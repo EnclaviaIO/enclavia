@@ -1,14 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use crate::message::{ClientMessage, ServerMessage, StreamHalf};
+use enclavia_protocol::{ClientMessage, ServerMessage, StreamHalf};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::info;
 use url::Url;
 
 use crate::error::Error;
 use enclavia_protocol::attestation::{
-    AttestationError, Pcrs, UnvalidatedAttestation, ValidatedAttestation,
+    AttestationError, Pcrs, RejectionReason, UnvalidatedAttestation, ValidatedAttestation,
 };
 use enclavia_protocol::chain::{ChainLinkJson, EnclaveChainRow, RecordedLink};
 use uuid::Uuid;
@@ -184,7 +184,7 @@ impl Client {
             hdrs.insert(0, ("Host".into(), self.host().to_string()));
         }
 
-        let raw = http::serialize_request(method, path, &hdrs, None);
+        let raw = http::serialize_request(method, path, &hdrs, None)?;
         let mut stream = self.open_stream(raw).await?;
         // The stream's id and the cmd_tx are private. We grab them via the
         // accessors we need: the byte-pump's accumulator + recv loop is
@@ -278,6 +278,7 @@ impl Client {
         // dropping frames when this fills, so the capacity only sets how much
         // burst we absorb before the WebSocket read stalls.
         let (stream_tx, stream_rx) = mpsc::channel::<Result<Vec<u8>, Error>>(64);
+        let terminal_err = Arc::new(StdMutex::new(None));
 
         let cmd_tx = self.current_cmd_tx().await;
         cmd_tx
@@ -285,13 +286,20 @@ impl Client {
                 payload,
                 id_tx,
                 stream_tx,
+                terminal_err: Arc::clone(&terminal_err),
             })
             .await
             .map_err(|_| Error::ConnectionClosed)?;
 
         let id = id_rx.await.map_err(|_| Error::ConnectionClosed)??;
 
-        Ok(UpgradedStream::new(id, cmd_tx, stream_rx, Vec::new()))
+        Ok(UpgradedStream::new(
+            id,
+            cmd_tx,
+            stream_rx,
+            terminal_err,
+            Vec::new(),
+        ))
     }
 
     /// The host portion of the proxy URL (used for the HTTP Host header).
@@ -586,11 +594,9 @@ impl ClientBuilder {
             ));
         }
 
-        let pcrs = self.pcrs.unwrap_or(Pcrs {
-            pcr0: Vec::new(),
-            pcr1: Vec::new(),
-            pcr2: Vec::new(),
-        });
+        let pcrs = self.pcrs.ok_or_else(|| {
+            Error::Attestation("expected PCRs must be configured via .pcrs(..)".into())
+        })?;
 
         let parsed_url =
             Url::parse(&self.url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
@@ -692,10 +698,13 @@ impl ConnectConfig {
         {
             Ok(()) => info!("Attestation verified (pinned PCRs match)"),
             Err(pinned_err) => match &self.trust_upgrades {
-                // Pinned PCRs did not match, but the caller opted into
-                // following upgrades: try to verify the running enclave
-                // as a descendant of the pinned version.
-                Some(tu) => {
+                // Only fall back to the upgrade chain when the live attestation
+                // itself is authentic (valid cert chain / signature / nonce /
+                // clock skew) and failed SOLELY because the enclave upgraded to
+                // different PCRs. Nonce mismatches, expired/forged certs, or
+                // malformed documents fail immediately without contacting the
+                // backend.
+                Some(tu) if pinned_err.reason() == RejectionReason::PcrMismatch => {
                     if self.pcrs.pcr0.is_empty()
                         && self.pcrs.pcr1.is_empty()
                         && self.pcrs.pcr2.is_empty()
@@ -714,8 +723,8 @@ impl ConnectConfig {
                     .await?;
                     info!("Attestation verified (descends from pinned PCRs via upgrade chain)");
                 }
-                // Fail closed: no matching pin, no upgrade path opted in.
-                None => return Err(Error::Attestation(pinned_err.to_string())),
+                // Fail closed: non-PCR attestation error, or no upgrade path opted in.
+                _ => return Err(Error::Attestation(pinned_err.to_string())),
             },
         }
 
@@ -845,4 +854,22 @@ fn validate_live(
         return Err(AttestationError::SkipChainNotCompiled);
     }
     doc.validate_session(handshake_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn builder_rejects_missing_pcrs_before_connecting() {
+        let err = ClientBuilder::new("ws://127.0.0.1:1")
+            .build()
+            .await
+            .err()
+            .expect("missing .pcrs() must fail fast");
+        assert!(
+            matches!(err, Error::Attestation(ref msg) if msg.contains(".pcrs")),
+            "unexpected error: {err:?}"
+        );
+    }
 }

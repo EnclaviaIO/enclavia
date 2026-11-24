@@ -9,7 +9,6 @@
 mod client;
 mod error;
 mod http;
-mod message;
 mod noise;
 mod request;
 mod response;

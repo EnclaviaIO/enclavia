@@ -62,8 +62,12 @@ impl RequestBuilder {
             self.headers.push(("Connection".into(), "close".into()));
         }
 
-        let raw_request =
-            http::serialize_request(self.method, &self.path, &self.headers, self.body.as_deref());
+        let raw_request = http::serialize_request(
+            self.method,
+            &self.path,
+            &self.headers,
+            self.body.as_deref(),
+        )?;
 
         // send_request re-establishes and RE-VERIFIES the attested channel
         // if it is down, but never silently re-sends an in-flight request:

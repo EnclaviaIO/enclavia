@@ -96,6 +96,9 @@ pub enum PolicyError {
     /// this enclave.
     #[error("a statement allows kms:Decrypt without binding it to this enclave's PCR0/1/2")]
     UngatedDecrypt,
+    /// The policy contained no PCR-pinned `Allow kms:Decrypt` statement.
+    #[error("key policy contains no PCR-pinned Allow kms:Decrypt statement")]
+    MissingDecryptStatement,
     /// A `kms:Decrypt` statement binds a PCR to the wrong value.
     #[error("kms:Decrypt is bound to PCR{index} {found:?}, not this enclave's {expected:?}")]
     PcrMismatch {
@@ -110,9 +113,26 @@ pub enum PolicyError {
 
 /// Verify that `policy_json` (the stringified document returned by
 /// `kms:GetKeyPolicy`) is safe for a LUKS-wrapping key whose `kms:Decrypt`
-/// must be gated to `own` — this enclave's own PCR0/1/2. Fails closed; see
-/// the module docs for the exact invariants.
+/// must be gated to `own` — this enclave's own PCR0/1/2. Fails closed and
+/// requires at least one PCR-pinned `Allow kms:Decrypt` statement so an empty
+/// or decrypt-less policy cannot pass silently on real AWS KMS.
 pub fn verify_decrypt_policy(policy_json: &str, own: &Pcrs) -> Result<(), PolicyError> {
+    verify_decrypt_policy_inner(policy_json, own, true)
+}
+
+/// Variant of [`verify_decrypt_policy`] that allows a policy with no
+/// `Allow kms:Decrypt` statement (e.g. `Statement: []`). Intended ONLY for
+/// dev/QEMU `mock-kms` auto-created keys that have no policy attached; real
+/// AWS KMS verification MUST use [`verify_decrypt_policy`].
+pub fn verify_decrypt_policy_allow_empty(policy_json: &str, own: &Pcrs) -> Result<(), PolicyError> {
+    verify_decrypt_policy_inner(policy_json, own, false)
+}
+
+fn verify_decrypt_policy_inner(
+    policy_json: &str,
+    own: &Pcrs,
+    require_decrypt_statement: bool,
+) -> Result<(), PolicyError> {
     let doc: Value =
         serde_json::from_str(policy_json).map_err(|e| PolicyError::Json(e.to_string()))?;
 
@@ -127,6 +147,8 @@ pub fn verify_decrypt_policy(policy_json: &str, own: &Pcrs) -> Result<(), Policy
         ("1", 1u8, hex::encode(&own.pcr1)),
         ("2", 2u8, hex::encode(&own.pcr2)),
     ];
+
+    let mut saw_pinned_decrypt = false;
 
     for stmt in &statements {
         // Deny statements only restrict; they cannot grant anything, so
@@ -179,7 +201,12 @@ pub fn verify_decrypt_policy(policy_json: &str, own: &Pcrs) -> Result<(), Policy
                     }
                 }
             }
+            saw_pinned_decrypt = true;
         }
+    }
+
+    if require_decrypt_statement && !saw_pinned_decrypt {
+        return Err(PolicyError::MissingDecryptStatement);
     }
 
     Ok(())
@@ -322,9 +349,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_statements_pass_vacuously() {
+    fn empty_statements_rejected_by_default_and_allowed_for_mock() {
         let doc = r#"{"Version":"2012-10-17","Statement":[]}"#;
-        verify_decrypt_policy(doc, &own()).expect("empty policy is vacuously safe");
+        assert_eq!(
+            verify_decrypt_policy(doc, &own()),
+            Err(PolicyError::MissingDecryptStatement)
+        );
+        verify_decrypt_policy_allow_empty(doc, &own())
+            .expect("mock allow_empty permits empty statements");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use enclavia_protocol::{NoiseHandshake, NoiseTransport};
 use tracing::{debug, info};
 
 use crate::error::Error;
@@ -11,19 +12,15 @@ pub(crate) async fn recv_binary(ws: &mut Ws) -> Result<Vec<u8>, Error> {
     }
 }
 
-/// Perform a Noise NN handshake over a WebSocket connection.
+/// Perform a Noise NN handshake over a WebSocket connection using the shared
+/// `enclavia-protocol` handshake state machine.
 ///
-/// Returns the `TransportState` for encrypting/decrypting messages and the
+/// Returns the `NoiseTransport` for encrypting/decrypting messages and the
 /// handshake hash (used as the attestation nonce).
 pub(crate) async fn perform_handshake(
     ws: &mut Ws,
-) -> Result<(snow::TransportState, Vec<u8>), Error> {
-    let mut handshake = snow::Builder::new(
-        crate::message::NOISE_PATTERN
-            .parse()
-            .expect("valid noise pattern"),
-    )
-    .build_initiator()?;
+) -> Result<(NoiseTransport, Vec<u8>), Error> {
+    let mut handshake = NoiseHandshake::initiator()?;
 
     let mut buf = vec![0u8; 65535];
 

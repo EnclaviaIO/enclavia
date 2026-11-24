@@ -878,6 +878,33 @@ struct KeyMetadata {
     // material, "AWS_CLOUDHSM" / "EXTERNAL_KEY_STORE" for custom stores.
     #[serde(rename = "Origin")]
     origin: String,
+    // Multi-region keys share identical private key material across replicas,
+    // whose policies can be widened independently before or after locking
+    // this key's policy. Must be explicitly `false`.
+    #[serde(rename = "MultiRegion", default)]
+    multi_region: Option<bool>,
+    #[serde(rename = "KeyState", default)]
+    key_state: Option<String>,
+    #[serde(rename = "KeyUsage", default)]
+    key_usage: Option<String>,
+    #[serde(rename = "KeyManager", default)]
+    key_manager: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListGrantsReq<'a> {
+    #[serde(rename = "KeyId")]
+    key_id: &'a str,
+    #[serde(rename = "Limit")]
+    limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListGrantsResp {
+    #[serde(rename = "Grants", default)]
+    grants: Vec<serde_json::Value>,
+    #[serde(rename = "Truncated", default)]
+    truncated: bool,
 }
 
 async fn kms_get_public_key(key_id: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -898,58 +925,116 @@ async fn kms_get_key_policy(key_id: &str) -> Result<String, Box<dyn std::error::
     Ok(parsed.policy)
 }
 
-/// Fetch the key's `Origin` via `kms:DescribeKey`.
-async fn kms_key_origin(key_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Fetch the key's metadata via `kms:DescribeKey`.
+async fn kms_describe_key(key_id: &str) -> Result<KeyMetadata, Box<dyn std::error::Error>> {
     let body = serde_json::to_vec(&DescribeKeyReq { key_id })?;
     let resp = kms_call("TrentService.DescribeKey", body).await?;
     let parsed: DescribeKeyResp = serde_json::from_slice(&resp)?;
-    Ok(parsed.key_metadata.origin)
+    Ok(parsed.key_metadata)
+}
+
+/// Fetch all grants attached to `key_id` via `kms:ListGrants`.
+async fn kms_list_grants(key_id: &str) -> Result<ListGrantsResp, Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(&ListGrantsReq { key_id, limit: 100 })?;
+    let resp = kms_call("TrentService.ListGrants", body).await?;
+    Ok(serde_json::from_slice(&resp)?)
+}
+
+/// Validate `DescribeKey.KeyMetadata` invariants (fail-closed):
+/// - `Origin == "AWS_KMS"` (non-exportable, KMS-generated material)
+/// - `MultiRegion == Some(false)` (no cross-region replicas with weaker policy)
+/// - `KeyState == Some("Enabled")`
+/// - `KeyUsage == Some("ENCRYPT_DECRYPT")`
+/// - `KeyManager == Some("CUSTOMER")`
+fn validate_key_metadata(key_id: &str, meta: &KeyMetadata) -> Result<(), String> {
+    if meta.origin != "AWS_KMS" {
+        return Err(format!(
+            "KMS key {key_id} has Origin={}, refusing to trust it: only AWS_KMS-generated \
+             (non-exportable) keys are trusted",
+            meta.origin
+        ));
+    }
+    if meta.multi_region != Some(false) {
+        return Err(format!(
+            "KMS key {key_id} has MultiRegion={:?}, refusing to trust it: multi-region keys \
+             share private key material across replicas and cannot be bounded by one policy",
+            meta.multi_region
+        ));
+    }
+    if meta.key_state.as_deref() != Some("Enabled") {
+        return Err(format!(
+            "KMS key {key_id} has KeyState={:?}, expected \"Enabled\"",
+            meta.key_state
+        ));
+    }
+    if meta.key_usage.as_deref() != Some("ENCRYPT_DECRYPT") {
+        return Err(format!(
+            "KMS key {key_id} has KeyUsage={:?}, expected \"ENCRYPT_DECRYPT\"",
+            meta.key_usage
+        ));
+    }
+    if meta.key_manager.as_deref() != Some("CUSTOMER") {
+        return Err(format!(
+            "KMS key {key_id} has KeyManager={:?}, expected \"CUSTOMER\"",
+            meta.key_manager
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `ListGrants` output: pre-existing grants survive `PutKeyPolicy`
+/// and never appear in `GetKeyPolicy`, so any grant (or truncated listing)
+/// must fail closed.
+fn validate_grants(key_id: &str, resp: &ListGrantsResp) -> Result<(), String> {
+    if resp.truncated || !resp.grants.is_empty() {
+        return Err(format!(
+            "KMS key {key_id} has pre-existing grants (count={}, truncated={}), refusing to \
+             trust it: grants bypass key-policy PCR conditions",
+            resp.grants.len(),
+            resp.truncated
+        ));
+    }
+    Ok(())
 }
 
 /// Verify the KMS key is safe to trust before we seal under it / rely on
-/// it (see the call sites in `init` and `prepare_upgrade`). Two checks,
-/// both fatal:
+/// it (see the call sites in `init` and `prepare_upgrade`). Three checks,
+/// all fatal:
 ///
-/// 1. **Origin must be `AWS_KMS`** (`kms:DescribeKey`). A key with imported
-///    material (`EXTERNAL`) or a custom key store means someone holds the
-///    private key out-of-band and could decrypt our sealed passphrase
-///    offline, regardless of how tight the policy looks. So even a hostile
-///    host that swaps the bootstrap blob's `key_id` to a key it created
-///    cannot point us at a BYOK key.
-/// 2. **Policy gates Decrypt to the expected PCR0/1/2** (`kms:GetKeyPolicy` +
-///    `enclavia_protocol::kms_policy::verify_decrypt_policy`), and grants no
-///    principal a way to loosen that gate.
-///
-/// The "expected" PCRs differ per caller: `init` passes this enclave's own
-/// PCRs (the running image recovers the passphrase); `prepare_upgrade`
-/// passes the NEW version's PCR0-2 (`to`; the successor must be able to
-/// recover it — and nobody else).
-///
-/// Both checks are only as trustworthy as the channel to KMS: see the
-/// authenticated-transport note on `kms_call`.
+/// 1. **Key metadata (`kms:DescribeKey`)**: `Origin == "AWS_KMS"`,
+///    `MultiRegion == false`, `KeyState == "Enabled"`,
+///    `KeyUsage == "ENCRYPT_DECRYPT"`, `KeyManager == "CUSTOMER"`.
+/// 2. **Zero pre-existing grants (`kms:ListGrants`)**: grants survive
+///    `PutKeyPolicy` and do not appear in `GetKeyPolicy`, so any existing
+///    grant could allow ungated `kms:Decrypt`.
+/// 3. **Key policy (`kms:GetKeyPolicy`)**: gates `kms:Decrypt` strictly to
+///    the expected PCR0/1/2, grants no gate-loosening actions, and on real
+///    AWS KMS contains at least one PCR-pinned `Allow kms:Decrypt` statement.
 async fn verify_key_policy_for(
     key_id: &str,
     expected: &enclavia_protocol::attestation::Pcrs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let origin = kms_key_origin(key_id).await?;
-    if origin != "AWS_KMS" {
-        return Err(format!(
-            "KMS key {key_id} has Origin={origin}, refusing to trust it: only KMS-generated \
-             (non-exportable) keys are trusted; imported/external material could be held \
-             out-of-band and decrypt our sealed passphrase."
-        )
-        .into());
-    }
+    let meta = kms_describe_key(key_id).await?;
+    validate_key_metadata(key_id, &meta)?;
+
+    let grants = kms_list_grants(key_id).await?;
+    validate_grants(key_id, &grants)?;
 
     let policy = kms_get_key_policy(key_id).await?;
-    enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, expected).map_err(|e| {
+    let is_mock = matches!(kms_transport()?, KmsTransport::Mock);
+    let policy_check = if is_mock {
+        enclavia_protocol::kms_policy::verify_decrypt_policy_allow_empty(&policy, expected)
+    } else {
+        enclavia_protocol::kms_policy::verify_decrypt_policy(&policy, expected)
+    };
+    policy_check.map_err(|e| {
         format!(
             "KMS key {key_id} policy rejected, refusing to trust it: {e}. \
              The key's Decrypt must be gated to the expected PCR0/1/2 and \
              grant no principal a way to loosen it."
         )
     })?;
-    info!(key_id, "KMS key origin and policy verified against the expected PCRs");
+    info!(key_id, "KMS key metadata, grants, and policy verified against the expected PCRs");
     Ok(())
 }
 
@@ -1318,5 +1403,81 @@ Digests:
             TransportSelection::Aws(r) => assert_eq!(r, "us-east-1"),
             other => panic!("expected Aws, got {other:?}"),
         }
+    }
+
+    // ---- KMS metadata & grants verification (P0-2) --------------------
+
+    fn good_metadata() -> KeyMetadata {
+        KeyMetadata {
+            origin: "AWS_KMS".into(),
+            multi_region: Some(false),
+            key_state: Some("Enabled".into()),
+            key_usage: Some("ENCRYPT_DECRYPT".into()),
+            key_manager: Some("CUSTOMER".into()),
+        }
+    }
+
+    #[test]
+    fn validate_key_metadata_accepts_good_single_region_customer_key() {
+        validate_key_metadata("k1", &good_metadata()).unwrap();
+    }
+
+    #[test]
+    fn validate_key_metadata_rejects_multi_region_and_missing_fields() {
+        let mut m = good_metadata();
+        m.multi_region = Some(true);
+        assert!(validate_key_metadata("k1", &m).unwrap_err().contains("MultiRegion"));
+
+        let mut m = good_metadata();
+        m.multi_region = None;
+        assert!(validate_key_metadata("k1", &m).unwrap_err().contains("MultiRegion"));
+
+        let mut m = good_metadata();
+        m.origin = "EXTERNAL".into();
+        assert!(validate_key_metadata("k1", &m).unwrap_err().contains("Origin"));
+
+        let mut m = good_metadata();
+        m.key_state = Some("PendingDeletion".into());
+        assert!(validate_key_metadata("k1", &m).unwrap_err().contains("KeyState"));
+
+        let mut m = good_metadata();
+        m.key_usage = Some("SIGN_VERIFY".into());
+        assert!(validate_key_metadata("k1", &m).unwrap_err().contains("KeyUsage"));
+
+        let mut m = good_metadata();
+        m.key_manager = Some("AWS".into());
+        assert!(validate_key_metadata("k1", &m).unwrap_err().contains("KeyManager"));
+    }
+
+    #[test]
+    fn validate_grants_rejects_any_grant_or_truncation() {
+        validate_grants(
+            "k1",
+            &ListGrantsResp {
+                grants: vec![],
+                truncated: false,
+            },
+        )
+        .unwrap();
+
+        let err = validate_grants(
+            "k1",
+            &ListGrantsResp {
+                grants: vec![serde_json::json!({"GrantId": "g-1"})],
+                truncated: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("grants"), "{err}");
+
+        let err = validate_grants(
+            "k1",
+            &ListGrantsResp {
+                grants: vec![],
+                truncated: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("truncated=true"), "{err}");
     }
 }

@@ -74,20 +74,18 @@ fn save_credentials_at(
     }
 
     let json = serde_json::to_string_pretty(creds).expect("serialize credentials");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".credentials.json.")
+        .tempfile_in(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    f.write_all(json.as_bytes())?;
+    tmp.as_file_mut().write_all(json.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// buffers the content to find the tag) rejects a byte string; every reader
 /// built from this crate accepts both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ClientMessage {
     /// Request an attestation document. The server includes the handshake hash
     /// as the attestation nonce and the current control nonce as user_data.
@@ -167,7 +167,7 @@ pub enum ServerMessage {
 /// Storage re-key parameters for a `PrepareUpgrade` control command. Only
 /// provided for enclaves that have a persistent LUKS-backed storage volume;
 /// `None` for stateless enclaves.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RekeyParams {
     /// DER-encoded SubjectPublicKeyInfo of the new RSA-OAEP KMS key.
     /// The enclave wraps a freshly-generated passphrase under this key and
@@ -403,6 +403,32 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn client_message_rejects_unknown_fields() {
+        #[derive(Serialize)]
+        struct Smuggled {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            id: u64,
+            payload: Vec<u8>,
+            extra: &'static str,
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &Smuggled {
+                kind: "Data",
+                id: 1,
+                payload: vec![1, 2, 3],
+                extra: "unexpected",
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let err = ciborium::from_reader::<ClientMessage, _>(buf.as_slice())
+            .expect_err("unknown fields on ClientMessage must be rejected");
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     /// Byte payloads are read whether they arrive as a CBOR array of
