@@ -404,8 +404,8 @@ impl RaftRequestHandler {
                 "rejecting Raft RPC addressed to a different instance id"
             );
             return MeshRaftReply::Error(format!(
-                "target_id mismatch: addressed to {}, local instance is {}",
-                env.target_id, self_id
+                "target_id mismatch: addressed to {}, local instance is {self_id}",
+                env.target_id
             ));
         }
         // 2. Sender binding: the `vote.leader_id` in any Raft RPC must match
@@ -426,8 +426,7 @@ impl RaftRequestHandler {
                 "rejecting Raft RPC whose sender node_id does not match the attested channel pubkey"
             );
             return MeshRaftReply::Error(format!(
-                "sender identity mismatch: vote claims {:?}, channel attests {}",
-                claimed_sender, peer_id
+                "sender identity mismatch: vote claims {claimed_sender:?}, channel attests {peer_id}"
             ));
         }
 
